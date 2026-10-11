@@ -380,7 +380,13 @@ pub fn is_local_or_private(ip: &std::net::IpAddr) -> bool {
     use std::net::IpAddr;
     match ip {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
-        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            // Loopback, unique-local fc00::/7 and link-local fe80::/10:
+            // the last is where a router's neighbour and router
+            // advertisements come from.
+            v6.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
     }
 }
 
@@ -619,8 +625,8 @@ mod tests {
     }
 
     #[test]
-    fn is_local_or_private_flags_loopback_and_unique_local_ipv6() {
-        for addr in ["::1", "fc00::1", "fd12:3456::1"] {
+    fn is_local_or_private_flags_loopback_unique_local_and_link_local_ipv6() {
+        for addr in ["::1", "fc00::1", "fd12:3456::1", "fe80::1", "febf::1"] {
             let ip: std::net::IpAddr = addr.parse().unwrap();
             assert!(is_local_or_private(&ip), "{addr} should be local/private");
         }
@@ -628,7 +634,7 @@ mod tests {
 
     #[test]
     fn is_local_or_private_does_not_flag_public_addresses() {
-        for addr in ["198.51.100.9", "2001:db8::1"] {
+        for addr in ["198.51.100.9", "2001:db8::1", "fec0::1"] {
             let ip: std::net::IpAddr = addr.parse().unwrap();
             assert!(!is_local_or_private(&ip), "{addr} should be public");
         }

@@ -145,8 +145,8 @@ pub fn loaded_entries(rules: &[FirewallRule], now: i64) -> usize {
 ///
 /// The established/related and loopback accepts come first, before any
 /// user rule, so that a catch-all Block cannot cut existing connections or
-/// local traffic.
-fn fragment(out: &mut String, restore: &str, delimiter: &str, lines: &[String]) {
+/// local traffic. `head` is what else goes before them for this family.
+fn fragment(out: &mut String, restore: &str, delimiter: &str, head: &[&str], lines: &[String]) {
     out.push_str(&format!("{restore} -w --noflush <<'{delimiter}'\n"));
     out.push_str("*filter\n");
     out.push_str(&format!(":{CHAIN} - [0:0]\n"));
@@ -154,6 +154,9 @@ fn fragment(out: &mut String, restore: &str, delimiter: &str, lines: &[String]) 
         "-A {CHAIN} -m state --state ESTABLISHED,RELATED -j ACCEPT\n"
     ));
     out.push_str(&format!("-A {CHAIN} -i lo -j ACCEPT\n"));
+    for line in head {
+        out.push_str(&format!("-A {CHAIN} {line}\n"));
+    }
     for line in lines {
         out.push_str(line);
         out.push('\n');
@@ -161,6 +164,17 @@ fn fragment(out: &mut String, restore: &str, delimiter: &str, lines: &[String]) 
     out.push_str("COMMIT\n");
     out.push_str(&format!("{delimiter}\n"));
 }
+
+/// IPv6 neighbour discovery, accepted ahead of every rule: see the
+/// nftables renderer for why. conntrack leaves these packets untracked, so
+/// the established/related accept does not cover them, and a Block that
+/// covers a neighbour (a feed entry, a catch-all) would otherwise take the
+/// host's IPv6 down once its neighbour cache expires.
+const ND_ACCEPTS: [&str; 3] = [
+    "-p ipv6-icmp --icmpv6-type router-advertisement -j ACCEPT",
+    "-p ipv6-icmp --icmpv6-type neighbour-solicitation -j ACCEPT",
+    "-p ipv6-icmp --icmpv6-type neighbour-advertisement -j ACCEPT",
+];
 
 /// The guarded jumps into our chain from the chains that see traffic,
 /// indented by `indent`.
@@ -237,7 +251,7 @@ pub fn render(rules: &[FirewallRule], now: i64) -> String {
     }
     out.push_str("set -e\n\n");
 
-    fragment(&mut out, "iptables-restore", "STOP_BOTS_IPV4", &plan.v4);
+    fragment(&mut out, "iptables-restore", "STOP_BOTS_IPV4", &[], &plan.v4);
     // `INPUT` alone only covers services running on the host. Traffic for
     // a published container port is DNAT'd and then *forwarded*, so it
     // never reaches `INPUT` and an `INPUT`-only jump enforces nothing for
@@ -247,7 +261,13 @@ pub fn render(rules: &[FirewallRule], now: i64) -> String {
     // Listing `INPUT` is the cheapest proof that ip6tables works here at
     // all; it fails on a kernel booted with IPv6 disabled.
     out.push_str("\nif ip6tables -w -L INPUT -n >/dev/null 2>&1; then\n");
-    fragment(&mut out, "ip6tables-restore", "STOP_BOTS_IPV6", &plan.v6);
+    fragment(
+        &mut out,
+        "ip6tables-restore",
+        "STOP_BOTS_IPV6",
+        &ND_ACCEPTS,
+        &plan.v6,
+    );
     jumps(&mut out, "ip6tables", "    ");
     if !plan.v6.is_empty() {
         out.push_str("else\n");
@@ -430,6 +450,34 @@ mod tests {
             "rendered was:\n{rendered}"
         );
         assert!(rendered.contains(&format!("iptables -w -I INPUT -j {CHAIN}")));
+    }
+
+    /// Allowlist mode's `::/0` Block covers every neighbour and the router.
+    /// Their discovery packets are untracked, so only an accept ahead of
+    /// the rules keeps the host's IPv6 up.
+    #[test]
+    fn ipv6_neighbour_discovery_is_accepted_before_any_rule() {
+        let rendered = render(&[block("::/0")], NOW);
+        let v6 = fragment_of(&rendered, "STOP_BOTS_IPV6");
+        let first_rule = v6.iter().position(|l| l.contains("-s ::/0")).unwrap();
+        for kind in [
+            "router-advertisement",
+            "neighbour-solicitation",
+            "neighbour-advertisement",
+        ] {
+            let accept = v6
+                .iter()
+                .position(|l| l.contains(&format!("--icmpv6-type {kind} -j ACCEPT")));
+            assert!(
+                accept.is_some_and(|at| at < first_rule),
+                "{kind} must be accepted before the rules, rendered was:\n{rendered}"
+            );
+        }
+        let v4 = fragment_of(&rendered, "STOP_BOTS_IPV4");
+        assert!(
+            !v4.iter().any(|l| l.contains("icmpv6")),
+            "iptables has no ICMPv6, rendered was:\n{rendered}"
+        );
     }
 
     #[test]

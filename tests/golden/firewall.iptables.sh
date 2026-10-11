@@ -38,6 +38,9 @@ ip6tables-restore -w --noflush <<'STOP_BOTS_IPV6'
 :STOP-BOTS - [0:0]
 -A STOP-BOTS -m state --state ESTABLISHED,RELATED -j ACCEPT
 -A STOP-BOTS -i lo -j ACCEPT
+-A STOP-BOTS -p ipv6-icmp --icmpv6-type router-advertisement -j ACCEPT
+-A STOP-BOTS -p ipv6-icmp --icmpv6-type neighbour-solicitation -j ACCEPT
+-A STOP-BOTS -p ipv6-icmp --icmpv6-type neighbour-advertisement -j ACCEPT
 -A STOP-BOTS -s 2001:db8::/32 -j DROP
 COMMIT
 STOP_BOTS_IPV6

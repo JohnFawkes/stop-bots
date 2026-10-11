@@ -146,8 +146,13 @@ const RULES_CHAIN: &str = "bot_rules";
 /// as never-a-scanner, spelled as nftables literals.
 const PRIVATE_V4: &str = "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16";
 
-/// The v6 half of [`PRIVATE_V4`]: loopback and unique-local.
-const PRIVATE_V6: &str = "::1, fc00::/7";
+/// The v6 half of [`PRIVATE_V4`]: loopback, unique-local and link-local.
+const PRIVATE_V6: &str = "::1, fc00::/7, fe80::/10";
+
+/// The input chain's accept for IPv6 neighbour discovery: router
+/// advertisements and neighbour solicitations and advertisements.
+const ND_ACCEPT: &str =
+    "icmpv6 type { nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept";
 
 fn action_word(action: FirewallAction) -> &'static str {
     match action {
@@ -513,6 +518,15 @@ pub fn render(rules: &[FirewallRule], now: i64) -> String {
         "add rule {TABLE} {CHAIN} ct state established,related accept\n"
     ));
     out.push_str(&format!("add rule {TABLE} {CHAIN} iif lo accept\n"));
+    // IPv6 finds its neighbours and its router with ICMPv6, and conntrack
+    // leaves those packets untracked, so `established,related` never
+    // matches them. Without this, allowlist mode's `::/0 drop` (or any
+    // rule covering a neighbour's address) drops them, and once the
+    // neighbour cache expires the host has no IPv6 at all — SSH included,
+    // while the lockout guard, which checks the operator's own address,
+    // passes. They are link-scoped: the kernel discards one that has
+    // crossed a router.
+    out.push_str(&format!("add rule {TABLE} {CHAIN} {ND_ACCEPT}\n"));
     out.push_str(&format!("add rule {TABLE} {CHAIN} jump {RULES_CHAIN}\n"));
 
     // The same short-circuit on the forward path. `iif lo` has no meaning
@@ -718,6 +732,24 @@ mod tests {
             rendered.contains("policy accept"),
             "rendered was:\n{rendered}"
         );
+    }
+
+    /// Allowlist mode's `::/0` drop covers every neighbour and the router.
+    /// Their discovery packets are untracked, so only an accept ahead of
+    /// the jump keeps the host's IPv6 up.
+    #[test]
+    fn ipv6_neighbour_discovery_is_accepted_before_the_rules() {
+        let rendered = render(&[block("::/0")], NOW);
+        let accept = rendered
+            .find(&format!("add rule {TABLE} {CHAIN} {ND_ACCEPT}"))
+            .expect("the input chain accepts neighbour discovery");
+        let jump = rendered
+            .find(&format!("add rule {TABLE} {CHAIN} jump {RULES_CHAIN}"))
+            .unwrap();
+        assert!(accept < jump, "rendered was:\n{rendered}");
+        for kind in ["nd-router-advert", "nd-neighbor-solicit", "nd-neighbor-advert"] {
+            assert!(ND_ACCEPT.contains(kind), "{kind} missing from {ND_ACCEPT:?}");
+        }
     }
 
     #[test]

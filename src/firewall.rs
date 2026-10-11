@@ -486,7 +486,7 @@ pub fn all_rules(db: &Db) -> Result<Vec<FirewallRule>> {
 /// [`ipranges::is_local_or_private`] calls "this host or its own network,
 /// never an internet scanner". Shared with `nftables`, whose forward chain
 /// accepts the same set before any rule is consulted.
-pub const PRIVATE_RANGES: [&str; 7] = [
+pub const PRIVATE_RANGES: [&str; 8] = [
     "127.0.0.0/8",
     "10.0.0.0/8",
     "172.16.0.0/12",
@@ -494,6 +494,7 @@ pub const PRIVATE_RANGES: [&str; 7] = [
     "169.254.0.0/16",
     "::1",
     "fc00::/7",
+    "fe80::/10",
 ];
 
 /// An Allow for every [`PRIVATE_RANGES`] entry, placed after the admin's
@@ -521,7 +522,7 @@ pub const PRIVATE_RANGES: [&str; 7] = [
 /// **Why only when there are derived rules.** Nothing else comes after
 /// them to be shielded from, and a host with no rules at all must still
 /// render none: `health` reads "0 generated" as "nothing to enforce yet",
-/// and seven always-present rules would make every fresh host report
+/// and eight always-present rules would make every fresh host report
 /// generated rules that never reached the kernel.
 pub fn private_allow_rules() -> Vec<FirewallRule> {
     PRIVATE_RANGES
@@ -1889,7 +1890,7 @@ mod tests {
     }
 
     /// A host with nothing derived renders nothing extra, so `status` can
-    /// still say "no rules to enforce yet" rather than reporting seven
+    /// still say "no rules to enforce yet" rather than reporting eight
     /// synthetic rules missing from the kernel.
     #[test]
     fn with_nothing_derived_no_private_accepts_are_written() {

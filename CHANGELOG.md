@@ -29,6 +29,12 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   its match limit on ordinary browsers' user agents, which NGINX answers with a 500.
   Such patterns are now dropped and counted like the other unusable ones. No entry in
   the current upstream lists repeats more than once.
+- Geo allow-list mode no longer takes down the host's IPv6. Its `::/0` block also dropped
+  IPv6 neighbour discovery, which conntrack does not track, so once the neighbour cache
+  expired the host stopped answering over IPv6, SSH included, while the lockout check
+  passed. Both firewall backends now accept router and neighbour advertisements and
+  neighbour solicitations ahead of every rule, and link-local `fe80::/10` joins loopback
+  and unique-local as an address no rule or detector treats as an internet client.
 
 ## [0.1.1] — 2026-10-01
 

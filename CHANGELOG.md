@@ -45,6 +45,11 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   and 128 of them filled every slot. A response that makes no progress for ten seconds
   now ends its connection, and one client (an IPv6 client by its /64) may hold at most
   32 connections at once.
+- The root helper no longer follows a log that is a link in a directory someone else
+  can write, and refuses a FIFO or socket in place of a log. A site user who owned
+  the directory a site logs to could otherwise have pointed the helper at another
+  file root can read, and had its lines handed to the console, or hung the helper on
+  a FIFO. A log linked from a directory only root controls is still followed.
 
 ## [0.1.1] — 2026-10-01
 

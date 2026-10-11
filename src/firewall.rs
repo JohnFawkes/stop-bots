@@ -777,7 +777,7 @@ fn now_secs() -> i64 {
 /// it.
 ///
 /// **And not at all into a directory someone else could write** — see
-/// [`unsafe_script_directory`]. Whoever can write the directory can swap
+/// [`unsafe_directory`]. Whoever can write the directory can swap
 /// the script between this write and root running it, and no care taken
 /// over the write itself can prevent that.
 pub fn write_script(out: &Path, script: &str) -> std::io::Result<()> {
@@ -793,7 +793,7 @@ pub fn write_script(out: &Path, script: &str) -> std::io::Result<()> {
     // SAFETY: neither call has preconditions; both only read the
     // process's own credentials.
     let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    if let Some(why) = unsafe_script_directory(meta.uid(), meta.gid(), meta.mode(), euid, egid) {
+    if let Some(why) = unsafe_directory(meta.uid(), meta.gid(), meta.mode(), euid, egid) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!(
@@ -867,10 +867,11 @@ pub fn write_script(out: &Path, script: &str) -> std::io::Result<()> {
 }
 
 /// Why a directory owned by `uid`:`gid` with `mode` is not a safe place for
-/// a script root will run, or `None` if it is.
+/// a script root will run, or for a link root follows (see
+/// [`crate::logread::open_log`]), or `None` if it is.
 ///
 /// Anyone who can write the directory can rename a different file over
-/// the script after it is written. So the owner must be root or this
+/// the script after it is written, or a different link over the link. So the owner must be root or this
 /// process — nobody else — and nobody else may be able to write it either:
 /// not other users, and not a group this process is not the primary group
 /// of. The sticky bit (`/tmp`) is the exception, because it stops anyone
@@ -879,7 +880,7 @@ pub fn write_script(out: &Path, script: &str) -> std::io::Result<()> {
 /// The group rule is what lets an ordinary user's own `0775` directory
 /// through — the default under `umask 002`, where the group is the user's
 /// own — while still refusing `root:adm 0775`.
-fn unsafe_script_directory(uid: u32, gid: u32, mode: u32, euid: u32, egid: u32) -> Option<String> {
+pub(crate) fn unsafe_directory(uid: u32, gid: u32, mode: u32, euid: u32, egid: u32) -> Option<String> {
     const STICKY: u32 = 0o1000;
     if uid != 0 && uid != euid {
         return Some(format!("owned by uid {uid}"));
@@ -2243,10 +2244,10 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                unsafe_script_directory(uid, gid, mode, euid, egid).is_none(),
+                unsafe_directory(uid, gid, mode, euid, egid).is_none(),
                 safe,
                 "{what}: {:?}",
-                unsafe_script_directory(uid, gid, mode, euid, egid)
+                unsafe_directory(uid, gid, mode, euid, egid)
             );
         }
     }

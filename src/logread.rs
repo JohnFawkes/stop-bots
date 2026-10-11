@@ -142,6 +142,72 @@ pub struct FileRead {
     pub more: bool,
 }
 
+/// Opens the log at `path` for reading.
+///
+/// The root helper reads logs for the console with `CAP_DAC_OVERRIDE`,
+/// and a log's directory is not always root's alone: a site can log into
+/// a directory its own user owns. Whoever can write there could replace
+/// the log with a link to any file root can read, and the console would
+/// be handed its lines; or with a FIFO, and the read would hang the
+/// helper. So a link is followed only in a directory nobody but root (or
+/// this process) can change ([`crate::firewall::unsafe_directory`]), which
+/// keeps a log an administrator linked elsewhere working, and a FIFO or a
+/// socket, the special files anyone can make, is refused. (A device needs
+/// root to make, and `/dev/null` is a fine log to read nothing from.)
+/// `O_NONBLOCK` keeps the open itself from waiting for a FIFO's writer; on
+/// a regular file it changes nothing.
+pub fn open_log(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let open = |follow: bool| {
+        let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | nofollow)
+            .open(path)
+    };
+    let file = match open(false) {
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+            if let Some(why) = untrusted_directory_of(path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} is a link in a directory {why}, so it is not followed",
+                        path.display()
+                    ),
+                ));
+            }
+            open(true)?
+        }
+        opened => opened?,
+    };
+    use std::os::unix::fs::FileTypeExt;
+    let kind = file.metadata()?.file_type();
+    if kind.is_fifo() || kind.is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a FIFO or a socket, not a log", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+/// Why the directory `path` is in is one someone other than root or this
+/// process can change, or `None` if it is not.
+fn untrusted_directory_of(path: &Path) -> Option<String> {
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let meta = match std::fs::metadata(dir) {
+        Ok(meta) => meta,
+        Err(err) => return Some(format!("that could not be checked ({err})")),
+    };
+    // SAFETY: neither call has any failure mode.
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    crate::firewall::unsafe_directory(meta.uid(), meta.gid(), meta.mode(), euid, egid)
+}
+
 /// Reads every complete line of `path` that `from` has not seen, calling
 /// `visit` with each, and stops at the first line boundary at or after
 /// `budget` bytes. The cursor it returns resumes the read exactly there,
@@ -153,7 +219,7 @@ pub fn read_chunk(
     budget: u64,
     visit: &mut dyn FnMut(&str),
 ) -> io::Result<FileRead> {
-    let mut file = File::open(path)?;
+    let mut file = open_log(path)?;
     let meta = file.metadata()?;
     let (dev, ino, len) = (meta.dev(), meta.ino(), meta.len());
 
@@ -212,7 +278,7 @@ pub fn read_chunk(
 /// shorter than that. For picking up where something other than a cursor
 /// left off: the byte count 0.0.x kept for the access-stats tally.
 pub fn cursor_at(path: &Path, offset: u64) -> io::Result<FileCursor> {
-    let mut file = File::open(path)?;
+    let mut file = open_log(path)?;
     let meta = file.metadata()?;
     let offset = if offset <= meta.len() { offset } else { 0 };
     let head_len = offset.min(HEAD_BYTES);
@@ -248,7 +314,7 @@ fn drain_rotated_copy(
     let mut name = path.as_os_str().to_owned();
     name.push(".1");
     let rotated = PathBuf::from(name);
-    let Ok(mut file) = File::open(&rotated) else {
+    let Ok(mut file) = open_log(&rotated) else {
         return Drained::Finished(0);
     };
     let Ok(meta) = file.metadata() else {
@@ -281,7 +347,7 @@ fn drain_rotated_copy(
 /// line boundary inside them. For a report about what a log looks like,
 /// which a recent sample answers as well as the whole file.
 pub fn read_tail(path: &Path, max_bytes: u64, visit: &mut dyn FnMut(&str)) -> io::Result<()> {
-    let mut file = File::open(path)?;
+    let mut file = open_log(path)?;
     let len = file.metadata()?.len();
     if len <= max_bytes {
         return stream(&mut file, 0, false, u64::MAX, visit).map(|_| ());
@@ -651,6 +717,59 @@ mod tests {
 
         let (lines, _) = lines_of(&log, Some(second.cursor));
         assert!(lines.is_empty(), "nothing new is nothing: {lines:?}");
+    }
+
+    /// A site user who owns the log's directory must not be able to point
+    /// the root helper at another file and have its lines handed over.
+    #[test]
+    fn a_link_in_a_directory_others_can_write_is_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "root:x:0:0\n").unwrap();
+        let log = dir.path().join("access.log");
+        std::os::unix::fs::symlink(&secret, &log).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err = read_chunk(&log, None, u64::MAX, &mut |_| {}).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(err.to_string().contains("writable by every user"), "{err}");
+    }
+
+    /// An administrator who keeps the log elsewhere and links it into a
+    /// directory only they control still has it read.
+    #[test]
+    fn a_link_in_a_directory_only_its_owner_can_write_is_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let elsewhere = tempfile::tempdir().unwrap();
+        let real = elsewhere.path().join("access.log");
+        append(&real, "one\n");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = dir.path().join("access.log");
+        std::os::unix::fs::symlink(&real, &log).unwrap();
+
+        let (lines, _) = lines_of(&log, None);
+
+        assert_eq!(lines, ["one"]);
+    }
+
+    /// A FIFO in place of the log would hold the helper's one turn until
+    /// its deadline; it is refused at once.
+    #[test]
+    fn a_fifo_in_place_of_the_log_is_refused_without_waiting() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("access.log");
+        let name = std::ffi::CString::new(log.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+        let err = read_chunk(&log, None, u64::MAX, &mut |_| {}).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert!(read_tail(&log, 1024, &mut |_| {}).is_err());
     }
 
     /// A line still being written is not half a line.

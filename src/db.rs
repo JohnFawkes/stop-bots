@@ -799,6 +799,7 @@ pub fn validate_exempt_path(path: &str) -> Result<String> {
     {
         anyhow::bail!("an exempt path cannot contain {c:?}");
     }
+    reject_a_pattern_too_long_for_nginx(path, "an exempt path")?;
     Ok(path.to_string())
 }
 
@@ -813,7 +814,27 @@ fn validate_user_agent_fragment(user_agent: &str, what: &str) -> Result<String> 
     {
         anyhow::bail!("{what} cannot contain {c:?}");
     }
+    reject_a_pattern_too_long_for_nginx(user_agent, what)?;
     Ok(user_agent.to_string())
+}
+
+/// Refuses `literal` if, escaped, it is longer than a blocked user agent
+/// may be ([`crate::nginx::MAX_PATTERN_LEN`]).
+///
+/// Each trusted user agent, agent exemption and exempt path is written as
+/// one quoted NGINX parameter, which NGINX refuses past about 4 KB: one
+/// that long failed `nginx -t`, and every apply after it was rolled back
+/// until the row was removed. The cap is the one blocked user agents have
+/// always had, and a user agent cut for the stats always fits it.
+fn reject_a_pattern_too_long_for_nginx(literal: &str, what: &str) -> Result<()> {
+    let escaped = escape_regex_literal(literal).len();
+    if escaped > crate::nginx::MAX_PATTERN_LEN {
+        anyhow::bail!(
+            "{what} is too long: {escaped} bytes once escaped, at most {} fit",
+            crate::nginx::MAX_PATTERN_LEN
+        );
+    }
+    Ok(())
 }
 
 /// The entries of `addresses` that may be stored and later rendered into a
@@ -4675,6 +4696,20 @@ mod tests {
         ] {
             assert!(validate_trusted_user_agent(bad).is_err(), "{why}: {bad:?}");
         }
+    }
+
+    /// Past NGINX's parameter limit, one row failed `nginx -t` and froze
+    /// every apply until it was removed.
+    #[test]
+    fn a_user_agent_or_path_too_long_for_nginx_is_refused() {
+        let long = "A".repeat(crate::nginx::MAX_PATTERN_LEN + 1);
+        assert!(validate_trusted_user_agent(&long).is_err());
+        assert!(validate_exemption_user_agent(&long).is_err());
+        assert!(validate_exempt_path(&format!("/{long}")).is_err());
+        // Escaping is what is measured: 600 dots are 1,200 bytes written.
+        assert!(validate_trusted_user_agent(&".".repeat(600)).is_err());
+        let fits = "A".repeat(crate::nginx::MAX_PATTERN_LEN);
+        assert_eq!(validate_trusted_user_agent(&fits).unwrap(), fits);
     }
 
     #[test]

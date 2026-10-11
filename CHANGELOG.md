@@ -54,6 +54,11 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   matched every request and would have blocked every visitor, and the first also
   published `Disallow: /` for the whole site. The honeypot now matches only paths that
   start with it, as robots.txt does, rather than paths that contain it anywhere.
+- A trusted user agent, an agent exemption or an exempt path longer than 1,024 bytes
+  (once escaped) is refused, and a longer one already stored is left out of the
+  generated config. One that long made `nginx -t` fail, and every apply after it was
+  rolled back. A site with many exempt paths no longer hits the same limit: they are
+  split between several `if`s, as the bot patterns are.
 
 ## [0.1.1] — 2026-10-01
 

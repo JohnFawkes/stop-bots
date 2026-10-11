@@ -2199,7 +2199,7 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     }
     let code = config.response.status_code();
     let (prefixes, exact) = effective_exempt_paths(config);
-    let exemptions = exemption_regex(&prefixes, exact);
+    let exemptions = exemption_regexes(&prefixes, exact);
 
     let mut out = format!("    {BLOCK_BEGIN}\n");
 
@@ -2229,7 +2229,7 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     } else {
         String::new()
     };
-    let uses_flag = exemptions.is_some()
+    let uses_flag = !exemptions.is_empty()
         || clears_trusted
         || !agent_clears.is_empty()
         || (pattern.is_some() && !config.request_rules.is_empty());
@@ -2273,7 +2273,7 @@ fn block_text(config: &BlockConfig) -> Option<String> {
             rule.condition()
         ));
     }
-    if let Some(exemptions) = &exemptions {
+    for exemptions in &exemptions {
         out.push_str(&format!(
             "    if ($uri ~* {}) {{\n        set $stop_bots_block 0;\n    }}\n",
             nginx_quoted(exemptions)
@@ -2440,9 +2440,15 @@ fn is_stored_as_valid(value: &str, validate: fn(&str) -> Result<String>) -> bool
     validate(value).is_ok_and(|valid| valid == value)
 }
 
-/// Builds the `$uri` regex that clears the block flag, or `None` when
-/// there are no usable exemptions: `prefixes` match anything under them,
-/// `exact` only themselves.
+/// Builds the `$uri` regexes that clear the block flag, none when there
+/// are no usable exemptions: `prefixes` match anything under them, `exact`
+/// only themselves.
+///
+/// Usually one. Each is written as one quoted parameter, which NGINX
+/// refuses past about 4 KB, so a site with enough exemptions gets them
+/// split between several the way [`chunk_patterns`] splits bot patterns;
+/// joined into one, a hundred ordinary paths failed `nginx -t` and froze
+/// every apply after them.
 ///
 /// **An exemption is a literal path prefix, never a regex.** Anchored with
 /// `^` and alternated, so `/blog` exempts `/blog` and `/blog/post` but not
@@ -2461,7 +2467,7 @@ fn is_stored_as_valid(value: &str, validate: fn(&str) -> Result<String>) -> bool
 /// [`agent_exemption_clears`] gives: the raw request line is not the path
 /// NGINX serves, and `/robots.txt/../wp-login.php` begins with an exempt
 /// prefix while resolving to a blocked one.
-fn exemption_regex(prefixes: &[String], exact: &[&str]) -> Option<String> {
+fn exemption_regexes(prefixes: &[String], exact: &[&str]) -> Vec<String> {
     let usable = |p: &&str| is_stored_as_valid(p, crate::db::validate_exempt_path);
     let escaped: Vec<String> = prefixes
         .iter()
@@ -2476,7 +2482,11 @@ fn exemption_regex(prefixes: &[String], exact: &[&str]) -> Option<String> {
                 .map(|p| format!("{}$", crate::db::escape_regex_literal(p))),
         )
         .collect();
-    (!escaped.is_empty()).then(|| format!("^({})", escaped.join("|")))
+    let escaped: Vec<&str> = escaped.iter().map(String::as_str).collect();
+    chunk_patterns(&escaped, MAX_PATTERN_CHUNK_LEN - "^()".len())
+        .into_iter()
+        .map(|chunk| format!("^({chunk})"))
+        .collect()
 }
 
 /// The statements that clear the block flag for agent exemptions: one
@@ -2516,14 +2526,20 @@ fn agent_exemption_clears(exemptions: &[crate::db::AgentExemption]) -> String {
             continue;
         }
         let paths: Vec<String> = group.iter().map(|e| e.path.clone()).collect();
-        let Some(paths) = exemption_regex(&paths, &[]) else {
+        let paths = exemption_regexes(&paths, &[]);
+        if paths.is_empty() {
             continue;
-        };
+        }
         out.push_str(&format!(
-            "    set {AGENT_EXEMPT_VAR} \"\";\n    if ($http_user_agent ~* {}) {{\n        set {AGENT_EXEMPT_VAR} $uri;\n    }}\n    if ({AGENT_EXEMPT_VAR} ~* {}) {{\n        set $stop_bots_block 0;\n    }}\n",
+            "    set {AGENT_EXEMPT_VAR} \"\";\n    if ($http_user_agent ~* {}) {{\n        set {AGENT_EXEMPT_VAR} $uri;\n    }}\n",
             nginx_quoted(&crate::db::escape_regex_literal(user_agent)),
-            nginx_quoted(&paths)
         ));
+        for paths in &paths {
+            out.push_str(&format!(
+                "    if ({AGENT_EXEMPT_VAR} ~* {}) {{\n        set $stop_bots_block 0;\n    }}\n",
+                nginx_quoted(paths)
+            ));
+        }
     }
     out
 }
@@ -5653,16 +5669,35 @@ mod tests {
     #[test]
     fn the_exemption_regex_is_anchored_and_alternated() {
         assert_eq!(
-            exemption_regex(&["/blog".to_string(), "/feed".to_string()], &[]),
-            Some("^(/blog|/feed)".to_string())
+            exemption_regexes(&["/blog".to_string(), "/feed".to_string()], &[]),
+            ["^(/blog|/feed)"]
         );
+    }
+
+    /// One quoted parameter past about 4 KB fails `nginx -t`, and a site
+    /// can have more exemptions than fit in one.
+    #[test]
+    fn many_exemptions_are_split_between_regexes_that_each_fit() {
+        let paths: Vec<String> = (0..200).map(|n| format!("/section-{n:03}/page/")).collect();
+        let regexes = exemption_regexes(&paths, &[]);
+        assert!(regexes.len() > 1, "{} bytes in one", regexes[0].len());
+        for regex in &regexes {
+            assert!(
+                nginx_quoted(regex).len() <= MAX_PATTERN_CHUNK_LEN,
+                "{} bytes",
+                nginx_quoted(regex).len()
+            );
+            assert!(regex.starts_with("^(") && regex.ends_with(')'), "{regex}");
+        }
+        let kept = regexes.iter().map(|r| r.matches('|').count() + 1).sum::<usize>();
+        assert_eq!(kept, paths.len(), "every path is in exactly one");
     }
 
     /// Unescaped regex metacharacters in a literal URL prefix would widen
     /// the exemption — which fails *open*, unlike a too-narrow pattern.
     #[test]
     fn the_exemption_regex_escapes_metacharacters() {
-        let regex = exemption_regex(&["/a.b?c".to_string()], &[]).unwrap();
+        let regex = exemption_regexes(&["/a.b?c".to_string()], &[]).remove(0);
         assert!(regex.contains("\\."), "regex was: {regex}");
         assert!(regex.contains("\\?"), "regex was: {regex}");
     }
@@ -5671,10 +5706,10 @@ mod tests {
     fn the_exemption_regex_drops_unusable_paths() {
         // Not anchored at the start: could never match, so it's dropped
         // rather than silently widening or narrowing anything.
-        assert_eq!(exemption_regex(&["blog".to_string()], &[]), None);
+        assert!(exemption_regexes(&["blog".to_string()], &[]).is_empty());
         // Would terminate the quoted config string.
-        assert_eq!(exemption_regex(&["/a\"b".to_string()], &[]), None);
-        assert_eq!(exemption_regex(&[], &[]), None);
+        assert!(exemption_regexes(&["/a\"b".to_string()], &[]).is_empty());
+        assert!(exemption_regexes(&[], &[]).is_empty());
     }
 
     // ---- agent exemptions ----

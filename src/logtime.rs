@@ -105,7 +105,9 @@ fn zone_offset(text: &str) -> Option<i64> {
         _ => return None,
     };
     let rest: String = rest.chars().filter(|c| *c != ':').collect();
-    if rest.len() != 4 {
+    // ASCII first: `len` counts bytes, and the slices below would split a
+    // wider character and panic.
+    if !rest.is_ascii() || rest.len() != 4 {
         return None;
     }
     let hours = i64::from(digits(&rest[..2])?);
@@ -288,6 +290,15 @@ mod tests {
         // The same instant written two hours east of UTC.
         assert_eq!(nginx_time_local("28/Sep/2026:08:33:01 +0200"), Some(SEP_28));
         assert_eq!(nginx_time_local("28/Sep/2026:01:03:01 -0530"), Some(SEP_28));
+    }
+
+    /// Four bytes that are not four characters: sliced as bytes, `é`
+    /// panicked, and a log read that panics on a line reads it again on
+    /// every pass.
+    #[test]
+    fn a_zone_with_a_wider_character_is_refused_not_sliced() {
+        assert_eq!(nginx_time_local("28/Sep/2026:06:33:01 +1\u{e9}1"), None);
+        assert_eq!(iso8601("2026-09-28T06:33:01+1\u{e9}1"), None);
     }
 
     #[test]

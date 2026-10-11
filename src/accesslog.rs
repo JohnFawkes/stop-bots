@@ -120,11 +120,13 @@ fn parse_combined_line(line: &str) -> Option<ParsedLine> {
 
     let mut fields = line.splitn(3, '"');
     // Unquoted prefix: ip, remote_user and `[time_local]`. The ip is
-    // captured above; the time is whatever sits between the brackets, and
-    // a line without a readable one still parses, undated.
+    // captured above; the time is whatever sits between the last pair of
+    // brackets, and a line without a readable one still parses, undated.
+    // The last, because `$remote_user` comes first and is the client's to
+    // write, brackets and all, while `$time_local` never has one.
     let prefix = fields.next()?;
     let time = prefix
-        .split_once('[')
+        .rsplit_once('[')
         .and_then(|(_, rest)| rest.split_once(']'))
         .and_then(|(stamp, _)| crate::logtime::nginx_time_local(stamp));
     let request = fields.next()?;
@@ -2320,6 +2322,16 @@ mod tests {
     fn a_combined_line_carries_its_time() {
         let line =
             "203.0.113.5 - - [28/Sep/2026:08:33:01 +0200] \"GET / HTTP/1.1\" 200 1 \"-\" \"UA\"";
+        assert_eq!(parse_line(line).unwrap().time, Some(SEP_28));
+    }
+
+    /// `$remote_user` is whatever a client's `Authorization` header says,
+    /// brackets included, and comes before the time. A date written there
+    /// would have aged the line out of every detector's window.
+    #[test]
+    fn a_time_in_the_remote_user_does_not_date_the_line() {
+        let line = "203.0.113.5 - x [01/Jan/2000:00:00:00 +0000] y \
+                    [28/Sep/2026:08:33:01 +0200] \"GET /.env HTTP/1.1\" 404 1 \"-\" \"UA\"";
         assert_eq!(parse_line(line).unwrap().time, Some(SEP_28));
     }
 

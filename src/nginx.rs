@@ -388,8 +388,12 @@ pub enum PatternProblem {
     /// literal characters, or it has an empty alternative — it matches
     /// (nearly) every user agent.
     MatchesTooMuch,
-    /// A repeated group that itself repeats something, `(a+)+`: the shape
-    /// that makes a backtracking engine take exponential time per request.
+    /// A shape that makes a backtracking engine try more ways to match
+    /// than PCRE's match limit allows: a repeated group that itself repeats
+    /// something, `(a+)+`; a repeated group with alternatives, `(a|aa)+`;
+    /// or more than one repetition anywhere, `.*.*.*`. NGINX answers a
+    /// regex that hits the limit with a 500, for every request it is
+    /// tested against, and `nginx -t` cannot tell.
     Backtracks,
     /// Something PCRE refuses to compile: a range out of order (`[z-a]`), a
     /// quantifier whose numbers are out of order (`{2,1}`) or too big
@@ -408,7 +412,7 @@ impl std::fmt::Display for PatternProblem {
             PatternProblem::ControlCharacter => "it contains a control character",
             PatternProblem::TooLong => "it is too long",
             PatternProblem::MatchesTooMuch => "it would match (nearly) every user agent",
-            PatternProblem::Backtracks => "it nests one repetition inside another",
+            PatternProblem::Backtracks => "it repeats in more than one place",
             PatternProblem::Invalid => "it is not a regex NGINX would compile",
             PatternProblem::Unchecked => "it is not a regex this tool can check",
         })
@@ -456,6 +460,7 @@ pub fn pattern_problem(pattern: &str) -> Option<PatternProblem> {
     let mut shape = Shape {
         chars: &chars,
         pos: 0,
+        repetitions: 0,
     };
     match shape.alternation(0) {
         Err(problem) => Some(problem),
@@ -478,6 +483,8 @@ struct Measured {
     min_literals: usize,
     /// Whether it contains a quantifier anywhere.
     quantified: bool,
+    /// Whether it is a choice between alternatives, `a|b`.
+    alternates: bool,
     /// Whether a quantifier may follow it. An anchor (`^`, `\b`) matches a
     /// position rather than a character, and no list repeats one.
     repeatable: bool,
@@ -537,6 +544,16 @@ const POSIX_CLASSES: [&str; 14] = [
 struct Shape<'a> {
     chars: &'a [char],
     pos: usize,
+    /// How many quantifiers that can match more than once it has passed.
+    ///
+    /// Each one multiplies the ways PCRE can try to match by up to the
+    /// length of the user agent: `Mozilla.*.*.*.*.*.*[!#]` is tried
+    /// about 150^6 ways against an ordinary Chrome user agent, hits
+    /// PCRE's match limit and makes NGINX answer 500 to every browser.
+    /// One is linear per starting position. No pattern in any upstream
+    /// list repeats more than once (October 2026: 2 of 1,775 repeat at
+    /// all), so the limit costs nothing real.
+    repetitions: usize,
 }
 
 impl Shape<'_> {
@@ -556,14 +573,17 @@ impl Shape<'_> {
         }
         let mut min_literals = usize::MAX;
         let mut quantified = false;
+        let mut branches = 0;
         loop {
             let branch = self.sequence(depth)?;
             min_literals = min_literals.min(branch.min_literals);
             quantified |= branch.quantified;
+            branches += 1;
             if self.peek() != Some('|') {
                 return Ok(Measured {
                     min_literals,
                     quantified,
+                    alternates: branches > 1,
                     repeatable: true,
                 });
             }
@@ -594,8 +614,18 @@ impl Shape<'_> {
                     }) {
                         return Err(PatternProblem::Unchecked);
                     }
-                    if quantifier.repeats && atom.quantified {
+                    // `(a|aa)+` can split a run of `a`s between its
+                    // branches in exponentially many ways; telling
+                    // overlapping branches from disjoint ones is more than
+                    // a walk can do, and no list repeats a choice.
+                    if quantifier.repeats && (atom.quantified || atom.alternates) {
                         return Err(PatternProblem::Backtracks);
+                    }
+                    if quantifier.repeats {
+                        self.repetitions += 1;
+                        if self.repetitions > 1 {
+                            return Err(PatternProblem::Backtracks);
+                        }
                     }
                     min_literals = min_literals
                         .saturating_add(atom.min_literals.saturating_mul(quantifier.min));
@@ -613,6 +643,7 @@ impl Shape<'_> {
         Ok(Measured {
             min_literals,
             quantified,
+            alternates: false,
             repeatable: true,
         })
     }
@@ -621,11 +652,13 @@ impl Shape<'_> {
         let literal = |n| Measured {
             min_literals: n,
             quantified: false,
+            alternates: false,
             repeatable: true,
         };
         let anchor = Measured {
             min_literals: 0,
             quantified: false,
+            alternates: false,
             repeatable: false,
         };
         let c = self.peek().ok_or(PatternProblem::Unchecked)?;
@@ -4981,6 +5014,49 @@ mod tests {
             "Evil(Bot(a*))+",
         ] {
             assert!(!is_usable_pattern(pattern), "{pattern:?} must be dropped");
+        }
+    }
+
+    /// Each of these passes `nginx -t` and, against an ordinary Chrome
+    /// user agent, runs PCRE into its match limit: NGINX then answers 500
+    /// to every browser on every site.
+    #[test]
+    fn a_pattern_that_repeats_more_than_once_is_never_written() {
+        for (pattern, why) in [
+            ("Mozilla.*.*.*.*.*.*[!#]", "adjacent repetitions"),
+            ("Mozilla.*Chrome.*Safari", "two repetitions apart"),
+            (r"Bot\d+\.\d+", "two repetitions of a class"),
+            ("Bot.{0,500}.{0,500}x", "bounded repetitions count too"),
+        ] {
+            assert_eq!(
+                pattern_problem(pattern),
+                Some(PatternProblem::Backtracks),
+                "{pattern:?} ({why})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_choice_is_never_written() {
+        for pattern in ["Mozilla(.|.)*[!#]", "xyz(a|aa)+$", "Bot(?:a|b){2,}"] {
+            assert_eq!(
+                pattern_problem(pattern),
+                Some(PatternProblem::Backtracks),
+                "{pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_repetition_and_optional_parts_are_kept() {
+        for pattern in [
+            r"BlogTraffic\/\d\.\d+ Feed-Fetcher",
+            r"Poduptime;\s*\+fediverse\.observer",
+            "Face(book){0,1}[Bb]ot",
+            r"Datadog(?:\/{0,1}Synthetics| Synthetic)",
+            "(sistrix|SISTRIX) [cC]rawler",
+        ] {
+            assert_eq!(pattern_problem(pattern), None, "{pattern:?}");
         }
     }
 

@@ -23,6 +23,12 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   user agent in a combined-style format. A request whose host can't be tied to a site
   gets the allowances of every application on the server. `scan-sites` says which
   application it found behind each site.
+- A downloaded bot list can no longer make NGINX answer 500 to every visitor. A pattern
+  that repeats in more than one place, such as `Mozilla.*.*.*.*[!#]`, or repeats a
+  choice, such as `(a|aa)+`, passed the check, passed `nginx -t`, and then ran PCRE into
+  its match limit on ordinary browsers' user agents, which NGINX answers with a 500.
+  Such patterns are now dropped and counted like the other unusable ones. No entry in
+  the current upstream lists repeats more than once.
 
 ## [0.1.1] — 2026-10-01
 

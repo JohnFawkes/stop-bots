@@ -550,6 +550,20 @@ pub fn probe_path_ips(log_text: &str, probe_paths: &[String]) -> Vec<(String, St
     )
 }
 
+/// Every IP that requested a path starting with `honeypot`, paired with
+/// the path. The same matcher the scheduled detector uses: anchored, as
+/// the robots.txt line that publishes the trap is.
+pub fn honeypot_ips(log_text: &str, honeypot: &str) -> Vec<(String, String)> {
+    convicted_in_text(
+        log_text,
+        Watch {
+            honeypot: honeypot.to_string(),
+            ..Watch::only(Detector::Honeypot)
+        },
+        Rule::Once,
+    )
+}
+
 /// Every address that sent an exploit payload — in the request line, the
 /// user agent or the referer — with the first signature seen from it.
 ///
@@ -1115,8 +1129,11 @@ impl Observer {
                     .any(|needle| path.contains(needle.as_str()))
                     .then(|| Item::seen(&line.path))
             }
+            // Anchored, as the `Disallow:` line that publishes it is: a
+            // crawler that obeys robots.txt avoids exactly the paths that
+            // start with it.
             Detector::Honeypot => (!self.honeypot.is_empty()
-                && line.path.to_lowercase().contains(&self.honeypot))
+                && line.path.to_lowercase().starts_with(&self.honeypot))
             .then(|| Item::seen(&line.path)),
             Detector::RobotsTxt => line
                 .path

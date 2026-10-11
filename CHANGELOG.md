@@ -50,6 +50,10 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   the directory a site logs to could otherwise have pointed the helper at another
   file root can read, and had its lines handed to the console, or hung the helper on
   a FIFO. A log linked from a directory only root controls is still followed.
+- `set-honeypot-path /` is refused, and a `/` among `set-probe-paths` is skipped. Either
+  matched every request and would have blocked every visitor, and the first also
+  published `Disallow: /` for the whole site. The honeypot now matches only paths that
+  start with it, as robots.txt does, rather than paths that contain it anywhere.
 
 ## [0.1.1] — 2026-10-01
 

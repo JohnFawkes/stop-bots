@@ -448,9 +448,10 @@ enum Command {
     ///
     /// Replaces the extra paths `block-probe-paths` checks. The built-in
     /// list is never removable — switch the detector off instead. One path
-    /// per line; blank lines and `#` comments are ignored, and every entry
-    /// must start with `/`, since matching is anchored at the start of the
-    /// request path.
+    /// per line; blank lines and `#` comments are ignored. Each is looked
+    /// for anywhere in the request path, so every entry must start with
+    /// `/`, which keeps it to the start of a path segment, and must name
+    /// something after it.
     SetProbePaths {
         /// Newline-separated paths. Pass an empty string to clear.
         #[arg(long)]
@@ -4561,9 +4562,9 @@ fn set_probe_paths(db_path: Option<PathBuf>, paths: String) -> Result<()> {
     db.set_text_setting(stop_bots::protection::PROBE_PATHS_EXTRA, &paths)?;
     let accepted = stop_bots::protection::extra_probe_paths(&db)?;
     say!("Extra probe paths set ({} accepted).", accepted.len());
-    // Report what was dropped rather than silently ignoring it: an entry
-    // that doesn't start with `/` can never match, and finding that out
-    // from a detector that quietly never fires is much worse.
+    // Report what was dropped rather than silently ignoring it: finding
+    // that out from a detector that never fires, or one that fires on
+    // everyone, is much worse.
     let offered = paths
         .lines()
         .map(str::trim)
@@ -4571,8 +4572,9 @@ fn set_probe_paths(db_path: Option<PathBuf>, paths: String) -> Result<()> {
         .count();
     if offered > accepted.len() {
         say!(
-            "Ignored {} entr(y/ies) that don't start with '/' — matching is anchored at the \
-             start of the request path.",
+            "Ignored {} entr(y/ies) that don't start with '/' or name nothing after it — \
+             each is looked for at the start of a path segment, and '/' alone is in every \
+             request.",
             offered - accepted.len()
         );
     }

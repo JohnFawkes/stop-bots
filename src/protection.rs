@@ -127,18 +127,21 @@ pub const INJECTION_TTL_DAYS_DEFAULT: i64 = 7;
 
 /// Every extra probe path configured on top of the built-in list: the
 /// `PROBE_PATHS_EXTRA` setting split on newlines, with blank lines and
-/// `#` comments dropped so an admin can annotate the list. Entries that
-/// don't start with `/` are skipped rather than silently never matching —
-/// [`crate::accesslog::probe_path_ips`] anchors at the start of the
-/// request path, so a bare `wp-config.php` would match nothing and look
-/// like the detector was broken.
+/// `#` comments dropped so an admin can annotate the list.
+///
+/// [`crate::accesslog::probe_path_ips`] looks for each anywhere in the
+/// request path, and the leading `/` is what keeps that to the start of a
+/// path segment, so an entry without one is skipped: a bare `env` would
+/// match every word ending in it. So is one that is nothing but slashes,
+/// which every request contains: one `/` among the extra paths would have
+/// blocked every visitor for five days.
 pub fn extra_probe_paths(db: &Db) -> Result<Vec<String>> {
     let raw = db.get_text_setting(PROBE_PATHS_EXTRA)?.unwrap_or_default();
     Ok(raw
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter(|line| line.starts_with('/'))
+        .filter(|line| line.starts_with('/') && !line.trim_matches('/').is_empty())
         .map(str::to_string)
         .collect())
 }
@@ -200,6 +203,9 @@ pub fn honeypot_path(db: &Db) -> Result<String> {
 /// - **It must start with `/`.** Matching is anchored at the start of the
 ///   request path, so anything else could never fire and would leave the
 ///   detector looking switched on while doing nothing.
+/// - **It must name something below `/`.** `/` is the start of every
+///   request path: every visitor would be blocked for thirty days, and
+///   robots.txt would disallow the whole site.
 /// - **Only characters a URL path spells literally.** The path is
 ///   published as one `Disallow:` line of the generated robots.txt. Trim
 ///   only reached the ends, so a newline in the middle ended that line and
@@ -209,6 +215,12 @@ pub fn validate_honeypot_path(path: &str) -> Result<String> {
     let path = path.trim();
     if !path.starts_with('/') {
         anyhow::bail!("the honeypot path must start with '/' (got {path:?})");
+    }
+    if path.trim_matches('/').is_empty() {
+        anyhow::bail!(
+            "the honeypot path must name something below '/', which every request starts \
+             with (got {path:?})"
+        );
     }
     if let Some(c) = path.chars().find(|c| {
         !(c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '.' | '_' | '~' | '%' | '+' | '@'))
@@ -1149,6 +1161,28 @@ mod tests {
                 "{bad:?} must not be used even if it was stored"
             );
         }
+    }
+
+    /// `/` begins every request path: as the trap it would block every
+    /// visitor for thirty days and disallow the whole site in robots.txt.
+    #[test]
+    fn a_honeypot_path_that_names_nothing_below_the_root_is_refused() {
+        let db = Db::open_in_memory().unwrap();
+        for bad in ["/", "//", " / "] {
+            assert!(validate_honeypot_path(bad).is_err(), "{bad:?} must be refused");
+            db.set_text_setting(HONEYPOT_PATH, bad).unwrap();
+            assert_eq!(honeypot_path(&db).unwrap(), HONEYPOT_PATH_DEFAULT, "{bad:?}");
+        }
+    }
+
+    /// One `/` among the extra probe paths was in every request, and every
+    /// visitor would have been blocked for five days.
+    #[test]
+    fn an_extra_probe_path_that_is_only_slashes_is_skipped() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_text_setting(PROBE_PATHS_EXTRA, "/\n//\n/my-secret\n")
+            .unwrap();
+        assert_eq!(extra_probe_paths(&db).unwrap(), ["/my-secret"]);
     }
 
     #[test]

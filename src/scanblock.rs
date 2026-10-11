@@ -548,7 +548,7 @@ pub fn block_honeypot(
     let text = web_log(db, log_text)?;
     let log_text: &str = &text;
     let path = crate::protection::honeypot_path(db)?;
-    let hits = accesslog::probe_path_ips(log_text, &[path]);
+    let hits = accesslog::honeypot_ips(log_text, &path);
     let found = hits.len();
     let candidates = hits
         .into_iter()
@@ -1708,6 +1708,15 @@ mod tests {
                 .candidates,
             1
         );
+    }
+
+    /// Matched as robots.txt matches it, from the start: a page that only
+    /// mentions the trap further down its path did not ignore robots.txt.
+    #[test]
+    fn block_honeypot_matches_from_the_start_of_the_path() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("203.0.113.9", "/blog/stop-bots-trap/");
+        assert_eq!(block_honeypot(&db, 30, &log, true).unwrap().candidates, 0);
     }
 
     #[test]

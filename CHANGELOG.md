@@ -40,6 +40,11 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   removed that country's ranges, and the next apply blocked the whole country. The
   stored ranges are now kept and the update reports a failure, as it already did for a
   list with no usable entries.
+- One client can no longer shut everyone else out of the web console. A client that
+  sent requests and never read the responses kept each connection open indefinitely,
+  and 128 of them filled every slot. A response that makes no progress for ten seconds
+  now ends its connection, and one client (an IPv6 client by its /64) may hold at most
+  32 connections at once.
 
 ## [0.1.1] — 2026-10-01
 

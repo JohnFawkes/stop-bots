@@ -140,8 +140,8 @@ pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> anyhow::Resul
     served
 }
 
-/// How much a client can hold of this server before it has finished
-/// sending a request. See [`serve_on`].
+/// How much a client can hold of this server, and for how long. See
+/// [`serve_on`].
 #[derive(Debug, Clone, Copy)]
 pub struct ServeLimits {
     /// From the moment the server is ready for a request line to the end
@@ -151,6 +151,14 @@ pub struct ServeLimits {
     pub body_read_timeout: std::time::Duration,
     /// Connections open at once. The next waits in the kernel's backlog.
     pub max_connections: usize,
+    /// Connections one client may hold at once, keyed as the login
+    /// throttle keys it (an IPv6 client by its /64). One past it is hung
+    /// up on, so that one client cannot hold every `max_connections`.
+    pub max_connections_per_client: usize,
+    /// How long a response may make no progress being written before the
+    /// connection is dropped: a client that stops reading holds its slot
+    /// no longer than this.
+    pub write_idle_timeout: std::time::Duration,
     /// The most a connection may buffer of an unfinished request head.
     pub max_header_bytes: usize,
     /// The largest request body. Every form here is a few fields; there
@@ -170,6 +178,14 @@ impl Default for ServeLimits {
             // runs out first, and it runs out without taking the
             // descriptors the cron needs to read its logs.
             max_connections: 128,
+            // A browser opens six. Behind NGINX every request arrives from
+            // the proxy, which opens one per request in flight, and an
+            // operator's console has a handful of those.
+            max_connections_per_client: 32,
+            // As long as a head may take to arrive. A response is a page of
+            // HTML; a client that has taken none of it for ten seconds is
+            // not reading it.
+            write_idle_timeout: std::time::Duration::from_secs(10),
             // hyper's default is about 400 KB per connection; a real
             // request head here is a few hundred bytes plus the cookies.
             max_header_bytes: 16 * 1024,
@@ -190,7 +206,13 @@ impl Default for ServeLimits {
 /// at most `max_connections` are open at once.
 ///
 /// The handler itself has no deadline: an apply that has started must
-/// finish, not be abandoned half-way because it took a while.
+/// finish, not be abandoned half-way because it took a while. Writing its
+/// response does: a client that pipelined requests and never read the
+/// answers held its slot forever, because hyper waits on a full send
+/// buffer without a timer, and 128 of them shut everyone else out. Now a
+/// write that makes no progress for [`ServeLimits::write_idle_timeout`]
+/// ends the connection, and one client may hold at most
+/// [`ServeLimits::max_connections_per_client`] at once.
 ///
 /// The peer address goes into each request as axum's `ConnectInfo`, where
 /// [`client_address`] finds it — what makes the anti-lockout guard and the
@@ -204,6 +226,7 @@ pub async fn serve_on(
     use tower::ServiceExt;
 
     let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    let per_client = PerClient::default();
     loop {
         // A slot first, then the accept: past the cap, connections wait in
         // the kernel's backlog rather than as descriptors in this process.
@@ -223,9 +246,15 @@ pub async fn serve_on(
                 continue;
             }
         };
+        let Some(client_slot) = per_client.claim(peer.ip(), limits.max_connections_per_client)
+        else {
+            // Dropped unanswered, which frees the global slot with it.
+            continue;
+        };
         let app = app.clone();
         tokio::spawn(async move {
             let _slot = slot;
+            let _client_slot = client_slot;
             let service =
                 hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
                     let mut request = request.map(Body::new);
@@ -240,8 +269,153 @@ pub async fn serve_on(
                 .max_buf_size(limits.max_header_bytes.max(8192));
             // An error here is a client that went away or timed out:
             // nothing for the server to do about it.
+            let stream = WriteDeadline::new(stream, limits.write_idle_timeout);
             let _ = http.serve_connection(TokioIo::new(stream), service).await;
         });
+    }
+}
+
+/// How many connections each client holds, by [`super::auth::client_key`].
+#[derive(Clone, Default)]
+struct PerClient(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>);
+
+impl PerClient {
+    /// One more connection for the client at `ip`, or `None` if it already
+    /// holds `max`. Given back when the returned slot is dropped.
+    fn claim(&self, ip: std::net::IpAddr, max: usize) -> Option<ClientSlot> {
+        let key = super::auth::client_key(ip);
+        let mut held = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let count = held.entry(key.clone()).or_insert(0);
+        if *count >= max {
+            return None;
+        }
+        *count += 1;
+        Some(ClientSlot {
+            clients: self.clone(),
+            key,
+        })
+    }
+}
+
+/// One connection's share of [`PerClient`].
+struct ClientSlot {
+    clients: PerClient,
+    key: String,
+}
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        let mut held = self.clients.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = held.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// A stream whose writes fail once they have made no progress for a while.
+///
+/// hyper has a timer for reading a request head and none for writing a
+/// response, so a client that stops reading leaves the write pending for
+/// as long as it keeps the socket open. Only a stall counts: each write
+/// that goes through starts the clock again, so a large page to a slow
+/// client is fine.
+struct WriteDeadline<S> {
+    inner: S,
+    limit: std::time::Duration,
+    stalled: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> WriteDeadline<S> {
+    fn new(inner: S, limit: std::time::Duration) -> Self {
+        Self {
+            inner,
+            limit,
+            stalled: None,
+        }
+    }
+
+    /// `result` as the write it came from returned it, unless it has been
+    /// pending for longer than the limit.
+    fn watch<T>(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        result: std::task::Poll<std::io::Result<T>>,
+    ) -> std::task::Poll<std::io::Result<T>> {
+        use std::future::Future;
+        use std::task::Poll;
+
+        if result.is_ready() {
+            self.stalled = None;
+            return result;
+        }
+        let limit = self.limit;
+        let stalled = self
+            .stalled
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(limit)));
+        match stalled.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the client stopped reading the response",
+            ))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for WriteDeadline<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for WriteDeadline<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.watch(cx, result)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        this.watch(cx, result)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_flush(cx);
+        this.watch(cx, result)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_shutdown(cx);
+        this.watch(cx, result)
     }
 }
 
@@ -1193,19 +1367,22 @@ mod tests {
         }
     }
 
-    /// A server on an ephemeral loopback port, answering every request
-    /// with the peer address its handler was given.
+    /// A server on an ephemeral loopback port, answering `/` with the
+    /// peer address its handler was given and `/big` with more than any
+    /// socket buffers.
     async fn listening(limits: ServeLimits) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let app = Router::new().route(
-            "/",
-            get(
-                |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
-                    std::net::SocketAddr,
-                >| async move { peer.ip().to_string() },
-            ),
-        );
+        let app = Router::new()
+            .route(
+                "/",
+                get(
+                    |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
+                        std::net::SocketAddr,
+                    >| async move { peer.ip().to_string() },
+                ),
+            )
+            .route("/big", get(|| async { "x".repeat(32 << 20) }));
         tokio::spawn(serve_on(listener, app, limits));
         addr
     }
@@ -1277,6 +1454,69 @@ mod tests {
             "served after {:?}, before the idle connection's slot was free",
             started.elapsed()
         );
+    }
+
+    /// A client that asks and never reads used to hold its slot for as long
+    /// as it kept the socket open: hyper waits on a full send buffer with
+    /// no timer. 128 of them shut the console to everyone.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_gives_up_its_slot() {
+        let addr = listening(ServeLimits {
+            write_idle_timeout: std::time::Duration::from_millis(50),
+            ..quick_limits(1)
+        })
+        .await;
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        let mut stalled = socket.connect(addr).await.unwrap();
+        stalled
+            .write_all(b"GET /big HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let mut next = tokio::net::TcpStream::connect(addr).await.unwrap();
+        next.write_all(REQUEST).await.unwrap();
+        let response = read_all(&mut next).await;
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response:.200}");
+    }
+
+    /// One client holding every slot was the other half of that: past its
+    /// own share, the next connection from it is hung up on unanswered.
+    #[tokio::test]
+    async fn one_client_cannot_hold_every_connection() {
+        let addr = listening(ServeLimits {
+            header_read_timeout: std::time::Duration::from_secs(5),
+            max_connections_per_client: 1,
+            ..quick_limits(4)
+        })
+        .await;
+        let _idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let started = std::time::Instant::now();
+        let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _ = second.write_all(REQUEST).await;
+
+        let response = read_all(&mut second).await;
+
+        assert_eq!(response, "", "the second connection was answered");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "hung up on after {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_client_slot_is_given_back_when_dropped() {
+        let clients = PerClient::default();
+        let ip: std::net::IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let same_64: std::net::IpAddr = "2001:db8:1:2::ffff".parse().unwrap();
+        let first = clients.claim(ip, 1).expect("the first is free");
+        assert!(clients.claim(same_64, 1).is_none(), "a /64 is one client");
+        drop(first);
+        assert!(clients.claim(same_64, 1).is_some(), "the slot came back");
     }
 
     /// The header timeout ends with the headers; a body sent a byte at a

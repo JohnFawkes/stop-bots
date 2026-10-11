@@ -35,6 +35,11 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   passed. Both firewall backends now accept router and neighbour advertisements and
   neighbour solicitations ahead of every rule, and link-local `fe80::/10` joins loopback
   and unique-local as an address no rule or detector treats as an internet client.
+- A country, crawler range list or reputation feed that comes back empty no longer
+  wipes what was stored for it. Under allow-list mode an empty zone file from IPdeny
+  removed that country's ranges, and the next apply blocked the whole country. The
+  stored ranges are now kept and the update reports a failure, as it already did for a
+  list with no usable entries.
 
 ## [0.1.1] — 2026-10-01
 

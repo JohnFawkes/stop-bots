@@ -3219,6 +3219,41 @@ impl Db {
             .context("failed to list ip range sources")
     }
 
+    /// Refuses an empty fetch for a source that has ranges stored in
+    /// `table`, where `column` is `key`.
+    ///
+    /// The other half of [`reject_a_wholly_unusable_fetch`]: an empty
+    /// response is as much a broken feed as one full of bad lines, and the
+    /// delete that follows would act on it the same way. Under allowlist
+    /// mode, a country whose zone came back empty would lose its Allow and
+    /// fall to the catch-all, and cron would apply that unattended. A
+    /// source with nothing stored yet loses nothing, so its empty first
+    /// fetch is still just "nothing to say".
+    fn reject_an_empty_fetch_over_stored(
+        &self,
+        table: &'static str,
+        column: &'static str,
+        key: &str,
+        cidrs: &[String],
+    ) -> Result<()> {
+        if !cidrs.is_empty() {
+            return Ok(());
+        }
+        let stored: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+            params![key],
+            |row| row.get(0),
+        )?;
+        if stored > 0 {
+            anyhow::bail!(
+                "{key}: the fetch returned no entries at all — keeping the {stored} range(s) \
+                 already stored, since an empty list is a broken feed far more often than \
+                 an emptied one"
+            );
+        }
+        Ok(())
+    }
+
     /// Replaces every CIDR `source_id` currently contributes with `cidrs`,
     /// updates its `last_fetched_at`/`range_count`, and returns the new
     /// count — same clear-then-reinsert idiom as
@@ -3229,6 +3264,7 @@ impl Db {
             reject_an_oversized_fetch(source_id, cidrs)?;
             reject_an_overbroad_fetch(source_id, cidrs, FEED_MAX_V4_SHARE)?;
             reject_a_wholly_unusable_fetch(source_id, cidrs)?;
+            self.reject_an_empty_fetch_over_stored("ip_ranges", "source_id", source_id, cidrs)?;
             self.conn.execute(
                 "DELETE FROM ip_ranges WHERE source_id = ?1",
                 params![source_id],
@@ -3358,6 +3394,12 @@ impl Db {
             reject_an_oversized_fetch(country_code, cidrs)?;
             reject_an_overbroad_fetch(country_code, cidrs, COUNTRY_MAX_V4_SHARE)?;
             reject_a_wholly_unusable_fetch(country_code, cidrs)?;
+            self.reject_an_empty_fetch_over_stored(
+                "country_ip_ranges",
+                "country_code",
+                country_code,
+                cidrs,
+            )?;
             self.conn.execute(
                 "DELETE FROM country_ip_ranges WHERE country_code = ?1",
                 params![country_code],
@@ -3598,6 +3640,12 @@ impl Db {
             reject_an_oversized_fetch(source_id, cidrs)?;
             reject_an_overbroad_fetch(source_id, cidrs, FEED_MAX_V4_SHARE)?;
             reject_a_wholly_unusable_fetch(source_id, cidrs)?;
+            self.reject_an_empty_fetch_over_stored(
+                "reputation_ranges",
+                "source_id",
+                source_id,
+                cidrs,
+            )?;
             self.conn.execute(
                 "DELETE FROM reputation_ranges WHERE source_id = ?1",
                 params![source_id],
@@ -5483,16 +5531,57 @@ mod tests {
         );
     }
 
-    /// An upstream that legitimately has nothing to say is not a failure —
-    /// only a non-empty list with nothing usable in it is.
+    /// A source with nothing stored loses nothing to an empty fetch, so
+    /// that is not a failure.
     #[test]
-    fn an_empty_fetch_is_not_treated_as_a_broken_one() {
+    fn an_empty_first_fetch_is_not_treated_as_a_broken_one() {
         let db = Db::open_in_memory().unwrap();
-        db.replace_country_ranges("xx", &["5.6.7.8".to_string()])
-            .unwrap();
-
         assert_eq!(db.replace_country_ranges("xx", &[]).unwrap(), 0);
-        assert!(db.country_ranges("xx").unwrap().is_empty());
+        assert_eq!(db.replace_ip_ranges("googlebot", &[]).unwrap(), 0);
+        assert_eq!(db.replace_reputation_ranges("tor-exits", &[]).unwrap(), 0);
+    }
+
+    /// An empty 200 from a broken or hijacked feed must not wipe what is
+    /// stored: under allowlist mode a country that loses its ranges is
+    /// blocked whole by the catch-all.
+    #[test]
+    fn an_empty_fetch_keeps_the_ranges_already_stored() {
+        let db = Db::open_in_memory().unwrap();
+        let kept = vec!["5.6.7.0/24".to_string()];
+        db.register_ip_range_source(&sample_ip_range_source("googlebot", Category::Search))
+            .unwrap();
+        db.register_reputation_source(&ReputationSource {
+            id: "tor-exits".to_string(),
+            name: "Tor exit nodes".to_string(),
+            url: "https://example.invalid/tor".to_string(),
+            enabled: true,
+            last_fetched_at: None,
+            range_count: 0,
+        })
+        .unwrap();
+        db.replace_country_ranges("xx", &kept).unwrap();
+        db.replace_ip_ranges("googlebot", &kept).unwrap();
+        db.replace_reputation_ranges("tor-exits", &kept).unwrap();
+
+        let err = db.replace_country_ranges("xx", &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("keeping the 1 range(s)"),
+            "error was: {err:#}"
+        );
+        assert!(db.replace_ip_ranges("googlebot", &[]).is_err());
+        assert!(db.replace_reputation_ranges("tor-exits", &[]).is_err());
+
+        assert_eq!(db.country_ranges("xx").unwrap(), kept);
+        assert_eq!(db.ip_ranges_for_source("googlebot").unwrap(), kept);
+        let reputation: Vec<String> = db
+            .conn
+            .prepare("SELECT cidr FROM reputation_ranges WHERE source_id = 'tor-exits'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(reputation, kept);
     }
 
     /// The whole internet, in the three spellings a hostile or broken feed

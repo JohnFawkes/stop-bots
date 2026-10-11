@@ -251,7 +251,13 @@ pub fn render(rules: &[FirewallRule], now: i64) -> String {
     }
     out.push_str("set -e\n\n");
 
-    fragment(&mut out, "iptables-restore", "STOP_BOTS_IPV4", &[], &plan.v4);
+    fragment(
+        &mut out,
+        "iptables-restore",
+        "STOP_BOTS_IPV4",
+        &[],
+        &plan.v4,
+    );
     // `INPUT` alone only covers services running on the host. Traffic for
     // a published container port is DNAT'd and then *forwarded*, so it
     // never reaches `INPUT` and an `INPUT`-only jump enforces nothing for

@@ -1138,7 +1138,10 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink("/etc/hostname", &path).unwrap();
 
-        assert!(!same_file(&held, &path), "a link in its place is another file");
+        assert!(
+            !same_file(&held, &path),
+            "a link in its place is another file"
+        );
     }
 
     /// Opening a database that is already current must not copy it:

@@ -1169,9 +1169,16 @@ mod tests {
     fn a_honeypot_path_that_names_nothing_below_the_root_is_refused() {
         let db = Db::open_in_memory().unwrap();
         for bad in ["/", "//", " / "] {
-            assert!(validate_honeypot_path(bad).is_err(), "{bad:?} must be refused");
+            assert!(
+                validate_honeypot_path(bad).is_err(),
+                "{bad:?} must be refused"
+            );
             db.set_text_setting(HONEYPOT_PATH, bad).unwrap();
-            assert_eq!(honeypot_path(&db).unwrap(), HONEYPOT_PATH_DEFAULT, "{bad:?}");
+            assert_eq!(
+                honeypot_path(&db).unwrap(),
+                HONEYPOT_PATH_DEFAULT,
+                "{bad:?}"
+            );
         }
     }
 

@@ -5689,7 +5689,10 @@ mod tests {
             );
             assert!(regex.starts_with("^(") && regex.ends_with(')'), "{regex}");
         }
-        let kept = regexes.iter().map(|r| r.matches('|').count() + 1).sum::<usize>();
+        let kept = regexes
+            .iter()
+            .map(|r| r.matches('|').count() + 1)
+            .sum::<usize>();
         assert_eq!(kept, paths.len(), "every path is in exactly one");
     }
 

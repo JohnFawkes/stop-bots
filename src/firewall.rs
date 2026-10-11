@@ -880,7 +880,13 @@ pub fn write_script(out: &Path, script: &str) -> std::io::Result<()> {
 /// The group rule is what lets an ordinary user's own `0775` directory
 /// through — the default under `umask 002`, where the group is the user's
 /// own — while still refusing `root:adm 0775`.
-pub(crate) fn unsafe_directory(uid: u32, gid: u32, mode: u32, euid: u32, egid: u32) -> Option<String> {
+pub(crate) fn unsafe_directory(
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    euid: u32,
+    egid: u32,
+) -> Option<String> {
     const STICKY: u32 = 0o1000;
     if uid != 0 && uid != euid {
         return Some(format!("owned by uid {uid}"));

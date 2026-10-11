@@ -747,8 +747,15 @@ mod tests {
             .find(&format!("add rule {TABLE} {CHAIN} jump {RULES_CHAIN}"))
             .unwrap();
         assert!(accept < jump, "rendered was:\n{rendered}");
-        for kind in ["nd-router-advert", "nd-neighbor-solicit", "nd-neighbor-advert"] {
-            assert!(ND_ACCEPT.contains(kind), "{kind} missing from {ND_ACCEPT:?}");
+        for kind in [
+            "nd-router-advert",
+            "nd-neighbor-solicit",
+            "nd-neighbor-advert",
+        ] {
+            assert!(
+                ND_ACCEPT.contains(kind),
+                "{kind} missing from {ND_ACCEPT:?}"
+            );
         }
     }
 

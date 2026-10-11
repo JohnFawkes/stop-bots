@@ -282,7 +282,7 @@ fn backup(conn: &Connection, path: &Path, version: u32) -> Result<()> {
     let base = backup_path(path, version);
     let mut target = base.clone();
     let mut n = 0;
-    loop {
+    let copy = loop {
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -292,7 +292,7 @@ fn backup(conn: &Connection, path: &Path, version: u32) -> Result<()> {
             Ok(file) => {
                 give_to_owner_of(&file, path)
                     .with_context(|| format!("failed to hand over {}", target.display()))?;
-                break;
+                break file;
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 n += 1;
@@ -306,7 +306,7 @@ fn backup(conn: &Connection, path: &Path, version: u32) -> Result<()> {
                 })
             }
         }
-    }
+    };
     let target_str = target
         .to_str()
         .with_context(|| format!("the backup path {} is not UTF-8", target.display()))?;
@@ -320,10 +320,30 @@ fn backup(conn: &Connection, path: &Path, version: u32) -> Result<()> {
     // `VACUUM INTO` leaves the copy unsynced. It has to be on disk before
     // the upgrade commits, or a power cut could leave an upgraded database
     // beside a torn copy of the old one.
-    std::fs::File::open(&target)
-        .and_then(|file| file.sync_all())
+    //
+    // Through the descriptor `create_new` returned, not by name: the
+    // directory can be the console's, and a name reopened there can be a
+    // FIFO by now, which would hang this root run on the open. The same
+    // descriptor says whether the name still holds the file it made.
+    copy.sync_all()
         .with_context(|| format!("failed to write {} to disk", target.display()))?;
+    if !same_file(&copy, &target) {
+        anyhow::bail!(
+            "{} was replaced while the pre-upgrade copy was written into it; nothing was \
+             changed",
+            target.display()
+        );
+    }
     Ok(())
+}
+
+/// Whether the name `path` still refers to the file open as `file`.
+fn same_file(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::symlink_metadata(path)) {
+        (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+        _ => false,
+    }
 }
 
 /// Gives `copy` the owner of the database at `db`, when this is root.
@@ -1104,6 +1124,21 @@ mod tests {
         );
         let second = dir.path().join("db.sqlite3.bak-v0.1");
         assert!(second.exists(), "the new copy should sit beside it");
+    }
+
+    /// The console owns the backup's directory and can swap the name
+    /// while root writes the copy; the check that follows must see it.
+    #[test]
+    fn a_backup_name_swapped_for_another_file_is_noticed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3.bak-v0");
+        let held = std::fs::File::create(&path).unwrap();
+        assert!(same_file(&held, &path), "nothing was swapped yet");
+
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", &path).unwrap();
+
+        assert!(!same_file(&held, &path), "a link in its place is another file");
     }
 
     /// Opening a database that is already current must not copy it:

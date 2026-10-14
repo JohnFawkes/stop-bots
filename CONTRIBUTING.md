@@ -142,8 +142,10 @@ coverage: the container suite (`make integration-test`) runs a binary inside Doc
 its coverage never comes back.
 
 It is a check, not a boast — but the check and the achieved figure are deliberately two
-different numbers. CI runs the same command with `--fail-under-lines 90`, and the badge
-at the top of the README claims that **floor**, not this snapshot.
+different numbers. CI runs the same command with `--fail-under-lines 90`: that **floor**
+is the promise, not this snapshot. The README carries no coverage badge, because CI
+publishes no coverage figure for one to read, and a hand-written number is a claim
+nothing keeps true.
 
 A floor set at today's figure would be a trap rather than a check: with no headroom, one
 ordinary function landing slightly under-tested turns CI red on an unrelated pull
@@ -152,7 +154,7 @@ the rot the floor exists to prevent. 90% is low enough to survive normal develop
 (about 850 lines of headroom today) and high enough that a real collapse is a red build.
 
 Raising the floor as the achieved figure rises is welcome. It just has to move together
-with the badge in `README.md` and this paragraph.
+with this paragraph.
 
 **No test touches the network**, which is where the remaining gap is and why it is there.
 Every downloader takes a `--source <file>` override that parses the same format the server

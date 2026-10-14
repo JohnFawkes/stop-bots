@@ -149,6 +149,18 @@ impl WebServer {
     ) -> Result<String> {
         match self {
             WebServer::Nginx => {
+                let config_for = |block: &nginx::ServerBlock| {
+                    Some(
+                        block
+                            .names
+                            .first()
+                            .and_then(|name| site_configs.iter().find(|(n, _)| n == name))
+                            .map_or(default_config, |(_, config)| config),
+                    )
+                };
+                if let Some(why) = nginx::refusal(content, config_path, root, config_for) {
+                    anyhow::bail!("{why}");
+                }
                 nginx::blocks_for_file(content, config_path, site_configs, default_config)
             }
             WebServer::Apache => {
@@ -168,7 +180,15 @@ impl WebServer {
         config: &BlockConfig,
     ) -> Result<String> {
         match self {
-            WebServer::Nginx => nginx::block_for_site(content, config_path, server_name, config),
+            WebServer::Nginx => {
+                let config_for = |block: &nginx::ServerBlock| {
+                    (block.names.first().map(String::as_str) == Some(server_name)).then_some(config)
+                };
+                if let Some(why) = nginx::refusal(content, config_path, root, config_for) {
+                    anyhow::bail!("{why}");
+                }
+                nginx::block_for_site(content, config_path, server_name, config)
+            }
             WebServer::Apache => {
                 apache::block_for_site(content, config_path, root, server_name, config)
             }
@@ -186,7 +206,24 @@ impl WebServer {
     ) -> SiteApplyStatus {
         match self {
             WebServer::Nginx => {
-                nginx::site_apply_status(config_path, server_name, config, &nginx::conf_d_dir(root))
+                // What an apply would refuse is not up to date, however the
+                // file reads: the apply that would bring it up to date fails.
+                let refused = fs::read_to_string(config_path).is_ok_and(|content| {
+                    let config_for = |block: &nginx::ServerBlock| {
+                        (block.names.first().map(String::as_str) == Some(server_name))
+                            .then_some(config)
+                    };
+                    nginx::refusal(&content, config_path, root, config_for).is_some()
+                });
+                match nginx::site_apply_status(
+                    config_path,
+                    server_name,
+                    config,
+                    &nginx::conf_d_dir(root),
+                ) {
+                    SiteApplyStatus::UpToDate if refused => SiteApplyStatus::Stale,
+                    status => status,
+                }
             }
             WebServer::Apache => apache::site_apply_status(config_path, server_name, config, root),
         }

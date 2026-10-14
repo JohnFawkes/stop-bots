@@ -3917,6 +3917,56 @@ fn uninstall_needs_root_without_a_prefix() {
         .stderr(predicate::str::contains("needs root"));
 }
 
+/// NGINX answers every visitor over HTTP/1.1 until something turns
+/// HTTP/2 on, and then the HTTP/1.x rule would turn every one of them
+/// away while `nginx -t` passes. So the apply refuses it, leaves the site
+/// as it was, and writes it once HTTP/2 is on.
+#[test]
+fn the_http_1x_rule_is_refused_on_nginx_until_http2_is_on() {
+    let fx = Fixture::new();
+    fs::write(
+        fx.nginx_root.join("nginx.conf"),
+        "http {\n    include *.conf;\n}\n",
+    )
+    .unwrap();
+    let site = fx.nginx_root.join("tls.conf");
+    let before = "server {\n    listen 443 ssl;\n    server_name tls.example;\n    \
+                  ssl_certificate /etc/ssl/x.pem;\n}\n";
+    fs::write(&site, before).unwrap();
+    fx.seed_bots();
+    fx.scan_sites();
+    fx.run(&[
+        "set-site-rule",
+        "--site",
+        "tls.example",
+        "--rule",
+        "http-1x",
+        "--enabled",
+        "true",
+    ]);
+
+    fx.cmd(&[
+        "apply-blocks",
+        "--root",
+        fx.nginx_root.to_str().unwrap(),
+        "--no-reload",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "nothing in the NGINX config turns HTTP/2 on",
+    ));
+    assert_eq!(fs::read_to_string(&site).unwrap(), before);
+
+    fs::write(&site, before.replace("ssl;", "ssl;\n    http2 on;")).unwrap();
+    fx.apply_blocks();
+    let written = fs::read_to_string(&site).unwrap();
+    assert!(
+        written.contains(r#"if ($server_protocol ~ "^HTTP/1\.") {"#),
+        "site was:\n{written}"
+    );
+}
+
 // ---- Apache ----
 //
 // The same binary driving a fake Apache tree, with a fake `apache2ctl` and

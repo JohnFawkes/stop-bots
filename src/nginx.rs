@@ -2286,6 +2286,97 @@ pub fn site_apply_status(
     }
 }
 
+// ---- the HTTP/1.x rule where nothing speaks HTTP/2 ----
+
+/// How many directories above a root `nginx.conf` is looked for: a root of
+/// `/etc/nginx/sites-enabled` is still `/etc/nginx`'s tree.
+const MAIN_CONFIG_LEVELS_UP: usize = 2;
+
+/// Whether the NGINX config around `root` turns HTTP/2 on anywhere: an
+/// `http2 on;` (NGINX 1.25.1 and later, in `http` or a `server`), or a
+/// `listen` with the `http2` parameter (before that, and still read). The
+/// whole tree from `nginx.conf`'s directory down, because either may be
+/// in another file: `http2 on;` in `nginx.conf`'s `http` block, or the
+/// `listen ... http2` of another `server` on the same port, which turns
+/// HTTP/2 on for every `server` on it.
+///
+/// `None` when there is no `nginx.conf` at or just above `root` to read
+/// from — a root whose main config is somewhere this cannot see, as in a
+/// container — and nothing is refused on that.
+///
+/// Read with [`lex`], so a commented-out `# listen 443 ssl http2;` does
+/// not count.
+fn enables_http2(root: &Path) -> Option<bool> {
+    let root = std::path::absolute(root).ok()?;
+    let top = root
+        .ancestors()
+        .take(MAIN_CONFIG_LEVELS_UP + 1)
+        .find(|dir| dir.join("nginx.conf").is_file())?;
+    let files = WalkDir::new(top)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            fs::metadata(entry.path()).is_ok_and(|meta| meta.is_file() && meta.len() < 1 << 20)
+        });
+    for entry in files {
+        let Ok(content) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let mut statement: Vec<String> = Vec::new();
+        for (token, _) in lex(&content).tokens {
+            if matches!(token.as_str(), ";" | "{" | "}") {
+                let words: Vec<&str> = statement.iter().map(String::as_str).collect();
+                match words.as_slice() {
+                    ["http2", "on"] => return Some(true),
+                    ["listen", rest @ ..] if rest.contains(&"http2") => return Some(true),
+                    _ => {}
+                }
+                statement.clear();
+            } else {
+                statement.push(token);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// Why an apply cannot write `content`'s blocks as `config_for` asks, if
+/// it cannot: the HTTP/1.x rule in a TLS `server` of a host on which
+/// nothing turns HTTP/2 on, where NGINX answers every visitor over
+/// HTTP/1.1 and the rule would turn every one of them away. `nginx -t`
+/// passes it, so it is refused here, as Apache's is without `mod_http2`.
+///
+/// `config_for` is the config a block is written with, or `None` for a
+/// block the apply leaves alone. A block without TLS is not asked: the
+/// rule is never written there (see [`for_block`]).
+pub fn refusal<'a>(
+    content: &str,
+    config_path: &Path,
+    root: &Path,
+    config_for: impl Fn(&ServerBlock) -> Option<&'a BlockConfig>,
+) -> Option<String> {
+    let blocks = parse_server_blocks(content);
+    let wants_http1x = blocks.iter().find(|block| {
+        config_for(block).is_some_and(|config| {
+            for_block(config, content, block)
+                .request_rules
+                .contains(&RequestRule::Http1x)
+        })
+    })?;
+    if enables_http2(root) != Some(false) {
+        return None;
+    }
+    let name = wants_http1x.names.first().map_or("a site", String::as_str);
+    Some(format!(
+        "refusing to write {}: the HTTP/1.x rule is on for {name}, but nothing in the NGINX \
+         config turns HTTP/2 on (`http2 on;`, or `listen 443 ssl http2;` before NGINX \
+         1.25.1): NGINX answers every visitor of it over HTTP/1.1, and the rule would turn \
+         every one of them away. Turn HTTP/2 on for it, or switch the rule off for the site.",
+        config_path.display()
+    ))
+}
+
 /// What [`apply_block_for_site`] would make of `content`, without writing
 /// it.
 pub fn block_for_site(
@@ -5432,6 +5523,83 @@ mod tests {
                 "{} must not break ACME renewal; text was:\n{text}",
                 rule.label()
             );
+        }
+    }
+
+    /// An NGINX tree in a temporary directory: `nginx.conf` and one site,
+    /// each with the text given.
+    fn nginx_tree(main: &str, site: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("sites-enabled")).unwrap();
+        fs::write(dir.path().join("nginx.conf"), main).unwrap();
+        fs::write(dir.path().join("sites-enabled/site.conf"), site).unwrap();
+        dir
+    }
+
+    const HTTP: &str = "http {\n    include sites-enabled/*;\n}\n";
+    const TLS_SITE: &str =
+        "server {\n    listen 443 ssl;\n    server_name a.example;\n    ssl_certificate x.pem;\n}\n";
+
+    /// Either spelling turns HTTP/2 on, wherever in the tree it is; a
+    /// comment or `off` does not; and with no `nginx.conf` to start from,
+    /// nothing can be said.
+    #[test]
+    fn http2_is_found_wherever_the_tree_turns_it_on() {
+        for (main, site, expected) in [
+            (HTTP, TLS_SITE, Some(false)),
+            ("http {\n    http2 on;\n}\n", TLS_SITE, Some(true)),
+            (HTTP, &TLS_SITE.replace("ssl;", "ssl http2;"), Some(true)),
+            (
+                HTTP,
+                &TLS_SITE.replace("ssl;", "ssl;\n    http2 on;"),
+                Some(true),
+            ),
+            (
+                HTTP,
+                &TLS_SITE.replace("ssl;", "ssl;\n    # listen 443 ssl http2;"),
+                Some(false),
+            ),
+            (
+                HTTP,
+                &TLS_SITE.replace("ssl;", "ssl;\n    http2 off;"),
+                Some(false),
+            ),
+        ] {
+            let tree = nginx_tree(main, site);
+            assert_eq!(
+                enables_http2(&tree.path().join("sites-enabled")),
+                expected,
+                "nginx.conf:\n{main}\nsite:\n{site}"
+            );
+        }
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(enables_http2(bare.path()), None);
+    }
+
+    /// The HTTP/1.x rule where nothing speaks HTTP/2 passes `nginx -t` and
+    /// then turns away every visitor, so it is refused; where something
+    /// does, or the rule is only asked of a plain block, it is not.
+    #[test]
+    fn the_http_1x_rule_is_refused_only_where_nothing_speaks_http2() {
+        let config = cfg_rules(&[RequestRule::Http1x]);
+        let plain = TLS_SITE
+            .replace("443 ssl", "80")
+            .replace("    ssl_certificate x.pem;\n", "");
+        for (site, http2_on, refused) in [
+            (TLS_SITE.to_string(), false, true),
+            (TLS_SITE.to_string(), true, false),
+            (plain, false, false),
+        ] {
+            let main = if http2_on {
+                "http {\n    http2 on;\n}\n"
+            } else {
+                HTTP
+            };
+            let tree = nginx_tree(main, &site);
+            let why = refusal(&site, Path::new("site.conf"), tree.path(), |_| {
+                Some(&config)
+            });
+            assert_eq!(why.is_some(), refused, "site:\n{site}\nrefusal: {why:?}");
         }
     }
 

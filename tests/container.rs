@@ -7693,10 +7693,8 @@ const RHEL_SITE: &str = "/etc/httpd/conf.d/test-site.conf";
 
 impl Apache {
     /// A running `httpd` with RHEL's tree, and stop-bots told it is Apache
-    /// rooted at `/etc/httpd` with RHEL's commands — as an operator there
-    /// has to, since the defaults are Debian's. `httpd -k graceful` stands
-    /// in for `systemctl reload httpd`: no init here, as in
-    /// `Dockerfile.apache`.
+    /// rooted at `/etc/httpd` — and nothing else, which is all an operator
+    /// there has to say: the commands follow the tree.
     fn start_rhel(name: &str) -> Apache {
         build_rhel_image();
         let name = scoped(name);
@@ -7714,10 +7712,13 @@ impl Apache {
         let apache = Apache { name };
         apache.sh("httpd -k start");
         apache.wait_until_serving();
-        apache.stop_bots(
-            "set-web-server apache --root /etc/httpd \
-             --test 'apachectl configtest' --reload 'httpd -k graceful'",
-        );
+        let chosen = apache.stop_bots("set-web-server apache --root /etc/httpd");
+        for command in ["apachectl configtest", "systemctl reload httpd"] {
+            assert!(
+                chosen.contains(command),
+                "RHEL's tree does not default to `{command}`:\n{chosen}"
+            );
+        }
         let scanned = apache.stop_bots("scan-sites");
         assert!(
             scanned.contains("Discovered 1 site(s)"),
@@ -7787,18 +7788,16 @@ fn apache_on_rhel_blocks_from_conf_d_and_uninstalls_cleanly() {
     assert!(ok, "httpd's config no longer loads:\n{stdout}{stderr}");
 }
 
-/// **The detectors read what RHEL's `httpd` logs.** The site logs to the
-/// relative `logs/access_log`, which is `/var/log/httpd/access_log` once
-/// resolved against `ServerRoot` and through the `logs` link. The default
-/// the detectors try is Debian's, so on RHEL the operator names the log,
-/// as the error without it says to.
+/// **The detectors read what RHEL's `httpd` logs, with nothing named.**
+/// The site logs to the relative `logs/access_log`, which is
+/// `/var/log/httpd/access_log` through the `logs` link — RHEL's stock
+/// access log, the default in its tree.
 #[test]
 fn apache_on_rhel_detects_from_httpds_access_log() {
     if !enabled() {
         return;
     }
     let apache = Apache::start_rhel("sb-apache-rhel-log");
-    apache.stop_bots("set-log-paths --access-log /var/log/httpd/access_log");
     let from = |address: &str| format!("-H 'X-Forwarded-For: {address}'");
     apache.status(
         "/",

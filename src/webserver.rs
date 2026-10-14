@@ -124,6 +124,32 @@ impl WebServer {
         }
     }
 
+    /// [`Self::default_test`] for the config under `root`. Apache's
+    /// differs between Debian's tree and RHEL's ([`apache::layout`]), and
+    /// a default that names `apache2ctl` on RHEL fails every apply.
+    pub fn default_test_at(self, root: &Path) -> &'static str {
+        match self {
+            WebServer::Nginx => self.default_test(),
+            WebServer::Apache => apache::layout(root).test(),
+        }
+    }
+
+    /// [`Self::default_reload`] for the config under `root`, likewise.
+    pub fn default_reload_at(self, root: &Path) -> &'static str {
+        match self {
+            WebServer::Nginx => self.default_reload(),
+            WebServer::Apache => apache::layout(root).reload(),
+        }
+    }
+
+    /// [`Self::default_access_log`] for the config under `root`, likewise.
+    pub fn default_access_log_at(self, root: &Path) -> &'static str {
+        match self {
+            WebServer::Nginx => self.default_access_log(),
+            WebServer::Apache => apache::layout(root).access_log(),
+        }
+    }
+
     /// Every site declared under `root`, one per named block. A `root`
     /// that does not exist is an error; see `nginx::discover_sites`.
     pub fn discover_sites(self, root: &Path) -> Result<Vec<DiscoveredSite>> {

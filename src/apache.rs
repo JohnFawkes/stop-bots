@@ -1436,6 +1436,58 @@ pub fn serves_tls(config_path: &Path, server_name: &str) -> bool {
     })
 }
 
+/// The stock layout an Apache root belongs to, which decides the defaults
+/// an operator would otherwise have to type: the config test, the reload
+/// and the access log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// `/etc/apache2`, with `apache2ctl`, the `apache2` unit and
+    /// `/var/log/apache2`. Also the answer for a root with no main config
+    /// to read, as it has always been.
+    Debian,
+    /// `/etc/httpd`, with its main config in `conf/httpd.conf`,
+    /// `apachectl`, the `httpd` unit and `/var/log/httpd`.
+    Rhel,
+}
+
+/// Which stock layout `root` is part of, from where its main config is
+/// ([`main_config`]): RHEL keeps it in `conf/httpd.conf`, and nothing else
+/// does. A source build's or the upstream image's top-level `httpd.conf`
+/// is neither layout, and keeps Debian's defaults as before; those hosts
+/// name their own commands anyway.
+pub fn layout(root: &Path) -> Layout {
+    match main_config(root) {
+        Some((_, main)) if main.ends_with("conf/httpd.conf") => Layout::Rhel,
+        _ => Layout::Debian,
+    }
+}
+
+impl Layout {
+    /// The config test this layout ships.
+    pub fn test(self) -> &'static str {
+        match self {
+            Layout::Debian => "apache2ctl configtest",
+            Layout::Rhel => "apachectl configtest",
+        }
+    }
+
+    /// The reload, through this layout's unit.
+    pub fn reload(self) -> &'static str {
+        match self {
+            Layout::Debian => "systemctl reload apache2",
+            Layout::Rhel => "systemctl reload httpd",
+        }
+    }
+
+    /// Where this layout's stock config writes the access log.
+    pub fn access_log(self) -> &'static str {
+        match self {
+            Layout::Debian => "/var/log/apache2/access.log",
+            Layout::Rhel => "/var/log/httpd/access_log",
+        }
+    }
+}
+
 /// Where Debian's `envvars` points `${APACHE_LOG_DIR}`.
 const DEBIAN_LOG_DIR: &str = "/var/log/apache2";
 
@@ -2412,6 +2464,33 @@ mod tests {
                 "{pattern} against {name}"
             );
         }
+    }
+
+    #[test]
+    fn only_rhels_own_tree_gets_rhels_defaults() {
+        for (what, files, expected) in [
+            ("RHEL's conf/httpd.conf", &[RHEL_MAIN][..], Layout::Rhel),
+            ("Debian's apache2.conf", &[DEBIAN_MAIN], Layout::Debian),
+            (
+                "a source build's httpd.conf",
+                &[("httpd.conf", "")],
+                Layout::Debian,
+            ),
+            (
+                "no main config at all",
+                &[("sites/x.conf", "")],
+                Layout::Debian,
+            ),
+        ] {
+            let root = tree(files);
+            assert_eq!(layout(root.path()), expected, "{what}");
+        }
+        let root = tree(&[RHEL_MAIN, ("conf.d/site.conf", "")]);
+        assert_eq!(
+            layout(&root.path().join("conf.d")),
+            Layout::Rhel,
+            "a root inside RHEL's tree, where its sites are"
+        );
     }
 
     #[test]

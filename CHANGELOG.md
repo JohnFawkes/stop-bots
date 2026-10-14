@@ -8,6 +8,17 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Changed
+
+- **An Apache root in RHEL's tree gets RHEL's defaults.** `sudo stop-bots set-web-server
+  apache --root /etc/httpd` is now all RHEL needs: where the root's main config is
+  `conf/httpd.conf`, the config test defaults to `apachectl configtest`, the reload to
+  `systemctl reload httpd` and the access log to `/var/log/httpd/access_log`, in place of
+  Debian's `apache2ctl`, `apache2` and `/var/log/apache2/access.log`, none of which exist
+  there. Under rc.1 every apply on such a host failed its config test until `--test` and
+  `--reload` were given, and the detectors read nothing until `set-log-paths` was. Stored
+  commands and a stored log path still win, so a host set up that way is unchanged.
+
 ## [0.2.0-rc.1] — 2026-10-14
 
 **Going back to 0.1.x.** This release is 0.2.0 rather than 0.1.2 because an Apache host

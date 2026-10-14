@@ -65,6 +65,9 @@ pub struct LogPaths {
     pub ssh: Option<PathBuf>,
     /// The web server whose access log is read when none is stored.
     pub server: crate::webserver::WebServer,
+    /// Its config root, which decides where that default is: Apache logs
+    /// to `/var/log/httpd` in RHEL's tree, not Debian's `/var/log/apache2`.
+    pub root: PathBuf,
 }
 
 impl LogPaths {
@@ -73,7 +76,13 @@ impl LogPaths {
     pub fn access_path(&self, flag: Option<&Path>) -> PathBuf {
         flag.or(self.access.as_deref())
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from(self.server.default_access_log()))
+            .unwrap_or_else(|| PathBuf::from(self.default_access_log()))
+    }
+
+    /// Where the access log is when nothing names it: the web server's
+    /// stock path, for the layout its root is in.
+    pub fn default_access_log(&self) -> &'static str {
+        self.server.default_access_log_at(&self.root)
     }
 
     /// [`Self::access_path`], read whole. For the one-off CLI commands;
@@ -104,7 +113,7 @@ impl LogPaths {
     pub fn access_description(&self, flag: Option<&Path>) -> String {
         match flag.or(self.access.as_deref()) {
             Some(path) => path.display().to_string(),
-            None => self.server.default_access_log().to_string(),
+            None => self.default_access_log().to_string(),
         }
     }
 }
@@ -125,9 +134,12 @@ mod tests {
 
     #[test]
     fn nothing_stored_reads_as_nothing_configured() {
+        let paths = crate::hostconf::HostConf::default().log_paths();
+        assert_eq!((&paths.access, &paths.ssh), (&None, &None));
         assert_eq!(
-            crate::hostconf::HostConf::default().log_paths(),
-            LogPaths::default()
+            paths.access_path(None),
+            PathBuf::from(crate::accesslog::DEFAULT_LOG_PATH),
+            "the default is not NGINX's log"
         );
     }
 

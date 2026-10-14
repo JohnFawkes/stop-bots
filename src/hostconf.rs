@@ -274,9 +274,10 @@ impl HostConf {
                 (&self.apache_reload_command, APACHE_RELOAD),
             ),
         };
+        let root = self.root(None);
         Ok(ServerCommands {
-            test: command(test.0, test.1, server.default_test())?,
-            reload: command(reload.0, reload.1, server.default_reload())?,
+            test: command(test.0, test.1, server.default_test_at(&root))?,
+            reload: command(reload.0, reload.1, server.default_reload_at(&root))?,
         })
     }
 
@@ -310,6 +311,7 @@ impl HostConf {
             access: self.access_log.clone(),
             ssh: self.ssh_log.clone(),
             server: self.web_server(),
+            root: self.root(None),
         }
     }
 }
@@ -626,6 +628,35 @@ mod tests {
     }
 
     #[test]
+    fn an_apache_root_in_rhels_tree_gets_rhels_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("conf")).unwrap();
+        std::fs::write(root.path().join("conf/httpd.conf"), "").unwrap();
+        let conf = HostConf {
+            web_server: Some(WebServer::Apache),
+            apache_root: Some(root.path().to_path_buf()),
+            ..HostConf::default()
+        };
+        let commands = conf.commands().unwrap();
+        assert_eq!(commands.test, ["apachectl", "configtest"]);
+        assert_eq!(commands.reload, ["systemctl", "reload", "httpd"]);
+        assert_eq!(
+            conf.log_paths().access_path(None),
+            PathBuf::from("/var/log/httpd/access_log")
+        );
+
+        let stored = HostConf {
+            apache_test_command: Some("httpd -t".into()),
+            ..conf
+        };
+        assert_eq!(
+            stored.commands().unwrap().test,
+            ["httpd", "-t"],
+            "a stored command no longer wins over the layout's default"
+        );
+    }
+
+    #[test]
     fn what_is_saved_is_what_is_read_back() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("etc/host.conf");
@@ -636,7 +667,10 @@ mod tests {
             nginx_root: Some("/srv/web nginx".into()),
             apache_test_command: Some("apachectl -t".into()),
             apache_reload_command: None,
-            apache_root: Some("/etc/httpd".into()),
+            // Not a tree on any host, so the default reload is Debian's
+            // wherever this runs: one in RHEL's tree gets RHEL's (see
+            // `an_apache_root_in_rhels_tree_gets_rhels_defaults`).
+            apache_root: Some("/srv/web apache".into()),
             access_log: Some("/srv/logs/access.log".into()),
             ssh_log: None,
         };
@@ -648,7 +682,7 @@ mod tests {
             conf.commands().unwrap().reload,
             ["systemctl", "reload", "apache2"]
         );
-        assert_eq!(conf.root(None), PathBuf::from("/etc/httpd"));
+        assert_eq!(conf.root(None), PathBuf::from("/srv/web apache"));
         let nginx = HostConf {
             web_server: None,
             ..conf

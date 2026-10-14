@@ -1315,10 +1315,11 @@ enum Command {
         /// next `cargo clean`.
         #[arg(long)]
         binary: Option<PathBuf>,
-        /// NGINX config root the service will scan, stored as
-        /// `set-nginx-commands --root` would. Defaults to the one already
-        /// stored, else /etc/nginx. It only ever sets NGINX's: on an Apache
-        /// host, set the root with `set-web-server apache --root`.
+        /// The web server's config root the service will scan, stored as
+        /// `set-web-server --root` would: NGINX's on an NGINX host, Apache's
+        /// on an Apache one (choose Apache with `set-web-server apache`
+        /// first). Defaults to the one already stored, else the stock path,
+        /// /etc/nginx or /etc/apache2.
         #[arg(long)]
         root: Option<PathBuf>,
         /// Pin the service to this SSH log instead of letting it find one.
@@ -3896,7 +3897,7 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
 
     // Not named in ExecStart: the running service reads the stored root
     // itself, so `--root` (or the old unit's) is stored below, as
-    // `set-nginx-commands --root` would. The unit only has to let the
+    // `set-web-server --root` would. The unit only has to let the
     // service write there; `install_web` adds the root already stored.
     layout.nginx_roots = options.root.iter().chain(&legacy_root).cloned().collect();
 
@@ -3966,10 +3967,15 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
         // only root writes, not in the database the console writes.
         let mut host = stop_bots::hostconf::HostConf::load_from(&host_path)?;
         if let Some(root) = &options.root {
-            host.nginx_root = Some(std::path::absolute(root)?);
+            // The root of the server this host runs. It used to be NGINX's
+            // whatever the host ran, so on an Apache host `--root
+            // /etc/httpd` was stored where nothing reads it and the
+            // console went on scanning /etc/apache2.
+            *host.root_setting_mut() = Some(std::path::absolute(root)?);
             host.save_to(&host_path)?;
             steps.push(format!(
-                "NGINX root {} recorded in {}",
+                "{} root {} recorded in {}",
+                host.web_server().label(),
                 root.display(),
                 host_path.display()
             ));

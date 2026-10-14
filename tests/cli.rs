@@ -3632,6 +3632,54 @@ fn install_web_stores_the_nginx_root_and_lets_the_helper_write_it() {
     );
 }
 
+/// On an Apache host `--root` is Apache's root. It used to be stored as
+/// `nginx_root` whatever the host ran, where nothing on an Apache host
+/// reads it, and the console went on scanning /etc/apache2.
+#[test]
+fn install_web_stores_the_root_of_the_server_the_host_runs() {
+    let (tmp, binary) = fake_debian_root();
+    let host_conf = tmp.path().join("etc/stop-bots/host.conf");
+    fs::create_dir_all(host_conf.parent().unwrap()).unwrap();
+    fs::write(&host_conf, "web_server = apache\n").unwrap();
+
+    let output = stop_bots_bin()
+        .args([
+            "install",
+            "web",
+            "--prefix",
+            tmp.path().to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+            "--root",
+            "/srv/httpd",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("Apache root /srv/httpd recorded"),
+        "was: {stdout}"
+    );
+
+    let host = stop_bots::hostconf::HostConf::load_from(&host_conf).unwrap();
+    assert_eq!(
+        (host.apache_root.as_deref(), host.nginx_root.as_deref()),
+        (Some(Path::new("/srv/httpd")), None),
+        "host.conf was:\n{}",
+        host.render()
+    );
+    let unit = fs::read_to_string(
+        tmp.path()
+            .join("etc/systemd/system/stop-bots-helper.service"),
+    )
+    .unwrap();
+    assert!(
+        unit.lines()
+            .any(|line| line == "ReadWritePaths=-/srv/httpd"),
+        "unit was:\n{unit}"
+    );
+}
+
 /// `install web --ssh-log` is stored where the helper reads the SSH log
 /// from, as `set-log-paths --ssh-log` would store it, and not handed to
 /// the console, which reads no log itself.

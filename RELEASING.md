@@ -156,6 +156,24 @@ shipped with it. Step 2 is cheap to run and the only thing that catches that.
 2. **Move the `Unreleased` section** of `CHANGELOG.md` under the new version heading, add
    the date, and update the link definitions at the bottom.
 
+   The heading is `## [x.y.z] — <date>`, with the version exactly as tagged, and a
+   release candidate gets one of its own: `## [0.1.0-rc.1]` for `v0.1.0-rc.1`, as
+   every candidate so far has. The release workflow refuses a tag whose version has no
+   such heading, and publishes the section under it as the release notes
+   (`scripts/changelog-section.py` prints exactly what it will publish), so write it
+   for the people upgrading.
+
+   **For `0.2.0`, the release that adds Apache:** the section has to tell Apache hosts
+   that they cannot go back to `0.1.x` by installing the older package. `set-web-server`
+   writes `web_server` (and, for Apache, `apache_*`) keys to
+   `/etc/stop-bots/host.conf`; `0.1.x` refuses a key it does not know, so everything
+   that reads that file fails with an error naming the line. With the keys deleted it
+   runs, but treats the host as NGINX and does not recognise the blocks `0.2.0` wrote
+   into the Apache config. The way back is, under `0.2.0`, `sudo stop-bots uninstall
+   web-server`, then deleting those keys, then the downgrade. The same holds if `0.2.0`
+   itself is withdrawn (below): removing it from the APT repository does not take an
+   Apache host back, and the hosts that already installed it need the same three steps.
+
 3. **Check it locally.** This is the same set CI runs, and it is faster to find out here:
 
    ```
@@ -200,11 +218,22 @@ shipped with it. Step 2 is cheap to run and the only thing that catches that.
    git push origin v0.0.1
    ```
 
-   This runs the test suite on `x86_64` and `aarch64` runners, and only if both pass
-   builds `x86_64` and `aarch64` Linux binaries — statically linked against musl,
-   so one package serves every distribution — creates the GitHub release with a tarball,
-   a `.deb` and a SHA-256 for each, and then republishes the APT repository with both
-   `.deb`s added. Releases with a `v0.0.` prefix are marked pre-release automatically.
+   This first checks the tag against `Cargo.toml` and `CHANGELOG.md`, runs the test
+   suite on `x86_64` and `aarch64` runners, and only if both pass builds `x86_64` and
+   `aarch64` Linux binaries — statically linked against musl, so one package serves
+   every distribution. Then, in order:
+
+   - it attests build provenance for every tarball and `.deb` (see
+     [Verifying a download](#verifying-a-download));
+   - it creates the GitHub release: per architecture a tarball (the binary, README,
+     licence, man pages and completions) and a `.deb`, a `.sha256` beside each, one
+     `SHA256SUMS` over all of them, and the changelog section as the notes;
+   - it republishes the APT repository with both `.deb`s added.
+
+   A release is marked pre-release if its tag starts with `v0.0.` or has a semver
+   pre-release part — a release candidate, `v0.1.0-rc.1`. A candidate also stays out of
+   the APT repository, which has one channel, `stable`; its `.deb`s are on its GitHub
+   release.
 
    Watch the `apt` job specifically. It runs last and is the only step that writes to
    `gh-pages`, so it is the one whose failure leaves the two publications disagreeing.
@@ -225,9 +254,10 @@ shipped with it. Step 2 is cheap to run and the only thing that catches that.
    git add packaging && git commit -m "packaging: 0.0.1"
    ```
 
-   It fetches the published checksums (a network read only), writes both PKGBUILDs
-   and generates the ebuild from the tag's `Cargo.lock`. Submitting to the AUR and
-   the overlay stays manual; `packaging/README.md` has the steps for each.
+   It fetches the published checksums (network reads only), writes both PKGBUILDs and
+   their `.SRCINFO`, and generates the ebuild from the tag: `CRATES` from its
+   `Cargo.lock`, `LICENSE` and `RUST_MIN_VER` from `cargo metadata`. Submitting to the
+   AUR and the overlay stays manual; `packaging/README.md` has the steps for each.
 
    Debian and Ubuntu are **not** in this step: the `.deb`s were built and published by
    step 5. `packaging/README.md` says which packages need a human and which do not.
@@ -267,10 +297,12 @@ free the number.
 
 ## A note on `Cargo.lock`
 
-It is tracked, and the release build passes `--locked` while CI does not. That is the
-right way round — CI catches a dependency that has drifted, the release build is
-reproducible — but it does mean a green CI is not proof that the release build will
-resolve the same tree. In practice this only bites if a dependency is yanked between the
+It is tracked, and the release build passes `--locked` while CI's test job does not. That
+is the right way round — CI catches a dependency that has drifted, the release build is
+reproducible — but it does mean a green test job is not proof that the release build
+will resolve the same tree. The MSRV job is the exception and does pass `--locked`: it
+exists to say whether the shipped tree builds on the oldest supported Rust, so it has
+to check that tree. In practice this only bites if a dependency is yanked between the
 two.
 
 ## Versioning
@@ -309,9 +341,14 @@ of it can change in any release, patch releases included. Designing a public Rus
 is not a goal for `1.0` either. The product is the binary; a designed library would be a
 second product with its own users, and nobody has asked for one.
 
-While the version is `0.0.x`, cargo treats every release as breaking, and that is also
-true of the contract above: it is still being settled. `ROADMAP.md` lists what has to
-hold before `0.1.0`.
+The contract above has held since `0.1.0`. Before it, while the version was `0.0.x`,
+cargo treated every release as breaking and so did this project; `ROADMAP.md`'s
+checklist for 0.1 is what had to hold to leave that behind, and its "After 0.1, towards
+1.0" section is what has to hold next.
+
+Going back across a minor release is not part of the contract. In particular an Apache
+host cannot go back from `0.2.0` to `0.1.x` without removing what `0.2.0` wrote first;
+step 2 above has the details, and the `0.2.0` changelog has to repeat them.
 
 The MSRV in `Cargo.toml` (`rust-version`) is enforced by a dedicated CI job. Raising it
 changes who can build the program, so it waits for a minor release too; a dependency
@@ -330,8 +367,45 @@ by something rather than by memory:
 
 The first two are why the announcement goes out after step 6, not before it.
 
-All three hold as of `0.0.1`, published 2026-09-14: the badge resolves, the releases page
-has the `x86_64` tarball and its checksum, and the coverage job is green. They are listed
-here because each *release* has to re-establish them, not because any of them is still
-outstanding. A badge that has gone back to rendering an error means the publish did not
-land, whatever the terminal said.
+All three have held since `0.0.1`, published 2026-09-14, and were last checked for
+`0.1.1`, published 2026-10-01: crates.io has it, and its release page has the tarballs
+and the `.deb`s for both architectures. They are listed here because each *release*
+has to re-establish them, not because any of them is still outstanding. A badge that has
+gone back to rendering an error means the publish did not land, whatever the terminal
+said.
+
+## Verifying a download
+
+This section is written to be linked to from the README.
+
+The APT repository needs nothing from you: `apt` checks every package against the
+index that `signed-by` pins, and refuses one that does not match. What follows is for a
+file downloaded from a GitHub release page by hand.
+
+**That it arrived intact.** Each asset has a `.sha256` beside it, and `SHA256SUMS`
+covers all of them:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+**That this repository's release workflow built it.** Every tarball and `.deb` has a
+build provenance attestation: a statement, signed through Sigstore with a certificate
+issued to `release.yml` in `ivankovic/stop-bots` and logged publicly, of which commit
+and which workflow run produced that exact file. GitHub's CLI checks it:
+
+```sh
+gh attestation verify stop-bots-0.2.0-x86_64-unknown-linux-musl.tar.gz \
+  --repo ivankovic/stop-bots \
+  --signer-workflow ivankovic/stop-bots/.github/workflows/release.yml
+```
+
+It fails if the file was built anywhere else or changed afterwards; with `--format
+json` it also shows the commit and the workflow run that built it. A checksum can only say a file matches the
+one on the release page; the attestation says where that one came from, which is the
+question that matters if the release page itself were tampered with. `gh` has to be
+logged in (`gh auth login`) to fetch the attestation.
+
+Attestations exist from the release after `0.1.1` on. The assets are not GPG-signed:
+the only key the project has is the APT repository's, and it is kept to the one job
+that signs the repository index.

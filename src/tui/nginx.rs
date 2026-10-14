@@ -55,7 +55,6 @@
 //! normally root-owned) with a "Try running as root" suggestion.
 
 use crate::db::{BlockResponse, Db, Site};
-use crate::nginx;
 use crate::tui::site_detail::SiteDetail;
 use crate::tui::{centered_rect, KeyOutcome, Theme};
 use crate::webserver::SiteApplyStatus;
@@ -1096,7 +1095,7 @@ impl Nginx {
 ///
 /// `conf_d` is resolved by the caller for that reason: the comparison also
 /// reads the trust file, which lives beside the site configs rather than
-/// in `/etc/nginx` (see [`nginx::conf_d_dir`]), and working that out needs
+/// in `/etc/nginx` (see [`crate::nginx::conf_d_dir`]), and working that out needs
 /// the database this function deliberately cannot see.
 pub fn run_status_check(
     server: WebServer,
@@ -1294,7 +1293,10 @@ pub fn preview_apply(plan: &ApplyPlan) -> Vec<webserver::FileChange> {
             },
         };
         let (path, _, current) = &mut files[at];
-        if let Ok(next) = nginx::block_for_site(current, path, &site.server_name, &site.config) {
+        if let Ok(next) =
+            plan.server
+                .block_for_site(current, path, &plan.root, &site.server_name, &site.config)
+        {
             *current = next;
         }
     }

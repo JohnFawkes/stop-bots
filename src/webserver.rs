@@ -135,10 +135,15 @@ impl WebServer {
 
     /// What applying `site_configs` (and `default_config` for every block
     /// they do not name) to every block in `content` makes of it.
+    ///
+    /// `root` is the config root the file is under. Apache reads the rest
+    /// of its config there, to refuse a block that would pass the config
+    /// test and not do what it says (see `apache::refusal`).
     pub fn blocks_for_file(
         self,
         content: &str,
         config_path: &Path,
+        root: &Path,
         site_configs: &[(String, BlockConfig)],
         default_config: &BlockConfig,
     ) -> Result<String> {
@@ -147,23 +152,26 @@ impl WebServer {
                 nginx::blocks_for_file(content, config_path, site_configs, default_config)
             }
             WebServer::Apache => {
-                apache::blocks_for_file(content, config_path, site_configs, default_config)
+                apache::blocks_for_file(content, config_path, root, site_configs, default_config)
             }
         }
     }
 
     /// What applying `config` to only `server_name`'s blocks in `content`
-    /// makes of it.
+    /// makes of it. `root` as for [`Self::blocks_for_file`].
     pub fn block_for_site(
         self,
         content: &str,
         config_path: &Path,
+        root: &Path,
         server_name: &str,
         config: &BlockConfig,
     ) -> Result<String> {
         match self {
             WebServer::Nginx => nginx::block_for_site(content, config_path, server_name, config),
-            WebServer::Apache => apache::block_for_site(content, config_path, server_name, config),
+            WebServer::Apache => {
+                apache::block_for_site(content, config_path, root, server_name, config)
+            }
         }
     }
 
@@ -1339,7 +1347,7 @@ pub fn apply_blocks_to_file(
 ) -> Result<bool> {
     let before = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
-    let after = server.blocks_for_file(&before, config_path, site_configs, default_config)?;
+    let after = server.blocks_for_file(&before, config_path, root, site_configs, default_config)?;
     if after == before {
         return Ok(false);
     }
@@ -1381,7 +1389,7 @@ pub fn apply_block_for_site(
 ) -> Result<bool> {
     let before = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
-    let after = server.block_for_site(&before, config_path, server_name, config)?;
+    let after = server.block_for_site(&before, config_path, root, server_name, config)?;
     if after == before {
         return Ok(false);
     }
@@ -1457,7 +1465,7 @@ pub fn preview_all_sites(
             .collect::<Result<_>>()?;
         let before = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let after = server.blocks_for_file(&before, &path, &site_configs, &default_config)?;
+        let after = server.blocks_for_file(&before, &path, root, &site_configs, &default_config)?;
         if after != before {
             changes.push(FileChange {
                 path,

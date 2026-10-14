@@ -23,8 +23,14 @@ blocks this release wrote into Apache's sites. To go back, first run
 choosing NGINX writes no `web_server` line, and `set-web-server nginx` stores the same
 keys `set-nginx-commands` does. Only an NGINX host that was set to Apache at some point
 may still carry `apache_*` lines, which 0.1.1 refuses; delete them first. The database
-and the files this release writes for NGINX are otherwise unchanged; a site with an
-exemption reads as stale until it is applied again (see Fixed).
+and the files this release writes for NGINX are otherwise unchanged; a site whose block
+exempts a path reads as stale until it is applied again (see Fixed).
+
+**Upgrading, with the console installed.** Run `sudo stop-bots install web` after the
+package upgrade, as for 0.1.0. The package has no maintainer scripts, so the console and
+its root helper go on running the old binary until something restarts them, and the old
+helper goes on writing the old blocks. `install web` restarts both, and keeps the
+password and any unit you edited.
 
 ### Added
 
@@ -43,11 +49,18 @@ exemption reads as stale until it is applied again (see Fixed).
     `SetEnvIf` file, and the generated `robots.txt`, in `/etc/stop-bots/apache`, is
     served by a rewrite to the file, which answers before a site's own `ProxyPass /`.
   - Debian's layout (`/etc/apache2`, generated files in `conf-enabled`) and RHEL's
-    (`set-web-server apache --root /etc/httpd`, which reads everything from `conf.d`,
-    where the generated files go). Relative log paths resolve against the root's own
-    `ServerRoot`, through RHEL's `logs` link. The console's root helper is granted that
-    tree and its logs, and `install web --root` stores the root of the server the host
-    runs.
+    (`/etc/httpd`, which reads everything from `conf.d`, where the generated files go).
+    The defaults are Debian's, so on RHEL say all three of its paths and commands:
+
+    ```
+    sudo stop-bots set-web-server apache --root /etc/httpd \
+      --test 'apachectl configtest' --reload 'systemctl reload httpd'
+    sudo stop-bots set-log-paths --access-log /var/log/httpd/access_log
+    ```
+
+    For the console's root helper, relative log paths resolve against the root's own
+    `ServerRoot`, through RHEL's `logs` link, and the helper is granted that tree and
+    its logs; `install web --root` stores the root of the server the host runs.
   - The block decides once, on the request the client sent. Its last rule skips
     internal redirects and subrequests, so an exempt path that a front controller's
     `.htaccess` sends on to `/index.php`, or a trusted client there, stays let through,
@@ -102,8 +115,10 @@ exemption reads as stale until it is applied again (see Fixed).
   second pass. Exemptions now match the path of the request the client sent wherever it
   has nothing NGINX would resolve (no `%`, `//` or dot segment), and `$uri` otherwise, so
   `/wp-json/../wp-login.php` still matches as `/wp-login.php`. Trust was not affected. A
-  site with an exemption, the one serving `robots.txt` adds included, reads as stale
-  until it is applied again.
+  site whose block exempts any path reads as stale until it is applied again: one with
+  an exempt path or an agent exemption, one serving the generated `robots.txt`, one
+  with any request-shape rule (each exempts `/.well-known/`), and one the console is
+  served under by path.
 - The HTTP/1.x rule is refused on an NGINX host where nothing turns HTTP/2 on (no
   `http2 on;` and no `listen ... http2` anywhere under `nginx.conf`). There NGINX answers
   every visitor over HTTP/1.1, and the rule passed `nginx -t` and turned every one of

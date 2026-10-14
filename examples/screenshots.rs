@@ -46,8 +46,8 @@
 //! frames are the same [`svg`] output rasterised, so it cannot drift from
 //! the stills beside it. It gives up two of the three properties above —
 //! it is a binary blob in review, and it needs fonts on the generating
-//! machine — which is why it is one file rather than the format
-//! everything uses. See [`tour_gif`].
+//! machine (Iosevka, see [`TOUR_FONT`]) — which is why it is one file
+//! rather than the format everything uses. See [`tour_gif`].
 //!
 //! The web console's pages come from the same seed, rendered through the
 //! real router in-process (the way `tests/web.rs` drives it) and written
@@ -338,8 +338,9 @@ enum Browser {
     Chromium(PathBuf),
 }
 
-/// Firefox first, because it is what the maintainer has; then the
-/// Chromium names Debian, Fedora and Google ship under.
+/// Firefox first, because it is what the maintainer has (as `firefox-bin`,
+/// Gentoo's name for Mozilla's own build); then the Chromium names Debian,
+/// Fedora and Google ship under.
 fn find_browser() -> Option<Browser> {
     let on_path = |name: &str| {
         std::env::var_os("PATH").and_then(|path| {
@@ -348,7 +349,10 @@ fn find_browser() -> Option<Browser> {
                 .find(|candidate| candidate.is_file())
         })
     };
-    if let Some(path) = on_path("firefox") {
+    if let Some(path) = ["firefox", "firefox-bin"]
+        .iter()
+        .find_map(|name| on_path(name))
+    {
         return Some(Browser::Firefox(path));
     }
     [
@@ -468,7 +472,7 @@ fn tour_gif(app: &mut App, path: &Path) -> Result<()> {
     let mut frames = Vec::with_capacity(TOUR.len());
     for screen in TOUR {
         app.screen = screen;
-        let markup = render_svg(app, TOUR_ROWS)?;
+        let markup = render_svg(app, TOUR_ROWS)?.replacen(FONT_STACK, TOUR_FONT, 1);
         frames.push(rasterise(&markup, &fonts)?);
     }
 
@@ -497,35 +501,44 @@ fn tour_gif(app: &mut App, path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The fonts the frames are rasterised with.
+/// The font the tour's frames name in place of [`FONT_STACK`]: Iosevka,
+/// at its Extended width.
 ///
 /// The stills never need this: an SVG names a font stack and leaves the
-/// choice to whoever opens it. A GIF has to commit to actual glyphs, so
-/// something has to resolve that stack here.
+/// choice to whoever opens it. A GIF has to commit to actual glyphs, so it
+/// names one font outright rather than the first of the stack a machine
+/// happens to have. Extended because its advance is 0.6 em, which at
+/// [`FONT_SIZE`] is [`CELL_W`]: the glyphs sit on the grid at their own
+/// width. Iosevka's normal width is 0.5 em, and `textLength` would stretch
+/// every glyph a fifth wider to fill its cell.
+const TOUR_FONT: &str = r#"font-family="Iosevka" font-stretch="expanded""#;
+
+/// The fonts the frames are rasterised with.
 ///
 /// System fonts rather than a copy committed to the repository. That does
-/// mean a machine with a different DejaVu build can produce slightly
+/// mean a machine with a different Iosevka build can produce slightly
 /// different bytes, which is the same bargain the web screenshots already
 /// make by rasterising through whichever browser is installed — and it is
-/// better than carrying 660 KB of font binaries for one example. Missing
-/// fonts are an error rather than a silent fallback: the grid only lines
-/// up if the glyphs are monospace, and a proportional fallback would
-/// produce a picture of a broken layout.
+/// better than carrying megabytes of font binaries for one example. A
+/// missing font is an error rather than a silent fallback: a narrower face
+/// would be stretched onto the grid, and a proportional one would produce a
+/// picture of a broken layout.
 fn font_database() -> Result<Arc<usvg::fontdb::Database>> {
     let mut db = usvg::fontdb::Database::new();
     db.load_system_fonts();
 
-    const WANTED: &str = "DejaVu Sans Mono";
-    let have = db
-        .faces()
-        .any(|face| face.families.iter().any(|(name, _)| name == WANTED));
+    const WANTED: &str = "Iosevka";
+    let have = db.faces().any(|face| {
+        face.stretch == usvg::fontdb::Stretch::Expanded
+            && face.families.iter().any(|(name, _)| name == WANTED)
+    });
     anyhow::ensure!(
         have,
-        "{WANTED} is not installed, and the tour GIF needs a monospace font to line its \
-         columns up (Debian/Ubuntu: apt install fonts-dejavu-core). The SVG screenshots \
-         do not need it and were still written."
+        "{WANTED} Extended is not installed, and the tour GIF is drawn in it (Gentoo: \
+         emerge media-fonts/iosevka; elsewhere, the TTC from \
+         https://github.com/be5invis/Iosevka/releases). The SVG screenshots do not \
+         need it and were still written."
     );
-    db.set_monospace_family(WANTED);
     Ok(Arc::new(db))
 }
 
@@ -820,6 +833,9 @@ fn tempdir() -> Result<PathBuf> {
 const CELL_W: f32 = 8.4;
 const CELL_H: f32 = 18.0;
 const FONT_SIZE: f32 = 14.0;
+/// The fonts an SVG offers whoever opens it, first match wins.
+const FONT_STACK: &str =
+    r#"font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace""#;
 /// The distance from the top of a cell down to the text baseline.
 const BASELINE: f32 = 13.5;
 const PAD: f32 = 12.0;
@@ -838,7 +854,7 @@ fn svg(buffer: &Buffer) -> String {
 
     let mut s = String::new();
     s.push_str(&format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-size="{FONT_SIZE}">
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.0} {h:.0}" width="{w:.0}" height="{h:.0}" {FONT_STACK} font-size="{FONT_SIZE}">
 <rect width="100%" height="100%" rx="8" fill="{BG_DEFAULT}"/>
 "#
     ));

@@ -264,7 +264,9 @@ as a diff in review rather than as a picture nobody thought to re-take.
 Re-run it after any change to a screen's layout, and commit the result. The SVGs are
 a pure function of the seed; the PNGs also depend on the fonts installed on the
 machine that rendered them, so expect a byte-level diff from another machine even
-when nothing changed. The README
+when nothing changed. The animated `tour.gif` is drawn in Iosevka Extended, whose
+advance is exactly the SVGs' cell width, and the generator stops with an error rather
+than fall back to another font if it is not installed. The README
 references the files by absolute `raw.githubusercontent.com` URL, because relative
 image paths do not resolve on crates.io (which is also why `Cargo.toml` excludes
 `docs/` from the package).

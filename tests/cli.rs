@@ -2922,6 +2922,12 @@ fn a_failed_step_is_reported_and_sets_a_failing_exit_status() {
     let site = fixture.write_site("example.com");
 
     // An unwritable output path fails the firewall step and nothing else.
+    // Under a regular file rather than under a missing directory: the
+    // writer creates missing directories, so `/nonexistent/...` only fails
+    // where `/` is read-only, and a sandbox with a writable root passed it.
+    let not_a_directory = fixture.db.with_file_name("not-a-directory");
+    fs::write(&not_a_directory, "").unwrap();
+    let out = not_a_directory.join("firewall.nft");
     fixture
         .cmd(&[
             "batch",
@@ -2929,7 +2935,7 @@ fn a_failed_step_is_reported_and_sets_a_failing_exit_status() {
             "--root",
             fixture.nginx_root.to_str().unwrap(),
             "--out",
-            "/nonexistent/directory/firewall.nft",
+            out.to_str().unwrap(),
             "--ssh-log",
             "tests/fixtures/logs/auth.log",
             "--access-log",

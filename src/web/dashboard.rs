@@ -50,6 +50,9 @@ struct View {
     ai: Policy,
     /// Whether the humans-only mode is forcing the three above.
     humans_only: bool,
+    /// Whether the old-browser list is blocked, which humans only leaves
+    /// alone.
+    old_browsers: bool,
     geo_mode: GeoMode,
     selected_countries: Vec<String>,
     fetched_countries: Vec<(String, i64, i64)>,
@@ -129,6 +132,7 @@ fn load(
         search: db.get_category_default(Category::Search)?,
         ai: db.get_category_default(Category::Ai)?,
         humans_only: db.get_humans_only()?,
+        old_browsers: db.get_block_old_browsers()?,
         geo_mode: db.get_geo_mode()?,
         selected_countries: db.list_selected_countries()?,
         fetched_countries: db.list_fetched_countries()?,
@@ -361,6 +365,24 @@ fn categories_panel(view: &View, ctx: &Ctx) -> Markup {
                                             }
                                         }
                                     }
+                                }
+                            }
+                        }
+                    }
+                    // Not a category of bots but a list of their
+                    // disguises, with one switch for every site that
+                    // humans only does not force.
+                    tr {
+                        td { "Old browsers" }
+                        td {
+                            (policy_pill(if view.old_browsers { Policy::Blocked } else { Policy::Allowed }))
+                        }
+                        td .right {
+                            form .inline method="post" action=(ctx.url("/old-browsers")) {
+                                (layout::csrf_field(ctx))
+                                input type="hidden" name="enabled" value=(if view.old_browsers { "false" } else { "true" });
+                                button type="submit" {
+                                    @if view.old_browsers { "Allow" } @else { "Block" }
                                 }
                             }
                         }
@@ -1091,6 +1113,7 @@ pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
     Router::new()
         .route(&base.url("/category"), post(set_category))
         .route(&base.url("/humans-only"), post(set_humans_only))
+        .route(&base.url("/old-browsers"), post(set_old_browsers))
         .route(&base.url("/geo-mode"), post(set_geo_mode))
         .route(&base.url("/geo-add"), post(add_country))
         .route(&base.url("/geo-remove"), post(remove_country))
@@ -1148,6 +1171,32 @@ async fn set_humans_only(
             } else {
                 "Humans only is off. The category policies you had before are back in force."
                     .to_string()
+            },
+            true,
+        ),
+        Err(err) => back_with(&state, "/", &err.to_string(), false),
+    }
+}
+
+/// Blocks or allows the old-browser list on every site.
+async fn set_old_browsers(
+    State(state): State<AppState>,
+    _auth: Auth,
+    Form(form): Form<HumansOnlyForm>,
+) -> Response {
+    let on = form.enabled == "true";
+    match state.with_db(move |db| db.set_block_old_browsers(on)).await {
+        Ok(()) => back_with(
+            &state,
+            "/",
+            &if on {
+                format!(
+                    "Old browsers are blocked on every site. Apply on the {} screen to write \
+                     it into the site configs.",
+                    state.host().web_server().label()
+                )
+            } else {
+                "Old browsers are allowed again.".to_string()
             },
             true,
         ),

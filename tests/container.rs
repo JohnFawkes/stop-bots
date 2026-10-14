@@ -7818,3 +7818,71 @@ fn apache_on_rhel_detects_from_httpds_access_log() {
         "block-probe-paths said:\n{detected}\nlist-firewall-rules said:\n{rules}"
     );
 }
+
+// ---- the old-browser list, under both servers ----
+
+/// An old browser, a feature phone, and two browsers people run now.
+const OLD_AND_NEW: [(&str, &str, &str); 4] = [
+    (
+        "Opera/9.80 (Windows NT 6.1; U; en) Presto/2.8.131 Version/11.11",
+        "403",
+        "Presto-era Opera",
+    ),
+    (
+        "SonyEricssonT650i/R7AA Browser/NetFront/3.3 Profile/MIDP-2.0",
+        "403",
+        "a feature phone",
+    ),
+    (
+        "Mozilla/5.0 (X11; Linux x86_64; rv:158.0) Gecko/20100101 Firefox/158.0",
+        "200",
+        "Firefox now",
+    ),
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
+         Chrome/140.0.0.0 Safari/537.36",
+        "200",
+        "Chrome now",
+    ),
+];
+
+/// **Switched on, the list turns old browsers away under a real NGINX and
+/// serves browsers people run**: its escaped literals reach PCRE as the
+/// strings they are.
+#[test]
+fn nginx_turns_away_old_browsers_once_the_list_is_on() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-old-browsers");
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    server.stop_bots("set-old-browsers --enabled true");
+    server.apply_and_reload();
+
+    for (user_agent, expected, what) in OLD_AND_NEW {
+        assert_eq!(
+            server.status("/", &format!("-A {}", sh_quoted(user_agent))),
+            expected,
+            "{what}"
+        );
+    }
+}
+
+/// The same under a real Apache, through `mod_rewrite`'s own quoting.
+#[test]
+fn apache_turns_away_old_browsers_once_the_list_is_on() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-old-browsers");
+    apache.stop_bots("set-old-browsers --enabled true");
+    apache.apply();
+
+    for (user_agent, expected, what) in OLD_AND_NEW {
+        assert_eq!(
+            apache.status("/", &format!("-A {}", sh_quoted(user_agent))),
+            expected,
+            "{what}"
+        );
+    }
+}

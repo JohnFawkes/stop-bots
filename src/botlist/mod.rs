@@ -26,6 +26,7 @@
 
 pub mod ai_robots_txt;
 pub mod nginx_bad_bots;
+pub mod old_browsers;
 pub mod stop_bots_extras;
 pub mod well_known_bots;
 

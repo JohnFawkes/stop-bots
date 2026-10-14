@@ -406,7 +406,8 @@ Some directories don't exist yet but should be created if the need arises.
         |- db/managed.rs  <- The record of every generated file written, for cleaning up
         |- db/evidence.rs <- What the detectors have seen, and each log's read cursor
         |- db/blocks.rs   <- The Blocks views' pages, removal by source, and unblocks by hand
-        |- botlist/       <- One file per bot-list source parser
+        |- botlist/       <- One file per bot-list source parser, and old_browsers.rs, the
+        |                    compiled-in list of old browser agents behind its own switch
         |- fetch.rs       <- The one place an outbound HTTP request is made
         |- refresh.rs     <- "Update everything": every downloadable list as fetch-then-store, one at a time
         |- webserver.rs   <- What NGINX and Apache share: the policy, the apply (test, put back, reload), uninstall

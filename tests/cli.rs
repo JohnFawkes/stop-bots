@@ -4768,6 +4768,32 @@ fn set_subnet_escalation_switches_it_on_with_a_threshold() {
 
 // ---- categories and bots ----
 
+/// The old-browser list reaches the generated block once it is switched
+/// on, and leaves it once it is off again.
+#[test]
+fn set_old_browsers_changes_what_apply_blocks_writes() {
+    let fx = Fixture::new();
+    let site = fx.write_site("example.com");
+    fx.scan_sites();
+
+    fx.run(&["set-old-browsers", "--enabled", "true"])
+        .stdout(predicate::str::contains(
+            "Old browsers are BLOCKED on every site",
+        ));
+    fx.apply_blocks();
+    let config = fs::read_to_string(&site).unwrap();
+    assert!(config.contains(r"Opera/9\."), "config was:\n{config}");
+    fx.run(&["list-categories"])
+        .stdout(predicate::str::contains(
+            "Old browsers: blocked on every site",
+        ));
+
+    fx.run(&["set-old-browsers", "--enabled", "false"]);
+    fx.apply_blocks();
+    let config = fs::read_to_string(&site).unwrap();
+    assert!(!config.contains("NetFront"), "config was:\n{config}");
+}
+
 /// The host-wide category policy reaches the generated NGINX block: an
 /// allowed category's bots are no longer in it.
 #[test]

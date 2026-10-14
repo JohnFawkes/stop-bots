@@ -95,7 +95,7 @@ impl Ctx {
             db_notice,
             // The file is world-readable, and a console that cannot read
             // it names the tab as every host did before there was a choice.
-            web_server: crate::webserver::WebServer::configured(),
+            web_server: state.host().web_server(),
         };
         ctx
     }
@@ -160,21 +160,19 @@ impl Tab {
         }
     }
 
-    /// [`Self::label`], with the sites tab named for the web server this
-    /// host runs.
+    /// [`Self::label`] for the web server this host runs.
     pub fn label_in(self, ctx: &Ctx) -> &'static str {
-        match self {
-            Tab::Nginx => ctx.chrome.web_server.label(),
-            tab => tab.label(),
-        }
+        self.label(ctx.chrome.web_server)
     }
 
-    pub fn label(self) -> &'static str {
+    /// The tab's name. The sites tab is named for the web server it
+    /// manages, so the name needs it: there is no answer without one.
+    pub fn label(self, server: crate::webserver::WebServer) -> &'static str {
         match self {
             Tab::Dashboard => "Dashboard",
             Tab::Bots => "Bot settings",
             Tab::Firewall => "Firewall",
-            Tab::Nginx => "NGINX",
+            Tab::Nginx => server.label(),
             Tab::Blocks => "Blocks",
             Tab::Help => "Help",
         }
@@ -551,6 +549,20 @@ mod tests {
         let before = paths.len();
         paths.dedup();
         assert_eq!(before, paths.len(), "two tabs share a path: {paths:?}");
+    }
+
+    #[test]
+    fn the_sites_tab_is_named_for_the_hosts_web_server() {
+        use crate::webserver::WebServer;
+        for server in WebServer::ALL {
+            let mut ctx = Ctx::for_tests();
+            ctx.chrome.web_server = server;
+            let rendered = page(Tab::Nginx, &ctx, None, html! {}).into_string();
+            assert!(
+                rendered.contains(&format!("<title>{} — stop-bots</title>", server.label())),
+                "{server:?}'s page:\n{rendered}"
+            );
+        }
     }
 
     #[test]

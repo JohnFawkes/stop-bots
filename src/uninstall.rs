@@ -211,6 +211,9 @@ impl Plan {
             webserver::WebServer::Apache => vec![
                 crate::apache::conf_enabled_dir(&nginx_root),
                 nginx_root.join("conf-enabled"),
+                // RHEL's, which `conf_enabled_dir` picks only while there
+                // is no `conf-enabled` beside it.
+                nginx_root.join("conf.d"),
                 base.join(crate::apache::CONF_ENABLED_DIR.trim_start_matches('/')),
             ],
         };
@@ -741,18 +744,23 @@ fn remove_nginx(plan: &Plan, options: &Options, report: &mut Report) {
                 }
                 if removal.reloaded {
                     report.steps.push(Step {
-                        what: "test and reload NGINX".to_string(),
+                        what: format!("test and reload {}", plan.server.label()),
                         outcome: Outcome::Done,
                     });
                 } else if options.dry_run && plan.host {
                     report.steps.push(Step {
-                        what: format!("test and reload NGINX ({})", plan.nginx.test.join(" ")),
+                        what: format!(
+                            "test and reload {} ({})",
+                            plan.server.label(),
+                            plan.nginx.test.join(" ")
+                        ),
                         outcome: Outcome::Planned,
                     });
                 } else if !plan.host {
+                    let server = plan.server.label();
                     report.skip(
-                        "test and reload NGINX",
-                        "--prefix is not the running NGINX's config",
+                        format!("test and reload {server}"),
+                        format!("--prefix is not the running {server}'s config"),
                     );
                 }
             }

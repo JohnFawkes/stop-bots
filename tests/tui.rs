@@ -261,7 +261,7 @@ fn seed_cron_state(db_path: &Path) {
 }
 
 fn spawn_tui_with_args(db_path: &Path, extra_args: &[&str]) -> PtySession {
-    spawn_tui_cmd(db_path, extra_args, None)
+    spawn_tui_cmd(db_path, extra_args, None, None)
 }
 
 /// Like [`spawn_tui`], but *without* `--no-reload` and with `fakebin`
@@ -272,7 +272,7 @@ fn spawn_tui_with_args(db_path: &Path, extra_args: &[&str]) -> PtySession {
 /// tools at all; this is the opposite: run them, and control what they
 /// resolve to.
 fn spawn_tui_with_fake_tools(db_path: &Path, fakebin: &Path) -> PtySession {
-    spawn_tui_cmd(db_path, &[], Some(fakebin))
+    spawn_tui_cmd(db_path, &[], Some(fakebin), None)
 }
 
 /// [`spawn_tui_with_fake_tools`] plus extra arguments — for the one test
@@ -284,7 +284,7 @@ fn spawn_tui_with_fake_tools_and_args(
     fakebin: &Path,
     extra_args: &[&str],
 ) -> PtySession {
-    spawn_tui_cmd(db_path, extra_args, Some(fakebin))
+    spawn_tui_cmd(db_path, extra_args, Some(fakebin), None)
 }
 
 /// The one place the child process is put together. Every spawner above
@@ -293,7 +293,15 @@ fn spawn_tui_with_fake_tools_and_args(
 /// shelling out to the real `nginx -t`/`systemctl reload nginx` on
 /// whatever machine runs the test suite (see `main.rs`'s `apply-blocks
 /// --no-reload`, the same escape hatch for the CLI's own apply path).
-fn spawn_tui_cmd(db_path: &Path, extra_args: &[&str], fakebin: Option<&Path>) -> PtySession {
+///
+/// `host_conf` is a host settings file of the test's own; without one,
+/// a generated one nothing writes, which is every default.
+fn spawn_tui_cmd(
+    db_path: &Path,
+    extra_args: &[&str],
+    fakebin: Option<&Path>,
+    host_conf: Option<&Path>,
+) -> PtySession {
     seed_cron_state(db_path);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_stop-bots"));
     cmd.args(["tui", "--db", db_path.to_str().unwrap()]);
@@ -319,9 +327,37 @@ fn spawn_tui_cmd(db_path: &Path, extra_args: &[&str], fakebin: Option<&Path>) ->
     // Never the host's own settings: on a machine that runs stop-bots, its
     // host.conf named a `docker exec` reload, and the apply tests waited on
     // it until they were killed.
-    cmd.env("STOP_BOTS_HOST_CONF", generated_dir("host.conf"));
+    match host_conf {
+        Some(path) => cmd.env("STOP_BOTS_HOST_CONF", path),
+        None => cmd.env("STOP_BOTS_HOST_CONF", generated_dir("host.conf")),
+    };
 
     spawn_in_pty(cmd, 32, 100, Duration::from_millis(timeout_ms()))
+}
+
+/// The sites screen is named for the web server the host settings choose,
+/// in the tab bar and on the screen itself, and offers no rate limit where
+/// that server has none.
+#[test]
+fn an_apache_host_names_its_sites_screen_apache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("apache2");
+    std::fs::create_dir_all(&root).unwrap();
+    let host_conf = tmp.path().join("host.conf");
+    std::fs::write(
+        &host_conf,
+        format!("web_server = apache\napache_root = {}\n", root.display()),
+    )
+    .unwrap();
+    let mut session = spawn_tui_cmd(&tmp.path().join("db.sqlite3"), &[], None, Some(&host_conf));
+    session.exp_string("Apache").unwrap();
+
+    send_key(&mut session, "4");
+    session.exp_string("none").unwrap();
+
+    send_key(&mut session, "q");
+    send_key(&mut session, "q");
+    session.exp_eof().unwrap();
 }
 
 /// Sends a raw key sequence (no implicit newline); the pty write is

@@ -135,10 +135,15 @@ impl WebServer {
 
     /// What applying `site_configs` (and `default_config` for every block
     /// they do not name) to every block in `content` makes of it.
+    ///
+    /// `root` is the config root the file is under. Apache reads the rest
+    /// of its config there, to refuse a block that would pass the config
+    /// test and not do what it says (see `apache::refusal`).
     pub fn blocks_for_file(
         self,
         content: &str,
         config_path: &Path,
+        root: &Path,
         site_configs: &[(String, BlockConfig)],
         default_config: &BlockConfig,
     ) -> Result<String> {
@@ -147,23 +152,26 @@ impl WebServer {
                 nginx::blocks_for_file(content, config_path, site_configs, default_config)
             }
             WebServer::Apache => {
-                apache::blocks_for_file(content, config_path, site_configs, default_config)
+                apache::blocks_for_file(content, config_path, root, site_configs, default_config)
             }
         }
     }
 
     /// What applying `config` to only `server_name`'s blocks in `content`
-    /// makes of it.
+    /// makes of it. `root` as for [`Self::blocks_for_file`].
     pub fn block_for_site(
         self,
         content: &str,
         config_path: &Path,
+        root: &Path,
         server_name: &str,
         config: &BlockConfig,
     ) -> Result<String> {
         match self {
             WebServer::Nginx => nginx::block_for_site(content, config_path, server_name, config),
-            WebServer::Apache => apache::block_for_site(content, config_path, server_name, config),
+            WebServer::Apache => {
+                apache::block_for_site(content, config_path, root, server_name, config)
+            }
         }
     }
 
@@ -272,6 +280,21 @@ impl WebServer {
         match self {
             WebServer::Nginx => "`server` block",
             WebServer::Apache => "<VirtualHost>",
+        }
+    }
+
+    /// Why rate limiting does nothing on this server, if it does nothing:
+    /// Apache has no request-rate limit of its own (only third-party
+    /// modules), so no block written for it carries one. Every front-end
+    /// asks before it offers the setting, rather than store one that reads
+    /// as on and limits nothing.
+    pub fn without_rate_limiting(self) -> Option<&'static str> {
+        match self {
+            WebServer::Nginx => None,
+            WebServer::Apache => Some(
+                "Apache has no rate limiting of its own, so stop-bots writes none there: \
+                 turning it on would limit nothing.",
+            ),
         }
     }
 
@@ -1339,7 +1362,7 @@ pub fn apply_blocks_to_file(
 ) -> Result<bool> {
     let before = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
-    let after = server.blocks_for_file(&before, config_path, site_configs, default_config)?;
+    let after = server.blocks_for_file(&before, config_path, root, site_configs, default_config)?;
     if after == before {
         return Ok(false);
     }
@@ -1381,7 +1404,7 @@ pub fn apply_block_for_site(
 ) -> Result<bool> {
     let before = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
-    let after = server.block_for_site(&before, config_path, server_name, config)?;
+    let after = server.block_for_site(&before, config_path, root, server_name, config)?;
     if after == before {
         return Ok(false);
     }
@@ -1457,7 +1480,7 @@ pub fn preview_all_sites(
             .collect::<Result<_>>()?;
         let before = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let after = server.blocks_for_file(&before, &path, &site_configs, &default_config)?;
+        let after = server.blocks_for_file(&before, &path, root, &site_configs, &default_config)?;
         if after != before {
             changes.push(FileChange {
                 path,
@@ -1672,6 +1695,65 @@ pub fn is_console_site_file(path: &Path) -> bool {
                 && first.contains("by stop-bots")
                 && first.contains("(`Web Access` panel)")
         })
+}
+
+/// Where `server` loads each file this project generates for it under
+/// `root`, whether or not one is there: the trust file and the rate-limit
+/// zones beside the sites. Not the `robots.txt`, which lives in a
+/// directory of this project's own and is read only through a block.
+fn generated_file_places(server: WebServer, root: &Path) -> Vec<PathBuf> {
+    match server {
+        WebServer::Nginx => {
+            let conf_d = nginx::conf_d_dir(root);
+            vec![
+                nginx::untrusted_rate_limit_conf_path(&conf_d),
+                nginx::rate_limit_conf_path(&conf_d),
+                nginx::trusted_conf_path(&conf_d),
+            ]
+        }
+        WebServer::Apache => vec![apache::trusted_conf_path(&apache::conf_enabled_dir(root))],
+    }
+}
+
+/// What stop-bots has left in `server`'s config under `root`: each site
+/// file with a block or a console section in it, each generated file where
+/// it would be, and the console's own site. Empty for a root that is not
+/// there.
+///
+/// Asked before the host's web server is switched. Everything that finds
+/// these again — an apply, `uninstall web-server` — works on the server the
+/// host settings choose, so once they choose the other one, what is left
+/// here would stay in a config that is still loaded, with nothing in
+/// stop-bots that would ever take it out.
+pub fn leftovers(server: WebServer, root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut site_files: Vec<PathBuf> = server
+        .discover_sites(root)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|site| site.config_path)
+        .collect();
+    site_files.sort();
+    site_files.dedup();
+    for path in site_files {
+        if fs::read_to_string(&path)
+            .is_ok_and(|content| server.without_injected_blocks(&content) != content)
+        {
+            found.push(path);
+        }
+    }
+    for path in generated_file_places(server, root) {
+        if let Ok(Some(file)) = DirFile::locate(&path) {
+            if file.is_regular() && is_generated(&file) {
+                found.push(path);
+            }
+        }
+    }
+    let console = server.console_site_path(root);
+    if is_console_site_file(&console) && !found.contains(&console) {
+        found.push(console);
+    }
+    found
 }
 
 /// What [`remove_everything`] did, or would do.
@@ -2141,4 +2223,178 @@ fn reload(server: WebServer, commands: &ServerCommands) -> Result<()> {
 pub fn reload_with(server: WebServer, commands: &ServerCommands) -> Result<()> {
     test_config(server, commands)?;
     reload(server, commands)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- split_command ----
+
+    #[test]
+    fn a_command_splits_into_words_and_quotes_keep_theirs_together() {
+        for (written, argv) in [
+            ("nginx -t", vec!["nginx", "-t"]),
+            (
+                "  apachectl   configtest  ",
+                vec!["apachectl", "configtest"],
+            ),
+            (
+                "docker exec 'my web' nginx -t",
+                vec!["docker", "exec", "my web", "nginx", "-t"],
+            ),
+            (r#"say "it's""#, vec!["say", "it's"]),
+            ("a\"b c\"d", vec!["ab cd"]),
+            ("run ''", vec!["run", ""]),
+        ] {
+            assert_eq!(split_command(written).unwrap(), argv, "{written:?}");
+        }
+    }
+
+    /// No shell: what a shell would act on is just part of a word.
+    #[test]
+    fn a_command_is_never_a_shell_line() {
+        assert_eq!(
+            split_command("nginx -t; rm -rf / $(id) `x` | y").unwrap(),
+            ["nginx", "-t;", "rm", "-rf", "/", "$(id)", "`x`", "|", "y"]
+        );
+    }
+
+    #[test]
+    fn an_unbalanced_quote_or_nothing_at_all_is_refused() {
+        for written in ["nginx '-t", "\"", "", "   "] {
+            assert!(split_command(written).is_err(), "{written:?} was accepted");
+        }
+    }
+
+    // ---- Snapshot ----
+
+    #[test]
+    fn a_snapshot_puts_back_a_changed_file_with_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "before\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let snapshot = Snapshot::take([path.clone()]).unwrap();
+
+        write_managed(&path, "after\n").unwrap();
+        snapshot.restore().unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "before\n");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[test]
+    fn a_snapshot_removes_a_file_that_was_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stop-bots-trusted.conf");
+        let snapshot = Snapshot::take([path.clone()]).unwrap();
+
+        write_managed(&path, "new\n").unwrap();
+        snapshot.restore().unwrap();
+
+        assert!(!path.exists());
+    }
+
+    /// A link counts as absent: putting a planted one back would put back
+    /// the thing that was planted.
+    #[test]
+    fn a_snapshot_does_not_put_a_link_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        fs::write(&target, "not ours\n").unwrap();
+        let path = dir.path().join("stop-bots-trusted.conf");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let snapshot = Snapshot::take([path.clone()]).unwrap();
+
+        write_managed(&path, "ours\n").unwrap();
+        snapshot.restore().unwrap();
+
+        assert!(fs::symlink_metadata(&path).is_err(), "the link came back");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "not ours\n");
+    }
+
+    #[test]
+    fn a_failed_restore_names_the_file_and_the_rest_are_still_put_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let stuck = dir.path().join("gone/site.conf");
+        fs::create_dir_all(stuck.parent().unwrap()).unwrap();
+        fs::write(&stuck, "before\n").unwrap();
+        let fine = dir.path().join("other.conf");
+        fs::write(&fine, "before\n").unwrap();
+        let snapshot = Snapshot::take([stuck.clone(), fine.clone()]).unwrap();
+
+        fs::remove_dir_all(stuck.parent().unwrap()).unwrap();
+        fs::write(&fine, "after\n").unwrap();
+        let err = snapshot.restore().unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains(&stuck.display().to_string()),
+            "said: {err:#}"
+        );
+        assert_eq!(fs::read_to_string(&fine).unwrap(), "before\n");
+    }
+
+    // ---- switching servers ----
+
+    #[test]
+    fn leftovers_name_each_site_file_with_a_block_and_each_generated_file() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("apache2.conf"),
+            "IncludeOptional conf-enabled/*.conf\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.path().join("conf-enabled")).unwrap();
+        let blocked = root.path().join("blocked.conf");
+        let untouched = root.path().join("untouched.conf");
+        let site =
+            |name: &str| format!("<VirtualHost *:80>\n    ServerName {name}\n</VirtualHost>\n");
+        fs::write(&untouched, site("b.example")).unwrap();
+        let config = BlockConfig::new(vec!["BadBot".to_string()], BlockResponse::Forbidden);
+        let applied = WebServer::Apache
+            .blocks_for_file(&site("a.example"), &blocked, root.path(), &[], &config)
+            .unwrap();
+        fs::write(&blocked, applied).unwrap();
+        assert_eq!(
+            leftovers(WebServer::Apache, root.path()),
+            vec![blocked.clone()]
+        );
+
+        let trust = apache::trusted_conf_path(&apache::conf_enabled_dir(root.path()));
+        fs::write(&trust, format!("{}SetEnvIf x y\n", managed_header())).unwrap();
+        assert_eq!(
+            leftovers(WebServer::Apache, root.path()),
+            vec![blocked, trust]
+        );
+    }
+
+    /// A file of the same name an operator wrote is theirs, not a leftover.
+    #[test]
+    fn a_file_without_this_projects_header_is_no_leftover() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("conf-enabled")).unwrap();
+        let trust = apache::trusted_conf_path(&apache::conf_enabled_dir(root.path()));
+        fs::write(&trust, "SetEnvIf x y\n").unwrap();
+        assert_eq!(
+            leftovers(WebServer::Apache, root.path()),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    #[test]
+    fn a_root_that_is_not_there_has_no_leftovers() {
+        let gone = Path::new("/nonexistent/stop-bots/nginx-root");
+        assert_eq!(leftovers(WebServer::Nginx, gone), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn only_nginx_rate_limits() {
+        assert_eq!(WebServer::Nginx.without_rate_limiting(), None);
+        assert!(WebServer::Apache.without_rate_limiting().is_some());
+    }
 }

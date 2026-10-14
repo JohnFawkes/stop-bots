@@ -23,6 +23,14 @@ RUN sed -i 's/^Listen 80$/Listen 8080/' /etc/httpd/conf/httpd.conf && \
     mkdir -p /var/www/test /etc/stop-bots && \
     echo '<h1>hello</h1>' > /var/www/test/index.html
 
+# No init system, as in `Dockerfile.apache`: `systemctl reload httpd`, the
+# reload stop-bots defaults to in RHEL's tree, is a graceful restart by hand.
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        '[ "$1" = reload ] && exec httpd -k graceful' \
+        'exit 0' \
+        > /usr/local/bin/systemctl && chmod +x /usr/local/bin/systemctl
+
 COPY stop-bots /usr/local/bin/stop-bots
 
 CMD ["sleep", "infinity"]

@@ -75,7 +75,8 @@ const ROOT_HELP: &str = "The web server's config root. Defaults to the one store
 
 /// Help text shared by every detector subcommand's `--access-log`.
 const ACCESS_LOG_HELP: &str = "Read this access log instead of the stored one \
-(`set-log-paths`), else /var/log/nginx/access.log, or /var/log/apache2/access.log for Apache";
+(`set-log-paths`), else /var/log/nginx/access.log, or for Apache /var/log/apache2/access.log \
+(/var/log/httpd/access_log in RHEL's /etc/httpd)";
 
 /// Help text shared by every detector subcommand's `--dry-run`.
 const DRY_RUN_HELP: &str = "Show what would be blocked without storing anything";
@@ -3730,7 +3731,7 @@ fn run_set_log_paths(
         Some(path) => say!("  access log: {}", path.display()),
         None => say!(
             "  access log: {} (default — nothing stored)",
-            paths.server.default_access_log()
+            paths.default_access_log()
         ),
     }
     match &paths.ssh {

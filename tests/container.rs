@@ -7509,8 +7509,13 @@ impl Host {
 /// **Upgrading changes nothing by itself, and tells the truth about what
 /// the next apply will change.** The host 0.1.1 set up keeps every site
 /// file and its loaded ruleset byte for byte across the upgrade, keeps its
-/// host settings free of a `web_server` line, and `status` names the two
-/// sites whose block the release changed, and only those, as not applied.
+/// host settings free of a `web_server` line, and the sites `status` calls
+/// not applied are exactly the sites the next apply then rewrites.
+///
+/// Which sites those are depends on the release: one that changes the
+/// block's shape changes the sites that exempt a path, and one whose
+/// built-in list grew changes them all. So the test compares the two
+/// rather than naming either.
 #[test]
 fn upgrading_a_0_1_1_nginx_host_changes_nothing_until_it_is_applied() {
     if !enabled() {
@@ -7534,9 +7539,33 @@ fn upgrading_a_0_1_1_nginx_host_changes_nothing_until_it_is_applied() {
     let status = host
         .run_uncontended(&format!("stop-bots status --db {HOST_DB}"))
         .1;
+    let not_applied: std::collections::BTreeSet<String> = status
+        .lines()
+        .find_map(|line| line.split_once("site(s) not applied: "))
+        .map(|(_, names)| {
+            names
+                .split(", ")
+                .map(|name| name.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let hash = |file: &str| host.sh(&format!("sha256sum /etc/nginx/sites-enabled/{file}"));
+    let hashes: Vec<String> = UPGRADE_SITES.iter().map(|(file, _)| hash(file)).collect();
+    host.stop_bots("apply-blocks");
+    let rewritten: std::collections::BTreeSet<String> = UPGRADE_SITES
+        .iter()
+        .zip(&hashes)
+        .filter(|((file, _), before)| hash(file) != **before)
+        .map(|((file, _), _)| format!("{}.example", file.trim_end_matches("-site.conf")))
+        .collect();
     assert!(
-        status.contains("2 of 3 site(s) not applied: other.example, test.example"),
-        "status does not name exactly the sites with an exemption as not applied:\n{status}"
+        !rewritten.is_empty(),
+        "the release changed no site's block, so this proves nothing"
+    );
+    assert_eq!(
+        not_applied, rewritten,
+        "status's not-applied sites are not the ones the apply rewrote. status:\n{status}"
     );
 }
 

@@ -31,7 +31,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   "research" scanners, SEO, lead and ads.txt crawlers, and two scanners calling
   themselves `MistralBot` and `CohereBot`, which asked only for framework manifests. All
   are scanners for policy, so they are blocked by default. YaCy's crawler, which now
-  sends `yacycrawler` where the upstream list has `yacybot`, is added as a search engine.
+  sends `yacycrawler` where the upstream list has `yacybot`, is added as a search engine. The list is
+  compiled in and loaded when the upgraded binary first opens the database, so every
+  site reads as not applied until the next apply writes the new names in.
 
 ## [0.2.0-rc.2] — 2026-10-14
 

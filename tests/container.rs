@@ -66,11 +66,19 @@
 //!
 //! ## And a stranger's host
 //!
-//! `Dockerfile.stranger` is a fresh Debian 12 or Ubuntu 24.04 with nothing
-//! of ours on it, for [`a_stranger_follows_the_quick_start`]: the README's
+//! `Dockerfile.stranger` is a fresh Debian 12 or Ubuntu 24.04, with NGINX
+//! or Apache, and nothing of ours on it, for
+//! [`a_stranger_follows_the_quick_start`]: the README's
 //! quick start from `apt install` of the `.deb` to `uninstall all`. It
 //! needs a package, named by `STOP_BOTS_STRANGER_DEB`, and skips without
 //! one; `make stranger-test` builds one and runs it.
+//!
+//! ## And two hosts nobody here runs
+//!
+//! `Dockerfile.rhel` is AlmaLinux 10's `httpd`, for RHEL's `/etc/httpd`
+//! tree. `Dockerfile.upgrade` is the [`Host`] image with the released 0.1.1
+//! binary beside the one under test, so the upgrade tests start from what
+//! 0.1.1 actually left on a host.
 
 use std::process::Command;
 
@@ -5668,8 +5676,8 @@ fn a_chain_written_by_0_0_15_is_taken_over_by_the_restore() {
 // ---- the stranger test: the README's quick start, on a fresh host ----
 
 /// The two distributions the README names, each as a fresh server with
-/// NGINX and nftables from its own archive and nothing of ours on it. See
-/// `Dockerfile.stranger` for what "fresh" includes.
+/// a web server and nftables from its own archive and nothing of ours on
+/// it. See `Dockerfile.stranger` for what "fresh" includes.
 #[derive(Clone, Copy)]
 enum Distro {
     Debian12,
@@ -5698,30 +5706,35 @@ impl Distro {
         }
     }
 
-    fn image(self) -> String {
-        tagged(&format!("stop-bots-stranger-{}", self.slug()))
+    fn image(self, web: Web) -> String {
+        tagged(&format!(
+            "stop-bots-stranger-{}{}",
+            self.slug(),
+            web.suffix()
+        ))
     }
 
-    /// Builds this distribution's image once per run, the way
+    /// Builds this distribution's image with `web` once per run, the way
     /// [`build_host_image`] does the other.
-    fn build(self) {
-        static DEBIAN: std::sync::Once = std::sync::Once::new();
-        static UBUNTU: std::sync::Once = std::sync::Once::new();
-        let once = match self {
-            Distro::Debian12 => &DEBIAN,
-            Distro::Ubuntu2404 => &UBUNTU,
-        };
-        once.call_once(|| {
-            with_build_lock(|| build_unless_current(&self.image(), || self.build_now()))
-        });
+    fn build(self, web: Web) {
+        static BUILT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let image = self.image(web);
+        let mut built = BUILT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !built.contains(&image) {
+            with_build_lock(|| build_unless_current(&image, || self.build_now(web)));
+            built.push(image);
+        }
     }
 
-    fn build_now(self) {
+    fn build_now(self, web: Web) {
         let ctx = stage_binary();
         let out = Command::new(runtime())
             .args(["build", "-q", "-f", &format!("{ctx}/Dockerfile.stranger")])
             .args(self.build_args())
-            .args(["-t", &self.image(), &ctx])
+            .args(["--build-arg", &format!("SERVER={}", web.package())])
+            .args(["-t", &self.image(web), &ctx])
             .output()
             .expect("failed to run the image build");
         assert!(
@@ -5731,6 +5744,70 @@ impl Distro {
             self.slug(),
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+}
+
+/// The web server on a stranger's host, as its distribution packages it.
+#[derive(Clone, Copy)]
+enum Web {
+    Nginx,
+    Apache,
+}
+
+impl Web {
+    /// The package, which is also the name of its unit.
+    fn package(self) -> &'static str {
+        match self {
+            Web::Nginx => "nginx",
+            Web::Apache => "apache2",
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Web::Nginx => "",
+            Web::Apache => "-apache",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Web::Nginx => "NGINX",
+            Web::Apache => "Apache",
+        }
+    }
+
+    fn conf_dir(self) -> &'static str {
+        match self {
+            Web::Nginx => "/etc/nginx",
+            Web::Apache => "/etc/apache2",
+        }
+    }
+
+    /// The site the package enables, on port 80.
+    fn default_site(self) -> &'static str {
+        match self {
+            Web::Nginx => "/etc/nginx/sites-available/default",
+            Web::Apache => "/etc/apache2/sites-available/000-default.conf",
+        }
+    }
+
+    fn config_test(self) -> &'static str {
+        match self {
+            Web::Nginx => "nginx -t",
+            Web::Apache => "apache2ctl configtest",
+        }
+    }
+
+    /// What the README's quick start asks of this server after installing
+    /// and before the first look: nothing for NGINX, the default; for
+    /// Apache, to say so once and to enable the module the blocks are
+    /// written in.
+    fn setup(self) -> &'static [&'static str] {
+        match self {
+            Web::Nginx => &[],
+            Web::Apache => &["stop-bots set-web-server apache", "a2enmod rewrite"],
+        }
     }
 }
 
@@ -5827,25 +5904,30 @@ impl Host {
     }
 
     /// What `uninstall` promises to put back, read the same way each
-    /// time: every file under /etc/nginx by hash, the nft tables, the
-    /// units, and /etc/stop-bots.
-    fn footprint(&self) -> String {
-        self.sh("set -e\n\
-             find /etc/nginx -type f | sort | xargs sha256sum\n\
+    /// time: every file under the web server's config by hash, the nft
+    /// tables, the units, and /etc/stop-bots.
+    fn footprint(&self, web: Web) -> String {
+        self.sh(&format!(
+            "set -e\n\
+             find {} -type f | sort | xargs sha256sum\n\
              echo '-- nft'; nft list tables\n\
              echo '-- units'; find /etc/systemd/system -name 'stop-bots*' | sort\n\
              systemctl list-unit-files 'stop-bots*' --no-legend | sort\n\
-             echo '-- /etc/stop-bots'; ls -A /etc/stop-bots 2>/dev/null || true")
+             echo '-- /etc/stop-bots'; ls -A /etc/stop-bots 2>/dev/null || true",
+            web.conf_dir()
+        ))
     }
 }
 
 /// **A stranger, following only the README's quick start, from install to
-/// blocking to uninstall, on a fresh `distro`.**
+/// blocking to uninstall, on a fresh `distro` running `web`.**
 ///
 /// Every command is the quick start's, run as it is written, in its order:
 ///
 /// ```text
 /// apt install ./stop-bots_*.deb
+/// stop-bots set-web-server apache    (Apache only)
+/// a2enmod rewrite                    (Apache only)
 /// stop-bots status
 /// stop-bots batch --dry-run --diff
 /// stop-bots batch --apply
@@ -5862,23 +5944,26 @@ impl Host {
 /// would run it; the container's shell already is.
 ///
 /// "Blocking" is checked from a second container, from its own address:
-/// NGINX turns away a scanner's user agent and serves a browser, and a
+/// the web server turns away a scanner's user agent and serves a browser, and a
 /// client that asks for `/.env` is blocked by the probe-path detector on
 /// the next pass and then dropped by nftables. After `install firewall`
 /// the table is deleted and the unit restarted, the way a boot loads it,
 /// and only what was applied comes back. After `uninstall all`, the host
 /// is as it was before the package was installed.
-fn a_stranger_follows_the_quick_start(distro: Distro) {
+fn a_stranger_follows_the_quick_start(distro: Distro, web: Web) {
     if !enabled() {
         return;
     }
     let Some(deb) = stranger_deb() else {
         return;
     };
-    distro.build();
-    let tag = format!("stop-bots-stranger-{}", distro.slug());
+    distro.build(web);
+    // No dots: the client reaches the host by this name, and Apache answers
+    // 400 to a `Host` whose label after a dot starts with digits, as
+    // `...-24.04-apache` would, which it takes for a malformed address.
+    let tag = format!("stop-bots-stranger-{}{}", distro.slug(), web.suffix()).replace('.', "-");
     let net = Network::create(&format!("{tag}-net"));
-    let host = Host::boot_image(&tag, &distro.image(), Some(&net));
+    let host = Host::boot_image(&tag, &distro.image(web), Some(&net));
     let client = Client::start(&format!("{tag}-client"), &net);
     let site = format!("http://{}/", host.name);
     let scanner = format!("-A '{SCANNER_UA}'");
@@ -5888,12 +5973,13 @@ fn a_stranger_follows_the_quick_start(distro: Distro) {
         " --no-fetch"
     };
 
-    host.sh("systemctl start nginx.service");
-    let pristine = host.footprint();
+    host.sh(&format!("systemctl start {}.service", web.package()));
+    let pristine = host.footprint(web);
     assert_eq!(
         client.eventually(&site, &scanner, "200"),
         "200",
-        "a fresh NGINX should serve everyone"
+        "a fresh {} should serve everyone",
+        web.name()
     );
 
     // Installing it: the package, with no network, so a dependency it
@@ -5916,10 +6002,15 @@ fn a_stranger_follows_the_quick_start(distro: Distro) {
         );
     }
 
+    // Telling it about the web server, where the README asks to.
+    for step in web.setup() {
+        host.quick_start(step);
+    }
+
     // Before anything: a first look, and the plan.
     host.quick_start("stop-bots status");
-    let default_site = "sha256sum /etc/nginx/sites-available/default";
-    let untouched = host.sh(default_site);
+    let default_site = format!("sha256sum {}", web.default_site());
+    let untouched = host.sh(&default_site);
     let plan = host.quick_start("stop-bots batch --dry-run --diff");
     for (what, needle) in [
         (
@@ -5935,7 +6026,7 @@ fn a_stranger_follows_the_quick_start(distro: Distro) {
         );
     }
     assert_eq!(
-        host.sh(default_site),
+        host.sh(&default_site),
         untouched,
         "the dry run changed the site"
     );
@@ -5970,7 +6061,8 @@ fn a_stranger_follows_the_quick_start(distro: Distro) {
     assert_eq!(
         client.status_of(&site, "--max-time 5"),
         "000",
-        "the prober is blocked and still reaches NGINX"
+        "the prober is blocked and still reaches {}",
+        web.name()
     );
 
     // Persistence: the unit loads what was applied, and nothing else.
@@ -6004,10 +6096,10 @@ fn a_stranger_follows_the_quick_start(distro: Distro) {
     );
 
     // And back out.
-    let before = host.footprint();
+    let before = host.footprint(web);
     let dry = host.quick_start("stop-bots uninstall all --dry-run");
     assert_eq!(
-        host.footprint(),
+        host.footprint(web),
         before,
         "the dry run changed something:\n{dry}"
     );
@@ -6016,7 +6108,7 @@ fn a_stranger_follows_the_quick_start(distro: Distro) {
     // settings file stay: what the operator set is not thrown away by a
     // plain uninstall. Everything else is as it was.
     assert_eq!(
-        host.footprint(),
+        host.footprint(web),
         format!("{pristine}host.conf\n"),
         "the host is not as it was before stop-bots, bar host.conf. uninstall said:\n{removed}"
     );
@@ -6026,14 +6118,15 @@ fn a_stranger_follows_the_quick_start(distro: Distro) {
     );
     let purged = host.quick_start("stop-bots uninstall all --purge");
     assert_eq!(
-        host.footprint(),
+        host.footprint(web),
         pristine,
         "--purge left something behind. It said:\n{purged}"
     );
-    let (valid, out, err) = host.run("nginx -t");
+    let (valid, out, err) = host.run(web.config_test());
     assert!(
         valid,
-        "NGINX does not load what uninstall left:\n{out}{err}"
+        "{} does not load what uninstall left:\n{out}{err}",
+        web.name()
     );
     assert_eq!(
         client.eventually(&site, &scanner, "200"),
@@ -6044,12 +6137,17 @@ fn a_stranger_follows_the_quick_start(distro: Distro) {
 
 #[test]
 fn a_stranger_on_debian_12_goes_from_install_to_blocking_to_uninstall() {
-    a_stranger_follows_the_quick_start(Distro::Debian12);
+    a_stranger_follows_the_quick_start(Distro::Debian12, Web::Nginx);
 }
 
 #[test]
 fn a_stranger_on_ubuntu_24_04_goes_from_install_to_blocking_to_uninstall() {
-    a_stranger_follows_the_quick_start(Distro::Ubuntu2404);
+    a_stranger_follows_the_quick_start(Distro::Ubuntu2404, Web::Nginx);
+}
+
+#[test]
+fn a_stranger_on_ubuntu_24_04_with_apache_goes_from_install_to_blocking_to_uninstall() {
+    a_stranger_follows_the_quick_start(Distro::Ubuntu2404, Web::Apache);
 }
 
 // ---- Apache ----
@@ -6925,4 +7023,799 @@ fn apache_refuses_a_site_that_switches_rewriting_off() {
     assert!(stderr.contains("RewriteEngine Off"), "said:\n{stderr}");
     let file = apache.sh("cat /etc/apache2/sites-available/off.conf");
     assert!(!file.contains("stop-bots"), "file:\n{file}");
+}
+
+/// The NGINX finding's table under a real Apache: blocked user agents with
+/// a backslash, a quote, a brace or a `$` in them, stored as a release
+/// that took them wrote them, each turn away exactly that client — and not
+/// the near miss beside it, a browser, curl or Googlebot.
+///
+/// Apache reads these through two parsers NGINX does not have:
+/// `mod_rewrite`'s own argument splitting, where nothing escapes a quote,
+/// and the core's `${NAME}` substitution, which runs on every line before
+/// any module sees it. So a few rows of its own ride along: a `${...}`
+/// that names a variable Apache defines, a `%{...}` that `mod_rewrite`
+/// expands in a test string, and agents that start with what it would read
+/// as a negation or a string comparison rather than a regex. Each of those, read the other way, either refuses everyone or
+/// no one.
+#[test]
+fn apache_blocks_hostile_stored_agents_exactly_their_client() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-hostile");
+    const APACHE_ONLY: [(&str, Option<&str>); 4] = [
+        (
+            "Scraper/2.1 ${APACHE_LOG_DIR}",
+            Some("Scraper/2.1 /var/log/apache2"),
+        ),
+        (
+            "Scraper/2.1 %{HTTP_HOST}",
+            Some("Scraper/2.1 127.0.0.1:8080"),
+        ),
+        ("!Scraper/2.1", None),
+        ("=Scraper/2.1", None),
+    ];
+    let hostile: Vec<_> = HOSTILE_USER_AGENTS.iter().chain(&APACHE_ONLY).collect();
+
+    let mut sql = String::new();
+    for (user_agent, _) in &hostile {
+        sql.push_str(&format!(
+            "INSERT INTO blocked_user_agents (user_agent, blocked_at) VALUES ('{}', 0);\n",
+            user_agent.replace('\'', "''")
+        ));
+    }
+    for path in [r"/x\|", r"/x\("] {
+        sql.push_str(&format!(
+            "INSERT INTO site_path_exemptions (site_id, path) \
+             SELECT id, '{path}' FROM sites WHERE server_name = 'test.example';\n"
+        ));
+    }
+    apache.sh(&format!("sqlite3 /tmp/db.sqlite3 <<'SQL'\n{sql}SQL"));
+    let json = r#"[{"id":"listed","categories":["ai"],"pattern":{"accepted":["ListedBot","Bot[z-a]x","Botx{2,1}","Botx{99999}"],"forbidden":[]}}]"#;
+    apache.sh(&format!("cat > /tmp/bots.json <<'JSON'\n{json}\nJSON"));
+    apache.stop_bots("update-bot-lists --source /tmp/bots.json");
+    apache.apply();
+
+    let site = apache.sh(&format!("cat {APACHE_SITE}"));
+    let status = |user_agent: &str| apache.status("/", &format!("-A {}", sh_quoted(user_agent)));
+    for (user_agent, near_miss) in &hostile {
+        assert_eq!(
+            status(user_agent),
+            "403",
+            "{user_agent:?} was served. site:\n{site}"
+        );
+        if let Some(near_miss) = near_miss {
+            assert_eq!(
+                status(near_miss),
+                "200",
+                "{near_miss:?} was refused by the rule for {user_agent:?}. site:\n{site}"
+            );
+        }
+    }
+    assert_eq!(
+        status("ListedBot/1.0"),
+        "403",
+        "the list's good pattern was lost"
+    );
+    for ordinary in [
+        "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
+        "curl/8.14.1",
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    ] {
+        assert_eq!(
+            status(ordinary),
+            "200",
+            "{ordinary:?} was refused. site:\n{site}"
+        );
+    }
+}
+
+/// A rule set for one site is enforced there and not on the site beside
+/// it: each `<VirtualHost>` gets its own block, written from its own
+/// settings.
+#[test]
+fn apache_enforces_a_per_site_rule_on_that_site_and_not_its_neighbour() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-two-sites");
+    apache.add_site(
+        "other",
+        "<VirtualHost *:8081>\n    ServerName other.example\n    DocumentRoot /var/www/test\n</VirtualHost>\n",
+    );
+    let no_ua = "-H 'Accept: text/html' -H 'Accept-Language: en' -A ''";
+    let other = || apache.status_at("http://127.0.0.1:8081/", "other.example", no_ua);
+    assert_eq!(
+        apache.status("/", no_ua),
+        "200",
+        "the site serves before the rule"
+    );
+    assert_eq!(other(), "200", "its neighbour serves before the rule");
+
+    apache.stop_bots("set-site-rule --site test.example --rule no-user-agent --enabled true");
+    apache.apply();
+
+    assert_eq!(
+        apache.status("/", no_ua),
+        "403",
+        "the rule did not take effect on the site it was set for"
+    );
+    assert_eq!(
+        other(),
+        "200",
+        "a rule set for one site is being enforced on its neighbour"
+    );
+}
+
+/// An agent exemption lets its one client through on its one path, and no
+/// further: not off the path, not by walking out of it, and not another
+/// bot on it.
+#[test]
+fn apache_serves_an_agent_exemption_only_its_client_on_only_its_paths() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-agent-exempt");
+    apache.seed_bot("okhttp", "okhttp");
+    apache.seed_bot("badbot", "BadBot");
+    apache.stop_bots("exempt-path --site test.example --path /dav/ --user-agent okhttp");
+    apache.apply();
+
+    for (path, user_agent, expected, why) in [
+        (
+            "/dav/file",
+            "okhttp/4.10.0",
+            "404",
+            "the exempt client on its path",
+        ),
+        (
+            "/DAV/file",
+            "okhttp/4.10.0",
+            "404",
+            "the path, matched without case",
+        ),
+        (
+            "/",
+            "okhttp/4.10.0",
+            "403",
+            "the exempt client off its path",
+        ),
+        (
+            "/dav/../index.html",
+            "okhttp/4.10.0",
+            "403",
+            "walking out with ..",
+        ),
+        (
+            "/dav/%2e%2e/index.html",
+            "okhttp/4.10.0",
+            "403",
+            "walking out with %2e%2e",
+        ),
+        (
+            "/dav/file",
+            "BadBot/1.0",
+            "403",
+            "another bot on the exempt path",
+        ),
+        ("/", "Mozilla/5.0", "200", "an ordinary visitor"),
+    ] {
+        assert_eq!(
+            apache.status(path, &format!("--path-as-is -A '{user_agent}'")),
+            expected,
+            "{why}: {user_agent} on {path}"
+        );
+    }
+}
+
+// ---- an Apache host, under real systemd ----
+//
+// The tests above run the generated Apache config through a real Apache
+// with no init. These run it the way `install web` leaves an Apache host:
+// the console in its sandbox, asking the root helper in its own, which is
+// granted Apache's tree and logs rather than NGINX's. That grant is a
+// property of the generated units under a real service manager, which is
+// exactly what the `Host` tests exist for.
+
+impl Host {
+    /// A booted host with Apache running in place of NGINX, and the host
+    /// settings saying so.
+    fn start_apache(name: &str) -> Host {
+        let host = Host::boot(name);
+        host.sh("systemctl start apache2");
+        let chosen = host.stop_bots("set-web-server apache");
+        assert!(chosen.contains("Apache"), "set-web-server said:\n{chosen}");
+        host
+    }
+
+    /// The status the host's Apache answers `/` with.
+    fn status(&self, curl_args: &str) -> String {
+        self.run(&format!(
+            "curl -s -o /dev/null -w '%{{http_code}}' {curl_args} http://127.0.0.1:8080/"
+        ))
+        .1
+        .trim()
+        .to_string()
+    }
+}
+
+/// **The helper applies Apache, and the reload takes.** Asked by the
+/// console's user, as the console asks, the helper writes the block into
+/// Debian's `/etc/apache2`, runs `apache2ctl configtest` and reloads
+/// `apache2` from inside its sandbox — and Apache then turns the bot away.
+/// Each of those needs something the helper's unit grants only on an
+/// Apache host.
+#[test]
+fn the_helper_applies_apache_and_reloads_it_under_its_sandbox() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start_apache("stop-bots-helper-apache");
+    host.sh("stop-bots install web --no-start && systemctl start stop-bots-helper.socket");
+    host.stop_bots("scan-sites");
+    host.seed_bot("evilbot", "EvilBot");
+    assert_eq!(
+        host.status(BAD_AGENT),
+        "200",
+        "the bot is refused before any apply"
+    );
+
+    let reply = ask_helper_with(
+        &host,
+        "stop-bots",
+        r#"{"ApplyNginx":{"site":null,"reload":true}}"#,
+    );
+    assert!(
+        reply.starts_with(r#"{"Ok""#),
+        "the helper could not apply Apache: {reply}\njournal:\n{}",
+        host.journal("stop-bots-helper.service")
+    );
+    assert!(
+        host.sh("cat /etc/apache2/sites-available/test-site.conf")
+            .contains("# BEGIN stop-bots"),
+        "the helper said it applied, but the site has no block"
+    );
+    assert_eq!(
+        eventually("403", || host.status(BAD_AGENT)),
+        "403",
+        "the block was written but Apache was not reloaded. journal:\n{}",
+        host.journal("stop-bots-helper.service")
+    );
+    assert_eq!(host.status(BROWSER), "200", "a browser is refused");
+}
+
+/// **The console detects from Apache's log, read through its helper.** A
+/// probe for `/.env` in `/var/log/apache2/access.log`, which Debian keeps
+/// `root:adm 640` where the console cannot read it, is blocked by the
+/// installed console — and it was the helper that read the log.
+#[test]
+fn the_console_detects_from_apaches_log_through_its_helper() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start_apache("stop-bots-console-detects-apache");
+    host.sh(
+        "now=$(date +'%d/%b/%Y:%H:%M:%S %z') && \
+         echo \"203.0.113.77 - - [$now] \\\"GET /.env HTTP/1.1\\\" 404 0 \\\"-\\\" \\\"curl/8\\\"\" \
+           >> /var/log/apache2/access.log",
+    );
+    assert_eq!(
+        host.sh("stat -c '%U:%G %a' /var/log/apache2/access.log")
+            .trim(),
+        "root:adm 640",
+        "Apache's access log is not as Debian ships it"
+    );
+
+    host.sh("stop-bots install web");
+    host.wait_for_console();
+    let rules = eventually("203.0.113.77", || {
+        host.run_uncontended(&format!("stop-bots list-firewall-rules --db {HOST_DB}"))
+            .1
+    });
+    assert!(
+        rules.contains("203.0.113.77"),
+        "the access log's prober was not blocked:\n{rules}\njournal:\n{}",
+        host.journal("stop-bots-web.service")
+    );
+    let helper = host.journal("stop-bots-helper.service");
+    assert!(
+        helper.contains("op=ReadLog") && helper.contains(&host.console_uid()),
+        "the helper read no log for the console:\n{helper}"
+    );
+}
+
+/// **On an Apache host, the console still cannot write the web server's
+/// config, and the helper can.** The same refusal NGINX's tree gets —
+/// read-only under the console's unit, and not its account's to write
+/// without the unit — with the helper's own sandbox as the control: a
+/// grant of NGINX's tree alone would fail it.
+#[test]
+fn on_an_apache_host_only_the_helper_can_write_apaches_config() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start_apache("stop-bots-apache-writes");
+    host.sh("stop-bots install web --no-start");
+    let path = "/etc/apache2/conf-enabled/stop-bots-probe.conf";
+    let touch = format!("/usr/bin/touch {path}");
+
+    for (how, mangle, refusal) in [
+        ("its unit", "", "Read-only file system"),
+        (
+            "its account alone",
+            "| sed -e '/^ProtectSystem=/d' -e '/^ReadWritePaths=/d'",
+            "Permission denied",
+        ),
+    ] {
+        let probe = format!("probe-console-apache-{}", refusal.len());
+        let wrote = host.oneshot_under_web_sandbox(&probe, &touch, mangle);
+        let journal = host.journal(&format!("{probe}.service"));
+        assert!(
+            !wrote && !host.run(&format!("test -e {path}")).0,
+            "under {how} the console wrote {path}"
+        );
+        assert!(
+            journal.contains(refusal),
+            "{path} was refused under {how}, but not with {refusal:?}:\n{journal}"
+        );
+    }
+
+    assert!(
+        host.oneshot_under_helper_sandbox("probe-helper-apache", &touch, ""),
+        "the helper cannot write Apache's config. unit:\n{}\njournal:\n{}",
+        host.sh("cat /etc/systemd/system/stop-bots-helper.service"),
+        host.journal("probe-helper-apache.service")
+    );
+    // And it is the Apache grant that lets it: without that one line, the
+    // helper's `ProtectSystem=strict` refuses it too.
+    host.sh(&format!("rm -f {path}"));
+    assert!(
+        !host.oneshot_under_helper_sandbox(
+            "probe-helper-apache-ungranted",
+            &touch,
+            "| sed -e '/^ReadWritePaths=-\\/etc\\/apache2$/d'",
+        ),
+        "the helper wrote Apache's config without the grant, so the unit's grant proves nothing"
+    );
+}
+
+// ---- upgrading a real 0.1.1 install ----
+//
+// The release that added Apache moved NGINX behind the layer both servers
+// share, and promises an NGINX host nothing to do: the same database, the
+// same files, and only a site with an exemption reading as stale until it
+// is applied again. These start from what the released 0.1.1 binary
+// actually left on a host, not from a fixture of it.
+
+/// The systemd host with the 0.1.1 binary beside the one under test — see
+/// `Dockerfile.upgrade`.
+fn upgrade_image() -> String {
+    tagged("stop-bots-upgrade")
+}
+
+fn build_upgrade_image() {
+    build_host_image();
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        with_build_lock(|| {
+            build_unless_current(&upgrade_image(), || {
+                let ctx = stage_binary();
+                let out = Command::new(runtime())
+                    .args(["build", "-q", "-f", &format!("{ctx}/Dockerfile.upgrade")])
+                    .args(["--build-arg", &format!("BASE={}", host_image())])
+                    .args(["-t", &upgrade_image(), &ctx])
+                    .output()
+                    .expect("failed to run the image build");
+                assert!(
+                    out.status.success(),
+                    "{} build (upgrade image) failed:\n{}",
+                    runtime(),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            });
+        });
+    });
+}
+
+/// The sites the upgrade test serves, by file and port: the suite's own,
+/// with a request-shape rule; a second with an exempt path; and a third
+/// with neither. The release changes the block of the first two, both of
+/// which exempt a path (a request rule always exempts `/.well-known/`),
+/// and not the third's.
+const UPGRADE_SITES: [(&str, u16); 3] = [
+    ("test-site.conf", 8080),
+    ("other-site.conf", 8081),
+    ("plain-site.conf", 8082),
+];
+
+impl Host {
+    /// A host that 0.1.1 set up, as an operator following its README would
+    /// have: the console installed as a service, the three sites of
+    /// [`UPGRADE_SITES`] scanned, a bot blocked, a per-site rule and an
+    /// exemption set, the blocks applied and a firewall rule loaded. The
+    /// binary under test is kept aside, at `/root/stop-bots-new`, for the
+    /// upgrade.
+    fn set_up_by_0_1_1(name: &str) -> Host {
+        build_upgrade_image();
+        let host = Host::boot_image(name, &upgrade_image(), None);
+        host.sh("cp /usr/local/bin/stop-bots /root/stop-bots-new \
+             && install -m 755 /usr/local/bin/stop-bots-0.1.1 /usr/local/bin/stop-bots");
+        assert!(
+            host.sh("stop-bots --version").contains("0.1.1"),
+            "the host is not running 0.1.1"
+        );
+        for (name, port) in [("other", 8081), ("plain", 8082)] {
+            host.sh(&format!(
+                "printf 'server {{\\n    listen {port};\\n    server_name {name}.example;\\n    \
+                 root /var/www/test;\\n    index index.html;\\n    \
+                 location / {{ try_files $uri $uri/ =404; }}\\n}}\\n' \
+                 > /etc/nginx/sites-enabled/{name}-site.conf"
+            ));
+        }
+        host.sh("systemctl start nginx");
+        host.sh("stop-bots install web");
+        host.wait_for_console();
+        host.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+        host.seed_bot("evilbot", "EvilBot");
+        host.stop_bots(
+            "set-site-rule --site test.example --rule no-accept-language --enabled true",
+        );
+        host.stop_bots("exempt-path --site other.example --path /wp-json/");
+        host.stop_bots("apply-blocks");
+        host.stop_bots("add-firewall-rule --address 203.0.113.50");
+        // An SSH log with nobody in it, for the lockout check to read: with
+        // none at all it rightly refuses to apply.
+        host.sh("touch /var/log/auth.log");
+        host.stop_bots("render-firewall --apply --ssh-log /var/log/auth.log");
+        host
+    }
+
+    /// Upgrades the way the changelog says to: the binary replaced, as a
+    /// package upgrade replaces it, then `install web`, which restarts the
+    /// console and its helper on it. The package has no maintainer scripts,
+    /// so without that step both keep running 0.1.1's code — the helper
+    /// too, which restarting the console alone does not reach, and which
+    /// would go on writing 0.1.1's blocks.
+    fn upgrade_to_the_binary_under_test(&self) {
+        self.sh(
+            "install -m 755 /root/stop-bots-new /usr/local/bin/stop-bots \
+             && stop-bots install web",
+        );
+        assert!(
+            !self.sh("stop-bots --version").contains("0.1.1"),
+            "the binary was not replaced"
+        );
+        self.wait_for_console();
+    }
+
+    /// What upgrading must not touch by itself: every site file by hash,
+    /// and the loaded ruleset.
+    fn what_is_enforced(&self) -> String {
+        self.sh("sha256sum /etc/nginx/sites-enabled/* && nft list ruleset")
+    }
+
+    /// The status `site` on `port` answers `/`-relative `path` with.
+    fn status_at(&self, port: u16, path: &str, curl_args: &str) -> String {
+        self.run(&format!(
+            "curl -s -o /dev/null -w '%{{http_code}}' {curl_args} http://127.0.0.1:{port}{path}"
+        ))
+        .1
+        .trim()
+        .to_string()
+    }
+}
+
+/// **Upgrading changes nothing by itself, and tells the truth about what
+/// the next apply will change.** The host 0.1.1 set up keeps every site
+/// file and its loaded ruleset byte for byte across the upgrade, keeps its
+/// host settings free of a `web_server` line, and `status` names the two
+/// sites whose block the release changed, and only those, as not applied.
+#[test]
+fn upgrading_a_0_1_1_nginx_host_changes_nothing_until_it_is_applied() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::set_up_by_0_1_1("stop-bots-upgrade-untouched");
+    let before = host.what_is_enforced();
+
+    host.upgrade_to_the_binary_under_test();
+
+    assert_eq!(
+        host.what_is_enforced(),
+        before,
+        "upgrading changed a site or the loaded rules by itself"
+    );
+    let settings = host.sh("cat /etc/stop-bots/host.conf");
+    assert!(
+        !settings.contains("web_server"),
+        "an NGINX host got a web_server line, which 0.1.1 refuses:\n{settings}"
+    );
+    let status = host
+        .run_uncontended(&format!("stop-bots status --db {HOST_DB}"))
+        .1;
+    assert!(
+        status.contains("2 of 3 site(s) not applied: other.example, test.example"),
+        "status does not name exactly the sites with an exemption as not applied:\n{status}"
+    );
+}
+
+/// **After the upgrade, the console applies through its helper, and every
+/// setting 0.1.1 stored is still enforced.** The per-site rule, the
+/// blocked bot and the exemption all hold on the sites they were set for,
+/// both sites read as applied, and the firewall rule is still there.
+#[test]
+fn a_0_1_1_nginx_host_applies_what_it_had_after_the_upgrade() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::set_up_by_0_1_1("stop-bots-upgrade-applies");
+    host.upgrade_to_the_binary_under_test();
+
+    let reply = ask_helper_with(
+        &host,
+        "stop-bots",
+        r#"{"ApplyNginx":{"site":null,"reload":true}}"#,
+    );
+    assert!(
+        reply.starts_with(r#"{"Ok""#),
+        "the upgraded helper could not apply: {reply}\njournal:\n{}",
+        host.journal("stop-bots-helper.service")
+    );
+    let status = host
+        .run_uncontended(&format!("stop-bots status --db {HOST_DB}"))
+        .1;
+    assert!(
+        status.contains("3 site(s) applied"),
+        "the sites do not read as applied:\n{status}"
+    );
+
+    let bot = "-A 'Mozilla/5.0 (compatible; EvilBot/1.0)'";
+    let browser = "-A 'Mozilla/5.0 (X11; Linux x86_64) Firefox/130.0' -H 'Accept-Language: en'";
+    for (port, path, curl_args, expected, why) in [
+        (8080, "/", bot, "403", "the blocked bot, on the first site"),
+        (8081, "/", bot, "403", "the blocked bot, on the second"),
+        (
+            8081,
+            "/wp-json/",
+            bot,
+            "404",
+            "the blocked bot, on the exempt path",
+        ),
+        (8080, "/", browser, "200", "a browser"),
+        (
+            8080,
+            "/",
+            "-A 'Mozilla/5.0'",
+            "403",
+            "no Accept-Language, where the rule is on",
+        ),
+        (
+            8081,
+            "/",
+            "-A 'Mozilla/5.0'",
+            "200",
+            "no Accept-Language, where it is off",
+        ),
+    ] {
+        assert_eq!(
+            eventually(expected, || host.status_at(port, path, curl_args)),
+            expected,
+            "{why}"
+        );
+    }
+    let rules = host.stop_bots("list-firewall-rules");
+    assert!(
+        rules.contains("203.0.113.50"),
+        "the firewall rule 0.1.1 stored is gone:\n{rules}"
+    );
+}
+
+/// **An NGINX host can still go back to 0.1.1**, as the changelog says.
+/// After the new release has applied, 0.1.1 opens the database and the
+/// host settings, recognises the blocks the new release wrote and
+/// replaces them rather than adding a second, and NGINX loads the result.
+#[test]
+fn a_0_1_1_nginx_host_can_go_back_after_the_upgrade_has_applied() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::set_up_by_0_1_1("stop-bots-upgrade-back");
+    host.upgrade_to_the_binary_under_test();
+    host.stop_bots("apply-blocks");
+
+    host.sh(
+        "install -m 755 /usr/local/bin/stop-bots-0.1.1 /usr/local/bin/stop-bots \
+         && systemctl restart stop-bots-web.service",
+    );
+    host.wait_for_console();
+    let (ok, stdout, stderr) = host.run(&format!("stop-bots apply-blocks --db {HOST_DB}"));
+    assert!(
+        ok,
+        "0.1.1 cannot apply after the upgrade:\n{stdout}{stderr}"
+    );
+    for (file, _) in UPGRADE_SITES {
+        let site = host.sh(&format!("cat /etc/nginx/sites-enabled/{file}"));
+        assert_eq!(
+            site.matches("# BEGIN stop-bots").count(),
+            1,
+            "{file} does not hold exactly one block:\n{site}"
+        );
+    }
+    let (valid, out, err) = host.run("nginx -t");
+    assert!(
+        valid,
+        "NGINX does not load what 0.1.1 wrote back:\n{out}{err}"
+    );
+    for (file, port) in UPGRADE_SITES {
+        assert_eq!(
+            eventually("403", || host.status_at(
+                port,
+                "/",
+                "-A 'Mozilla/5.0 (compatible; EvilBot/1.0)'"
+            )),
+            "403",
+            "{file} no longer blocks the bot under 0.1.1"
+        );
+    }
+}
+
+// ---- Apache as RHEL lays it out ----
+
+fn rhel_image() -> String {
+    tagged("stop-bots-rhel")
+}
+
+fn build_rhel_image() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        with_build_lock(|| {
+            build_unless_current(&rhel_image(), || {
+                let ctx = stage_binary();
+                let out = Command::new(runtime())
+                    .args(["build", "-q", "-f", &format!("{ctx}/Dockerfile.rhel")])
+                    .args(["-t", &rhel_image(), &ctx])
+                    .output()
+                    .expect("failed to run the image build");
+                assert!(
+                    out.status.success(),
+                    "{} build (RHEL image) failed:\n{}",
+                    runtime(),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            });
+        });
+    });
+}
+
+/// The site file, where RHEL keeps every site: in `conf.d`.
+const RHEL_SITE: &str = "/etc/httpd/conf.d/test-site.conf";
+
+impl Apache {
+    /// A running `httpd` with RHEL's tree, and stop-bots told it is Apache
+    /// rooted at `/etc/httpd` with RHEL's commands — as an operator there
+    /// has to, since the defaults are Debian's. `httpd -k graceful` stands
+    /// in for `systemctl reload httpd`: no init here, as in
+    /// `Dockerfile.apache`.
+    fn start_rhel(name: &str) -> Apache {
+        build_rhel_image();
+        let name = scoped(name);
+        remove_container(&name);
+        let out = Command::new(runtime())
+            .args(["run", "-d", "--name", &name, &rhel_image()])
+            .output()
+            .expect("failed to start the container");
+        assert!(
+            out.status.success(),
+            "{} run failed:\n{}",
+            runtime(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let apache = Apache { name };
+        apache.sh("httpd -k start");
+        apache.wait_until_serving();
+        apache.stop_bots(
+            "set-web-server apache --root /etc/httpd \
+             --test 'apachectl configtest' --reload 'httpd -k graceful'",
+        );
+        let scanned = apache.stop_bots("scan-sites");
+        assert!(
+            scanned.contains("Discovered 1 site(s)"),
+            "scan-sites said:\n{scanned}"
+        );
+        apache
+    }
+
+    /// `apply-blocks`, then a wait for the graceful restart; RHEL's
+    /// [`Self::apply`].
+    fn apply_rhel(&self) -> String {
+        let said = self.stop_bots("apply-blocks");
+        let (ok, stdout, stderr) = self.run("apachectl configtest");
+        assert!(ok, "the generated config does not load:\n{stdout}{stderr}");
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        self.wait_until_serving();
+        said
+    }
+}
+
+/// **On RHEL's tree, the block lands in the site in `conf.d`, the files it
+/// needs land in `conf.d` where `httpd.conf` reads them, `httpd` enforces
+/// it, and uninstalling puts the site back byte for byte.**
+#[test]
+fn apache_on_rhel_blocks_from_conf_d_and_uninstalls_cleanly() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start_rhel("sb-apache-rhel");
+    let original = apache.sh(&format!("cat {RHEL_SITE}"));
+    apache.seed_bot("evilbot", "EvilBot");
+    apache.stop_bots("set-robots-txt --enabled true");
+    apache.stop_bots("trust --user-agent 'EvilBot-Monitor'");
+    apache.apply_rhel();
+
+    let site = apache.sh(&format!("cat {RHEL_SITE}"));
+    assert!(site.contains("# BEGIN stop-bots"), "site file:\n{site}");
+    let conf_d = apache.sh("ls /etc/httpd/conf.d");
+    assert!(
+        conf_d.contains("stop-bots-trusted.conf"),
+        "the trust file is not in conf.d:\n{conf_d}"
+    );
+    for (curl_args, expected, why) in [
+        (BAD_AGENT, "403", "the blocked bot"),
+        (
+            "-A 'EvilBot-Monitor/2.0'",
+            "200",
+            "the trusted client it resembles",
+        ),
+        (BROWSER, "200", "a browser"),
+    ] {
+        assert_eq!(apache.status("/", curl_args), expected, "{why}");
+    }
+    assert!(
+        apache.body("/robots.txt", BAD_AGENT).contains("EvilBot"),
+        "robots.txt is not the generated one"
+    );
+
+    let said = apache.stop_bots("uninstall web-server");
+    assert_eq!(
+        apache.sh(&format!("cat {RHEL_SITE}")),
+        original,
+        "uninstall said:\n{said}"
+    );
+    apache.sh("test ! -e /etc/httpd/conf.d/stop-bots-trusted.conf");
+    let (ok, stdout, stderr) = apache.run("apachectl configtest");
+    assert!(ok, "httpd's config no longer loads:\n{stdout}{stderr}");
+}
+
+/// **The detectors read what RHEL's `httpd` logs.** The site logs to the
+/// relative `logs/access_log`, which is `/var/log/httpd/access_log` once
+/// resolved against `ServerRoot` and through the `logs` link. The default
+/// the detectors try is Debian's, so on RHEL the operator names the log,
+/// as the error without it says to.
+#[test]
+fn apache_on_rhel_detects_from_httpds_access_log() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start_rhel("sb-apache-rhel-log");
+    apache.stop_bots("set-log-paths --access-log /var/log/httpd/access_log");
+    let from = |address: &str| format!("-H 'X-Forwarded-For: {address}'");
+    apache.status(
+        "/",
+        &format!("{} -A 'RhelLogProbe/1.0'", from("203.0.113.9")),
+    );
+    apache.status("/.env", &from("203.0.113.10"));
+    assert!(
+        apache
+            .sh("cat /var/log/httpd/access_log")
+            .contains("203.0.113.10"),
+        "httpd did not log the client, so this proves nothing"
+    );
+
+    let detected = apache.stop_bots("block-probe-paths");
+    let rules = apache.stop_bots("list-firewall-rules");
+    assert!(
+        rules.contains("203.0.113.10") && !rules.contains("203.0.113.9"),
+        "block-probe-paths said:\n{detected}\nlist-firewall-rules said:\n{rules}"
+    );
 }

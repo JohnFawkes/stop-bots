@@ -5,11 +5,16 @@
 #     podman build --build-arg BASE=debian:12   -f Dockerfile.stranger .
 #     podman build --build-arg BASE=ubuntu:24.04 -f Dockerfile.stranger .
 #
+# and for both web servers it supports, by `SERVER`: `nginx` (the default)
+# or `apache2`, Debian's package for Apache, whose unit has the same name.
+#
 # What is here is what a stranger's server has before they read the README,
 # and nothing else. A cloud image's baseline (systemd, an SSH server, curl
-# and the CA bundle), then NGINX and nftables exactly as `apt install`
-# leaves them: the default site on port 80, the distro's logrotate and log
-# format, `nginx.service` enabled. No site of ours, no /etc/stop-bots, no
+# and the CA bundle), then the web server and nftables exactly as `apt
+# install` leaves them: the default site on port 80, the distro's logrotate
+# and log format, the server's unit enabled. For Apache that means
+# `mod_rewrite` off, as Debian ships it: turning it on is a quick start
+# step, and the test takes it. No site of ours, no /etc/stop-bots, no
 # hand-written config of any kind. The test installs the `.deb` itself, the
 # way the README says to, so a dependency the package forgets to declare is
 # missing here too.
@@ -21,17 +26,18 @@
 ARG BASE=debian:12
 FROM ${BASE}
 ARG EXTRA=""
+ARG SERVER=nginx
 
 # systemd checks this to decide it is containerised.
 ENV container=docker
 
-# Recommends on, as `apt install nginx` has them: a stranger does not pass
-# --no-install-recommends, and what it would have pulled in is part of the
-# host they get.
+# Recommends on, as `apt install nginx` (or `apache2`) has them: a
+# stranger does not pass --no-install-recommends, and what it would have
+# pulled in is part of the host they get.
 RUN apt-get update -qq && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
         systemd systemd-sysv dbus openssh-server curl ca-certificates ${EXTRA} && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx nftables && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${SERVER} nftables && \
     rm -rf /var/lib/apt/lists/*
 
 # The same boot trim as Dockerfile.host, and for the same reason: reach
@@ -43,7 +49,7 @@ RUN find /etc/systemd/system /lib/systemd/system -path '*.wants/*' \
         -not -name '*tmpfiles*' \
         -not -name '*sysusers*' \
         -delete && \
-    systemctl enable nginx.service ssh.service && \
+    systemctl enable ${SERVER}.service ssh.service && \
     if [ -e /lib/systemd/system/rsyslog.service ]; then systemctl enable rsyslog.service; fi
 
 STOPSIGNAL SIGRTMIN+3

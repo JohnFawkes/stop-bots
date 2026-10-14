@@ -1,0 +1,28 @@
+# Apache as RHEL lays it out, for the Apache backend's RHEL tests: `httpd`
+# from AlmaLinux's own archive, with its stock `/etc/httpd` — the config in
+# `conf/httpd.conf`, which includes `conf.modules.d` and `conf.d`, and
+# `logs` a link to `/var/log/httpd`. Nothing is enabled with `a2enmod` or
+# `a2ensite` here because RHEL has neither: `mod_rewrite` and
+# `mod_remoteip` are loaded by default, and a site is a file in `conf.d`.
+#
+# AlmaLinux 10 rather than 9 for its glibc: the binary is built on the host
+# and copied in, as for every image here, and a build on Ubuntu 24.04
+# (glibc 2.39) does not start on 9's 2.34. 10 has 2.39.
+FROM almalinux:10
+
+RUN dnf -q install -y httpd && dnf clean all
+
+# The suite's site on 8080, logging the client mod_remoteip found to the
+# relative `logs/access_log`, which is the link the detectors have to
+# follow; mod_remoteip trusts loopback, as in `Dockerfile.apache`.
+COPY site-rhel.conf /etc/httpd/conf.d/test-site.conf
+RUN sed -i 's/^Listen 80$/Listen 8080/' /etc/httpd/conf/httpd.conf && \
+    echo 'ServerName localhost' >> /etc/httpd/conf/httpd.conf && \
+    printf '%s\n' 'RemoteIPHeader X-Forwarded-For' 'RemoteIPInternalProxy 127.0.0.1' \
+        > /etc/httpd/conf.d/remoteip.conf && \
+    mkdir -p /var/www/test /etc/stop-bots && \
+    echo '<h1>hello</h1>' > /var/www/test/index.html
+
+COPY stop-bots /usr/local/bin/stop-bots
+
+CMD ["sleep", "infinity"]

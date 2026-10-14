@@ -5,7 +5,7 @@ FROM ubuntu:24.04
 
 RUN apt-get update -qq && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-        apache2 curl ca-certificates ssl-cert && \
+        apache2 curl ca-certificates ssl-cert sqlite3 && \
     rm -rf /var/lib/apt/lists/*
 
 # Debian's stock layout, as an operator has it: the site in

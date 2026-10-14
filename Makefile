@@ -28,7 +28,7 @@ STOP_BOTS_CONTAINER_RUNTIME ?= podman
 help:
 	@echo 'unit-test         everything that needs only a compiler (~20s)'
 	@echo 'integration-test  the container suite: needs a runtime + NET_ADMIN (~1min)'
-	@echo 'stranger-test     the README quick start on fresh Debian 12 and Ubuntu 24.04, from the .deb'
+	@echo 'stranger-test     the README quick start on fresh Debian 12 and Ubuntu 24.04 (NGINX and Apache), from the .deb'
 	@echo 'test              both, unit first'
 	@echo 'hooks             install the pre-commit hook (fmt + clippy)'
 	@echo 'screenshots       regenerate docs/screenshots/ from seeded fiction'
@@ -60,8 +60,9 @@ integration-test:
 	cargo test --test container -- --nocapture
 
 # The stranger test: the README's quick start, from `apt install` of the
-# package to `uninstall all`, on a fresh Debian 12 and a fresh Ubuntu 24.04
-# (see `a_stranger_follows_the_quick_start` in tests/container.rs).
+# package to `uninstall all`, on a fresh Debian 12 and a fresh Ubuntu 24.04,
+# and on Ubuntu 24.04 with Apache (see `a_stranger_follows_the_quick_start`
+# in tests/container.rs).
 #
 # It installs a .deb built the way the release builds one, static against
 # musl, because the host's glibc build does not start on Debian 12. So it

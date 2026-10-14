@@ -21,7 +21,7 @@ ENV container=docker
 RUN apt-get update -qq && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
         systemd systemd-sysv dbus sudo cron at \
-        nginx nftables iptables curl ca-certificates sqlite3 && \
+        nginx apache2 nftables iptables curl ca-certificates sqlite3 && \
     rm -rf /var/lib/apt/lists/*
 
 # Boot to `running` in a couple of seconds instead of waiting on network
@@ -43,5 +43,15 @@ COPY site.conf /etc/nginx/sites-enabled/test-site.conf
 RUN rm -f /etc/nginx/sites-enabled/default && \
     mkdir -p /var/www/test /etc/stop-bots && \
     echo '<h1>hello</h1>' > /var/www/test/index.html
+
+# Apache too, for the Apache host tests: installed the way Debian leaves
+# it, with mod_rewrite switched on as the README tells an operator to, and
+# the same site on the same port as NGINX's. Neither server is enabled (the
+# `find` above removed every `.wants` link), so a test starts the one it is
+# about and they never contend for 8080.
+COPY site-apache.conf /etc/apache2/sites-available/test-site.conf
+RUN a2enmod -q rewrite && a2dissite -q 000-default && a2ensite -q test-site && \
+    echo 'Listen 8080' > /etc/apache2/ports.conf && \
+    echo 'ServerName localhost' > /etc/apache2/conf-enabled/servername.conf
 
 CMD ["/lib/systemd/systemd"]

@@ -1,11 +1,36 @@
 # Contributing
 
-**Outside contributions are not accepted at this time** (see the README); this file
-documents how the maintainer and his coding agents work on the project.
+Contributions are welcome, and bug reports most of all.
 
-Everything they need to know about how this code is built, tested and laid out. It used
-to live at the bottom of `README.md`; it was moved here so the README stays a
-description of the *tool* rather than of the workshop.
+## Reporting a bug
+
+[Open an issue](https://github.com/ivankovic/stop-bots/issues). The most useful reports say:
+
+- which version (`stop-bots --version`) and which distribution you run it on;
+- what you did, what you expected, and what happened instead;
+- for a wrongly blocked or wrongly allowed client, the relevant lines from the SSH or NGINX log,
+  with anything private (your hostnames, your own IP addresses) redacted.
+
+A security problem is the exception: don't open a public issue, follow
+[`SECURITY.md`](SECURITY.md) instead.
+
+## Sending a change
+
+1. For anything bigger than a small fix, open an issue first so we can agree on the approach
+   before you spend time on it.
+2. Follow the rest of this file. In practice: `make hooks` once, so formatting and clippy run on
+   every commit, and `make unit-test` before you push. CI also runs the container suite.
+3. Agree to the [Contributor License Agreement](CLA.md) by posting the comment it asks for on
+   your pull request. You keep the copyright in your work; the CLA lets the project offer
+   alternative licenses alongside the AGPL (see "License" in the README). It is needed once,
+   and only for changes, not for bug reports.
+
+## How the project works
+
+The rest of this file is everything a contributor, the maintainer or a coding agent needs to
+know about how this code is built, tested and laid out. It used to live at the bottom of
+`README.md`; it was moved here so the README stays a description of the *tool* rather than of
+the workshop.
 
 The AI-only instructions are in [`AGENTS.md`](AGENTS.md); open work is in `TODO.md`. Releasing is its own
 document, [`RELEASING.md`](RELEASING.md).
@@ -407,6 +432,7 @@ Some directories don't exist yet but should be created if the need arises.
     |- CONTRIBUTING.md  <- This file. How the code is built, tested and laid out
     |- RELEASING.md     <- The release process, versioning, and what counts as breaking
     |- SECURITY.md      <- Supported versions and how to report a vulnerability
+    |- CLA.md           <- The Contributor License Agreement for code contributions
     |- ROADMAP.md       <- What 0.1 and 1.0 mean, and what stands between here and there
     |- CHANGELOG.md     <- What changed, per release
     |- AGENTS.md        <- AI-only instructions

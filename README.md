@@ -21,7 +21,7 @@ It works alongside NGINX and your existing firewall (nftables or iptables):
 
 The app tries its best to not lock you out of the server, but you use it on your own risk. And note
 that it is licensed under AGPL, so if you are using it commercially, make sure you obey the
-license.
+license, or [get an alternative license](#cant-use-agpl-software).
 
 # Quick start
 
@@ -712,8 +712,11 @@ elsewhere it won't be much use there.
 
 # Contributing
 
-Contributions are not accepted at this time. [CONTRIBUTING.md](CONTRIBUTING.md) describes how
-the maintainer works on the project.
+Contributions are welcome, especially bug reports. If something misbehaves, blocks the wrong
+traffic or misses a bot it should have caught, please
+[open an issue](https://github.com/ivankovic/stop-bots/issues). [CONTRIBUTING.md](CONTRIBUTING.md)
+describes how to report a bug, how to send a change, and how the project is built, tested and
+laid out. Code contributions need a one-time [Contributor License Agreement](CLA.md).
 
 # Contact
 
@@ -732,4 +735,6 @@ full text of the License.
 
 ## Can't use AGPL software?
 
-Alternative licensing is **NOT** available.
+Alternative licensing is available. If the AGPL doesn't work for you, for example because you
+want to ship a modified version without publishing its source, contact me at
+[marko@ivankovic.me](mailto:marko@ivankovic.me) to discuss a commercial license.

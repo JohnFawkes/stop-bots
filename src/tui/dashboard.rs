@@ -206,6 +206,9 @@ enum Popup {
     /// nothing. Behind `Arc`s because the popup is cloned every frame and
     /// a first apply's firewall diff is tens of thousands of lines.
     ConfirmApply {
+        /// The web server the sites are written for, which the popup
+        /// names.
+        server: crate::webserver::WebServer,
         lines: std::sync::Arc<[String]>,
         diff: std::sync::Arc<[String]>,
         show_diff: bool,
@@ -960,6 +963,7 @@ impl Dashboard {
     fn render_popup(&self, frame: &mut Frame, area: Rect, popup: Popup, theme: Theme) {
         match popup {
             Popup::ConfirmApply {
+                server,
                 lines,
                 diff,
                 show_diff,
@@ -967,6 +971,7 @@ impl Dashboard {
             } => render_confirm_apply(
                 frame,
                 area,
+                server,
                 &lines,
                 show_diff.then_some(&diff[..]),
                 scroll,
@@ -1758,6 +1763,7 @@ impl Dashboard {
     /// works the preview out off the event loop and hands it back here.
     pub fn show_apply_preview(&mut self, preview: &crate::preview::ApplyPreview) {
         self.popup = Some(Popup::ConfirmApply {
+            server: preview.server,
             lines: preview.lines().into(),
             diff: preview.diff().lines().map(str::to_string).collect(),
             show_diff: false,
@@ -1948,7 +1954,12 @@ impl Dashboard {
             let on = !self.humans_only;
             db.set_humans_only(on)?;
             *message = Some(if on {
-                "Humans only is on: every catalogued bot is blocked except Let's Encrypt, and fetching /robots.txt now earns a one-day block. Apply on the NGINX screen to enforce it.".to_string()
+                format!(
+                    "Humans only is on: every catalogued bot is blocked except Let's Encrypt, \
+                     and fetching /robots.txt now earns a one-day block. Apply on the {} \
+                     screen to enforce it.",
+                    crate::webserver::WebServer::configured().label()
+                )
             } else {
                 "Humans only is off. The category policies you had before are back in force."
                     .to_string()
@@ -2121,6 +2132,7 @@ fn policy_tag(policy: Policy) -> Span<'static> {
 fn render_confirm_apply(
     frame: &mut Frame,
     area: Rect,
+    server: crate::webserver::WebServer,
     lines: &[String],
     diff: Option<&[String]>,
     scroll: usize,
@@ -2156,11 +2168,12 @@ fn render_confirm_apply(
 
     let (body, keys): (Vec<Line>, &str) = match diff {
         None => (
-            vec![
-                "This writes the NGINX config for every site and reloads NGINX, then writes the \
-                 firewall script and runs it as root."
-                    .into(),
-            ],
+            vec![format!(
+                "This writes the {server} config for every site and reloads {server}, then \
+                 writes the firewall script and runs it as root.",
+                server = server.label()
+            )
+            .into()],
             "Enter apply  d show the diff  Esc cancel",
         ),
         Some([]) => (
@@ -3371,6 +3384,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let mut dashboard = Dashboard::default();
         let preview = crate::preview::ApplyPreview {
+            server: crate::webserver::WebServer::Nginx,
             nginx: Ok(Vec::new()),
             firewall: Err("not needed here".to_string()),
         };

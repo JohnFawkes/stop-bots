@@ -140,7 +140,7 @@ impl CronJob {
             CronJob::RenderFirewall => "Render firewall script",
             CronJob::HealthCheck => "Check system health",
             CronJob::Maintenance => "Prune and compact the database",
-            CronJob::ApplyNginx => "Auto-apply NGINX config",
+            CronJob::ApplyNginx => "Auto-apply site configs",
         }
     }
 
@@ -454,7 +454,7 @@ pub fn run_log_jobs(
                 if applied.access.is_readable() {
                     applied.stats.summary()
                 } else {
-                    "NGINX access log unavailable".to_string()
+                    "access log unavailable".to_string()
                 }
             }
             CronJob::RenderFirewall => {
@@ -735,7 +735,7 @@ fn run_detector(db: &Db, detector: Detector, applied: &crate::logscan::Applied) 
     let (log, name) = if detector.spec().uses_ssh_log {
         (&applied.ssh, "SSH log")
     } else {
-        (&applied.access, "NGINX access log")
+        (&applied.access, "access log")
     };
     if !log.is_readable() {
         return format!("{name} unavailable");
@@ -1348,7 +1348,7 @@ mod tests {
         );
         assert_eq!(
             summary_of(&db, CronJob::RecordAccessStats),
-            "NGINX access log unavailable"
+            "access log unavailable"
         );
 
         // Recorded, not just returned — a job that ran and reported

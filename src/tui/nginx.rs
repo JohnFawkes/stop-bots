@@ -77,7 +77,7 @@ const RATE_LIMIT_PRESETS: [(i64, i64); 3] = [(5, 10), (10, 20), (30, 60)];
 /// The popup title and its options, in the order [`SettingPopup::selected`]
 /// indexes them. One function so the renderer and the key handler can never
 /// disagree about how many options there are or what index means what.
-fn setting_options(setting: NginxSetting) -> (&'static str, Vec<String>) {
+fn setting_options(setting: NginxSetting, server: WebServer) -> (&'static str, Vec<String>) {
     match setting {
         // Each option carries what it's *for*, not just its number: the
         // list would otherwise read as five interchangeable status codes,
@@ -109,7 +109,10 @@ fn setting_options(setting: NginxSetting) -> (&'static str, Vec<String>) {
             "Apply config changes automatically",
             vec![
                 "Off \u{2014} apply by hand with a/A".to_string(),
-                "On \u{2014} the internal cron applies and reloads NGINX, hourly".to_string(),
+                format!(
+                    "On \u{2014} the internal cron applies and reloads {}, hourly",
+                    server.label()
+                ),
             ],
         ),
         NginxSetting::RateLimit => (
@@ -351,7 +354,7 @@ impl Nginx {
             self.render_popup(frame, area, popup, theme);
         }
         if let Some(popup) = &self.setting_popup {
-            let (title, options) = setting_options(popup.setting);
+            let (title, options) = setting_options(popup.setting, self.server);
             crate::tui::dashboard::render_option_list(
                 frame,
                 area,
@@ -646,7 +649,7 @@ impl Nginx {
         let Some(popup) = &mut self.setting_popup else {
             unreachable!("dispatched on this popup")
         };
-        let option_count = setting_options(popup.setting).1.len();
+        let option_count = setting_options(popup.setting, self.server).1.len();
         match key.code {
             KeyCode::Esc => {
                 self.setting_popup = None;
@@ -862,9 +865,11 @@ impl Nginx {
                 }
                 db.set_auto_apply(auto)?;
                 *message = Some(if auto {
-                    "Auto-apply on \u{2014} the internal cron will write these configs and \
-                     reload NGINX within the hour, and after every change from now on."
-                        .to_string()
+                    format!(
+                        "Auto-apply on \u{2014} the internal cron will write these configs and \
+                         reload {} within the hour, and after every change from now on.",
+                        self.server.label()
+                    )
                 } else {
                     "Auto-apply off \u{2014} config changes wait for a/A again".to_string()
                 });
@@ -983,11 +988,12 @@ impl Nginx {
             rolled_back,
         } = outcome;
         if let Some(err) = rolled_back {
+            let server = self.server.label();
             self.alert = Some(format!(
-                "The NGINX config test failed, so nothing was applied:\n{err}"
+                "The {server} config test failed, so nothing was applied:\n{err}"
             ));
             return (
-                "Nothing applied: the NGINX config test failed".to_string(),
+                format!("Nothing applied: the {server} config test failed"),
                 false,
             );
         }

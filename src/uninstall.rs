@@ -426,8 +426,9 @@ pub fn run(plan: &Plan, target: Target, options: &Options) -> Report {
         removed_a_unit |= remove_unit(plan, options, &mut report, HELPER_UNIT);
     } else if plan.unit_dir.join(WEB_UNIT).exists() {
         report.kept.push(format!(
-            "{WEB_UNIT} is still installed, and its internal cron re-applies the NGINX \
-             blocks and re-renders the firewall script. `stop-bots uninstall web` removes it."
+            "{WEB_UNIT} is still installed, and its internal cron re-applies the {} \
+             blocks and re-renders the firewall script. `stop-bots uninstall web` removes it.",
+            plan.server.label()
         ));
     }
     if target.firewall() {
@@ -895,7 +896,7 @@ fn host_settings(plan: &Plan, options: &Options, report: &mut Report) {
         remove_file_step(plan, options, report, &plan.host_conf);
     } else {
         report.kept.push(format!(
-            "the host settings (the NGINX commands and root, the log paths): {}. `--purge` \
+            "the host settings (the web server's commands and root, the log paths): {}. `--purge` \
              removes it too.",
             plan.host_conf.display()
         ));

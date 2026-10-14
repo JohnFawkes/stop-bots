@@ -3683,6 +3683,26 @@ fn a_console_with_a_helper_refuses_an_ssh_log_of_its_own() {
         ));
 }
 
+/// The refusal names the command that sets where the web server is on
+/// either server, not NGINX's alone: an Apache host's root is set with
+/// `set-web-server apache --root`.
+#[test]
+fn a_console_with_a_helper_points_a_root_at_set_web_server() {
+    let tmp = tempfile::tempdir().unwrap();
+    stop_bots_bin()
+        .args(["web", "--db"])
+        .arg(tmp.path().join("db.sqlite3"))
+        .args(["--helper"])
+        .arg(tmp.path().join("helper.sock"))
+        .args(["--root", "/etc/httpd"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--root cannot be combined with --helper",
+        ))
+        .stderr(predicate::str::contains("`stop-bots set-web-server`"));
+}
+
 /// `--dry-run` has to be trustworthy or nobody will use it on the one
 /// command in this project that starts a daemon.
 #[test]
@@ -3938,6 +3958,93 @@ fn apache_apply_tests_with_apache2ctl_then_reloads_apache() {
         written.starts_with("<VirtualHost *:80>\n    # BEGIN stop-bots (DO NOT EDIT)\n"),
         "site was:\n{written}"
     );
+}
+
+/// What an apply prints names the server it tested and reloaded: an
+/// Apache host told "Reloaded NGINX" goes looking for an NGINX it does
+/// not run.
+#[test]
+fn apache_apply_says_it_reloaded_apache() {
+    let fx = Fixture::new();
+    fx.debian_apache();
+    let (bin, _) = fake_tools(fx._tmp.path());
+    fx.seed_bots();
+    fx.run(&["scan-sites"]);
+
+    let preview = fx
+        .cmd(&["apply-blocks", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let preview = String::from_utf8(preview).unwrap();
+    assert!(
+        preview.contains("Apache: 1 file(s) would change") && !preview.contains("NGINX"),
+        "preview was:\n{preview}"
+    );
+
+    let out = fx.apply_with(&bin).success().get_output().stdout.clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains("Reloaded Apache") && !out.contains("NGINX"),
+        "apply printed:\n{out}"
+    );
+}
+
+/// The commands that say where a change ends up say Apache on an Apache
+/// host, each where it used to say NGINX.
+#[test]
+fn apache_hosts_are_told_about_apache_not_nginx() {
+    let fx = Fixture::new();
+    fx.debian_apache();
+    for (args, expected) in [
+        (
+            &["trust", "--address", "192.0.2.1"][..],
+            "never blocked by the firewall or Apache",
+        ),
+        (
+            &["trust", "--user-agent", "UptimeRobot"],
+            "never blocked by Apache",
+        ),
+        (
+            &["set-auto-apply", "--enabled", "true"],
+            "Automatic Apache applying enabled",
+        ),
+        (
+            &["set-rate-limit", "--enabled", "false"],
+            "write it into the Apache config",
+        ),
+        (
+            &["set-humans-only", "--enabled", "true"],
+            "the Apache screen's",
+        ),
+    ] {
+        let out = fx.run(args).get_output().stdout.clone();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains(expected) && !out.contains("NGINX"),
+            "`{}` printed:\n{out}",
+            args.join(" ")
+        );
+    }
+}
+
+#[test]
+fn apache_hosts_are_told_it_was_apaches_access_log_that_could_not_be_read() {
+    let fx = Fixture::new();
+    fx.debian_apache();
+    let missing = fx._tmp.path().join("no-such.log");
+    fx.cmd(&[
+        "list-turned-away",
+        "--access-log",
+        missing.to_str().unwrap(),
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "couldn't read the Apache access log",
+    ));
 }
 
 #[test]

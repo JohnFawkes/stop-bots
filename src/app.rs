@@ -88,16 +88,18 @@ pub enum Job {
 impl Job {
     /// What the footer calls this while it is running. Phrased as what is
     /// happening, not as the name of a function, since this is the only
-    /// thing on screen explaining why the admin is waiting.
-    pub fn label(&self) -> String {
+    /// thing on screen explaining why the admin is waiting — and so naming
+    /// the web server the host runs, which is not always NGINX.
+    pub fn label(&self, server: crate::webserver::WebServer) -> String {
+        let server = server.label();
         match self {
             Job::Cron(job) => format!("{} (scheduled)", job.label()),
             Job::ReadSshLog => "reading the SSH log".to_string(),
-            Job::ReloadNginx => "reloading NGINX".to_string(),
+            Job::ReloadNginx => format!("reloading {server}"),
             Job::RenderFirewall => "writing the firewall script".to_string(),
-            Job::ScanSites => "scanning the NGINX config".to_string(),
+            Job::ScanSites => format!("scanning the {server} config"),
             Job::ApplySites => "writing site config".to_string(),
-            Job::ApplyWebAccess => "setting up NGINX for this console".to_string(),
+            Job::ApplyWebAccess => format!("setting up {server} for this console"),
             Job::CheckSiteStatuses => "checking site config".to_string(),
             Job::UpdateEverything => "downloading every list".to_string(),
             Job::RefreshCrawlerRanges(kind) => format!("downloading {}", kind.name()),
@@ -1061,7 +1063,7 @@ impl App {
             SiteAction::Apply(_) | SiteAction::ApplyAll => Job::ApplySites,
         };
         if self.jobs_in_flight.contains(&job) {
-            self.message = Some(format!("Already {}.", job.label()));
+            self.message = Some(format!("Already {}.", job.label(self.nginx.server())));
             return Ok(());
         }
 
@@ -1170,7 +1172,10 @@ impl App {
             Ok(commands) => commands,
             Err(err) => {
                 self.jobs_in_flight.remove(&Job::ReloadNginx);
-                self.message = Some(format!("failed to reload NGINX: {err}"));
+                self.message = Some(format!(
+                    "failed to reload {}: {err}",
+                    self.nginx.server().label()
+                ));
                 return;
             }
         };
@@ -1189,7 +1194,10 @@ impl App {
         self.jobs_in_flight.remove(&Job::ReloadNginx);
         if let Err(err) = result {
             let applied = self.message.take().unwrap_or_default();
-            self.message = Some(format!("{applied} — failed to reload NGINX: {err}"));
+            self.message = Some(format!(
+                "{applied} — failed to reload {}: {err}",
+                self.nginx.server().label()
+            ));
         }
         if std::mem::take(&mut self.reload_nginx_pending) {
             self.start_nginx_reload();
@@ -1583,9 +1591,11 @@ impl App {
             .unwrap_or_default()
             .log_paths()
             .ssh(self.ssh_log.as_deref());
+        let server = self.nginx.server();
         let sender = self.events.sender();
         tokio::task::spawn_blocking(move || {
             let preview = crate::preview::ApplyPreview {
+                server,
                 nginx: nginx
                     .map(|plan| crate::tui::nginx::preview_apply(&plan))
                     .map_err(|err| format!("{err:#}")),
@@ -1669,7 +1679,10 @@ impl App {
     /// address back here once it validated.
     fn start_web_access(&mut self, request: crate::webaccess::Request) {
         if self.jobs_in_flight.contains(&Job::ApplyWebAccess) {
-            self.message = Some("Already setting NGINX up for this console.".to_string());
+            self.message = Some(format!(
+                "Already setting {} up for this console.",
+                self.nginx.server().label()
+            ));
             return;
         }
 
@@ -2014,8 +2027,10 @@ impl App {
             ("Quit", "q", Action::Quit),
         ]
         .into_iter()
+        // The rows that name the sites screen name it as its tab does: for
+        // the server the host runs.
         .map(|(label, hint, action)| Command {
-            label: label.to_string(),
+            label: label.replace("NGINX", self.nginx.server().label()),
             hint,
             action,
         })
@@ -2122,6 +2137,31 @@ mod tests {
             .set_cron_last_run(CronJob::HealthCheck.id(), now_secs(), "skipped for test")
             .unwrap();
         app
+    }
+
+    #[tokio::test]
+    async fn the_palette_names_the_sites_screen_for_the_hosts_web_server() {
+        let mut app = test_app();
+        app.nginx = tui::nginx::Nginx::new(
+            crate::webserver::WebServer::Apache,
+            std::path::PathBuf::from("/etc/apache2"),
+        );
+        let labels: Vec<String> = app.commands().into_iter().map(|c| c.label).collect();
+        for expected in [
+            "Go to Apache",
+            "Apply everything: Apache, then the firewall",
+            "Web access: put this console behind Apache",
+            "Rescan for Apache sites",
+        ] {
+            assert!(
+                labels.iter().any(|label| label == expected),
+                "no {expected:?} among:\n{labels:#?}"
+            );
+        }
+        assert!(
+            !labels.iter().any(|label| label.contains("NGINX")),
+            "an Apache host's palette names NGINX:\n{labels:#?}"
+        );
     }
 
     /// Marks both download jobs just run, so that no test's cron check

@@ -2022,6 +2022,15 @@ fn host_settings() -> Result<stop_bots::hostconf::HostConf> {
     stop_bots::hostconf::HostConf::load()
 }
 
+/// How the host's web server is named in what a command prints — "NGINX"
+/// or "Apache" — for a command with no host settings of its own at hand.
+/// A `host.conf` that cannot be read is NGINX here, as it is everywhere
+/// that asks [`webserver::WebServer::configured`]: a sentence is no place
+/// to fail a command that has already done its work.
+fn server_label() -> &'static str {
+    webserver::WebServer::configured().label()
+}
+
 fn open_default_db() -> Result<Db> {
     open_or_fallback(Path::new(DEFAULT_DB_PATH), user_db_path)
 }
@@ -2333,23 +2342,25 @@ fn preview_apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, diff: boo
     let changes = webserver::preview_all_sites(host.web_server(), &db, &root);
     say!("Dry run: nothing is written or reloaded.");
     let changes = changes.map_err(|err| format!("{err:#}"));
-    for line in stop_bots::preview::nginx_lines(&changes) {
+    for line in stop_bots::preview::nginx_lines(host.web_server(), &changes) {
         say!("{line}");
     }
     let changes = changes.map_err(|err| anyhow::anyhow!(err))?;
     if diff {
         say_inline!("{}", stop_bots::preview::nginx_diff(&changes));
     }
-    print_skipped_entries(&db)
+    print_skipped_entries(&db, host.web_server())
 }
 
-/// Says which stored entries the NGINX config leaves out (see
-/// `nginx::skipped_entries`), on stderr, one per line. An apply writes
-/// everything else, so this is a warning and not a failure.
-fn print_skipped_entries(db: &Db) -> Result<()> {
+/// Says which stored entries the web server's config leaves out (see
+/// `nginx::skipped_entries`, whose checks Apache's render shares), on
+/// stderr, one per line. An apply writes everything else, so this is a
+/// warning and not a failure.
+fn print_skipped_entries(db: &Db, server: webserver::WebServer) -> Result<()> {
     for entry in nginx::skipped_entries(db)? {
         say_err!(
-            "warning: left out of the NGINX config: {}",
+            "warning: left out of the {} config: {}",
+            server.label(),
             terminal_safe(&entry.to_string())
         );
     }
@@ -2414,9 +2425,9 @@ fn apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, no_reload: bool) 
         outcome.changed
     );
     if outcome.reloaded {
-        say!("Reloaded NGINX");
+        say!("Reloaded {}", host.web_server().label());
     }
-    print_skipped_entries(&db)
+    print_skipped_entries(&db, host.web_server())
 }
 
 fn add_firewall_rule(
@@ -2744,13 +2755,10 @@ fn set_rate_limit(
     burst: Option<i64>,
 ) -> Result<()> {
     let db = open_db(db_path)?;
+    let server = host_settings()?.web_server();
     // Refused rather than stored where nothing would write it: a limit
     // that reads as on and limits nothing is worse than none.
-    if let Some(why) = host_settings()?
-        .web_server()
-        .without_rate_limiting()
-        .filter(|_| enabled)
-    {
+    if let Some(why) = server.without_rate_limiting().filter(|_| enabled) {
         anyhow::bail!("{why}");
     }
     // Parameters are stored even when disabling, so `--enabled false
@@ -2772,7 +2780,10 @@ fn set_rate_limit(
     } else {
         say!("Rate limiting off.");
     }
-    say!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
+    say!(
+        "Run `stop-bots apply-blocks` to write it into the {} config.",
+        server.label()
+    );
     Ok(())
 }
 
@@ -2883,7 +2894,10 @@ fn trust(
     match (address, user_agent, remove) {
         (Some(address), _, false) => {
             let stored = db.trust_address(&address)?;
-            say!("Trusting {stored}: never blocked by the firewall or NGINX.");
+            say!(
+                "Trusting {stored}: never blocked by the firewall or {}.",
+                server_label()
+            );
             say!(
                 "Run `stop-bots render-firewall` and apply the script, and `stop-bots \
                  apply-blocks`, to put it in effect."
@@ -2903,7 +2917,8 @@ fn trust(
             let stored = db.trust_user_agent(&user_agent)?;
             say!(
                 "Trusting any user agent containing {stored:?}, ignoring case: never blocked \
-                 by NGINX."
+                 by {}.",
+                server_label()
             );
             // Said every time, because it is the part that surprises: the
             // firewall and the detectors still treat this client by its
@@ -2984,7 +2999,8 @@ fn set_auto_apply(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
     let db = open_db(db_path)?;
     db.set_auto_apply(enabled)?;
     say!(
-        "Automatic NGINX applying {}",
+        "Automatic {} applying {}",
+        server_label(),
         if enabled { "enabled" } else { "disabled" }
     );
     if enabled {
@@ -3024,8 +3040,11 @@ fn set_humans_only(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
             "  \u{2022} The three category policies are forced and cannot be edited until this \
              is off. Their stored values are kept."
         );
+        // The screen is named for the server, so the sentence is too.
+        let server = server_label();
         say!(
-            "\nRun apply-blocks (or the NGINX screen's `a`/`A`) to write it into the NGINX config."
+            "\nRun apply-blocks (or the {server} screen's `a`/`A`) to write it into the {server} \
+             config."
         );
     } else {
         say!("Humans only is OFF. The stored category policies are back in force.");
@@ -3286,7 +3305,10 @@ fn set_category(
     if db.get_humans_only()? {
         say!("{HUMANS_ONLY_NOTE}");
     }
-    say!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
+    say!(
+        "Run `stop-bots apply-blocks` to write it into the {} config.",
+        server_label()
+    );
     Ok(())
 }
 
@@ -3401,7 +3423,10 @@ fn set_bot(
     if db.get_humans_only()? {
         say!("{HUMANS_ONLY_NOTE}");
     }
-    say!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
+    say!(
+        "Run `stop-bots apply-blocks` to write it into the {} config.",
+        server_label()
+    );
     Ok(())
 }
 
@@ -3527,8 +3552,9 @@ impl WebSettings {
                 if !web::is_loopback(&addr) && !exposed {
                     anyhow::bail!(
                         "refusing to store {addr}, which is reachable from the network, while \
-                         exposure is off. The console can rewrite this host's firewall and NGINX \
-                         config. If that is what you want, add --expose true."
+                         exposure is off. The console can rewrite this host's firewall and {} \
+                         config. If that is what you want, add --expose true.",
+                        server_label()
                     );
                 }
                 Some(addr)
@@ -3912,7 +3938,8 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
             anyhow::bail!(
                 "refusing to install a service bound to {addr}, which is reachable \
                  from the network, without --expose. The console can rewrite this \
-                 host's firewall and NGINX config."
+                 host's firewall and {} config.",
+                server_label()
             );
         }
         db.set_text_setting(web::BIND_KEY, &addr.to_string())?;
@@ -4044,11 +4071,19 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
         return Ok(());
     }
 
+    let server = stop_bots::hostconf::HostConf::load_from(&layout.host_conf)
+        .unwrap_or_default()
+        .web_server()
+        .label();
+
     if options.start {
         say!("The console is on loopback. Reach it over an SSH tunnel:\n");
         say!("    ssh -L 8787:127.0.0.1:8787 <this-host>\n");
         say!("then open http://127.0.0.1:8787/.\n");
-        say!("To put it behind the NGINX it is protecting, use its Web Access panel, or `w` in the TUI.");
+        say!(
+            "To put it behind the {} it is protecting, use its Web Access panel, or `w` in the TUI.",
+            server
+        );
     } else {
         // Telling someone to open a URL for a service that is not running
         // is how a working install gets reported as broken.
@@ -4059,7 +4094,7 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
     }
     say!();
     say!(
-        "The console runs as the {} user. What needs root -- the NGINX config, the",
+        "The console runs as the {} user. What needs root -- the {server} config, the",
         layout.user
     );
     say!(
@@ -4123,7 +4158,7 @@ async fn run_web(
     } = run;
 
     // The helper takes nothing from the console but the operation: where
-    // NGINX is, where the script goes and which logs it reads are root's
+    // the web server is, where the script goes and which logs it reads are root's
     // to say, in the host settings. A flag that would be ignored is
     // refused instead.
     if helper.is_some() {
@@ -4137,7 +4172,7 @@ async fn run_web(
                 anyhow::bail!(
                     "{flag} cannot be combined with --helper: the helper does what needs root, \
                      and reads the logs, with the host's own settings (`stop-bots \
-                     set-nginx-commands`, `stop-bots set-log-paths`), and takes none from \
+                     set-web-server`, `stop-bots set-log-paths`), and takes none from \
                      the console"
                 );
             }
@@ -4184,12 +4219,13 @@ async fn run_web(
     if !web::is_loopback(&addr) && !exposed {
         anyhow::bail!(
             "refusing to bind {addr}, which is reachable from the network.\n\n\
-             The web UI can rewrite this host's firewall and NGINX config, so exposing it \n\
+             The web UI can rewrite this host's firewall and {} config, so exposing it \n\
              is a deliberate act rather than a default. If that is what you want:\n\n    \
              stop-bots set-web --bind {addr} --expose true --allowed-hosts <your-hostname>\n    \
              stop-bots web\n\n\
              Otherwise reach it over an SSH tunnel and leave it on loopback:\n\n    \
-             ssh -L 8787:127.0.0.1:8787 <this-host>"
+             ssh -L 8787:127.0.0.1:8787 <this-host>",
+            server_label()
         );
     }
 
@@ -4914,7 +4950,9 @@ fn read_access_log(db: &Db, access_log: Option<&Path>) -> Result<String> {
     // detector invoked by hand would still go to the default -- two answers
     // to one question, which is the shape of bug this whole type removes.
     let _ = db;
-    let paths = host_settings().unwrap_or_default().log_paths();
+    let host = host_settings().unwrap_or_default();
+    let server = host.web_server().label();
+    let paths = host.log_paths();
     match paths.access_source(access_log) {
         accesslog::LogSource::Found(text) => Ok(text),
         // Name the path that was actually tried, not the one the reader
@@ -4924,15 +4962,15 @@ fn read_access_log(db: &Db, access_log: Option<&Path>) -> Result<String> {
             let tried = paths.access_description(access_log);
             match (access_log, &paths.access) {
                 (Some(_), _) => anyhow::bail!(
-                    "couldn't read the NGINX access log at {tried} — pass a different \
+                    "couldn't read the {server} access log at {tried} — pass a different \
                      --access-log, or run as root, for this to work"
                 ),
                 (None, Some(_)) => anyhow::bail!(
-                    "couldn't read the NGINX access log at {tried}, the path stored by \
+                    "couldn't read the {server} access log at {tried}, the path stored by \
                      `set-log-paths` — check it exists, or run as root"
                 ),
                 (None, None) => anyhow::bail!(
-                    "couldn't read the NGINX access log (tried {tried}) — set one with \
+                    "couldn't read the {server} access log (tried {tried}) — set one with \
                      `stop-bots set-log-paths --access-log <path>`, pass --access-log, \
                      or run as root"
                 ),
@@ -5029,17 +5067,19 @@ fn record_access_stats(db_path: Option<PathBuf>, access_log: Option<PathBuf>) ->
     // The same pass the internal cron makes, from the same cursor, keyed by
     // the path actually read: what the console already tallied is not
     // tallied again, and what this reads the detectors see too.
+    let host = host_settings()?;
     let flags = stop_bots::logscan::Flags {
         ssh_log: None,
         access_log,
-        stored: host_settings()?.log_paths(),
+        stored: host.log_paths(),
     };
     let applied =
         stop_bots::logscan::run(&db, &[stop_bots::cron::CronJob::RecordAccessStats], &flags)?;
     if let stop_bots::logscan::Availability::Unavailable(tried) = &applied.access {
         anyhow::bail!(
-            "couldn't read the NGINX access log at {tried} — pass --access-log, set one with \
-             `stop-bots set-log-paths --access-log <path>`, or run as root"
+            "couldn't read the {} access log at {tried} — pass --access-log, set one with \
+             `stop-bots set-log-paths --access-log <path>`, or run as root",
+            host.web_server().label()
         );
     }
     say!("{}", applied.stats.summary());

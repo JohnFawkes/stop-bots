@@ -217,9 +217,11 @@ fn nginx_settings_panel(view: &View, ctx: &Ctx) -> Markup {
                             "Auto-apply"
                             br;
                             span .hint {
-                                "Lets the internal cron write these configs and reload NGINX \
-                                 hourly, instead of waiting for Apply. NGINX only \u{2014} the \
-                                 firewall script still needs you."
+                                "Lets the internal cron write these configs and reload "
+                                (ctx.chrome.web_server.label())
+                                " hourly, instead of waiting for Apply. "
+                                (ctx.chrome.web_server.label())
+                                " only \u{2014} the firewall script still needs you."
                             }
                         }
                         td {
@@ -314,7 +316,16 @@ fn sites_panel(view: &View, ctx: &Ctx) -> Markup {
                 p .hint { "Whether each site is up to date could not be checked: " (problem) }
             }
             @if view.sites.is_empty() {
-                (layout::empty("No sites yet. Rescan to look for server blocks under the NGINX root."))
+                (layout::empty(&match ctx.chrome.web_server {
+                    crate::webserver::WebServer::Nginx => {
+                        "No sites yet. Rescan to look for server blocks under the NGINX root."
+                            .to_string()
+                    }
+                    server => format!(
+                        "No sites yet. Rescan to look for <VirtualHost> sections under the {} root.",
+                        server.label()
+                    ),
+                }))
             } @else {
                 table {
                     thead { tr {
@@ -878,11 +889,14 @@ async fn set_auto_apply(
         Ok(()) => back_with(
             &state,
             "/nginx",
-            if on {
-                "Auto-apply on. The internal cron will write these configs and reload NGINX \
-                 within the hour, and after every change from now on."
+            &if on {
+                format!(
+                    "Auto-apply on. The internal cron will write these configs and reload {} \
+                     within the hour, and after every change from now on.",
+                    state.host().web_server().label()
+                )
             } else {
-                "Auto-apply off. Config changes wait for Apply again."
+                "Auto-apply off. Config changes wait for Apply again.".to_string()
             },
             true,
         ),
@@ -1034,14 +1048,15 @@ fn applied_message(
     changed: bool,
     reloaded: bool,
 ) -> Response {
+    let server = state.host().web_server().label();
     let note = if reloaded {
-        " NGINX reloaded."
+        format!(" {server} reloaded.")
     } else if !state.apply_for_real {
-        " (NGINX not reloaded: --no-apply)"
+        format!(" ({server} not reloaded: --no-apply)")
     } else if changed {
-        ""
+        String::new()
     } else {
-        " Nothing changed, so NGINX was not reloaded."
+        format!(" Nothing changed, so {server} was not reloaded.")
     };
     back_with(state, back, &format!("{message}{note}"), true)
 }

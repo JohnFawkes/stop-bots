@@ -349,8 +349,9 @@ async fn set_status(
             &state,
             "/bots",
             &format!(
-                "{slug} now: {}. Apply on the NGINX screen to write it out.",
-                form.status
+                "{slug} now: {}. Apply on the {} screen to write it out.",
+                form.status,
+                state.host().web_server().label()
             ),
             true,
         ),

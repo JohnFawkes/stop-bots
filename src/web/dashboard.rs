@@ -1138,10 +1138,16 @@ async fn set_humans_only(
         Ok(()) => back_with(
             &state,
             "/",
-            if on {
-                "Humans only is on: every catalogued bot is blocked except Let's Encrypt, and fetching /robots.txt now earns a one-day block. Apply on the NGINX screen to write it into the site configs."
+            &if on {
+                format!(
+                    "Humans only is on: every catalogued bot is blocked except Let's Encrypt, \
+                     and fetching /robots.txt now earns a one-day block. Apply on the {} \
+                     screen to write it into the site configs.",
+                    state.host().web_server().label()
+                )
             } else {
                 "Humans only is off. The category policies you had before are back in force."
+                    .to_string()
             },
             true,
         ),
@@ -1183,9 +1189,10 @@ async fn set_category(
             &state,
             "/",
             &format!(
-                "{} are now {}. Apply on the NGINX screen to write it into the site configs.",
+                "{} are now {}. Apply on the {} screen to write it into the site configs.",
                 crate::present::category_label(category),
-                policy_id(policy)
+                policy_id(policy),
+                state.host().web_server().label()
             ),
             true,
         ),
@@ -1528,6 +1535,7 @@ async fn confirm_apply_all(
 }
 
 fn confirm_body(preview: &crate::preview::Summary, show_diff: bool, ctx: &Ctx) -> Markup {
+    let server = ctx.chrome.web_server.label();
     let diff = if show_diff {
         preview.diff.clone()
     } else {
@@ -1539,9 +1547,9 @@ fn confirm_body(preview: &crate::preview::Summary, show_diff: bool, ctx: &Ctx) -
         html! {
             .panel-body {
                 p {
-                    "This writes the NGINX config for every site and reloads NGINX, then \
-                     writes the firewall script and runs it as root. The two are independent: \
-                     whichever fails, the other still gets its turn."
+                    "This writes the " (server) " config for every site and reloads " (server)
+                    ", then writes the firewall script and runs it as root. The two are \
+                     independent: whichever fails, the other still gets its turn."
                 }
                 pre .preview { (preview.lines.join("\n")) }
                 .row {
@@ -1581,10 +1589,11 @@ async fn apply_all(
 ) -> Response {
     let mut parts: Vec<String> = Vec::new();
     let mut ok = true;
+    let server = state.host().web_server().label();
 
     match state.privileged().apply_all(true).await {
         Ok(outcome) => {
-            parts.push(format!("NGINX: {} file(s) changed", outcome.changed));
+            parts.push(format!("{server}: {} file(s) changed", outcome.changed));
             if outcome.reloaded {
                 parts.push("reloaded".to_string());
             } else if outcome.changed > 0 {
@@ -1593,7 +1602,7 @@ async fn apply_all(
         }
         Err(err) => {
             ok = false;
-            parts.push(format!("NGINX failed: {err:#}"));
+            parts.push(format!("{server} failed: {err:#}"));
         }
     }
 

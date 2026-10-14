@@ -1147,6 +1147,31 @@ async fn an_apache_hosts_settings_say_why_there_is_no_rate_limit() {
     assert!(html.contains("<title>Apache"), "page was:\n{html}");
 }
 
+/// What the console says after a change, and on the help page, names the
+/// server the host runs: "Apply on the NGINX screen" sends an Apache
+/// host's operator looking for a tab that is not there.
+#[tokio::test]
+async fn an_apache_hosts_console_names_apache_not_nginx() {
+    let (app, password, tmp, _db_path) = app_with_db();
+    choose_apache(&tmp);
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(&app, &cookie, &csrf, "/humans-only", "enabled=true").await;
+    assert!(
+        flash.contains("Apply on the Apache screen") && !flash.contains("NGINX"),
+        "was: {flash}"
+    );
+    let (_, flash) = act(&app, &cookie, &csrf, "/nginx/auto-apply", "enabled=1").await;
+    assert!(
+        flash.contains("reload Apache") && !flash.contains("NGINX"),
+        "was: {flash}"
+    );
+
+    let help = page_html(&app, &cookie, "/help").await;
+    assert!(help.contains("Apache config root"), "page was:\n{help}");
+    assert!(!help.contains("NGINX config"), "page was:\n{help}");
+}
+
 #[tokio::test]
 async fn a_rate_limit_of_zero_is_refused() {
     let (app, password, _tmp, db_path) = app_with_db();

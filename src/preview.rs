@@ -38,14 +38,17 @@ use std::path::Path;
 /// other.
 #[derive(Debug, Clone)]
 pub struct ApplyPreview {
+    /// The web server the site half is for, which its summary names.
+    pub server: crate::webserver::WebServer,
     pub nginx: Result<Vec<FileChange>, String>,
     pub firewall: Result<FirewallOutcome, String>,
 }
 
 impl ApplyPreview {
-    /// The summary, a line each: the NGINX half, then the firewall's.
+    /// The summary, a line each: the web server's half, then the
+    /// firewall's.
     pub fn lines(&self) -> Vec<String> {
-        let mut lines = nginx_lines(&self.nginx);
+        let mut lines = nginx_lines(self.server, &self.nginx);
         match &self.firewall {
             Ok(outcome) => lines.extend(outcome.lines()),
             Err(err) => lines.push(format!("Firewall: could not be previewed: {err}")),
@@ -111,18 +114,26 @@ pub fn truncated(full: &str, max: usize) -> String {
     shown
 }
 
-/// The NGINX half of a summary: how many files would change, and which.
-pub fn nginx_lines(changes: &Result<Vec<FileChange>, String>) -> Vec<String> {
+/// The web server's half of a summary: how many files would change, and
+/// which. Headed with the server's name — an Apache host's summary that
+/// said "NGINX" would read as a preview of a server it does not run.
+pub fn nginx_lines(
+    server: crate::webserver::WebServer,
+    changes: &Result<Vec<FileChange>, String>,
+) -> Vec<String> {
+    let server = server.label();
     match changes {
-        Err(err) => vec![format!("NGINX: could not be previewed: {err}")],
-        Ok(changes) if changes.is_empty() => vec!["NGINX: no file would change".to_string()],
-        Ok(changes) => std::iter::once(format!("NGINX: {} file(s) would change:", changes.len()))
-            .chain(
-                changes
-                    .iter()
-                    .map(|change| format!("  {}{}", change.path.display(), change.kind())),
-            )
-            .collect(),
+        Err(err) => vec![format!("{server}: could not be previewed: {err}")],
+        Ok(changes) if changes.is_empty() => vec![format!("{server}: no file would change")],
+        Ok(changes) => {
+            std::iter::once(format!("{server}: {} file(s) would change:", changes.len()))
+                .chain(
+                    changes
+                        .iter()
+                        .map(|change| format!("  {}{}", change.path.display(), change.kind())),
+                )
+                .collect()
+        }
     }
 }
 
@@ -142,6 +153,7 @@ pub fn apply_everything(
     ssh_log: SshLog<'_>,
 ) -> ApplyPreview {
     ApplyPreview {
+        server,
         nginx: crate::webserver::preview_all_sites(server, db, root)
             .map_err(|err| format!("{err:#}")),
         firewall: crate::firewall::render_and_apply(db, run.dry_run(true), ssh_log)

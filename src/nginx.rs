@@ -3155,7 +3155,7 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            err.to_string().contains("outside the NGINX root"),
+            err.to_string().contains("outside the config root"),
             "error was: {err}"
         );
         assert_eq!(fs::read_to_string(&victim).unwrap(), one_site());
@@ -5679,7 +5679,7 @@ server {
         .unwrap_err();
 
         assert!(
-            format!("{err:#}").contains("outside the NGINX root"),
+            format!("{err:#}").contains("outside the config root"),
             "error was: {err:#}"
         );
         assert_eq!(fs::read_to_string(&victim).unwrap(), TWO_BLOCK_SITE);

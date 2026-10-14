@@ -1017,10 +1017,10 @@ pub(crate) fn resolve_site_file(path: &Path, root: &Path) -> Result<PathBuf> {
         return Ok(resolved);
     }
     let root = fs::canonicalize(root)
-        .with_context(|| format!("failed to read the NGINX root {}", root.display()))?;
+        .with_context(|| format!("failed to read the config root {}", root.display()))?;
     if !resolved.starts_with(&root) {
         anyhow::bail!(
-            "refusing to write {}: it links to {}, outside the NGINX root {}",
+            "refusing to write {}: it links to {}, outside the config root {}",
             path.display(),
             resolved.display(),
             root.display()

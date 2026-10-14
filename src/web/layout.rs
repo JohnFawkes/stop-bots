@@ -258,7 +258,7 @@ pub fn page(tab: Tab, ctx: &Ctx, flash: Option<Flash>, content: Markup) -> Marku
                             // that does it: one click here changes
                             // nothing.
                             form .inline method="get" action=(ctx.url("/apply-all")) {
-                                button .primary type="submit" title="See what would change in the NGINX config and the firewall, then apply both" {
+                                button .primary type="submit" title=(format!("See what would change in the {} config and the firewall, then apply both", ctx.chrome.web_server.label())) {
                                     "Apply everything\u{2026}" kbd { "a" }
                                 }
                             }

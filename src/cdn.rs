@@ -123,6 +123,16 @@ pub fn real_ip_config() -> String {
     out
 }
 
+/// The same for Apache: `mod_remoteip`'s two directives, which make the
+/// client address `%a` logs the visitor again. One `RemoteIPTrustedProxy`
+/// takes every range.
+pub fn apache_real_ip_config() -> String {
+    format!(
+        "RemoteIPHeader CF-Connecting-IP RemoteIPTrustedProxy {}",
+        RANGES.join(" ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5,30 +5,32 @@
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](https://github.com/ivankovic/stop-bots/blob/main/LICENSE)
 
 A TUI, a web console and a CLI that help you configure your server to stop bad bots without
-hiding behind a CDN.
+hiding behind a CDN. It is a fancy UI for your existing web server (nginx or Apache) and your
+firewall (nftables or iptables). For those of us that don't want to hide behind Cloudflare and give
+one company the keys to all kingdoms.
 
-It works alongside your web server (NGINX or Apache) and your existing firewall (nftables or
-iptables):
+It protects you in two ways:
 
-- **Web server config.** It classifies known bots by category (scanners, search engines, AI
-  crawlers) and blocks or allows them by injecting a rule into your site configs. It scans the
-  access log to detect bots dynamically and block them even if no ruleset tracks them yet.
-- **A firewall script.** Block entire countries, datacenter IP ranges, known bot IP ranges or any
-  IP address that repeatedly tries to log into your server unsuccessfully. Every block records
-  why it exists.
+- Preventative - It downloads known bot lists and IP ranges and blocks them. I particularly
+  recommend using Geo-blocking. For private servers, you can use an allowlist and block more than
+  90% of all attacks.
+- Responsive - It monitors access logs and detects attackers and kicks them out. Note that this
+  means a few packets will reach your server before they are detected, but at least it will stop
+  them from escalating.
 
-It is built not to surprise you on a live server:
+It **tries** to keep you from doing something self-destructive. You will always see what changes
+first before you apply it, and you can use the `--dry-run` flag for extra safety. But I suspect
+eventually you will want to enable auto-apply, for convenience. Because of this, the app also tries
+not to lock you out. IP addresses with successful SSH logins are never blocked, webserver configs
+are always tested before application and it tries to recognize apps running behind HTTP proxies and
+adapts the dynamic detection rules to the apps.
 
-- **You see what changes first.** In the TUI and the console, every apply shows what would change
-  and asks; on the CLI, `--dry-run --diff` prints the same without changing anything.
-- **It tries hard not to lock you out.** Addresses that recently logged in over SSH are never
-  blocked, an apply that would cut off a connected SSH client is refused unless you force it,
-  and a web server config that fails `nginx -t` (or `apache2ctl configtest`) is put back as
-  it was.
-- **One command undoes it.** `sudo stop-bots uninstall all` takes every change back out of
-  your web server config and firewall.
+**Big red button**: `sudo stop-bots uninstall all`
 
 ![Each screen in sequence: Dashboard, Bot settings, Firewall, the web server's sites and Blocks](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/tour.gif)
+
+The rest of this readme was written by the AI. Feel free to ask your own AI to summarize it, I won't
+mind.
 
 ## What happens to my server
 

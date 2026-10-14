@@ -8,6 +8,48 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+**Going back to 0.1.x.** This release is 0.2.0 rather than 0.1.2 because an Apache host
+cannot be downgraded: every 0.1.x release promises that going back one patch release is
+safe (see "Versioning" in `RELEASING.md`), and on an Apache host that is not true. 0.1.1
+knows nothing of the web server setting. It refuses a `/etc/stop-bots/host.conf` that
+names one, so most of its commands fail, and where it falls back to its defaults instead
+(the web console, the detectors' log paths) it takes the host for NGINX: it looks for
+sites in `/etc/nginx` and reads NGINX's log, and it never finds, updates or removes the
+blocks this release wrote into Apache's sites. To go back, first run
+`sudo stop-bots uninstall web-server` with this release, then delete the `web_server` and
+`apache_*` lines from `host.conf`. The same goes for an NGINX host that has run
+`set-web-server`, which also writes `web_server`. Any other NGINX host can go back to
+0.1.1 as before; the database and the files this release writes for NGINX are unchanged.
+
+### Added
+
+- **Apache, beside NGINX.** `sudo stop-bots set-web-server apache` makes this an Apache
+  host. It is stored in `/etc/stop-bots/host.conf` with Apache's own config root
+  (`/etc/apache2`), config test (`apache2ctl configtest`) and reload (`systemctl reload
+  apache2`), each of which `--root`, `--test` and `--reload` change for a server that is
+  not where Debian puts it. Every command, the TUI and the web console follow it. NGINX
+  is still the default, and an NGINX host has nothing to do.
+  - Sites are the `<VirtualHost>` sections in Debian's layout under `/etc/apache2`. Each
+    gets a block of `mod_rewrite` rules at its top, between the same
+    `# BEGIN stop-bots (DO NOT EDIT)` markers NGINX's blocks carry. Trusted addresses and
+    user agents go in a generated `SetEnvIf` file in `conf-enabled`, and the generated
+    `robots.txt`, in `/etc/stop-bots/apache`, is served with an `Alias`.
+  - Debian ships `mod_rewrite` switched off. An apply that needs it is refused with the
+    `sudo a2enmod rewrite` that fixes it, and `status` says so too. Web Access needs
+    `mod_proxy_http` (`sudo a2enmod proxy_http`) and puts the console behind Apache as a
+    `<Location>` in a site, or as a site of its own in `sites-enabled`, named to sort last
+    so it is never Apache's default site.
+  - The detectors read `/var/log/apache2/access.log` unless `set-log-paths` names another;
+    both servers write the same combined format. The application behind a site is
+    recognised from its `ProxyPass`, `DocumentRoot` and `Alias`.
+  - What Apache cannot do: it has no rate limiting of its own, so that setting writes
+    nothing there, and `mod_rewrite` cannot close the connection, tarpit or answer 418,
+    so those three responses are a 403.
+  - `uninstall web-server` is another name for `uninstall nginx`. Both remove the blocks
+    and generated files of whichever web server the host is set to.
+  - Database ids, `host.conf` keys and the root helper's requests keep their names, so
+    an existing install migrates nothing.
+
 ### Fixed
 
 - The web scanner detector no longer blocks the owner of a Nextcloud, Jellyfin, Immich

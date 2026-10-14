@@ -1133,7 +1133,7 @@ fn a_site_path_exemption_switches_the_block_to_the_flag_form() {
         "exempted was:\n{exempted}"
     );
     assert!(
-        exempted.contains("if ($uri ~* \"^(/blog)\")"),
+        exempted.contains("if ($stop_bots_path ~* \"^(/blog)\")"),
         "exempted was:\n{exempted}"
     );
     assert!(
@@ -1172,7 +1172,7 @@ fn exempt_path_with_a_user_agent_scopes_the_clear_to_that_client() {
     let exempted = fs::read_to_string(&site_file).unwrap();
     for expected in [
         "if ($http_user_agent ~* \"okhttp\") {",
-        "set $stop_bots_exempt $uri;",
+        "set $stop_bots_exempt $stop_bots_path;",
         "if ($stop_bots_exempt ~* \"^(/remote\\.php/dav/)\") {",
     ] {
         assert!(

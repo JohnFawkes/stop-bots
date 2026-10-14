@@ -4953,6 +4953,49 @@ fn exempt_paths_and_well_known_stay_reachable_for_a_blocked_client() {
     );
 }
 
+/// A WordPress-style front controller: `try_files` sends every path that
+/// is not a file on to one page, an internal redirect on which NGINX runs
+/// the `server`'s `if`s again with the new `$uri`. The exemption decided
+/// on the path the client asked for must stand, and must not stretch to
+/// a path that only starts with it before `..` is resolved.
+#[test]
+fn an_exempt_path_stays_exempt_through_a_front_controller() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-frontctl");
+    server.sh(
+        "mkdir -p /var/www/wp && echo front > /var/www/wp/index.html && \
+         printf 'server {\n    listen 8081;\n    server_name wp.example;\n    \
+         root /var/www/wp;\n    location / { try_files $uri $uri/ /index.html; }\n}\n' \
+         > /etc/nginx/sites-enabled/wp.conf && nginx -s reload",
+    );
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    server.seed_bot("badbot", "BadBot");
+    server.stop_bots("exempt-path --site wp.example --path /wp-json/");
+    server.apply_and_reload();
+
+    let bot = "-A 'BadBot/1.0'";
+    assert_eq!(
+        server.status_on(8081, "/wp-json/wp/v2/posts", bot),
+        "200",
+        "the redirect to /index.html undid the exemption"
+    );
+    for (path, why) in [
+        ("/about/", "a path that is not exempt"),
+        (
+            "/wp-json/../about/",
+            "a path that resolves out of the exempt one",
+        ),
+    ] {
+        assert_eq!(
+            server.status_on(8081, path, &format!("--path-as-is {bot}")),
+            "403",
+            "{why} let the bot through: {path}"
+        );
+    }
+}
+
 /// `s` in single quotes for `sh -c`, so none of it is shell syntax.
 fn sh_quoted(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))

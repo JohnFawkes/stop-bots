@@ -1172,6 +1172,48 @@ const LIMIT_KEY_VAR: &str = "$stop_bots_limit_key";
 /// before every read, so no `map` or `http`-level declaration is needed.
 const AGENT_EXEMPT_VAR: &str = "$stop_bots_exempt";
 
+/// The path every exemption is matched against: the path of the request
+/// the client sent. See [`path_of_the_request_sent`].
+const PATH_VAR: &str = "$stop_bots_path";
+
+/// Sets [`PATH_VAR`] to the path of the request the client sent, for the
+/// exemptions to be matched against instead of `$uri`.
+///
+/// **Why not `$uri`.** An internal redirect starts the request again at
+/// NGINX's server-rewrite phase (`ngx_http_handler` sets `phase_handler`
+/// to `server_rewrite_index` for an internal request), which is exactly
+/// where these server-level `if`s run — and `$uri` is the *new* path
+/// then. A WordPress site's `try_files $uri $uri/ /index.php?$args` sends
+/// `/wp-json/wp/v2/posts` on to `/index.php`, so an exemption for
+/// `/wp-json/` let the request through on the first pass and blocked it
+/// on the second: every exemption on a front-controller application was
+/// undone. Trust is not affected; it is
+/// decided by address and user agent, which a redirect does not change.
+/// (`rewrite ... last` and a named `@location` go back to the location
+/// phases only, past these.)
+///
+/// **Why not `$request_uri` either.** It is the same on every pass, and on
+/// a subrequest, but it is the request line as sent: undecoded, with `..`
+/// and `//` unresolved. `/wp-json/../wp-login.php` starts with an exempt
+/// prefix and is served as `/wp-login.php`; see [`exemption_regexes`] for
+/// when that bypass was found.
+///
+/// So the path is taken from `$request_uri` only where it cannot differ
+/// from what `$uri` was on the first pass: the whole path before any `?`,
+/// with no `%` (nothing to decode), no `#` or `\`, no `//` (nothing to
+/// merge) and no `.` or `..` segment (nothing to resolve). That is every
+/// path an application routes in practice. Anything else falls back to
+/// `$uri`, which is what every exemption used before: on the first pass
+/// the same thing, and after a redirect at worst an exemption lost, never
+/// one gained.
+fn path_of_the_request_sent() -> String {
+    format!(
+        "    set {PATH_VAR} $uri;\n    if ($request_uri ~ {}) {{\n        set {PATH_VAR} $1;\n    }}\n    if ({PATH_VAR} ~ {}) {{\n        set {PATH_VAR} $uri;\n    }}\n",
+        nginx_quoted(r"^(/[^?%#\\]*)(\?.*)?$"),
+        nginx_quoted(r"//|/\.\.?(/|$)"),
+    )
+}
+
 /// The zone a site's `limit_req` uses while anything is trusted: keyed on
 /// [`LIMIT_KEY_VAR`], in a file of its own
 /// ([`untrusted_rate_limit_conf_path`]).
@@ -1527,9 +1569,12 @@ fn block_text(config: &BlockConfig) -> Option<String> {
             condition(*rule)
         ));
     }
+    if !exemptions.is_empty() || !agent_clears.is_empty() {
+        out.push_str(&path_of_the_request_sent());
+    }
     for exemptions in &exemptions {
         out.push_str(&format!(
-            "    if ($uri ~* {}) {{\n        set $stop_bots_block 0;\n    }}\n",
+            "    if ({PATH_VAR} ~* {}) {{\n        set $stop_bots_block 0;\n    }}\n",
             nginx_quoted(exemptions)
         ));
     }
@@ -1650,7 +1695,7 @@ fn console_prefix_in(content: &str, block: &ServerBlock) -> Option<String> {
     is_stored_as_valid(&prefix, crate::db::validate_exempt_path).then_some(prefix)
 }
 
-/// Builds the `$uri` regexes that clear the block flag, none when there
+/// Builds the path regexes that clear the block flag, none when there
 /// are no usable exemptions: `prefixes` match anything under them, `exact`
 /// only themselves.
 ///
@@ -1673,10 +1718,12 @@ fn console_prefix_in(content: &str, block: &ServerBlock) -> Option<String> {
 /// trusted, so a row an older release stored without that check is left
 /// out (see [`skipped_entries`]) instead of written.
 ///
-/// Matched against `$uri`, never `$request_uri`, for the reason
-/// [`agent_exemption_clears`] gives: the raw request line is not the path
-/// NGINX serves, and `/robots.txt/../wp-login.php` begins with an exempt
-/// prefix while resolving to a blocked one.
+/// Matched against [`PATH_VAR`], never `$request_uri` as it stands, for the
+/// reason [`agent_exemption_clears`] gives: the raw request line is not
+/// the path NGINX serves, and `/robots.txt/../wp-login.php` begins with an
+/// exempt prefix while resolving to a blocked one. [`PATH_VAR`] is the
+/// request line's path only where it is the path NGINX serves; see
+/// [`path_of_the_request_sent`].
 pub(crate) fn exemption_regexes(prefixes: &[String], exact: &[&str]) -> Vec<String> {
     let usable = |p: &&str| is_stored_as_valid(p, crate::db::validate_exempt_path);
     let escaped: Vec<String> = prefixes
@@ -1708,7 +1755,7 @@ pub(crate) fn exemption_regexes(prefixes: &[String], exact: &[&str]) -> Vec<Stri
 ///
 /// ```nginx
 /// set $stop_bots_exempt "";
-/// if ($http_user_agent ~* "okhttp") { set $stop_bots_exempt $uri; }
+/// if ($http_user_agent ~* "okhttp") { set $stop_bots_exempt $stop_bots_path; }
 /// if ($stop_bots_exempt ~* "^(/remote\.php/dav/)") { set $stop_bots_block 0; }
 /// ```
 ///
@@ -1716,13 +1763,15 @@ pub(crate) fn exemption_regexes(prefixes: &[String], exact: &[&str]) -> Vec<Stri
 /// holding the path by one group's user agent would otherwise let the next
 /// group's paths through for a client that never matched it.
 ///
-/// `$uri`, not `$request_uri`, like the plain exemptions. `$uri` has had
-/// `..` and `//` resolved and is decoded, so `/remote.php/dav/../../login`
-/// is `/login` and matches nothing here; `$request_uri` is the raw request
-/// line, where that same string starts with the exempt prefix while the
-/// application behind the proxy resolves it to somewhere else. The plain
-/// exemptions read `$request_uri` too until the same bypass was found
-/// there.
+/// [`PATH_VAR`], not `$request_uri`, like the plain exemptions. `$uri` has
+/// had `..` and `//` resolved and is decoded, so
+/// `/remote.php/dav/../../login` is `/login` and matches nothing here;
+/// `$request_uri` is the raw request line, where that same string starts
+/// with the exempt prefix while the application behind the proxy resolves
+/// it to somewhere else. The plain exemptions read `$request_uri` too until
+/// the same bypass was found there. [`PATH_VAR`] takes the request line's
+/// path only when it has nothing to resolve, and `$uri` otherwise
+/// ([`path_of_the_request_sent`]), so the bypass stays closed.
 ///
 /// The user agent is matched as an escaped, case-insensitive substring,
 /// the same as a trusted one, and checked again here rather than trusting
@@ -1741,7 +1790,7 @@ fn agent_exemption_clears(exemptions: &[crate::db::AgentExemption]) -> String {
             continue;
         }
         out.push_str(&format!(
-            "    set {AGENT_EXEMPT_VAR} \"\";\n    if ($http_user_agent ~* {}) {{\n        set {AGENT_EXEMPT_VAR} $uri;\n    }}\n",
+            "    set {AGENT_EXEMPT_VAR} \"\";\n    if ($http_user_agent ~* {}) {{\n        set {AGENT_EXEMPT_VAR} {PATH_VAR};\n    }}\n",
             nginx_quoted(&crate::db::escape_regex_literal(user_agent)),
         ));
         for paths in &paths {
@@ -3989,7 +4038,7 @@ mod tests {
         );
         assert!(clear < act, "act last");
         assert!(
-            text.contains("if ($uri ~* \"^(/blog)\")"),
+            text.contains("if ($stop_bots_path ~* \"^(/blog)\")"),
             "text was:\n{text}"
         );
         assert!(text.contains("return 403;"), "text was:\n{text}");
@@ -3998,15 +4047,58 @@ mod tests {
     /// `$request_uri` is the raw request line. `GET
     /// /blog/../wp-login.php` starts with `/blog` there, while NGINX and the
     /// application behind it serve `/wp-login.php` — a blocked bot reaching
-    /// any path by prefixing an exempt one. `$uri` is already resolved.
+    /// any path by prefixing an exempt one. So it is read once, into the
+    /// path an exemption is matched against, and only through the capture
+    /// that takes a path with nothing to resolve; then anything with a `//`
+    /// or a dot segment in it goes back to `$uri`.
     #[test]
-    fn a_plain_exemption_matches_the_resolved_path_not_the_raw_one() {
+    fn a_plain_exemption_reads_the_raw_path_only_where_it_is_the_resolved_one() {
         let text = block_text(&cfg_exempt(&["BadBot"], &["/blog"])).unwrap();
+        let expected = [
+            "    set $stop_bots_path $uri;\n",
+            "    if ($request_uri ~ \"^(/[^?%#\\\\\\]*)(\\?.*)?$\") {\n        set $stop_bots_path $1;\n    }\n",
+            "    if ($stop_bots_path ~ \"//|/\\.\\.?(/|$)\") {\n        set $stop_bots_path $uri;\n    }\n",
+            "    if ($stop_bots_path ~* \"^(/blog)\") {\n",
+        ];
+        let at: Vec<Option<usize>> = expected.iter().map(|line| text.find(line)).collect();
         assert!(
-            text.contains("if ($uri ~* \"^(/blog)\")"),
-            "text was:\n{text}"
+            at.iter().all(Option::is_some) && at.windows(2).all(|w| w[0] < w[1]),
+            "expected, in this order:\n{}\ntext was:\n{text}",
+            expected.concat()
         );
-        assert!(!text.contains("$request_uri"), "text was:\n{text}");
+        assert_eq!(text.matches("$request_uri").count(), 1, "text was:\n{text}");
+    }
+
+    /// A front controller's `try_files ... /index.php` is an internal
+    /// redirect, which runs these `if`s again with `$uri` the new path. So
+    /// nothing that clears the flag may read `$uri` directly, or the
+    /// redirect undoes the exemption the request was let in on.
+    #[test]
+    fn no_exemption_reads_the_path_an_internal_redirect_changes() {
+        let config = BlockConfig {
+            serve_robots_txt: true,
+            ..cfg_agent(&["okhttp"], &[("okhttp", "/remote.php/dav/")])
+        };
+        let config = BlockConfig {
+            exempt_paths: vec!["/wp-json/".to_string()],
+            ..config
+        };
+        let text = block_text(&config).unwrap();
+        for line in text.lines().filter(|line| line.contains("$uri")) {
+            assert_eq!(
+                line.trim(),
+                "set $stop_bots_path $uri;",
+                "only the fallback reads $uri; text was:\n{text}"
+            );
+        }
+    }
+
+    /// A site with no exemption has nothing to match a path against, and
+    /// its block keeps the text it had.
+    #[test]
+    fn a_block_with_no_exemption_works_out_no_path() {
+        let text = block_text(&cfg(&["BadBot"])).unwrap();
+        assert!(!text.contains("stop_bots_path"), "text was:\n{text}");
     }
 
     /// `/robots.txt` is one file, not a prefix: `/robots.txt/../x` and
@@ -4019,7 +4111,7 @@ mod tests {
         };
         let text = block_text(&config).unwrap();
         assert!(
-            text.contains("if ($uri ~* \"^(/blog|/robots\\.txt$)\")"),
+            text.contains("if ($stop_bots_path ~* \"^(/blog|/robots\\.txt$)\")"),
             "text was:\n{text}"
         );
     }
@@ -4152,15 +4244,18 @@ mod tests {
 
     /// `$request_uri` is the raw request line: `/remote.php/dav/../../x`
     /// starts with the exempt prefix there, and the application resolves it
-    /// to `/x`. `$uri` has already been resolved by NGINX.
+    /// to `/x`. The agent exemptions read the same path the plain ones do,
+    /// which is the raw one only where it has nothing to resolve.
     #[test]
-    fn an_agent_exemption_matches_the_resolved_path_not_the_raw_one() {
+    fn an_agent_exemption_matches_the_same_path_as_a_plain_one() {
         let text = block_text(&cfg_agent(&["okhttp"], &[("okhttp", "/remote.php/dav/")])).unwrap();
+        let worked_out = text.find("    if ($stop_bots_path ~ \"//");
+        let read = text.find("set $stop_bots_exempt $stop_bots_path;");
         assert!(
-            text.contains("set $stop_bots_exempt $uri;"),
-            "text was:\n{text}"
+            worked_out.is_some() && read.is_some() && worked_out < read,
+            "the path must be worked out before the agent exemption reads it:\n{text}"
         );
-        assert!(!text.contains("$request_uri"), "text was:\n{text}");
+        assert_eq!(text.matches("$request_uri").count(), 1, "text was:\n{text}");
     }
 
     #[test]
@@ -4331,7 +4426,7 @@ mod tests {
         assert!(ifs > 1, "expected chunking, got {ifs}");
         // Every chunk sets the flag; exactly one clears it and one acts.
         assert_eq!(text.matches("set $stop_bots_block 1;").count(), ifs);
-        assert_eq!(text.matches("if ($uri ").count(), 1);
+        assert_eq!(text.matches("if ($stop_bots_path ~* ").count(), 1);
         assert_eq!(text.matches("if ($stop_bots_block) {").count(), 1);
     }
 
@@ -6157,7 +6252,7 @@ server {
     fn a_stored_path_exemption_that_is_not_a_literal_path_is_left_out() {
         let text = block_text(&cfg_exempt(&["BadBot"], &[r"/x\|", r"/x\(", "/blog"])).unwrap();
         assert!(
-            text.contains(r#"if ($uri ~* "^(/blog)") {"#),
+            text.contains(r#"if ($stop_bots_path ~* "^(/blog)") {"#),
             "text was:\n{text}"
         );
         assert!(!text.contains("/x"), "text was:\n{text}");
@@ -6168,7 +6263,7 @@ server {
     #[test]
     fn a_path_exemption_reaches_pcre_as_a_literal_prefix() {
         let text = block_text(&cfg_exempt(&["BadBot"], &["/a.b+(c)"])).unwrap();
-        let rest = text.split("if ($uri ~* ").nth(1).unwrap();
+        let rest = text.split("if ($stop_bots_path ~* ").nth(1).unwrap();
         let end = closing_quote(rest).unwrap();
         assert_eq!(nginx_unquoted(&rest[1..end]), r"^(/a\.b\+\(c\))");
     }
@@ -6219,7 +6314,7 @@ server {
         let plain = blocks.iter().find(|b| !b.is_tls).unwrap();
         let tls_block = current_block_text(&applied, tls).unwrap();
         assert!(
-            tls_block.contains(r#"if ($uri ~* "^(/stop-bots/|/\.well-known/)") {"#),
+            tls_block.contains(r#"if ($stop_bots_path ~* "^(/stop-bots/|/\.well-known/)") {"#),
             "the console's server must exempt it:\n{tls_block}"
         );
         // Only there: the redirect block serves no console.

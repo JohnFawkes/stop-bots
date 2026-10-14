@@ -8,6 +8,8 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.2.0-rc.1] — 2026-10-14
+
 **Going back to 0.1.x.** This release is 0.2.0 rather than 0.1.2 because an Apache host
 cannot be downgraded: every 0.1.x release promises that going back one patch release is
 safe (see "Versioning" in `RELEASING.md`), and on an Apache host that is not true. 0.1.1
@@ -75,6 +77,21 @@ exemption reads as stale until it is applied again (see Fixed).
     and generated files of whichever web server the host is set to.
   - Database ids, `host.conf` keys and the root helper's requests keep their names, so
     an existing install migrates nothing.
+- **Every release asset has a checksum and a build provenance attestation.** A `.sha256`
+  beside each tarball and `.deb`, one `SHA256SUMS` over all of them, and an attestation,
+  signed through Sigstore, that this repository's release workflow built each file.
+  `RELEASING.md` ("Verifying a download") says how to check both. The tarballs now carry
+  the man pages and the bash, zsh and fish completions the `.deb` already shipped.
+- **`make demo`**, from a clone of the repository, drops you into a shell in a throwaway
+  Ubuntu container running NGINX, with a few bad requests already in its log and a list
+  of things to try. The firewall rules it applies stay inside the container.
+
+### Changed
+
+- **The licence is now AGPL-3.0-only**, rather than AGPL-3.0-or-later: no later version
+  of the AGPL applies. Code contributions need a one-time Contributor License Agreement
+  (`CLA.md`), which lets the project also be offered under a commercial licence.
+  Running stop-bots on a server does not change the licence of anything it protects.
 
 ### Fixed
 
@@ -140,6 +157,17 @@ exemption reads as stale until it is applied again (see Fixed).
   generated config. One that long made `nginx -t` fail, and every apply after it was
   rolled back. A site with many exempt paths no longer hits the same limit: they are
   split between several `if`s, as the bot patterns are.
+- The copy of the database taken before an upgrade is synced through the file it was
+  written to, and the upgrade stops if that name no longer holds it. It used to be
+  reopened by name, and with the console installed that name is in a directory the
+  console can write, so a compromised console could have swapped in a FIFO and hung the
+  root migration for good.
+- The access log's time is read from the last brackets on the line, the ones NGINX's
+  `$time_local` writes, rather than the first, which a client-controlled field can come
+  before in a custom log format; a backdated stamp there would have aged the line out
+  of every detector's window. A time zone with a non-ASCII character in it is refused
+  rather than stopping the log read at that line. Neither is reachable with NGINX's
+  stock formats.
 
 ## [0.1.1] — 2026-10-01
 
@@ -2039,7 +2067,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.2.0-rc.1...HEAD
+[0.2.0-rc.1]: https://github.com/ivankovic/stop-bots/compare/v0.1.1...v0.2.0-rc.1
 [0.1.1]: https://github.com/ivankovic/stop-bots/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ivankovic/stop-bots/compare/v0.0.15...v0.1.0
 [0.1.0-rc.3]: https://github.com/ivankovic/stop-bots/compare/v0.1.0-rc.2...v0.1.0-rc.3

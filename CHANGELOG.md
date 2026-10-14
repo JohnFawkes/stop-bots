@@ -8,6 +8,14 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.2.0-rc.2] — 2026-10-14
+
+Also corrected since rc.1's release notes, in its section below: with the console
+installed, run `sudo stop-bots install web` after upgrading, or the old console and its
+root helper go on running; and every NGINX site whose block exempts a path reads as not
+applied until the next apply, which includes any site with a request-shape rule, not
+only those with an exemption.
+
 ### Changed
 
 - **An Apache root in RHEL's tree gets RHEL's defaults.** `sudo stop-bots set-web-server
@@ -2098,7 +2106,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.2.0-rc.1...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.2.0-rc.2...HEAD
+[0.2.0-rc.2]: https://github.com/ivankovic/stop-bots/compare/v0.2.0-rc.1...v0.2.0-rc.2
 [0.2.0-rc.1]: https://github.com/ivankovic/stop-bots/compare/v0.1.1...v0.2.0-rc.1
 [0.1.1]: https://github.com/ivankovic/stop-bots/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ivankovic/stop-bots/compare/v0.0.15...v0.1.0

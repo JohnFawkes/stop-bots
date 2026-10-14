@@ -3931,7 +3931,7 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
         say!("The console is on loopback. Reach it over an SSH tunnel:\n");
         say!("    ssh -L 8787:127.0.0.1:8787 <this-host>\n");
         say!("then open http://127.0.0.1:8787/.\n");
-        say!("To put it behind the NGINX it is protecting, see \"Behind NGINX\" in the README.");
+        say!("To put it behind the NGINX it is protecting, use its Web Access panel, or `w` in the TUI.");
     } else {
         // Telling someone to open a URL for a service that is not running
         // is how a working install gets reported as broken.

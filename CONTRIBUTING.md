@@ -37,7 +37,9 @@ document, [`RELEASING.md`](RELEASING.md).
 
 ## Technology
 
-The project is completely written in Rust.
+The project is completely written in Rust, and needs Rust 1.88 or newer to build: `cargo install
+--path .` from a checkout. It is Linux only in practice: it shells out to `systemctl`, `nginx -t`
+and `nft`/`iptables`, so while it compiles elsewhere it won't be much use there.
 
 SQLite is used to store user configuation and other runtime data.
 

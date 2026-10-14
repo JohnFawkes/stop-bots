@@ -17,9 +17,12 @@ names one, so most of its commands fail, and where it falls back to its defaults
 sites in `/etc/nginx` and reads NGINX's log, and it never finds, updates or removes the
 blocks this release wrote into Apache's sites. To go back, first run
 `sudo stop-bots uninstall web-server` with this release, then delete the `web_server` and
-`apache_*` lines from `host.conf`. The same goes for an NGINX host that has run
-`set-web-server`, which also writes `web_server`. Any other NGINX host can go back to
-0.1.1 as before; the database and the files this release writes for NGINX are unchanged.
+`apache_*` lines from `host.conf`. An NGINX host can go back to 0.1.1 as before:
+choosing NGINX writes no `web_server` line, and `set-web-server nginx` stores the same
+keys `set-nginx-commands` does. Only an NGINX host that was set to Apache at some point
+may still carry `apache_*` lines, which 0.1.1 refuses; delete them first. The database
+and the files this release writes for NGINX are otherwise unchanged; a site with an
+exemption reads as stale until it is applied again (see Fixed).
 
 ### Added
 
@@ -27,24 +30,47 @@ blocks this release wrote into Apache's sites. To go back, first run
   host. It is stored in `/etc/stop-bots/host.conf` with Apache's own config root
   (`/etc/apache2`), config test (`apache2ctl configtest`) and reload (`systemctl reload
   apache2`), each of which `--root`, `--test` and `--reload` change for a server that is
-  not where Debian puts it. Every command, the TUI and the web console follow it. NGINX
-  is still the default, and an NGINX host has nothing to do.
-  - Sites are the `<VirtualHost>` sections in Debian's layout under `/etc/apache2`. Each
-    gets a block of `mod_rewrite` rules at its top, between the same
-    `# BEGIN stop-bots (DO NOT EDIT)` markers NGINX's blocks carry. Trusted addresses and
-    user agents go in a generated `SetEnvIf` file in `conf-enabled`, and the generated
-    `robots.txt`, in `/etc/stop-bots/apache`, is served with an `Alias`.
+  not where Debian puts it. Every command, the TUI and the web console follow it, and
+  say Apache where they used to say NGINX: the sites tab, what an apply reports, the
+  health report's advice (`mod_remoteip` rather than NGINX's `real_ip` directives). NGINX
+  is still the default, and an NGINX host has nothing to do: choosing NGINX writes no
+  `web_server` line at all.
+  - Sites are the `<VirtualHost>` sections under the root. Each gets a block of
+    `mod_rewrite` rules at its top, between the same `# BEGIN stop-bots (DO NOT EDIT)`
+    markers NGINX's blocks carry. Trusted addresses and user agents go in a generated
+    `SetEnvIf` file, and the generated `robots.txt`, in `/etc/stop-bots/apache`, is
+    served by a rewrite to the file, which answers before a site's own `ProxyPass /`.
+  - Debian's layout (`/etc/apache2`, generated files in `conf-enabled`) and RHEL's
+    (`set-web-server apache --root /etc/httpd`, which reads everything from `conf.d`,
+    where the generated files go). Relative log paths resolve against the root's own
+    `ServerRoot`, through RHEL's `logs` link. The console's root helper is granted that
+    tree and its logs, and `install web --root` stores the root of the server the host
+    runs.
+  - The block decides once, on the request the client sent. Its last rule skips
+    internal redirects and subrequests, so an exempt path that a front controller's
+    `.htaccess` sends on to `/index.php`, or a trusted client there, stays let through,
+    and a blocked request is served the site's own `ErrorDocument`.
+  - `apache2ctl configtest` passes configs that do nothing, so the rest of Apache's
+    config is read and an apply refuses, with what to change, a generated file in a
+    directory Apache never includes, a `RewriteEngine Off` later in the same
+    `<VirtualHost>`, and the HTTP/1.x rule on a host that does not speak HTTP/2
+    (`mod_http2` off, no `Protocols h2`, or the prefork MPM). `status` never reads
+    such a site as up to date.
+  - `set-web-server` refuses to switch while the server chosen now still has stop-bots
+    in its config, listing each file and naming `uninstall web-server` as the way to
+    take it out. Switching first left the blocks where nothing would find them again.
   - Debian ships `mod_rewrite` switched off. An apply that needs it is refused with the
     `sudo a2enmod rewrite` that fixes it, and `status` says so too. Web Access needs
     `mod_proxy_http` (`sudo a2enmod proxy_http`) and puts the console behind Apache as a
-    `<Location>` in a site, or as a site of its own in `sites-enabled`, named to sort last
-    so it is never Apache's default site.
+    `<Location>` in a site, or as a site of its own in `sites-enabled` (`conf.d` on
+    RHEL), named to sort last so it is never Apache's default site.
   - The detectors read `/var/log/apache2/access.log` unless `set-log-paths` names another;
     both servers write the same combined format. The application behind a site is
     recognised from its `ProxyPass`, `DocumentRoot` and `Alias`.
-  - What Apache cannot do: it has no rate limiting of its own, so that setting writes
-    nothing there, and `mod_rewrite` cannot close the connection, tarpit or answer 418,
-    so those three responses are a 403.
+  - What Apache cannot do: it has no rate limiting of its own, so `set-rate-limit
+    --enabled true` and the console's form refuse it and the TUI and console say why
+    instead of offering it; and `mod_rewrite` cannot close the connection, tarpit or
+    answer 418, so those three responses are a 403.
   - `uninstall web-server` is another name for `uninstall nginx`. Both remove the blocks
     and generated files of whichever web server the host is set to.
   - Database ids, `host.conf` keys and the root helper's requests keep their names, so
@@ -52,6 +78,19 @@ blocks this release wrote into Apache's sites. To go back, first run
 
 ### Fixed
 
+- An exempt path on NGINX now stays exempt behind a front controller. An internal
+  redirect runs the block again with the new path: WordPress's `try_files $uri $uri/
+  /index.php?$args` sent `/wp-json/wp/v2/posts` on to `/index.php`, so an exemption for
+  `/wp-json/` (or an agent exemption) let a blocked client in and then blocked it on the
+  second pass. Exemptions now match the path of the request the client sent wherever it
+  has nothing NGINX would resolve (no `%`, `//` or dot segment), and `$uri` otherwise, so
+  `/wp-json/../wp-login.php` still matches as `/wp-login.php`. Trust was not affected. A
+  site with an exemption, the one serving `robots.txt` adds included, reads as stale
+  until it is applied again.
+- The HTTP/1.x rule is refused on an NGINX host where nothing turns HTTP/2 on (no
+  `http2 on;` and no `listen ... http2` anywhere under `nginx.conf`). There NGINX answers
+  every visitor over HTTP/1.1, and the rule passed `nginx -t` and turned every one of
+  them away.
 - The web scanner detector no longer blocks the owner of a Nextcloud, Jellyfin, Immich
   or Navidrome server for what that application's own apps do. Nextcloud's iOS app,
   catching up on a hundred photos deleted elsewhere, asks after each one and gets a

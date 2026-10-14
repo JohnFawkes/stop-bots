@@ -532,10 +532,15 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
                 }),
         );
         tabs.push(" ".into());
+        // The sites screen is named for the web server it manages.
+        let title = match screen {
+            Screen::Nginx => app.nginx.server().label(),
+            screen => screen.title(),
+        };
         tabs.push(if active {
-            screen.title().fg(theme.accent()).bold().underlined()
+            title.fg(theme.accent()).bold().underlined()
         } else {
-            screen.title().fg(theme.dim())
+            title.fg(theme.dim())
         });
     }
     frame.render_widget(Paragraph::new(Line::from(tabs)), tabs_area);

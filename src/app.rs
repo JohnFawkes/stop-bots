@@ -23,8 +23,8 @@ use crate::cron::CronJob;
 use crate::db::Db;
 use crate::event::{AppEvent, Event, EventHandler};
 use crate::ipranges;
-use crate::nginx;
 use crate::tui::{self, KeyOutcome, Screen, Theme};
+use crate::webserver;
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
@@ -345,7 +345,7 @@ impl App {
             db_notice: None,
             dashboard: tui::dashboard::Dashboard::default(),
             bot_settings: tui::bot_settings::BotSettings::default(),
-            nginx: tui::nginx::Nginx::new(root),
+            nginx: tui::nginx::Nginx::new(crate::webserver::WebServer::configured(), root),
             firewall: tui::firewall::Firewall::default(),
             blocks: tui::blocks::Blocks::default(),
             // Backdated by a full `CRON_CHECK_INTERVAL` so the very first
@@ -1017,11 +1017,11 @@ impl App {
             self.nginx.finish_status_check(Vec::new());
             return Ok(());
         }
-        let conf_d = crate::nginx::conf_d_dir(self.nginx.root());
+        let (server, root) = (self.nginx.server(), self.nginx.root().to_path_buf());
         self.jobs_in_flight.insert(Job::CheckSiteStatuses);
         let sender = self.events.sender();
         tokio::task::spawn_blocking(move || {
-            let statuses = crate::tui::nginx::run_status_check(&plan, &conf_d);
+            let statuses = crate::tui::nginx::run_status_check(server, &plan, &root);
             let _ = sender.send(Event::App(AppEvent::SiteStatusesChecked { statuses }));
         });
         Ok(())
@@ -1031,7 +1031,7 @@ impl App {
     /// something changed while it was out.
     fn finish_site_status_check(
         &mut self,
-        statuses: Vec<crate::nginx::SiteApplyStatus>,
+        statuses: Vec<crate::webserver::SiteApplyStatus>,
     ) -> Result<()> {
         self.jobs_in_flight.remove(&Job::CheckSiteStatuses);
         self.nginx.finish_status_check(statuses);
@@ -1069,9 +1069,9 @@ impl App {
         match action {
             SiteAction::Scan => {
                 self.jobs_in_flight.insert(job);
-                let root = self.nginx.root().to_path_buf();
+                let (server, root) = (self.nginx.server(), self.nginx.root().to_path_buf());
                 tokio::task::spawn_blocking(move || {
-                    let sites = nginx::discover_sites(&root).map_err(|err| err.to_string());
+                    let sites = server.discover_sites(&root).map_err(|err| err.to_string());
                     let _ = sender.send(Event::App(AppEvent::SitesScanned { sites }));
                 });
             }
@@ -1106,7 +1106,7 @@ impl App {
     /// the count to report.
     fn finish_site_scan(
         &mut self,
-        sites: Result<Vec<nginx::DiscoveredSite>, String>,
+        sites: Result<Vec<webserver::DiscoveredSite>, String>,
     ) -> Result<()> {
         self.jobs_in_flight.remove(&Job::ScanSites);
         self.message = Some(self.nginx.finish_scan(&self.db, sites));
@@ -1163,7 +1163,10 @@ impl App {
         // cannot reach a `Db` — the same split every other `start_*` makes.
         // A malformed stored command surfaces as the reload failing, which
         // is where the admin is already looking.
-        let commands = match self.host().and_then(|host| host.commands()) {
+        let commands = self
+            .host()
+            .and_then(|host| Ok((host.web_server(), host.commands()?)));
+        let (server, commands) = match commands {
             Ok(commands) => commands,
             Err(err) => {
                 self.jobs_in_flight.remove(&Job::ReloadNginx);
@@ -1173,7 +1176,7 @@ impl App {
         };
         let sender = self.events.sender();
         tokio::task::spawn_blocking(move || {
-            let result = nginx::reload_with(&commands).map_err(|err| err.to_string());
+            let result = webserver::reload_with(server, &commands).map_err(|err| err.to_string());
             let _ = sender.send(Event::App(AppEvent::NginxReloaded { result }));
         });
     }

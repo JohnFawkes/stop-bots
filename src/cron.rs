@@ -59,8 +59,8 @@
 //! check could not run" is not "the check passed".
 
 use crate::db::Db;
-use crate::nginx::NginxCommands;
 use crate::protection::Detector;
+use crate::webserver::ServerCommands;
 use anyhow::Result;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -640,13 +640,18 @@ pub fn apply_nginx(
         Err(err) => return format!("error: {err}"),
     }
 
-    let commands = match reload.then(|| NginxCommands::from_host(host)).transpose() {
+    let commands = match reload.then(|| ServerCommands::from_host(host)).transpose() {
         Ok(commands) => commands,
         Err(err) => return format!("error: {err:#}"),
     };
     // Tested before the reload, and put back if the test fails — see
     // `apply_all_sites_and_reload`. Unattended is where that matters most.
-    match crate::nginx::apply_all_sites_and_reload(db, root, commands.as_ref()) {
+    match crate::webserver::apply_all_sites_and_reload(
+        host.web_server(),
+        db,
+        root,
+        commands.as_ref(),
+    ) {
         Ok(applied) => apply_nginx_summary(&applied),
         Err(err) => format!("error: {err:#}"),
     }
@@ -654,7 +659,7 @@ pub fn apply_nginx(
 
 /// The `ApplyNginx` job's summary of what an apply did: shared with the
 /// web console, whose apply may happen in its root helper.
-pub fn apply_nginx_summary(applied: &crate::nginx::ApplyAllOutcome) -> String {
+pub fn apply_nginx_summary(applied: &crate::webserver::ApplyAllOutcome) -> String {
     // Writing the sentinel block does nothing until NGINX re-reads it, so
     // there is nothing to reload when nothing changed on disk — the same
     // condition `apply-blocks` and `batch` both gate on, and the reason

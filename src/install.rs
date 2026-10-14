@@ -270,7 +270,32 @@ impl Layout {
             .chain(layout.nginx_roots.iter().cloned())
             .collect();
         layout.log_dirs.extend(nginx_log_dirs(&roots));
+        if let Some(apache_root) = self.stored_apache_root() {
+            // The same grants for Apache, whose test opens every log its
+            // config names just as `nginx -t` does.
+            for dir in crate::apache::log_dirs(&apache_root) {
+                if grantable(&dir) && !layout.log_dirs.contains(&dir) {
+                    layout.log_dirs.push(dir);
+                }
+            }
+            layout.nginx_roots.push(apache_root);
+        }
         layout
+    }
+
+    /// Apache's config root, under this layout's prefix, when the host
+    /// settings choose Apache: the directory the helper rewrites instead
+    /// of NGINX's.
+    fn stored_apache_root(&self) -> Option<PathBuf> {
+        let host = crate::hostconf::HostConf::load_from(&self.host_conf).ok()?;
+        if host.web_server() != crate::webserver::WebServer::Apache {
+            return None;
+        }
+        let stock = self.nginx_dir.with_file_name("apache2");
+        Some(match host.apache_root {
+            Some(root) if root.starts_with(crate::apache::DEFAULT_ROOT) || grantable(&root) => root,
+            _ => stock,
+        })
     }
 }
 

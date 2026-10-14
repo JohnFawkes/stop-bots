@@ -50,7 +50,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::db::{keys, Db};
 use crate::logpaths::LogPaths;
-use crate::nginx::NginxCommands;
+use crate::webserver::{ServerCommands, WebServer};
 
 /// Where the file lives.
 pub const DEFAULT_PATH: &str = "/etc/stop-bots/host.conf";
@@ -78,9 +78,13 @@ pub fn path() -> PathBuf {
     PathBuf::from(DEFAULT_PATH)
 }
 
+const WEB_SERVER: &str = "web_server";
 const NGINX_TEST: &str = "nginx_test_command";
 const NGINX_RELOAD: &str = "nginx_reload_command";
 const NGINX_ROOT: &str = "nginx_root";
+const APACHE_TEST: &str = "apache_test_command";
+const APACHE_RELOAD: &str = "apache_reload_command";
+const APACHE_ROOT: &str = "apache_root";
 const ACCESS_LOG: &str = "access_log";
 const SSH_LOG: &str = "ssh_log";
 
@@ -88,13 +92,22 @@ const SSH_LOG: &str = "ssh_log";
 /// built-in default, as it was when nothing was stored in the database.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostConf {
+    /// Which web server serves this host's sites. `None` is NGINX, which
+    /// is what every host was before there was a choice.
+    pub web_server: Option<WebServer>,
     /// How to test the NGINX config, as one command line split by
-    /// [`crate::nginx::split_command`]. Never through a shell.
+    /// [`crate::webserver::split_command`]. Never through a shell.
     pub nginx_test_command: Option<String>,
     /// How to reload NGINX, the same way.
     pub nginx_reload_command: Option<String>,
     /// Where NGINX's config lives.
     pub nginx_root: Option<PathBuf>,
+    /// How to test the Apache config, the same way as NGINX's.
+    pub apache_test_command: Option<String>,
+    /// How to reload Apache.
+    pub apache_reload_command: Option<String>,
+    /// Where Apache's config lives.
+    pub apache_root: Option<PathBuf>,
     /// The NGINX access log.
     pub access_log: Option<PathBuf>,
     /// The SSH log, which the lockout guard reads.
@@ -137,9 +150,23 @@ impl HostConf {
             }
             let value = (!value.is_empty()).then(|| value.to_string());
             match key {
+                WEB_SERVER => {
+                    conf.web_server = match value.as_deref() {
+                        None => None,
+                        Some(id) => Some(WebServer::from_id(id).with_context(|| {
+                            format!(
+                                "line {number} sets `{key}` to `{id}`, which is not one of: {}",
+                                WebServer::ALL.map(WebServer::id).join(", ")
+                            )
+                        })?),
+                    }
+                }
                 NGINX_TEST => conf.nginx_test_command = value,
                 NGINX_RELOAD => conf.nginx_reload_command = value,
                 NGINX_ROOT => conf.nginx_root = value.map(PathBuf::from),
+                APACHE_TEST => conf.apache_test_command = value,
+                APACHE_RELOAD => conf.apache_reload_command = value,
+                APACHE_ROOT => conf.apache_root = value.map(PathBuf::from),
                 ACCESS_LOG => conf.access_log = value.map(PathBuf::from),
                 SSH_LOG => conf.ssh_log = value.map(PathBuf::from),
                 other => bail!("line {number} sets `{other}`, which is not a host setting"),
@@ -155,16 +182,26 @@ impl HostConf {
     /// paths. Nothing may hold a line break, which is what keeps one value
     /// from becoming two lines of the file.
     pub fn validate(&self) -> Result<()> {
-        for command in [&self.nginx_test_command, &self.nginx_reload_command]
-            .into_iter()
-            .flatten()
+        for command in [
+            &self.nginx_test_command,
+            &self.nginx_reload_command,
+            &self.apache_test_command,
+            &self.apache_reload_command,
+        ]
+        .into_iter()
+        .flatten()
         {
             no_control_characters(command)?;
-            crate::nginx::split_command(command)?;
+            crate::webserver::split_command(command)?;
         }
-        for path in [&self.nginx_root, &self.access_log, &self.ssh_log]
-            .into_iter()
-            .flatten()
+        for path in [
+            &self.nginx_root,
+            &self.apache_root,
+            &self.access_log,
+            &self.ssh_log,
+        ]
+        .into_iter()
+        .flatten()
         {
             let text = path
                 .to_str()
@@ -180,15 +217,23 @@ impl HostConf {
     /// The file's text: a header, then each setting that is set.
     pub fn render(&self) -> String {
         let mut out = String::from(
-            "# stop-bots host settings. Written by `stop-bots set-nginx-commands`\n\
-             # and `stop-bots set-log-paths`; read by every stop-bots process.\n\
+            "# stop-bots host settings. Written by `stop-bots set-web-server`,\n\
+             # `stop-bots set-nginx-commands` and `stop-bots set-log-paths`; read\n\
+             # by every stop-bots process.\n\
              # Only root may change this file: the web console reads it and\n\
              # cannot write it.\n",
         );
         let lines = [
+            (
+                WEB_SERVER,
+                self.web_server.map(|server| server.id().to_string()),
+            ),
             (NGINX_TEST, self.nginx_test_command.clone()),
             (NGINX_RELOAD, self.nginx_reload_command.clone()),
             (NGINX_ROOT, path_text(&self.nginx_root)),
+            (APACHE_TEST, self.apache_test_command.clone()),
+            (APACHE_RELOAD, self.apache_reload_command.clone()),
+            (APACHE_ROOT, path_text(&self.apache_root)),
             (ACCESS_LOG, path_text(&self.access_log)),
             (SSH_LOG, path_text(&self.ssh_log)),
         ];
@@ -207,32 +252,45 @@ impl HostConf {
         write_file(path, &self.render())
     }
 
-    /// The NGINX commands, each falling back to its default.
-    pub fn commands(&self) -> Result<NginxCommands> {
+    /// Which web server serves this host's sites.
+    pub fn web_server(&self) -> WebServer {
+        self.web_server.unwrap_or_default()
+    }
+
+    /// The web server's commands, each falling back to its default.
+    pub fn commands(&self) -> Result<ServerCommands> {
         let command = |raw: &Option<String>, key: &str, fallback: &str| -> Result<Vec<String>> {
-            crate::nginx::split_command(raw.as_deref().unwrap_or(fallback))
+            crate::webserver::split_command(raw.as_deref().unwrap_or(fallback))
                 .with_context(|| format!("the host setting `{key}` is not a valid command"))
         };
-        Ok(NginxCommands {
-            test: command(
-                &self.nginx_test_command,
-                NGINX_TEST,
-                NginxCommands::DEFAULT_TEST,
-            )?,
-            reload: command(
-                &self.nginx_reload_command,
-                NGINX_RELOAD,
-                NginxCommands::DEFAULT_RELOAD,
-            )?,
+        let server = self.web_server();
+        let (test, reload) = match server {
+            WebServer::Nginx => (
+                (&self.nginx_test_command, NGINX_TEST),
+                (&self.nginx_reload_command, NGINX_RELOAD),
+            ),
+            WebServer::Apache => (
+                (&self.apache_test_command, APACHE_TEST),
+                (&self.apache_reload_command, APACHE_RELOAD),
+            ),
+        };
+        Ok(ServerCommands {
+            test: command(test.0, test.1, server.default_test())?,
+            reload: command(reload.0, reload.1, server.default_reload())?,
         })
     }
 
-    /// Where NGINX's config is: `flag` if given, else the setting, else
-    /// the stock path.
+    /// Where the web server's config is: `flag` if given, else the
+    /// setting, else the stock path.
     pub fn root(&self, flag: Option<&Path>) -> PathBuf {
+        let server = self.web_server();
+        let stored = match server {
+            WebServer::Nginx => &self.nginx_root,
+            WebServer::Apache => &self.apache_root,
+        };
         flag.map(Path::to_path_buf)
-            .or_else(|| self.nginx_root.clone())
-            .unwrap_or_else(|| PathBuf::from(crate::nginx::DEFAULT_ROOT))
+            .or_else(|| stored.clone())
+            .unwrap_or_else(|| PathBuf::from(server.default_root()))
     }
 
     /// The two log paths, as [`LogPaths`] resolves them.
@@ -240,6 +298,7 @@ impl HostConf {
         LogPaths {
             access: self.access_log.clone(),
             ssh: self.ssh_log.clone(),
+            server: self.web_server(),
         }
     }
 }
@@ -539,8 +598,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conf = HostConf::load_from(&dir.path().join("host.conf")).unwrap();
         assert_eq!(conf, HostConf::default());
-        assert_eq!(conf.commands().unwrap(), NginxCommands::default());
+        assert_eq!(
+            conf.commands().unwrap(),
+            WebServer::Nginx.default_commands()
+        );
         assert_eq!(conf.root(None), PathBuf::from(crate::nginx::DEFAULT_ROOT));
+    }
+
+    #[test]
+    fn an_unknown_web_server_is_refused() {
+        let err = HostConf::parse("web_server = caddy\n").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("nginx, apache"),
+            "error was: {err:#}"
+        );
     }
 
     #[test]
@@ -548,16 +619,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("etc/host.conf");
         let conf = HostConf {
+            web_server: Some(WebServer::Apache),
             nginx_test_command: Some("docker exec \"my web\" nginx -t".into()),
             nginx_reload_command: Some("docker exec web nginx -s reload".into()),
             nginx_root: Some("/srv/web nginx".into()),
+            apache_test_command: Some("apachectl -t".into()),
+            apache_reload_command: None,
+            apache_root: Some("/etc/httpd".into()),
             access_log: Some("/srv/logs/access.log".into()),
             ssh_log: None,
         };
         conf.save_to(&path).unwrap();
         assert_eq!(HostConf::load_from(&path).unwrap(), conf);
+        // The server chosen decides whose commands and root are used.
+        assert_eq!(conf.commands().unwrap().test, ["apachectl", "-t"]);
         assert_eq!(
-            conf.commands().unwrap().test,
+            conf.commands().unwrap().reload,
+            ["systemctl", "reload", "apache2"]
+        );
+        assert_eq!(conf.root(None), PathBuf::from("/etc/httpd"));
+        let nginx = HostConf {
+            web_server: None,
+            ..conf
+        };
+        assert_eq!(
+            nginx.commands().unwrap().test,
             ["docker", "exec", "my web", "nginx", "-t"]
         );
     }

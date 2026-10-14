@@ -55,6 +55,8 @@ pub struct Chrome {
     pub health: Option<crate::health::Report>,
     /// That the database is not the system one, and which it is.
     pub db_notice: Option<String>,
+    /// The web server the host settings choose, which names the sites tab.
+    pub web_server: crate::webserver::WebServer,
 }
 
 impl Ctx {
@@ -91,6 +93,9 @@ impl Ctx {
             host: crate::host::name().map(str::to_string),
             health,
             db_notice,
+            // The file is world-readable, and a console that cannot read
+            // it names the tab as every host did before there was a choice.
+            web_server: crate::webserver::WebServer::configured(),
         };
         ctx
     }
@@ -155,6 +160,15 @@ impl Tab {
         }
     }
 
+    /// [`Self::label`], with the sites tab named for the web server this
+    /// host runs.
+    pub fn label_in(self, ctx: &Ctx) -> &'static str {
+        match self {
+            Tab::Nginx => ctx.chrome.web_server.label(),
+            tab => tab.label(),
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Tab::Dashboard => "Dashboard",
@@ -211,7 +225,7 @@ pub fn page(tab: Tab, ctx: &Ctx, flash: Option<Flash>, content: Markup) -> Marku
                 // No `referrer` leakage to anywhere: this console's URLs
                 // name the sites and addresses being administered.
                 meta name="referrer" content="no-referrer";
-                title { (tab.label()) " — stop-bots" }
+                title { (tab.label_in(ctx)) " — stop-bots" }
                 meta name="csrf-token" content=(ctx.csrf);
                 link rel="stylesheet" href=(ctx.url("/assets/style.css"));
                 // Applied before first paint, so a dark-theme user does
@@ -270,11 +284,11 @@ pub fn page(tab: Tab, ctx: &Ctx, flash: Option<Flash>, content: Markup) -> Marku
                         @for candidate in Tab::ALL {
                             @if candidate == tab {
                                 a href=(ctx.url(candidate.path())) aria-current="page" {
-                                    span .key { (candidate.key()) } (candidate.label())
+                                    span .key { (candidate.key()) } (candidate.label_in(ctx))
                                 }
                             } @else {
                                 a href=(ctx.url(candidate.path())) {
-                                    span .key { (candidate.key()) } (candidate.label())
+                                    span .key { (candidate.key()) } (candidate.label_in(ctx))
                                 }
                             }
                         }

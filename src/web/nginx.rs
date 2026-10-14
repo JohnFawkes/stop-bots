@@ -35,10 +35,10 @@ use maud::{html, Markup};
 use serde::Deserialize;
 
 use crate::db::{BlockResponse, Bot, Category, Db, Policy, Site};
-use crate::nginx::{RequestRule, SiteApplyStatus};
 use crate::web::layout::{self, Ctx, PillKind, Tab};
 use crate::web::server::{back_with, internal_error, render, Auth, FlashQuery};
 use crate::web::state::AppState;
+use crate::webserver::{RequestRule, SiteApplyStatus};
 
 // ---- list ----
 
@@ -59,7 +59,7 @@ struct View {
 /// The page, with each site's status worked out here.
 #[cfg(test)]
 fn load(db: &Db, root: &Path) -> anyhow::Result<View> {
-    let statuses = crate::nginx::site_statuses(db, root)?;
+    let statuses = crate::webserver::site_statuses(crate::webserver::WebServer::Nginx, db, root)?;
     load_with(db, root, Ok(statuses))
 }
 
@@ -440,7 +440,8 @@ fn load_detail(db: &Db, id: i64, bot_query: &str) -> anyhow::Result<Option<Detai
         .parent()
         .ok_or_else(|| anyhow::anyhow!("a scanned site has no directory"))?
         .to_path_buf();
-    let status = status_of(&crate::nginx::site_statuses(db, &root)?, id);
+    let statuses = crate::webserver::site_statuses(crate::webserver::WebServer::Nginx, db, &root)?;
+    let status = status_of(&statuses, id);
     load_detail_with(db, id, bot_query, status)
 }
 
@@ -1006,7 +1007,7 @@ async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
 }
 
 /// The flash for a finished apply. The reload itself happened inside the
-/// apply (see `nginx::apply_all_sites_and_reload`), and only after the new
+/// apply (see `webserver::apply_all_sites_and_reload`), and only after the new
 /// config passed the test, so all that is left is to say which it was.
 fn applied_message(
     state: &AppState,

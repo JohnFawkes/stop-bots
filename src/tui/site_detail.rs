@@ -34,9 +34,9 @@
 use crate::db::{
     effective_bot_policy, Bot, BotStatus, Category, Db, Policy, Site, SiteBotOverride,
 };
-use crate::nginx::RequestRule;
 use crate::present::category_label;
 use crate::tui::{centered_rect, KeyOutcome, Theme};
+use crate::webserver::RequestRule;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -208,7 +208,7 @@ impl SiteDetail {
         }
         self.bots = db.list_bots()?;
         self.bot_overrides = db.site_bot_overrides(self.site.id)?;
-        self.request_rules = crate::nginx::site_request_rules(db, self.site.id)?;
+        self.request_rules = crate::webserver::site_request_rules(db, self.site.id)?;
         let plain = db
             .site_path_exemptions(self.site.id)?
             .into_iter()

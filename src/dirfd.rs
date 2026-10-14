@@ -225,7 +225,7 @@ impl DirFile {
         for _ in 0..8 {
             let temp = c_name(OsStr::new(&format!(
                 ".{name}.stop-bots-{:016x}",
-                crate::nginx::random_u64()
+                crate::webserver::random_u64()
             )))?;
             // SAFETY: a valid descriptor and a NUL-terminated name.
             let fd = unsafe {

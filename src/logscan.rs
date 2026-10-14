@@ -259,11 +259,12 @@ fn watch(db: &Db, now: i64) -> Result<Watch> {
 /// config, and a stored answer would go on allowing an application's
 /// requests after it moved. A handful of small files a minute.
 pub fn hosted(db: &Db) -> Result<crate::services::Hosted> {
+    let server = crate::webserver::WebServer::configured();
     let mut sites = Vec::new();
     for site in db.list_sites()? {
         let path = Path::new(&site.config_path);
-        let service = crate::nginx::site_service(path, &site.server_name);
-        for name in crate::nginx::server_names_for(path, &site.server_name) {
+        let service = server.site_service(path, &site.server_name);
+        for name in server.server_names_for(path, &site.server_name) {
             sites.push((name, service));
         }
     }
@@ -714,6 +715,7 @@ mod tests {
             stored: crate::logpaths::LogPaths {
                 access: Some(access.clone()),
                 ssh: Some(auth.clone()),
+                ..Default::default()
             },
             ..Flags::default()
         };

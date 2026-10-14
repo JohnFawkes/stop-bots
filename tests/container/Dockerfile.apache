@@ -1,0 +1,38 @@
+# A real Apache httpd, for the Apache backend's tests: the same idea as
+# `Dockerfile`, which does this for NGINX. Ubuntu 24.04 for the same
+# reason — the binary is built on the host and copied in.
+FROM ubuntu:24.04
+
+RUN apt-get update -qq && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        apache2 curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# Debian's stock layout, as an operator has it: the site in
+# sites-available, enabled by a link, and mod_rewrite on — stop-bots
+# blocks with it, and Debian ships it off.
+#
+# And mod_remoteip, as a server behind a proxy has it, so a test can make
+# Apache log a public client: every request here comes from loopback,
+# which the detectors rightly never count. And mod_proxy_http, which Web
+# Access puts the console behind.
+COPY site-apache.conf /etc/apache2/sites-available/test-site.conf
+RUN a2enmod -q rewrite remoteip proxy_http && a2dissite -q 000-default && a2ensite -q test-site && \
+    printf '%s\n' 'RemoteIPHeader X-Forwarded-For' 'RemoteIPInternalProxy 127.0.0.1' \
+        > /etc/apache2/conf-enabled/remoteip.conf && \
+    printf '%s\n' 'Listen 8080' 'Listen 80' > /etc/apache2/ports.conf && \
+    echo 'ServerName localhost' > /etc/apache2/conf-enabled/servername.conf && \
+    mkdir -p /var/www/test /etc/stop-bots && \
+    echo '<h1>hello</h1>' > /var/www/test/index.html
+
+# No init system here either: `systemctl reload apache2`, which an apply
+# runs, is a graceful restart by hand.
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        '[ "$1" = reload ] && exec apache2ctl graceful' \
+        'exit 0' \
+        > /usr/local/bin/systemctl && chmod +x /usr/local/bin/systemctl
+
+COPY stop-bots /usr/local/bin/stop-bots
+
+CMD ["sleep", "infinity"]

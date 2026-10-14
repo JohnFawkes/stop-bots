@@ -85,6 +85,7 @@ pub fn check_label(check: &Check) -> &'static str {
         "script-fresh" => "script",
         "nginx-applied" => "nginx",
         "generated-files-reachable" => "files",
+        "apache-rewrite" => "rewrite",
         "turned-away-clients" => "refused",
         "service-health" => "console",
         "console-account" => "account",

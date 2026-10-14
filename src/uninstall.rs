@@ -29,7 +29,7 @@
 //! - **NGINX**: the injected blocks in every site file (both kinds of
 //!   marker), the generated `conf.d` files, the console's own site file,
 //!   and `/etc/stop-bots/nginx`. One change, tested and put back if NGINX
-//!   refuses it, then reloaded — `nginx::remove_everything`.
+//!   refuses it, then reloaded — `webserver::remove_everything`.
 //! - **The firewall scripts** in `/etc/stop-bots`, and the directory once
 //!   it is empty.
 //! - **The database** and its `.bak-v*` copies only with `--purge`, and
@@ -66,7 +66,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::install::{FIREWALL_UNIT, HELPER_SOCKET_UNIT, HELPER_UNIT, WEB_UNIT};
-use crate::nginx::{self, NginxCommands};
+use crate::nginx;
+use crate::webserver;
+use crate::webserver::ServerCommands;
 
 /// What to remove. `All` is everything, and the only one that touches
 /// the database or `/etc/stop-bots` itself.
@@ -128,6 +130,8 @@ pub struct Plan {
     pub output_dir: PathBuf,
     /// `/etc/stop-bots/nginx`: the generated `robots.txt`.
     pub managed_dir: PathBuf,
+    /// The web server the site files are for.
+    pub server: crate::webserver::WebServer,
     /// The NGINX config root whose site files carry the blocks.
     pub nginx_root: PathBuf,
     /// Every `conf.d` a generated file may be in: this root's, and the
@@ -136,7 +140,7 @@ pub struct Plan {
     /// Generated files the database's record says were written.
     pub recorded: Vec<PathBuf>,
     /// How to test and reload NGINX, as `set-nginx-commands` stored them.
-    pub nginx: NginxCommands,
+    pub nginx: ServerCommands,
     /// The database, kept unless `--purge`.
     pub db_path: PathBuf,
     /// The host settings file (see [`crate::hostconf`]), kept unless
@@ -177,23 +181,39 @@ impl Plan {
         };
         let host = stored.host_settings(&host_conf, &db_path)?;
 
-        let nginx_root = match (root_flag, &host.nginx_root) {
+        let server = host.web_server();
+        let stored_root = match server {
+            webserver::WebServer::Nginx => &host.nginx_root,
+            webserver::WebServer::Apache => &host.apache_root,
+        };
+        let nginx_root = match (root_flag, stored_root) {
             (Some(flag), _) => flag.to_path_buf(),
             // A stored root names the host's own path; under a prefix it
             // is taken to mean the same path inside the tree.
             (None, Some(root)) => base.join(root.strip_prefix("/").unwrap_or(root)),
-            (None, None) => base.join("etc/nginx"),
+            (None, None) => base.join(server.default_root().trim_start_matches('/')),
         };
         let output_dir = base.join("etc/stop-bots");
-        let managed_dir = match std::env::var_os(nginx::MANAGED_DIR_ENV) {
-            Some(dir) => PathBuf::from(dir),
-            None => output_dir.join("nginx"),
+        let (managed_env, managed_name) = match server {
+            webserver::WebServer::Nginx => (nginx::MANAGED_DIR_ENV, "nginx"),
+            webserver::WebServer::Apache => (crate::apache::MANAGED_DIR_ENV, "apache"),
         };
-        let mut conf_d_dirs = vec![
-            nginx::conf_d_dir(&nginx_root),
-            nginx_root.join("conf.d"),
-            base.join(nginx::CONF_D_DIR.trim_start_matches('/')),
-        ];
+        let managed_dir = match std::env::var_os(managed_env) {
+            Some(dir) => PathBuf::from(dir),
+            None => output_dir.join(managed_name),
+        };
+        let mut conf_d_dirs = match server {
+            webserver::WebServer::Nginx => vec![
+                nginx::conf_d_dir(&nginx_root),
+                nginx_root.join("conf.d"),
+                base.join(nginx::CONF_D_DIR.trim_start_matches('/')),
+            ],
+            webserver::WebServer::Apache => vec![
+                crate::apache::conf_enabled_dir(&nginx_root),
+                nginx_root.join("conf-enabled"),
+                base.join(crate::apache::CONF_ENABLED_DIR.trim_start_matches('/')),
+            ],
+        };
         conf_d_dirs.dedup();
 
         Ok(Plan {
@@ -202,6 +222,7 @@ impl Plan {
             unit_dir: base.join("etc/systemd/system"),
             output_dir,
             managed_dir,
+            server,
             nginx_root,
             conf_d_dirs,
             recorded: stored.recorded,
@@ -313,9 +334,9 @@ impl Stored {
         // user: rows the console can write must not choose what this root
         // process runs or which tree it rewrites.
         Ok(Stored {
-            root: setting(NginxCommands::ROOT_KEY)?,
-            test: setting(NginxCommands::TEST_KEY)?,
-            reload: setting(NginxCommands::RELOAD_KEY)?,
+            root: setting(ServerCommands::ROOT_KEY)?,
+            test: setting(ServerCommands::TEST_KEY)?,
+            reload: setting(ServerCommands::RELOAD_KEY)?,
             recorded,
         })
     }
@@ -593,7 +614,7 @@ fn jumps_into(listing: &str, chain: &str) -> Vec<Vec<String>> {
     listing
         .lines()
         .filter_map(|line| line.strip_prefix("-A "))
-        .filter_map(|rule| nginx::split_command(rule).ok())
+        .filter_map(|rule| webserver::split_command(rule).ok())
         .filter(|words| {
             words
                 .windows(2)
@@ -605,12 +626,12 @@ fn jumps_into(listing: &str, chain: &str) -> Vec<Vec<String>> {
 /// The generated files NGINX may read, wherever they may be: the
 /// record's, and each known name in each `conf.d` it may have gone to.
 ///
-/// Each is held through its directory ([`nginx::DirFile`]), so that what
+/// Each is held through its directory ([`webserver::DirFile`]), so that what
 /// is removed — and put back, if NGINX refuses the result — is in the
 /// directory that was checked.
-fn generated_nginx_files(plan: &Plan) -> Vec<nginx::DirFile> {
-    let console = nginx::console_site_path(&plan.nginx_root);
-    let mut files: Vec<nginx::DirFile> = plan
+fn generated_nginx_files(plan: &Plan) -> Vec<webserver::DirFile> {
+    let console = plan.server.console_site_path(&plan.nginx_root);
+    let mut files: Vec<webserver::DirFile> = plan
         .recorded
         .iter()
         .filter_map(|path| recorded_file_ours(path, &plan.managed_dir))
@@ -622,19 +643,19 @@ fn generated_nginx_files(plan: &Plan) -> Vec<nginx::DirFile> {
         known.push(nginx::trusted_conf_path(conf_d));
     }
     known.push(plan.managed_dir.join("robots.txt"));
-    if nginx::is_console_site_file(&console) {
+    if webserver::is_console_site_file(&console) {
         known.push(console);
     }
     files.extend(
         known
             .iter()
             .filter(|path| plan.allows(path))
-            .filter_map(|path| nginx::DirFile::locate(path).ok().flatten()),
+            .filter_map(|path| webserver::DirFile::locate(path).ok().flatten()),
     );
     let mut seen = std::collections::HashSet::new();
     files.retain(|file| plan.allows(file.path()) && seen.insert(file.path().to_path_buf()));
-    // The order a removal must go in; see `nginx::ManagedKind`.
-    files.sort_by_key(|file| nginx::ManagedKind::of(file.path()));
+    // The order a removal must go in; see `webserver::ManagedKind`.
+    files.sort_by_key(|file| webserver::ManagedKind::of(file.path()));
     files
 }
 
@@ -650,16 +671,20 @@ fn generated_nginx_files(plan: &Plan) -> Vec<nginx::DirFile> {
 /// file in `managed_dir`.
 ///
 /// And the path must already be resolved, with no link and no `..` in
-/// it ([`nginx::DirFile::exactly`]). A `conf.d` can be the console's own
+/// it ([`webserver::DirFile::exactly`]). A `conf.d` can be the console's own
 /// (`/var/lib/stop-bots/conf.d`), and one reached through a link the
 /// console made could lead elsewhere by the time it is used; what passes
 /// is used only through the directory descriptor this checked.
-fn recorded_file_ours(path: &Path, managed_dir: &Path) -> Option<nginx::DirFile> {
-    let file = nginx::DirFile::exactly(path).ok()?;
+fn recorded_file_ours(path: &Path, managed_dir: &Path) -> Option<webserver::DirFile> {
+    let file = webserver::DirFile::exactly(path).ok()?;
     let named = path
         .file_name()
         .is_some_and(|name| name.to_string_lossy().starts_with("stop-bots"));
-    let placed = (named && file.dir().file_name().is_some_and(|name| name == "conf.d"))
+    let placed = (named
+        && file
+            .dir()
+            .file_name()
+            .is_some_and(|name| name == "conf.d" || name == "conf-enabled"))
         || std::fs::canonicalize(managed_dir).is_ok_and(|managed| managed == file.dir());
     let headed = || {
         file.first_line()
@@ -679,11 +704,20 @@ fn remove_nginx(plan: &Plan, options: &Options, report: &mut Report) {
             format!("{} does not exist", plan.nginx_root.display()),
         );
     } else if !plan.allows(&plan.nginx_root) {
-        report.skip(what, "the NGINX root is outside --prefix");
+        report.skip(
+            what,
+            format!("the {} root is outside --prefix", plan.server.label()),
+        );
     } else {
         let generated = generated_nginx_files(plan);
         let commands = plan.host.then_some(&plan.nginx);
-        match nginx::remove_everything(&plan.nginx_root, &generated, commands, options.dry_run) {
+        match webserver::remove_everything(
+            plan.server,
+            &plan.nginx_root,
+            &generated,
+            commands,
+            options.dry_run,
+        ) {
             Ok(removal) if removal.site_files.is_empty() && removal.generated.is_empty() => {
                 report.skip(what, "nothing of stop-bots' is in it")
             }
@@ -928,7 +962,7 @@ mod tests {
                 "iptables",
                 "[ \"$2\" = -S ] && [ -n \"$3\" ] && exit 1\nexit 0",
             )];
-            staged.plan.nginx = NginxCommands {
+            staged.plan.nginx = ServerCommands {
                 test: vec![
                     staged.fake("nginx", "exit 0").display().to_string(),
                     "-t".into(),
@@ -1184,11 +1218,17 @@ mod tests {
         let checked = staged.path("var/lib/stop-bots/checked");
         std::fs::rename(recorded.parent().unwrap(), &checked).unwrap();
         std::os::unix::fs::symlink(&victim, recorded.parent().unwrap()).unwrap();
-        let refusing = NginxCommands {
+        let refusing = ServerCommands {
             test: vec!["false".into()],
             reload: vec!["true".into()],
         };
-        let result = nginx::remove_everything(&plan.nginx_root, &generated, Some(&refusing), false);
+        let result = webserver::remove_everything(
+            plan.server,
+            &plan.nginx_root,
+            &generated,
+            Some(&refusing),
+            false,
+        );
 
         assert!(result.is_err(), "NGINX refused it, so it was put back");
         assert_eq!(
@@ -1517,7 +1557,7 @@ mod tests {
             .unwrap();
             conn.execute(
                 "INSERT INTO settings VALUES (?1, '/srv/nginx')",
-                [NginxCommands::ROOT_KEY],
+                [ServerCommands::ROOT_KEY],
             )
             .unwrap();
         }
@@ -1540,7 +1580,7 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         crate::db::Db::open(&path)
             .unwrap()
-            .set_text_setting(NginxCommands::ROOT_KEY, "/srv/nginx")
+            .set_text_setting(ServerCommands::ROOT_KEY, "/srv/nginx")
             .unwrap();
 
         let plan = Plan::resolve(None, Some(path.clone()), None).unwrap();

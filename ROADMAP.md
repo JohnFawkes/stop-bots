@@ -8,9 +8,10 @@ read.
 
 ## What the project is for
 
-A single operator with one or a few NGINX servers who wants bad bots gone **without
-putting a CDN in front**. It classifies known bots, reads the host's own logs to catch the
-ones no list knows yet, and turns both into NGINX config and a firewall script. Three
+A single operator with one or a few NGINX or Apache servers who wants bad bots gone
+**without putting a CDN in front**. It classifies known bots, reads the host's own logs to
+catch the ones no list knows yet, and turns both into web server config and a firewall
+script. Three
 principles run through everything and should survive every release:
 
 1. **Nothing happens without you.** Everything is generated; applying is a separate,
@@ -197,14 +198,15 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
 - [x] **Docs fit for a newcomer.**
   - A quick start near the top: APT install, `sudo stop-bots`, `u`, review, `a`,
     `install firewall` for persistence (not in the README today), then `status`.
-  - Supported platforms, stated: Debian/Ubuntu, systemd, NGINX. Not Apache or Caddy.
+  - Supported platforms, stated: Debian/Ubuntu, systemd, NGINX. Apache has been added
+    since (`set-web-server apache`); Caddy is still not supported.
   - Correct the wrong claims:
     - `SECURITY.md` says every detector is off by default; five are on.
     - The README says "four screens" in one place and "five" in another.
     - The README says blocks "expire on its own".
     - The README describes a Firewall-screen capability that is CLI-only.
-  - Reconcile "Contributions are not accepted" with `CONTRIBUTING.md`: one line saying it
-    describes how the maintainer works. **M**
+  - Reconcile the README's Contributing section with `CONTRIBUTING.md`. Contributions are
+    now accepted, under a CLA (`CLA.md`). **M**
 
 ### D. Explain every block
 
@@ -282,7 +284,10 @@ Roughly in the order they would matter to a user:
    `tui/dashboard.rs` vs `web/dashboard.rs`).
 9. **Structural debt**, when it earns its keep: `Commands` out of `main.rs`, `db.rs` by
    concern.
-10. **Release pace and the changelog.** After 0.1, patch releases for fixes only, with
+10. **Apache at parity with NGINX.** Web Access and recognising the application behind
+    a site work on Apache too. What is left: the TUI and console still offer rate limiting
+    on an Apache host, where it writes nothing.
+11. **Release pace and the changelog.** After 0.1, patch releases for fixes only, with
     features batched into minors. Changelog bullets of one to three lines, with the
     reasoning in commits. It is 1,484 lines after two weeks and ships in the `.deb`.
 

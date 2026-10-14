@@ -274,9 +274,13 @@ impl HelperHost {
         fs::write(&ssh_log, "").unwrap();
         let host_conf = dir.path().join("host.conf");
         stop_bots::hostconf::HostConf {
+            web_server: None,
             nginx_test_command: Some("true".into()),
             nginx_reload_command: Some("true".into()),
             nginx_root: Some(root.clone()),
+            apache_test_command: None,
+            apache_reload_command: None,
+            apache_root: None,
             access_log: Some(dir.path().join("access.log")),
             ssh_log: Some(ssh_log),
         }

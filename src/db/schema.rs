@@ -712,7 +712,7 @@ fn v1_baseline(conn: &Connection) -> rusqlite::Result<()> {
 /// list of where files would be written today. See `db::managed`.
 ///
 /// Starts empty. Files written before it existed are still found by the
-/// fixed list of names `nginx::unused_managed_files` keeps as a fallback.
+/// fixed list of names `webserver::unused_managed_files` keeps as a fallback.
 fn v2_managed_files(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE managed_files (

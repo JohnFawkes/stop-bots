@@ -17,7 +17,7 @@
 
 //! Where this host's logs actually are, remembered.
 //!
-//! The same problem [`crate::nginx::NginxCommands`] solves, for the other
+//! The same problem [`crate::webserver::ServerCommands`] solves, for the other
 //! half of a containerised NGINX. That type exists because `nginx -t` and
 //! `systemctl reload nginx` are wrong when NGINX is in a container, so the
 //! right commands are stored and every caller reads them from there.
@@ -63,6 +63,8 @@ pub struct LogPaths {
     /// The SSH authentication log, feeding the SSH scanner detector and —
     /// more importantly — the anti-lockout window.
     pub ssh: Option<PathBuf>,
+    /// The web server whose access log is read when none is stored.
+    pub server: crate::webserver::WebServer,
 }
 
 impl LogPaths {
@@ -71,7 +73,7 @@ impl LogPaths {
     pub fn access_path(&self, flag: Option<&Path>) -> PathBuf {
         flag.or(self.access.as_deref())
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from(crate::accesslog::DEFAULT_LOG_PATH))
+            .unwrap_or_else(|| PathBuf::from(self.server.default_access_log()))
     }
 
     /// [`Self::access_path`], read whole. For the one-off CLI commands;
@@ -102,7 +104,7 @@ impl LogPaths {
     pub fn access_description(&self, flag: Option<&Path>) -> String {
         match flag.or(self.access.as_deref()) {
             Some(path) => path.display().to_string(),
-            None => crate::accesslog::DEFAULT_LOG_PATH.to_string(),
+            None => self.server.default_access_log().to_string(),
         }
     }
 }

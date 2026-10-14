@@ -22,7 +22,7 @@ use stop_bots::blocks::SourceFilter;
 use stop_bots::db::{Db, FirewallAction, FirewallRule, NewFirewallRule, RuleSource};
 use stop_bots::present::terminal_safe;
 use stop_bots::protection::Detector;
-use stop_bots::{accesslog, botlist, ipranges, nginx, say, say_err, say_inline, sshlog};
+use stop_bots::{accesslog, botlist, ipranges, nginx, say, say_err, say_inline, sshlog, webserver};
 
 const DEFAULT_DB_PATH: &str = stop_bots::db::SYSTEM_PATH;
 
@@ -70,8 +70,8 @@ const DB_HELP: &str =
 falling back to a per-user location if that is not writable";
 
 /// Help text shared by every `--root` flag.
-const ROOT_HELP: &str = "NGINX config root. Defaults to the one stored by `set-nginx-commands \
---root`, else /etc/nginx";
+const ROOT_HELP: &str = "The web server's config root. Defaults to the one stored by \
+`set-web-server --root` (or `set-nginx-commands --root`), else /etc/nginx, or /etc/apache2 for Apache";
 
 /// Help text shared by every detector subcommand's `--access-log`.
 const ACCESS_LOG_HELP: &str = "Read this NGINX access log instead of the stored one \
@@ -119,7 +119,7 @@ struct Cli {
 //   never the Rust variant (`ApplyBlocks`) or a table or module name.
 #[derive(Subcommand)]
 enum Command {
-    /// Discover NGINX sites under a config root and store them in the database
+    /// Discover the web server's sites under a config root and store them in the database
     #[command(alias = "scan")]
     ScanSites {
         #[arg(long, help = ROOT_HELP)]
@@ -137,7 +137,7 @@ enum Command {
         #[arg(long)]
         source: Option<PathBuf>,
     },
-    /// Apply the current blocking policy to every discovered NGINX site
+    /// Apply the current blocking policy to every discovered site
     ApplyBlocks {
         #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
@@ -743,6 +743,9 @@ enum Command {
     /// Off by default: a limit tuned for the wrong site turns away real
     /// visitors, and unlike a bot-pattern block there's no user agent to
     /// inspect afterwards to work out who was caught.
+    ///
+    /// NGINX only: Apache has no request-rate limit of its own, and on an
+    /// Apache host this setting writes nothing.
     SetRateLimit {
         /// Whether rate limiting is written into the site configs
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
@@ -868,7 +871,7 @@ enum Command {
     },
     /// Print the robots.txt that would be generated now, without writing it
     ShowRobotsTxt,
-    /// Set what NGINX sends a blocked request.
+    /// Set what the web server sends a blocked request.
     ///
     /// These are not interchangeable status codes; each says something
     /// different, and the difference matters most for clients caught by
@@ -884,6 +887,9 @@ enum Command {
     /// indistinguishable from the server being down. "tarpit" answers 403
     /// but throttles the body to a byte per second, holding the client's
     /// connection open — and one of yours.
+    ///
+    /// "teapot", "close" and "tarpit" are NGINX's: on Apache each is a
+    /// 403.
     ///
     /// Host-wide, and only changes what *would* be written: run
     /// `apply-blocks` afterwards to get the new response into the site
@@ -1086,6 +1092,40 @@ enum Command {
         root: Option<PathBuf>,
         /// Restore all three to their defaults.
         #[arg(long, conflicts_with_all = ["test", "reload", "root"])]
+        reset: bool,
+    },
+    /// Choose the web server whose sites this host protects.
+    ///
+    /// `nginx` is the default, and what every host was before there was a
+    /// choice. `apache` reads `<VirtualHost>` sections under /etc/apache2,
+    /// blocks with mod_rewrite (`a2enmod rewrite` if it is off), and tests
+    /// and reloads with `apache2ctl configtest` and `systemctl reload
+    /// apache2`. Stored in the host settings, so every command, the TUI and
+    /// the console follow it.
+    ///
+    /// Takes the chosen server's own commands and config root as
+    /// `set-nginx-commands` does NGINX's, for a server that is not where a
+    /// stock install puts it:
+    ///
+    ///   set-web-server apache --root /etc/httpd --test "apachectl -t"
+    ///
+    /// Pass no server to print what is in effect.
+    SetWebServer {
+        /// `nginx` or `apache`.
+        #[arg(value_parser = parse_web_server)]
+        server: Option<webserver::WebServer>,
+        /// The config check. Must exit non-zero on a bad config.
+        #[arg(long, requires = "server")]
+        test: Option<String>,
+        /// The reload.
+        #[arg(long, requires = "server")]
+        reload: Option<String>,
+        /// Where this host's site configs live, when that is not where a
+        /// stock install puts them.
+        #[arg(long, requires = "server")]
+        root: Option<PathBuf>,
+        /// Restore the server's commands and root to their defaults.
+        #[arg(long, requires = "server", conflicts_with_all = ["test", "reload", "root"])]
         reset: bool,
     },
     /// Report whether this host is actually protected.
@@ -1365,8 +1405,10 @@ enum InstallTarget {
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum UninstallTarget {
-    /// The blocks in every site, the generated conf.d files and
-    /// /etc/stop-bots/nginx.
+    /// The blocks in every site, the generated conf.d (or Apache's
+    /// conf-enabled) files and /etc/stop-bots/nginx (or apache), for the
+    /// web server the host settings choose.
+    #[value(alias = "web-server")]
     Nginx,
     /// The live nft table or iptables chain, the boot unit and the
     /// firewall scripts.
@@ -1842,6 +1884,22 @@ async fn run() -> Result<()> {
             root,
             reset,
         }) => set_nginx_commands(db, test, reload, root, reset),
+        Some(Command::SetWebServer {
+            server,
+            test,
+            reload,
+            root,
+            reset,
+        }) => set_web_server(
+            db,
+            server,
+            ServerSettings {
+                test,
+                reload,
+                root,
+                reset,
+            },
+        ),
         Some(Command::SetBlockResponse { response }) => set_block_response(db, response),
         Some(Command::SetRateLimit {
             enabled,
@@ -2020,7 +2078,7 @@ async fn run_tui(
     let defaulted = db_path.is_none();
     let db = open_db(db_path)?;
     stop_bots::firewall::seed_backend(&db, stop_bots::firewall::Installed::detect())?;
-    let root = nginx::root(&host_settings()?, root.as_deref());
+    let root = webserver::root(&host_settings()?, root.as_deref());
     let notice = stop_bots::db::location_notice(db.path().as_deref(), defaulted);
     let mut app = stop_bots::app::App::new(db, root, !no_reload, ssh_log)?;
     app.db_notice = notice;
@@ -2140,7 +2198,7 @@ async fn run_batch(db_path: Option<PathBuf>, request: BatchRequest, verbose: boo
     let db = open_db(db_path)?;
     let host = host_settings()?;
     let request = BatchRequest {
-        root: Some(nginx::root(&host, request.root.as_deref())),
+        root: Some(webserver::root(&host, request.root.as_deref())),
         ..request
     };
 
@@ -2174,9 +2232,11 @@ async fn run_batch(db_path: Option<PathBuf>, request: BatchRequest, verbose: boo
 
 fn scan_sites(root: Option<&Path>, db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
-    let root = nginx::root(&host_settings()?, root);
+    let host = host_settings()?;
+    let server = host.web_server();
+    let root = webserver::root(&host, root);
     let root = root.as_path();
-    let sites = nginx::discover_sites(root)?;
+    let sites = server.discover_sites(root)?;
     for site in &sites {
         db.upsert_site(&site.server_name, &site.config_path.to_string_lossy())?;
     }
@@ -2189,7 +2249,7 @@ fn scan_sites(root: Option<&Path>, db_path: Option<PathBuf>) -> Result<()> {
     // before it matters: see `stop_bots::services`.
     let mut named = std::collections::BTreeSet::new();
     for site in &sites {
-        if let Some(service) = nginx::site_service(&site.config_path, &site.server_name) {
+        if let Some(service) = server.site_service(&site.config_path, &site.server_name) {
             named.insert((site.server_name.as_str(), service.name()));
         }
     }
@@ -2223,8 +2283,9 @@ async fn update_bot_lists(
 fn preview_apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, diff: bool) -> Result<()> {
     let db = open_db(db_path)?;
     botlist::register_all_sources(&db)?;
-    let root = nginx::root(&host_settings()?, root);
-    let changes = nginx::preview_all_sites(&db, &root);
+    let host = host_settings()?;
+    let root = webserver::root(&host, root);
+    let changes = webserver::preview_all_sites(host.web_server(), &db, &root);
     say!("Dry run: nothing is written or reloaded.");
     let changes = changes.map_err(|err| format!("{err:#}"));
     for line in stop_bots::preview::nginx_lines(&changes) {
@@ -2259,7 +2320,7 @@ fn preview_batch(db_path: Option<PathBuf>, request: BatchRequest, diff: bool) ->
     // it would show a fresh host an NGINX plane with nothing to change.
     botlist::register_all_sources(&db)?;
     let host = host_settings()?;
-    let root = nginx::root(&host, request.root.as_deref());
+    let root = webserver::root(&host, request.root.as_deref());
     let (backend, out) = firewall_target(&db, request.backend, request.out)?;
     let run = stop_bots::firewall::FirewallRun::new(backend, out)
         .apply(request.apply)
@@ -2267,6 +2328,7 @@ fn preview_batch(db_path: Option<PathBuf>, request: BatchRequest, diff: bool) ->
     // The flag, else the path `set-log-paths` stored, else the search.
     let source = host.log_paths().ssh(request.ssh_log.as_deref());
     let preview = stop_bots::preview::apply_everything(
+        host.web_server(),
         &db,
         &root,
         run,
@@ -2294,11 +2356,12 @@ fn apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, no_reload: bool) 
     // nothing else ever would.
     botlist::register_all_sources(&db)?;
     let host = host_settings()?;
-    let root = nginx::root(&host, root);
+    let root = webserver::root(&host, root);
     // Tested, put back if the test fails, and reloaded only when something
     // actually changed on disk.
     let commands = (!no_reload).then(|| host.commands()).transpose()?;
-    let outcome = nginx::apply_all_sites_and_reload(&db, &root, commands.as_ref())?;
+    let outcome =
+        webserver::apply_all_sites_and_reload(host.web_server(), &db, &root, commands.as_ref())?;
     say!(
         "Applied blocking rules to {} site(s) across {} file(s), {} file(s) changed",
         outcome.sites,
@@ -2684,7 +2747,7 @@ fn set_site_rule(
     rule: String,
     enabled: bool,
 ) -> Result<()> {
-    use stop_bots::nginx::RequestRule;
+    use stop_bots::webserver::RequestRule;
 
     let db = open_db(db_path)?;
     let site = find_site(&db, &site)?;
@@ -3341,7 +3404,7 @@ fn list_bots(db_path: Option<PathBuf>, search: Option<String>) -> Result<()> {
 
 fn show_robots_txt(db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
-    say_inline!("{}", nginx::robots_txt_body(&db)?);
+    say_inline!("{}", webserver::robots_txt_body(&db)?);
     Ok(())
 }
 
@@ -3586,7 +3649,7 @@ fn run_set_log_paths(
         Some(path) => say!("  access log: {}", path.display()),
         None => say!(
             "  access log: {} (default — nothing stored)",
-            stop_bots::accesslog::DEFAULT_LOG_PATH
+            paths.server.default_access_log()
         ),
     }
     match &paths.ssh {
@@ -4035,7 +4098,7 @@ async fn run_web(
     // every other verb run as root move the host settings.
     let db = open_db_as_is(db_path)?;
     stop_bots::firewall::seed_backend(&db, stop_bots::firewall::Installed::detect())?;
-    let root = nginx::root(&host_settings()?, root.as_deref());
+    let root = webserver::root(&host_settings()?, root.as_deref());
     let db_notice = stop_bots::db::location_notice(db.path().as_deref(), defaulted);
 
     // The same registration the TUI does on startup, and for the same
@@ -4191,38 +4254,116 @@ fn set_nginx_commands(
     root: Option<PathBuf>,
     reset: bool,
 ) -> Result<()> {
-    use stop_bots::nginx::NginxCommands;
+    store_server_settings(
+        db_path,
+        webserver::WebServer::Nginx,
+        false,
+        ServerSettings {
+            test,
+            reload,
+            root,
+            reset,
+        },
+    )
+}
+
+/// What `set-web-server` and `set-nginx-commands` may change about one
+/// server.
+struct ServerSettings {
+    test: Option<String>,
+    reload: Option<String>,
+    root: Option<PathBuf>,
+    reset: bool,
+}
+
+fn parse_web_server(id: &str) -> std::result::Result<webserver::WebServer, String> {
+    webserver::WebServer::from_id(id).ok_or_else(|| {
+        format!(
+            "not a web server stop-bots knows: choose one of {}",
+            webserver::WebServer::ALL
+                .map(webserver::WebServer::id)
+                .join(", ")
+        )
+    })
+}
+
+fn set_web_server(
+    db_path: Option<PathBuf>,
+    server: Option<webserver::WebServer>,
+    settings: ServerSettings,
+) -> Result<()> {
+    match server {
+        Some(server) => store_server_settings(db_path, server, true, settings),
+        None => {
+            let _db = open_db(db_path)?;
+            let host = stop_bots::hostconf::HostConf::load()?;
+            say!("Web server:     {}", host.web_server().label());
+            print_server_settings(&host)
+        }
+    }
+}
+
+/// Stores `settings` for `server`, and with `choose` makes it the host's
+/// web server, then prints what is in effect for it.
+fn store_server_settings(
+    db_path: Option<PathBuf>,
+    server: webserver::WebServer,
+    choose: bool,
+    settings: ServerSettings,
+) -> Result<()> {
+    use stop_bots::hostconf::HostConf;
 
     // Opened for the migration only, as in `set-log-paths`: these are the
     // host's settings now, in `hostconf::path()`, which only root writes.
     let _db = open_db(db_path)?;
     let path = stop_bots::hostconf::path();
-    let mut host = stop_bots::hostconf::HostConf::load_from(&path)?;
-    let changing = reset || root.is_some() || test.is_some() || reload.is_some();
+    let mut host = HostConf::load_from(&path)?;
+    let ServerSettings {
+        test,
+        reload,
+        root,
+        reset,
+    } = settings;
+    let changing = choose || reset || root.is_some() || test.is_some() || reload.is_some();
+    if choose {
+        host.web_server = Some(server);
+    }
+    let (test_field, reload_field, root_field) = match server {
+        webserver::WebServer::Nginx => (
+            &mut host.nginx_test_command,
+            &mut host.nginx_reload_command,
+            &mut host.nginx_root,
+        ),
+        webserver::WebServer::Apache => (
+            &mut host.apache_test_command,
+            &mut host.apache_reload_command,
+            &mut host.apache_root,
+        ),
+    };
 
     if reset {
-        host.nginx_test_command = None;
-        host.nginx_reload_command = None;
-        host.nginx_root = None;
+        *test_field = None;
+        *reload_field = None;
+        *root_field = None;
     }
     if let Some(root) = &root {
         // Made absolute, because the service that reads it does not run
         // where this did; not canonicalised, because a symlink an operator
         // chose deliberately is not this command's to resolve.
-        host.nginx_root =
+        *root_field =
             Some(std::path::absolute(root).with_context(|| {
                 format!("{} is not a path this host can resolve", root.display())
             })?);
     }
     for (name, value, field) in [
-        ("--test", &test, &mut host.nginx_test_command),
-        ("--reload", &reload, &mut host.nginx_reload_command),
+        ("--test", &test, test_field),
+        ("--reload", &reload, reload_field),
     ] {
         let Some(value) = value else { continue };
         // Parsed before it is stored, so an unbalanced quote is rejected
         // here rather than at the next reload — which could be a cron run
         // hours later with nobody watching.
-        stop_bots::nginx::split_command(value)
+        stop_bots::webserver::split_command(value)
             .with_context(|| format!("refusing to store an unusable command for {name}"))?;
         *field = Some(value.clone());
     }
@@ -4230,7 +4371,18 @@ fn set_nginx_commands(
         host.save_to(&path)?;
     }
 
-    let commands = NginxCommands::from_host(&host)?;
+    if choose {
+        say!("Web server:     {}", server.label());
+    }
+    print_server_settings(&HostConf {
+        web_server: Some(server),
+        ..host
+    })
+}
+
+/// The commands and root `host` resolves for its web server.
+fn print_server_settings(host: &stop_bots::hostconf::HostConf) -> Result<()> {
+    let commands = webserver::ServerCommands::from_host(host)?;
     say!("Test command:   {}", commands.test.join(" "));
     say!("Reload command: {}", commands.reload.join(" "));
     say!("Config root:    {}", host.root(None).display());

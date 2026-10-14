@@ -31,8 +31,8 @@
 //! separate argument to `block_text` and an already-applied site will read
 //! as up to date while its config still carries the old text.
 
-use crate::db::BlockResponse;
 pub use crate::dirfd::DirFile;
+use crate::webserver::*;
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -40,6 +40,9 @@ use walkdir::WalkDir;
 
 const BLOCK_BEGIN: &str = "# BEGIN stop-bots (DO NOT EDIT)";
 const BLOCK_END: &str = "# END stop-bots";
+
+/// The stock location, and what every host had before this was configurable.
+pub const DEFAULT_ROOT: &str = "/etc/nginx";
 
 /// A `server { ... }` block found while scanning a config file.
 #[derive(Debug, Clone)]
@@ -59,13 +62,6 @@ pub struct ServerBlock {
     pub is_tls: bool,
     open: usize,
     close: usize,
-}
-
-/// A site discovered while scanning a config directory.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DiscoveredSite {
-    pub server_name: String,
-    pub config_path: PathBuf,
 }
 
 /// A config file split the way NGINX's own reader (`ngx_conf_read_token`)
@@ -916,7 +912,7 @@ impl Shape<'_> {
 /// they came from: a row stored by an older release, a list fetched before
 /// a check existed. [`skipped_entries`] names what is left out, for the
 /// status report.
-fn usable_patterns(patterns: &[String]) -> Vec<&str> {
+pub(crate) fn usable_patterns(patterns: &[String]) -> Vec<&str> {
     patterns
         .iter()
         .map(String::as_str)
@@ -1000,7 +996,7 @@ fn reaches_pcre_intact(regex: &str) -> bool {
 /// sentinel block in a real config file (confirmed empirically too: a
 /// 2000-byte quoted parameter still parses fine even after ~10KB of
 /// preceding file content).
-const MAX_PATTERN_CHUNK_LEN: usize = 2000;
+pub(crate) const MAX_PATTERN_CHUNK_LEN: usize = 2000;
 
 /// Joins `patterns` with `|` into regexes of at most `max_len` bytes each
 /// once written by [`nginx_quoted`], **never splitting a pattern**. A
@@ -1016,7 +1012,7 @@ const MAX_PATTERN_CHUNK_LEN: usize = 2000;
 /// a config that root loads, unattended, from cron. Whole patterns are
 /// what keep each chunk a regex; [`nginx_quoted`] is what keeps it inside
 /// its quotes whatever it ends in.
-fn chunk_patterns(patterns: &[&str], max_len: usize) -> Vec<String> {
+pub(crate) fn chunk_patterns(patterns: &[&str], max_len: usize) -> Vec<String> {
     let mut chunks: Vec<(String, usize)> = Vec::new();
     for pattern in patterns {
         let len = quoted_len(pattern);
@@ -1207,301 +1203,21 @@ pub fn untrusted_rate_limit_conf_path(conf_d: &Path) -> PathBuf {
 /// refuses to start with "unknown limit_req_zone".
 const RATE_LIMIT_ZONE: &str = "stop_bots";
 
-/// An optional per-site rule that decides a request is unwanted from its
-/// *shape* rather than from a user-agent pattern.
-///
-/// Each is a separate toggle rather than one "strict requests" switch, and
-/// deliberately so: if four rules hid behind one setting and an admin's
-/// monitoring stopped working, they'd have no way to tell which one did
-/// it. Every variant is off by default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RequestRule {
-    /// HTTP/1.0 and HTTP/1.1. Only emitted in TLS blocks — see
-    /// [`for_block`].
-    Http1x,
-    /// No `Accept` header. Every browser sends one; a fair amount of
-    /// tooling sends nothing.
-    NoAccept,
-    /// No `Accept-Language`. Browsers send it; most scripts don't. Weaker
-    /// than `NoAccept` — some privacy configurations strip it.
-    NoAcceptLanguage,
-    /// Empty or absent `User-Agent`. Distinct from bot-pattern matching,
-    /// which can only catch agents that identify themselves.
-    NoUserAgent,
-    /// A `Host` that is a bare IP address rather than a name. Scanners
-    /// sweep address ranges; real visitors arrive by hostname.
-    IpLiteralHost,
-    /// TLS 1.0 and 1.1. The same "only modern clients" argument as
-    /// [`Self::Http1x`] but on firmer ground — both are formally
-    /// deprecated and no current browser offers them. Inert outside a TLS
-    /// block, where `$ssl_protocol` is empty.
-    OldTls,
-}
-
-impl RequestRule {
-    pub const ALL: [RequestRule; 6] = [
-        RequestRule::Http1x,
-        RequestRule::NoAccept,
-        RequestRule::NoAcceptLanguage,
-        RequestRule::NoUserAgent,
-        RequestRule::IpLiteralHost,
-        RequestRule::OldTls,
-    ];
-
-    /// Stable id — a `site_request_rules.rule` value in every installed
-    /// database, so never rename one without a migration.
-    pub fn id(self) -> &'static str {
-        match self {
-            RequestRule::Http1x => "http_1x",
-            RequestRule::NoAccept => "no_accept",
-            RequestRule::NoAcceptLanguage => "no_accept_language",
-            RequestRule::NoUserAgent => "no_user_agent",
-            RequestRule::IpLiteralHost => "ip_literal_host",
-            RequestRule::OldTls => "old_tls",
-        }
+/// A request rule's NGINX condition, without the surrounding `if (...)`.
+/// A regex in one is written by [`nginx_quoted`], like every other.
+fn condition(rule: RequestRule) -> String {
+    let matches = |variable: &str, regex: &str| format!("{variable} ~ {}", nginx_quoted(regex));
+    match rule {
+        RequestRule::Http1x => matches("$server_protocol", r"^HTTP/1\."),
+        RequestRule::NoAccept => r#"$http_accept = """#.to_string(),
+        RequestRule::NoAcceptLanguage => r#"$http_accept_language = """#.to_string(),
+        RequestRule::NoUserAgent => r#"$http_user_agent = """#.to_string(),
+        // Anchored, and matching both an IPv4 literal and a bracketed
+        // IPv6 one. `$host` is already lowercased and port-stripped by
+        // NGINX, which `$http_host` is not.
+        RequestRule::IpLiteralHost => matches("$host", r"^(\d+\.\d+\.\d+\.\d+|\[)"),
+        RequestRule::OldTls => matches("$ssl_protocol", r"^TLSv1(\.[01])?$"),
     }
-
-    pub fn from_id(id: &str) -> Option<RequestRule> {
-        RequestRule::ALL.into_iter().find(|r| r.id() == id)
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            RequestRule::Http1x => "HTTP/1.x requests",
-            RequestRule::NoAccept => "No Accept header",
-            RequestRule::NoAcceptLanguage => "No Accept-Language",
-            RequestRule::NoUserAgent => "No User-Agent",
-            RequestRule::IpLiteralHost => "Host is an IP",
-            RequestRule::OldTls => "TLS 1.0 / 1.1",
-        }
-    }
-
-    /// A one-line note on what this turns away besides bots, shown next to
-    /// the toggle. Every one of these has collateral; saying so at the
-    /// point of the decision is the whole point.
-    pub fn caveat(self) -> &'static str {
-        match self {
-            RequestRule::Http1x => "also turns away crawlers and API clients",
-            RequestRule::NoAccept => "some API clients send none",
-            RequestRule::NoAcceptLanguage => "privacy tooling strips it",
-            RequestRule::NoUserAgent => "scripts and health checks often omit it",
-            RequestRule::IpLiteralHost => "breaks reaching the site by IP",
-            RequestRule::OldTls => "very old clients only",
-        }
-    }
-
-    /// Whether the rule can only work in a TLS-terminating block.
-    fn needs_tls(self) -> bool {
-        matches!(self, RequestRule::Http1x | RequestRule::OldTls)
-    }
-
-    /// The NGINX condition, without the surrounding `if (...)`. A regex in
-    /// one is written by [`nginx_quoted`], like every other.
-    fn condition(self) -> String {
-        let matches = |variable: &str, regex: &str| format!("{variable} ~ {}", nginx_quoted(regex));
-        match self {
-            RequestRule::Http1x => matches("$server_protocol", r"^HTTP/1\."),
-            RequestRule::NoAccept => r#"$http_accept = """#.to_string(),
-            RequestRule::NoAcceptLanguage => r#"$http_accept_language = """#.to_string(),
-            RequestRule::NoUserAgent => r#"$http_user_agent = """#.to_string(),
-            // Anchored, and matching both an IPv4 literal and a bracketed
-            // IPv6 one. `$host` is already lowercased and port-stripped by
-            // NGINX, which `$http_host` is not.
-            RequestRule::IpLiteralHost => matches("$host", r"^(\d+\.\d+\.\d+\.\d+|\[)"),
-            RequestRule::OldTls => matches("$ssl_protocol", r"^TLSv1(\.[01])?$"),
-        }
-    }
-}
-
-/// Everything that shapes one site's generated sentinel block. Grouped into
-/// a struct rather than passed as loose arguments because the block's
-/// *content* is what [`site_apply_status`] compares against disk: every
-/// field here is something that, when changed, must make an
-/// already-applied site read as `Stale`. Adding a knob that affects the
-/// generated text without adding it here would silently break that check.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct BlockConfig {
-    /// The per-site blocked user-agent patterns, as computed by
-    /// `Db::blocked_user_agent_patterns_for_site`. Empty means "block
-    /// nothing", which removes any existing sentinel block.
-    pub patterns: Vec<String>,
-    /// How a matched request is turned away — host-wide, but carried here
-    /// per site since it's part of the rendered text.
-    pub response: BlockResponse,
-    /// Whether to serve the generated `robots.txt` (see
-    /// [`robots_txt_path`]) from this site. Host-wide, like `response`.
-    ///
-    /// Only a flag, not the body: the body can run to several kilobytes
-    /// with every AI bot listed, and NGINX's config parser rejects a
-    /// single quoted parameter past roughly 4KB (the same ceiling
-    /// [`MAX_PATTERN_CHUNK_LEN`] exists for), so `return 200 "<body>"` is
-    /// not an option. The block `alias`es a file instead, so the body
-    /// never appears in the config text at all — which also keeps the
-    /// staleness comparison stable when only the body changes.
-    pub serve_robots_txt: bool,
-    /// Per-server rate limiting: `Some(burst)` emits a `limit_req`
-    /// referencing the shared zone, `None` emits nothing.
-    ///
-    /// Only the burst, not the rate: the rate belongs to `limit_req_zone`,
-    /// which is an `http`-context directive living in a separate file (see
-    /// [`rate_limit_conf_path`]). Carrying the rate here too would invite
-    /// writing it into a `server` block where NGINX rejects it.
-    pub rate_limit_burst: Option<u32>,
-    /// Request-path prefixes this site's bot block does not apply to.
-    ///
-    /// Non-empty switches the block to its second shape (see
-    /// [`block_text`]): a `set $stop_bots_block` flag rather than a direct
-    /// `return`, because NGINX has no way to say "match this user agent
-    /// unless the path is one of these" in a single condition.
-    pub exempt_paths: Vec<String>,
-    /// Request-path prefixes exempt only for clients whose user agent
-    /// contains the given string, sorted by user agent (see
-    /// [`crate::db::AgentExemption`]). Rendered by
-    /// [`agent_exemption_clears`], after every set like the other clears.
-    pub agent_exemptions: Vec<crate::db::AgentExemption>,
-    /// Per-site [`RequestRule`]s switched on for this site.
-    ///
-    /// These decide a request is unwanted from its shape rather than from
-    /// a user-agent pattern, and they are the bluntest instruments in the
-    /// project. Two things make them survivable, and both are enforced
-    /// rather than documented:
-    ///
-    /// 1. **TLS-only rules are dropped in non-TLS blocks** (see
-    ///    [`for_block`]). Browsers don't negotiate HTTP/2 without TLS, so
-    ///    on a `listen 80` block every request is HTTP/1.1 — and a site's
-    ///    port-80 and port-443 blocks routinely share one `server_name`,
-    ///    which is what a per-site setting keys on.
-    /// 2. **`/.well-known/` is always exempt** whenever any of these is on
-    ///    (see `effective_exempt_paths`). ACME HTTP-01 validation is
-    ///    fetched over HTTP/1.1 by a non-browser client with no `Accept`
-    ///    and often no `User-Agent`; blocking it doesn't fail now, it
-    ///    fails at certificate renewal weeks later.
-    ///
-    /// What no guard fixes: each rule turns away some legitimate
-    /// non-browser client. See [`RequestRule::caveat`].
-    pub request_rules: Vec<RequestRule>,
-    /// The body of the trust file (see [`trusted_conf_body`]), or `None`
-    /// when nothing is trusted.
-    ///
-    /// Only whether it is `Some` reaches the block text — one `if` that
-    /// clears the flag. The body is carried anyway because it is part of
-    /// what this site's protection *is*: trusting a second user agent
-    /// changes no site's block, only the file, and a site whose file is
-    /// out of date must still read as `Stale` or nobody will apply it. See
-    /// [`trust_file_is_current`].
-    pub trust: Option<String>,
-}
-
-impl BlockConfig {
-    /// The common case: patterns plus the host-wide response setting.
-    pub fn new(patterns: Vec<String>, response: BlockResponse) -> Self {
-        BlockConfig {
-            patterns,
-            response,
-            ..BlockConfig::default()
-        }
-    }
-}
-
-/// Builds the `robots.txt` body from the current blocking policy: one
-/// `User-agent:` line per blocked bot, a single shared `Disallow: /`, and
-/// a `Disallow:` for the honeypot trap path.
-///
-/// **Grouped under one `Disallow`, not one stanza per bot.** Both are
-/// valid, and grouping roughly halves a file that can otherwise list well
-/// over a thousand agents. It also makes the intent obvious at a glance
-/// rather than burying it in repetition.
-///
-/// **A robots token, not a regex.** `bot.user_agent_pattern` is an NGINX
-/// regex fragment (and often an alternation); robots.txt has no regex, so
-/// the *name* is used, and only when it's a single word that could
-/// plausibly be a real token. Anything with whitespace or regex
-/// metacharacters is skipped rather than emitted as a broken rule — a
-/// `User-agent:` line no crawler matches is worse than no line, because it
-/// looks like coverage that isn't there.
-///
-/// **The honeypot line is emitted whether or not the honeypot detector is
-/// on.** Publishing the trap path is what *creates* the trap; a detector
-/// that's off simply doesn't act on hits yet. Publishing it only when the
-/// detector is enabled would mean turning the detector on and then waiting
-/// for crawlers to re-read robots.txt before it could ever fire.
-pub fn robots_txt_body(db: &crate::db::Db) -> Result<String> {
-    let blocked: Vec<String> = db
-        .list_bots()?
-        .into_iter()
-        .filter(|bot| db.bot_is_blocked(bot).unwrap_or(false))
-        .filter_map(|bot| robots_token(&bot))
-        .collect();
-
-    let mut out = managed_header();
-    out.push('\n');
-    if blocked.is_empty() {
-        // Still a valid, meaningful robots.txt: "everyone may crawl
-        // everything except the trap". Emitting nothing here would make an
-        // enabled feature serve an empty file, which reads as broken.
-        out.push_str("User-agent: *\nDisallow:\n\n");
-    } else {
-        for name in &blocked {
-            out.push_str(&format!("User-agent: {name}\n"));
-        }
-        out.push_str("Disallow: /\n\n");
-    }
-
-    let trap = crate::protection::honeypot_path(db)?;
-    out.push_str("User-agent: *\n");
-    out.push_str(&format!("Disallow: {trap}\n"));
-    Ok(out)
-}
-
-/// The `User-agent:` token to publish for `bot`, or `None` if nothing
-/// usable can be derived.
-///
-/// **Prefers the user-agent pattern over the display name**, which is not
-/// a cosmetic choice. A bot's `name` is humanised from its slug by the
-/// well-known-bots parser — `ai-search-bot` becomes `Ai Search Bot` — so
-/// it is both mis-cased *and* contains spaces, and a name with spaces is
-/// no use as a robots token. Filtering on the name alone meant the
-/// generated robots.txt listed **none** of that source's bots while still
-/// being served: a file that forbade nobody, which is worse than no file,
-/// because it looks like the feature is working.
-///
-/// The pattern is the substring the bot actually sends, which is exactly
-/// what a robots token is. Backslash escapes are undone (patterns are
-/// NGINX regex fragments: `Googlebot\/`), a trailing `/` is trimmed
-/// (`Googlebot/` is a UA prefix, not a token), and only the first
-/// alternative of a merged pattern is used — one `User-agent:` line has
-/// room for one token.
-fn robots_token(bot: &crate::db::Bot) -> Option<String> {
-    let first = bot.user_agent_pattern.split('|').next().unwrap_or_default();
-    let unescaped = first.replace('\\', "");
-    let candidate = unescaped.trim_end_matches('/');
-    if is_robots_token(candidate) {
-        return Some(candidate.to_string());
-    }
-    // A name that happens to be a clean token (ai.robots.txt keys entries
-    // by the real token, so this is the common path for that source).
-    is_robots_token(&bot.name).then(|| bot.name.clone())
-}
-
-/// Whether `name` can be used verbatim as a robots.txt `User-agent:`
-/// value. Deliberately strict: robots.txt matching is a simple
-/// case-insensitive substring test with no escaping, so anything with
-/// whitespace or punctuation beyond the few characters real tokens use
-/// is rejected rather than guessed at.
-fn is_robots_token(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
-}
-
-/// The burst to emit for this host, or `None` when rate limiting is off.
-fn rate_limit_burst(db: &crate::db::Db) -> Result<Option<u32>> {
-    if !db.get_rate_limit_enabled()? {
-        return Ok(None);
-    }
-    Ok(Some(db.get_rate_limit_burst()? as u32))
 }
 
 /// The contents of the generated `limit_req_zone` file.
@@ -1515,18 +1231,6 @@ pub fn rate_limit_conf_body(rate_per_second: i64, zone_megabytes: i64) -> String
         "{}limit_req_zone $binary_remote_addr zone={RATE_LIMIT_ZONE}:{zone_megabytes}m \
          rate={rate_per_second}r/s;\n",
         managed_header()
-    )
-}
-
-/// The first line of every file this module writes whole: which version
-/// generated it, and that it is not for editing.
-///
-/// Only in whole files. The sentinel block inside an operator's site file
-/// carries no version, for the reasons `crate::generated` gives.
-fn managed_header() -> String {
-    format!(
-        "# {}. Edits will be overwritten.\n",
-        crate::generated::generated_by()
     )
 }
 
@@ -1625,133 +1329,16 @@ pub fn trusted_conf_body(addresses: &[String], user_agents: &[String]) -> Option
 /// about what the file says having changed.
 fn trust_file_is_current(config: &BlockConfig, on_disk: Option<&str>) -> bool {
     match (&config.trust, block_text(config)) {
-        (Some(expected), Some(_)) => {
-            on_disk.is_some_and(|text| crate::generated::same_but_for_the_version(text, expected))
+        (Some(trust), Some(_)) => {
+            let expected = trusted_conf_body(&trust.addresses, &trust.user_agents);
+            on_disk
+                .zip(expected.as_deref())
+                .is_some_and(|(text, expected)| {
+                    crate::generated::same_but_for_the_version(text, expected)
+                })
         }
         _ => true,
     }
-}
-
-/// Creates or updates every file the config about to be written will
-/// reference. **Runs before any site config is touched**, so an `alias` or
-/// a `limit_req` never points at something that isn't there yet.
-///
-/// Deliberately does not delete anything — see
-/// [`remove_unused_managed_files`] for why the two halves are separate.
-pub fn write_managed_files(db: &crate::db::Db, root: &Path) -> Result<usize> {
-    let files = planned_managed_files(db, root)?;
-    record_managed_files(db, &files)?;
-    write_planned_managed_files(&files)
-}
-
-/// What a generated NGINX file is, as the `managed_files` record spells
-/// it.
-///
-/// Declared in the order these files can be removed in: a file that reads
-/// a variable or a zone another one defines goes before it (see
-/// [`unused_managed_files`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ManagedKind {
-    /// `stop-bots-limits-untrusted.conf`, which reads the trust file's
-    /// variable.
-    UntrustedLimits,
-    /// `stop-bots-limits.conf`.
-    Limits,
-    /// The generated `robots.txt`.
-    RobotsTxt,
-    /// `stop-bots-trusted.conf`, which the untrusted zone reads.
-    Trusted,
-}
-
-impl ManagedKind {
-    const ALL: [ManagedKind; 4] = [
-        ManagedKind::UntrustedLimits,
-        ManagedKind::Limits,
-        ManagedKind::RobotsTxt,
-        ManagedKind::Trusted,
-    ];
-
-    /// The id in `managed_files.kind`. Stored, so never renamed.
-    pub fn id(self) -> &'static str {
-        match self {
-            ManagedKind::UntrustedLimits => "nginx-untrusted-limits",
-            ManagedKind::Limits => "nginx-limits",
-            ManagedKind::RobotsTxt => "nginx-robots-txt",
-            ManagedKind::Trusted => "nginx-trusted",
-        }
-    }
-
-    pub fn from_id(id: &str) -> Option<ManagedKind> {
-        ManagedKind::ALL.into_iter().find(|kind| kind.id() == id)
-    }
-
-    /// The kind of a file this module writes, by its name — which is
-    /// fixed for each kind wherever the file lives.
-    pub fn of(path: &Path) -> Option<ManagedKind> {
-        let name = path.file_name()?.to_str()?;
-        let conf_d = Path::new("");
-        ManagedKind::ALL.into_iter().find(|kind| {
-            let own = match kind {
-                ManagedKind::UntrustedLimits => untrusted_rate_limit_conf_path(conf_d),
-                ManagedKind::Limits => rate_limit_conf_path(conf_d),
-                ManagedKind::RobotsTxt => PathBuf::from("robots.txt"),
-                ManagedKind::Trusted => trusted_conf_path(conf_d),
-            };
-            own.as_os_str() == name
-        })
-    }
-}
-
-/// Records every file in `files` as about to be written, and forgets
-/// recorded ones that are gone and not about to come back.
-///
-/// **Before the write, not after.** The record is what cleaning up works
-/// from, so it must never be missing a file that exists: a process that
-/// dies between the two leaves a row for a file that may not exist, which
-/// costs one no-op removal, rather than a file no row names, which would
-/// never be removed at all.
-///
-/// Called wherever a `Db` is at hand ahead of [`write_planned_managed_files`]:
-/// here, by [`write_managed_files`] and [`apply_site_and_reload`], and by
-/// the TUI when it plans an apply on the main thread.
-pub fn record_managed_files(db: &crate::db::Db, files: &[(PathBuf, String)]) -> Result<()> {
-    let recorded: Vec<PathBuf> = files.iter().map(|(path, _)| recorded_form(path)).collect();
-    for path in &recorded {
-        if let Some(kind) = ManagedKind::of(path) {
-            db.record_managed_file(path, kind.id())?;
-        }
-    }
-    for row in db.managed_files()? {
-        let known = ManagedKind::from_id(&row.kind).is_some();
-        let planned = recorded.contains(&row.path);
-        if known && !planned && fs::symlink_metadata(&row.path).is_err() {
-            db.forget_managed_file(&row.path)?;
-        }
-    }
-    Ok(())
-}
-
-/// `path` as the record keeps it: its directory resolved, so that the
-/// record names it the way [`unused_managed_files`] will accept it back
-/// (see [`DirFile::exactly`]). As it is if its directory is not there yet.
-fn recorded_form(path: &Path) -> PathBuf {
-    match (path.parent().map(fs::canonicalize), path.file_name()) {
-        (Some(Ok(dir)), Some(name)) => dir.join(name),
-        _ => path.to_path_buf(),
-    }
-}
-
-/// Whether the regular file `file` is one this project generated, by its
-/// header. Read through its directory's descriptor, without following a
-/// link or waiting on a FIFO.
-///
-/// Asked before removing a file the record names in a place the current
-/// settings would not write to: the record says stop-bots wrote a file
-/// there once, and this says it is still that file rather than one an
-/// operator has since put in its place.
-pub fn is_generated(file: &DirFile) -> bool {
-    file.first_line()
-        .is_some_and(|first| first.starts_with('#') && first.contains("Generated by stop-bots"))
 }
 
 /// The managed files the current settings call for, as `(path, body)`
@@ -1797,134 +1384,22 @@ pub fn planned_managed_files(db: &crate::db::Db, root: &Path) -> Result<Vec<(Pat
     Ok(files)
 }
 
-/// Writes what [`planned_managed_files`] resolved. Touches no `Db`.
-///
-/// Returns how many files it actually changed, because that can be the
-/// whole of an apply: trusting a second user agent rewrites the trust
-/// file and no site's block, and an apply that counted only site files
-/// would decide NGINX had nothing new to read and never reload it.
-pub fn write_planned_managed_files(files: &[(PathBuf, String)]) -> Result<usize> {
-    let mut changed = 0;
-    for (path, body) in files {
-        if fs::read_to_string(path).ok().as_deref() != Some(body.as_str()) {
-            write_managed(path, body)?;
-            changed += 1;
-        }
-    }
-    Ok(changed)
-}
-
-/// Deletes every file this project owns that the current settings no
-/// longer reference. **Runs after site configs have been rewritten**, and
-/// that ordering is load-bearing rather than tidy:
-///
-/// A `server` block containing `limit_req zone=stop_bots;` whose
-/// `limit_req_zone` has been deleted is not a degraded config, it's an
-/// invalid one — NGINX refuses to load with "unknown limit_req_zone", so
-/// `nginx -t` fails and the *whole* reload is rejected, including every
-/// unrelated site. Removing the zone only once no block references it any
-/// more means the config on disk is valid at every point in between, so
-/// an apply that dies half way (a permission error on one file, say)
-/// leaves a working NGINX rather than one that won't reload at all.
-///
-/// A missing file is success, not an error.
-pub fn remove_unused_managed_files(db: &crate::db::Db, root: &Path) -> Result<usize> {
-    let unused = unused_managed_files(db, root)?;
-    remove_and_forget(db, &unused)
-}
-
-/// Removes `unused`, as [`unused_managed_files`] resolved it, and forgets
-/// each one's row.
-fn remove_and_forget(db: &crate::db::Db, unused: &[DirFile]) -> Result<usize> {
-    let removed = remove_planned_managed_files(unused)?;
-    for file in unused {
-        db.forget_managed_file(file.path())?;
-    }
-    Ok(removed)
-}
-
-/// The managed files the current settings no longer reference. Split from
-/// the removal for the same reason [`planned_managed_files`] is split from
-/// the write.
-///
-/// Two sources, in the order they may be removed ([`ManagedKind`]'s):
-///
-/// - **The record** of what was written (`managed_files`): every file
-///   stop-bots wrote that the current settings would not write where it
-///   is. This is what finds a set left in a `conf.d` the root no longer
-///   points at, and a file an earlier release wrote that this one does not
-///   know by name. Each is checked to still be a generated file first.
-/// - **The fixed list** of where each file would be now, for files written
-///   before the record existed. Removing one that is not there is a no-op.
-///
-/// Each comes back with its directory held open ([`DirFile`]): what is
-/// removed, read or put back later is in the directory checked here, even
-/// if a name on the way to it has changed since.
-pub fn unused_managed_files(db: &crate::db::Db, root: &Path) -> Result<Vec<DirFile>> {
-    let planned: Vec<PathBuf> = planned_managed_files(db, root)?
-        .iter()
-        .map(|(path, _)| recorded_form(path))
-        .collect();
-    let mut files = Vec::new();
-    for path in fallback_unused_managed_files(db, root)? {
-        if let Some(file) = DirFile::locate(&path)
-            .with_context(|| format!("failed to open the directory of {}", path.display()))?
-        {
-            files.push(file);
-        }
-    }
-    let within = managed_directories(root);
-    for row in db.managed_files()? {
-        let Some(kind) = ManagedKind::from_id(&row.kind) else {
-            continue;
-        };
-        if planned.contains(&row.path)
-            || files.iter().any(|file| file.path() == row.path)
-            || ManagedKind::of(&row.path) != Some(kind)
-        {
-            continue;
-        }
-        if let Some(file) = removable_record(&row.path, &within) {
-            files.push(file);
-        }
-    }
-    // Stable, so the fixed list's own order survives within a kind.
-    files.sort_by_key(|file| ManagedKind::of(file.path()));
-    Ok(files)
-}
-
 /// The directories a recorded file may be removed from: the `conf.d`
 /// this root's files go into, and [`managed_dir`], each with its links
 /// resolved. A directory that does not exist is left out.
-fn managed_directories(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn managed_directories(root: &Path) -> Vec<PathBuf> {
     [conf_d_dir(root), managed_dir()]
         .iter()
         .filter_map(|dir| fs::canonicalize(dir).ok())
         .collect()
 }
 
-/// The `managed_files` row naming `path`, if it may be acted on: a
-/// regular file, not a link, directly inside one of `within`, with this
-/// project's header — and `path` already resolved, with no link and no
-/// `..` anywhere in it.
-///
-/// **The record is not trusted.** The web console can write every row of
-/// the database, and this runs as root: a row naming `/etc/passwd`, a
-/// link to it, or `<conf.d>/../../passwd` must delete nothing. Nor may a
-/// row that reaches `conf.d` through a directory of the console's own
-/// (`/var/lib/stop-bots/link/...`): the console could point that link
-/// somewhere else between this check and the removal. So such a row is
-/// refused, and the one that passes comes back with its directory held
-/// open, which is what every later use goes through.
-fn removable_record(path: &Path, within: &[PathBuf]) -> Option<DirFile> {
-    let file = DirFile::exactly(path).ok()?;
-    (within.iter().any(|dir| dir == file.dir()) && file.is_regular() && is_generated(&file))
-        .then_some(file)
-}
-
 /// The fixed list: where each file the current settings do not call for
 /// would be, if it were written today.
-fn fallback_unused_managed_files(db: &crate::db::Db, root: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn fallback_unused_managed_files(
+    db: &crate::db::Db,
+    root: &Path,
+) -> Result<Vec<PathBuf>> {
     let conf_d = conf_d_dir(root);
     let mut paths = Vec::new();
     if !db.get_serve_robots_txt()? {
@@ -1945,227 +1420,6 @@ fn fallback_unused_managed_files(db: &crate::db::Db, root: &Path) -> Result<Vec<
         paths.push(trusted_conf_path(&conf_d));
     }
     Ok(paths)
-}
-
-/// Deletes what [`unused_managed_files`] resolved, through each one's
-/// directory descriptor. Touches no `Db`. Returns how many were actually
-/// there to delete — see [`write_planned_managed_files`] for why an apply
-/// needs the count.
-pub fn remove_planned_managed_files(files: &[DirFile]) -> Result<usize> {
-    let mut removed = 0;
-    for file in files {
-        if remove_managed(file)? {
-            removed += 1;
-        }
-    }
-    Ok(removed)
-}
-
-/// Writes a file this project owns outright. Replaced, never written
-/// through — see [`write_atomically`].
-fn write_managed(path: &Path, body: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    write_atomically(path, body.as_bytes(), 0o644, None)
-}
-
-/// Replaces `path` with `content`: a new file beside it, then a rename
-/// over it.
-///
-/// **A rename replaces a symlink; a write follows it.** Everything here
-/// runs as root, and on a host whose NGINX tree is a bind mount an
-/// unprivileged user may be able to create files in it. `fs::write` on a
-/// `conf.d/stop-bots-trusted.conf` they had made a link to `/etc/shadow`
-/// would have written our text there. The temporary file is created with
-/// `O_EXCL` under a random name, so a link planted at a guessed name makes
-/// the create fail rather than be followed. It is also what makes the
-/// write atomic: NGINX, or a reload that races us, sees the old file or
-/// the new one, never half of one.
-///
-/// A leading dot keeps the temporary file out of NGINX's own globs
-/// (`include sites-enabled/*`), which, like the shell's, skip dot files.
-fn write_atomically(
-    path: &Path,
-    content: &[u8],
-    mode: u32,
-    owner: Option<(u32, u32)>,
-) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    let name = path
-        .file_name()
-        .with_context(|| format!("{} has no file name", path.display()))?
-        .to_string_lossy();
-    for _ in 0..8 {
-        let temp = path.with_file_name(format!(".{name}.stop-bots-{:016x}", random_u64()));
-        let mut file = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)
-        {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => {
-                return Err(err).with_context(|| format!("failed to write {}", path.display()))
-            }
-        };
-        let written = (|| -> std::io::Result<()> {
-            file.write_all(content)?;
-            if let Some((uid, gid)) = owner {
-                // Best effort: only root can give a file away, and a
-                // non-root run that got this far owns what it replaces.
-                let _ = std::os::unix::fs::fchown(&file, Some(uid), Some(gid));
-            }
-            file.set_permissions(fs::Permissions::from_mode(mode))?;
-            file.sync_all()?;
-            fs::rename(&temp, path)
-        })();
-        if let Err(err) = written {
-            let _ = fs::remove_file(&temp);
-            return Err(err).with_context(|| format!("failed to write {}", path.display()));
-        }
-        return Ok(());
-    }
-    anyhow::bail!(
-        "failed to write {}: could not create a temporary file beside it",
-        path.display()
-    )
-}
-
-/// Unpredictable enough for a temporary file name, without a dependency:
-/// std seeds every `RandomState` from the OS.
-pub(crate) fn random_u64() -> u64 {
-    use std::hash::{BuildHasher, Hasher};
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    hasher.write_u128(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos()),
-    );
-    hasher.finish()
-}
-
-/// Where an operator's site file really is: `path` itself, or, when a
-/// symlink is involved, its target — which must be inside `root`.
-///
-/// Site files are legitimately links (`sites-enabled/x` to
-/// `../sites-available/x`), so a link is followed rather than replaced.
-/// But the same writable-tree case [`write_atomically`] is about applies:
-/// a link to a file outside the NGINX config is not one this tool was
-/// pointed at, and root rewriting whatever `server {` block it finds there
-/// is exactly what the link was planted for.
-fn resolve_site_file(path: &Path, root: &Path) -> Result<PathBuf> {
-    let resolved =
-        fs::canonicalize(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let as_given = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    if resolved == as_given {
-        return Ok(resolved);
-    }
-    let root = fs::canonicalize(root)
-        .with_context(|| format!("failed to read the NGINX root {}", root.display()))?;
-    if !resolved.starts_with(&root) {
-        anyhow::bail!(
-            "refusing to write {}: it links to {}, outside the NGINX root {}",
-            path.display(),
-            resolved.display(),
-            root.display()
-        );
-    }
-    Ok(resolved)
-}
-
-/// Writes an operator's site file in place of `path`, following a link to
-/// it (see [`resolve_site_file`]) and keeping its mode and owner.
-///
-/// A file the operator made read-only stays unwritten: a rename would
-/// replace it regardless of its permission bits, which is not what
-/// `chmod 444` was asking for — and running without root is reported as
-/// the permission error it is.
-fn write_site_file(path: &Path, root: &Path, content: &str) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let resolved = resolve_site_file(path, root)?;
-    fs::OpenOptions::new()
-        .write(true)
-        .open(&resolved)
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    let meta = fs::metadata(&resolved)
-        .with_context(|| format!("failed to read {}", resolved.display()))?;
-    write_atomically(
-        &resolved,
-        content.as_bytes(),
-        meta.mode() & 0o7777,
-        Some((meta.uid(), meta.gid())),
-    )
-}
-
-/// Removes a generated file, treating "already gone" as success.
-///
-/// Deleting rather than merely leaving it unreferenced matters most for
-/// the rate-limit zone: [`CONF_D_DIR`] is globbed by the stock
-/// `nginx.conf`, so a leftover file there stays *live* — it would keep
-/// allocating its shared memory zone forever after the feature was
-/// switched off. The `robots.txt` case is only inert-but-misleading, and
-/// is removed for consistency: a stale generated artifact on disk invites
-/// being wired back up by hand.
-fn remove_managed(file: &DirFile) -> Result<bool> {
-    file.remove()
-        .with_context(|| format!("failed to remove {}", file.path().display()))
-}
-
-/// The [`BlockConfig`] currently in effect for one site — its own resolved
-/// patterns (per-site overrides layered over the global cascade) plus every
-/// host-wide setting that shapes the generated text. Every caller that
-/// applies or status-checks a *specific* site goes through here rather than
-/// assembling the struct itself, so a newly added host-wide knob reaches
-/// all of them at once.
-pub fn block_config_for_site(db: &crate::db::Db, site_id: i64) -> Result<BlockConfig> {
-    Ok(BlockConfig {
-        patterns: db.blocked_user_agent_patterns_for_site(site_id)?,
-        response: db.get_block_response()?,
-        serve_robots_txt: db.get_serve_robots_txt()?,
-        rate_limit_burst: rate_limit_burst(db)?,
-        exempt_paths: db.site_path_exemptions(site_id)?,
-        agent_exemptions: db.site_agent_exemptions(site_id)?,
-        request_rules: site_request_rules(db, site_id)?,
-        trust: trusted_conf(db)?,
-    })
-}
-
-/// The request-shape rules switched on for one site, in a stable order.
-/// An unrecognised stored id is skipped rather than erroring: a database
-/// written by a newer build must not stop an older one from applying
-/// anything at all.
-pub fn site_request_rules(db: &crate::db::Db, site_id: i64) -> Result<Vec<RequestRule>> {
-    let mut rules: Vec<RequestRule> = db
-        .site_request_rules(site_id)?
-        .iter()
-        .filter_map(|id| RequestRule::from_id(id))
-        .collect();
-    rules.sort();
-    Ok(rules)
-}
-
-/// The [`BlockConfig`] for a `server` block with no site-specific overrides
-/// — the global cascade only. Used as `apply_blocks_to_file`'s
-/// `default_config` for blocks discovered on disk that were never scanned
-/// into the database.
-pub fn default_block_config(db: &crate::db::Db) -> Result<BlockConfig> {
-    Ok(BlockConfig {
-        patterns: db.blocked_user_agent_patterns()?,
-        response: db.get_block_response()?,
-        serve_robots_txt: db.get_serve_robots_txt()?,
-        rate_limit_burst: rate_limit_burst(db)?,
-        // A block with no site row has no per-site settings by
-        // definition — both are keyed on `sites.id`.
-        exempt_paths: Vec::new(),
-        agent_exemptions: Vec::new(),
-        request_rules: Vec::new(),
-        trust: trusted_conf(db)?,
-    })
 }
 
 /// Renders the sentinel block content (without surrounding blank lines) for
@@ -2270,7 +1524,7 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     for rule in &config.request_rules {
         out.push_str(&format!(
             "    if ({}) {{\n        {set_blocked}",
-            rule.condition()
+            condition(*rule)
         ));
     }
     for exemptions in &exemptions {
@@ -2326,43 +1580,6 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     }
     out.push_str(&format!("    {BLOCK_END}\n"));
     Some(out)
-}
-
-/// The exemptions actually applied, as `(prefixes, exact paths)`: the
-/// site's configured prefixes, plus `/robots.txt` itself — exactly that
-/// file, not everything under it — whenever this block serves it.
-///
-/// That addition is not a convenience, it's what makes robots.txt work at
-/// all. Server-level `if`/`return` run in NGINX's **server rewrite
-/// phase**, which happens *before* location selection — so a user agent
-/// caught by the block never reaches the `location = /robots.txt` block
-/// underneath it. Without this, the generated robots.txt would list
-/// exactly the agents that can never read it, and the polite layer would
-/// be pure decoration.
-///
-/// Letting a blocked crawler read robots.txt is also the behaviour worth
-/// wanting on its own: a bot that can fetch the file can learn to stop
-/// asking, whereas one that gets a bare 403 on everything learns nothing
-/// and keeps coming back. Serving it costs a single small static file.
-fn effective_exempt_paths(config: &BlockConfig) -> (Vec<String>, &'static [&'static str]) {
-    let mut paths = config.exempt_paths.clone();
-    let exact: &[&str] = if config.serve_robots_txt {
-        &["/robots.txt"]
-    } else {
-        &[]
-    };
-    if !config.request_rules.is_empty() {
-        // Never optional, and never surfaced as a setting to switch off.
-        // `/.well-known/` is where ACME HTTP-01 validation is fetched
-        // from, by a non-browser client speaking HTTP/1.1. Rejecting it
-        // doesn't break anything today — it breaks certificate renewal
-        // weeks later, which is about the least traceable failure this
-        // project could ship. The same path prefix carries security.txt
-        // and a pile of other machine-fetched documents, none of which
-        // negotiate HTTP/2 either.
-        paths.push("/.well-known/".to_string());
-    }
-    (paths, exact)
 }
 
 /// Narrows a site's config to what is actually safe to emit into *this*
@@ -2433,13 +1650,6 @@ fn console_prefix_in(content: &str, block: &ServerBlock) -> Option<String> {
     is_stored_as_valid(&prefix, crate::db::validate_exempt_path).then_some(prefix)
 }
 
-/// Whether `value`, as stored, is exactly what `validate` would store:
-/// how a row is checked again at render time rather than trusted, whatever
-/// wrote it.
-fn is_stored_as_valid(value: &str, validate: fn(&str) -> Result<String>) -> bool {
-    validate(value).is_ok_and(|valid| valid == value)
-}
-
 /// Builds the `$uri` regexes that clear the block flag, none when there
 /// are no usable exemptions: `prefixes` match anything under them, `exact`
 /// only themselves.
@@ -2467,7 +1677,7 @@ fn is_stored_as_valid(value: &str, validate: fn(&str) -> Result<String>) -> bool
 /// [`agent_exemption_clears`] gives: the raw request line is not the path
 /// NGINX serves, and `/robots.txt/../wp-login.php` begins with an exempt
 /// prefix while resolving to a blocked one.
-fn exemption_regexes(prefixes: &[String], exact: &[&str]) -> Vec<String> {
+pub(crate) fn exemption_regexes(prefixes: &[String], exact: &[&str]) -> Vec<String> {
     let usable = |p: &&str| is_stored_as_valid(p, crate::db::validate_exempt_path);
     let escaped: Vec<String> = prefixes
         .iter()
@@ -2622,28 +1832,6 @@ fn apply_block(content: &str, block: &ServerBlock, config: &BlockConfig) -> Stri
 const CONSOLE_BEGIN: &str = "# BEGIN stop-bots console (DO NOT EDIT)";
 const CONSOLE_END: &str = "# END stop-bots console";
 
-/// How the console is reached from outside this host.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConsoleAccess {
-    /// Its own `server` block on `host`, written as a new config file.
-    ///
-    /// Served over plain HTTP. Adding a certificate is a separate step
-    /// (certbot), and until it is taken, the console's password form and
-    /// its session cookie cross the network in the clear — which is why
-    /// [`ConsoleAccess::Path`] is the default the panel offers.
-    Subdomain { host: String },
-    /// A `location` block inserted into an existing site's `server` block,
-    /// which is how the console inherits that site's certificate.
-    Path {
-        /// Normalised with a leading and trailing slash, e.g. `/stop-bots/`.
-        prefix: String,
-        /// The site's config file, from `Db::list_sites`.
-        config_path: PathBuf,
-        /// The `server_name` whose block to edit.
-        server_name: String,
-    },
-}
-
 /// The `location` block that proxies to the console, shared by both modes.
 ///
 /// `proxy_pass` deliberately has **no** trailing slash, and the location
@@ -2754,47 +1942,6 @@ fn locate_console_block(content: &str, block: &ServerBlock) -> Option<(usize, us
     locate_marked(content, block, CONSOLE_BEGIN, CONSOLE_END)
 }
 
-/// Writes `content` to `path`, validates the whole NGINX config, and puts
-/// the previous state back if validation fails.
-///
-/// The reason this exists rather than a plain write: `apply_all_sites`
-/// writes then tests, which is survivable when it edited an existing file
-/// — but a *new* `server` block that fails `nginx -t` leaves the config
-/// unloadable, and nothing looks wrong because the running NGINX keeps
-/// serving from memory. The next reload is then somebody else's problem,
-/// most likely certbot's renewal hook at 3am.
-///
-/// `write` does the writing, both of `content` and of the restore, so the
-/// console's own file is replaced rather than written through
-/// ([`write_managed`]) and an operator's site file is written only where
-/// it really lives inside the root ([`write_site_file`]).
-fn write_validated(
-    path: &Path,
-    content: &str,
-    commands: &NginxCommands,
-    write: impl Fn(&Path, &str) -> Result<()>,
-) -> Result<()> {
-    let _lock = crate::applylock::hold()?;
-    let previous = fs::read_to_string(path).ok();
-    write(path, content).map_err(crate::hint::sudo_if_denied)?;
-
-    if let Err(err) = test_config(commands) {
-        // Put it back before reporting, so the operator is not left with a
-        // config that cannot be loaded.
-        let restored = match &previous {
-            Some(text) => write(path, text),
-            None => fs::remove_file(path).map_err(Into::into),
-        };
-        let note = if restored.is_ok() {
-            "the previous config was restored"
-        } else {
-            "AND RESTORING THE PREVIOUS CONFIG ALSO FAILED — fix this by hand"
-        };
-        anyhow::bail!("{err:#}\n\n{}: {}", note, path.display());
-    }
-    Ok(())
-}
-
 /// Sets the console up to be reachable, and returns what it did.
 ///
 /// Validated before it can take effect (see [`write_validated`]) and
@@ -2807,31 +1954,14 @@ pub fn apply_console_access(
     root: &Path,
     access: &ConsoleAccess,
     upstream: &std::net::SocketAddr,
-    commands: &NginxCommands,
+    commands: &ServerCommands,
 ) -> Result<PathBuf> {
-    // Checked again here, where they are written into a file a root NGINX
-    // loads, whatever checked them before: a front-end, or a request that
-    // came over the helper's socket.
-    match access {
-        ConsoleAccess::Subdomain { host } if !crate::webaccess::is_plausible_host(host) => {
-            anyhow::bail!("refusing to write a server block for {host:?}: it is not a host name")
-        }
-        ConsoleAccess::Path { prefix, .. }
-            if crate::web::BasePath::parse(prefix)
-                .ok()
-                .filter(|base| !base.is_root())
-                .map(|base| base.url("/"))
-                .as_deref()
-                != Some(prefix.as_str()) =>
-        {
-            anyhow::bail!("refusing to write a location for {prefix:?}: it is not a path prefix")
-        }
-        _ => {}
-    }
+    validate_console_access(access)?;
     match access {
         ConsoleAccess::Subdomain { host } => {
             let path = console_site_path(root);
             write_validated(
+                WebServer::Nginx,
                 &path,
                 &console_server_block(host, upstream),
                 commands,
@@ -2853,9 +1983,13 @@ pub fn apply_console_access(
                         config_path.display()
                     )
                 })?;
-            write_validated(config_path, &updated, commands, |path, text| {
-                write_site_file(path, root, text)
-            })?;
+            write_validated(
+                WebServer::Nginx,
+                config_path,
+                &updated,
+                commands,
+                |path, text| write_site_file(path, root, text),
+            )?;
             Ok(config_path.clone())
         }
     }
@@ -2905,113 +2039,6 @@ pub fn discover_sites(root: &Path) -> Result<Vec<DiscoveredSite>> {
         }
     }
     Ok(sites)
-}
-
-/// The file under `root` that declares `server_name`, found on disk.
-///
-/// The database records where a site was when it was scanned, and the
-/// web console can write that record. Whatever writes a site's file as
-/// root therefore asks the disk, and uses `recorded` only to tell apart
-/// two files that both declare the name: the one at the recorded path if
-/// it is among them, the only one if there is one, and otherwise none.
-pub fn locate_site(root: &Path, server_name: &str, recorded: Option<&Path>) -> Result<PathBuf> {
-    let discovered = discover_sites(root)?;
-    if let Some(found) = pick_site(&discovered, server_name, recorded) {
-        return Ok(found.to_path_buf());
-    }
-    let candidates = discovered
-        .iter()
-        .filter(|site| site.server_name == server_name)
-        .count();
-    match candidates {
-        0 => anyhow::bail!(
-            "no `server` block under {} is named {server_name} — re-scan sites and try again",
-            root.display()
-        ),
-        _ => anyhow::bail!(
-            "{candidates} files under {} declare {server_name}, and none is the one scanned — \
-             re-scan sites and try again",
-            root.display()
-        ),
-    }
-}
-
-/// [`locate_site`]'s choice among sites already discovered: the one named
-/// `server_name` at `recorded`, else the only one named `server_name`.
-fn pick_site<'a>(
-    discovered: &'a [DiscoveredSite],
-    server_name: &str,
-    recorded: Option<&Path>,
-) -> Option<&'a Path> {
-    let mut named = discovered
-        .iter()
-        .filter(|site| site.server_name == server_name)
-        .map(|site| site.config_path.as_path());
-    let all: Vec<&Path> = named.by_ref().collect();
-    if let Some(found) = recorded.and_then(|recorded| all.iter().find(|p| **p == recorded)) {
-        return Some(found);
-    }
-    match all.as_slice() {
-        [only] => Some(only),
-        _ => None,
-    }
-}
-
-/// The status of every scanned site, each judged against the file found
-/// for it on disk under `root` (see [`locate_site`]) rather than the one
-/// its row names. A site with no file there is [`SiteApplyStatus::NotFound`].
-pub fn site_statuses(db: &crate::db::Db, root: &Path) -> Result<Vec<(i64, SiteApplyStatus)>> {
-    let discovered = discover_sites(root).unwrap_or_default();
-    let conf_d = conf_d_dir(root);
-    let mut statuses = Vec::new();
-    for site in db.list_sites()? {
-        let status = match pick_site(
-            &discovered,
-            &site.server_name,
-            Some(Path::new(&site.config_path)),
-        ) {
-            Some(path) => site_apply_status(
-                path,
-                &site.server_name,
-                &block_config_for_site(db, site.id)?,
-                &conf_d,
-            ),
-            None => SiteApplyStatus::NotFound,
-        };
-        statuses.push((site.id, status));
-    }
-    Ok(statuses)
-}
-
-/// Applies the bot-blocking rule to every `server { ... }` block found in
-/// `config_path`. Each block gets the [`BlockConfig`] from `site_configs`
-/// belonging to its own `server_name` (its `names.first()`), or
-/// `default_config` if that name isn't in `site_configs` at all (e.g. a
-/// block discovered on disk that was never scanned into the db yet). A
-/// config that renders to nothing removes any existing block there.
-/// Returns whether the file was actually changed on disk.
-///
-/// Two blocks sharing the same `server_name` (e.g. a port-80-redirect block
-/// plus the real port-443 block for the same site) resolve to the same
-/// `site_configs` entry and so still get the same rule; two blocks with
-/// *different* names in the same file now correctly get independent rules.
-///
-/// `root` is the NGINX config root: a `config_path` that is a symlink is
-/// written through only to a target inside it (see [`write_site_file`]).
-pub fn apply_blocks_to_file(
-    config_path: &Path,
-    root: &Path,
-    site_configs: &[(String, BlockConfig)],
-    default_config: &BlockConfig,
-) -> Result<bool> {
-    let before = fs::read_to_string(config_path)
-        .with_context(|| format!("failed to read {}", config_path.display()))?;
-    let after = blocks_for_file(&before, config_path, site_configs, default_config)?;
-    if after == before {
-        return Ok(false);
-    }
-    write_site_file(config_path, root, &after)?;
-    Ok(true)
 }
 
 /// What [`apply_blocks_to_file`] would make of `content`, without writing
@@ -3064,23 +2091,6 @@ fn nth_block<'a>(
         );
     }
     Ok(&blocks[i])
-}
-
-/// Whether a site's on-disk config currently matches the blocking rule
-/// that would be computed for it right now — backs the TUI's per-site
-/// status tag in NGINX.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum SiteApplyStatus {
-    /// Every `server` block for this name already carries the expected
-    /// rule (or none is expected and none is present).
-    UpToDate,
-    /// At least one block for this name is missing the expected rule, or
-    /// carries a different one.
-    Stale,
-    /// The config file couldn't be read, or no `server` block in it
-    /// declares this `server_name` anymore (e.g. renamed or removed on
-    /// disk since the last scan).
-    NotFound,
 }
 
 /// The exact text of the sentinel block currently written inside `block`,
@@ -3227,30 +2237,6 @@ pub fn site_apply_status(
     }
 }
 
-/// Applies `config` only to the `server { ... }` block(s) in `config_path`
-/// whose first `server_name` is `server_name`, leaving every other block in
-/// the file completely untouched — unlike [`apply_blocks_to_file`], which
-/// resets every block it has no explicit entry for back to
-/// `default_config`. This backs the TUI's per-site "Apply now" action:
-/// applying one site's overrides must never silently rewrite an unrelated
-/// site sharing the same file. Returns whether the file was actually
-/// changed on disk. `root` is as for [`apply_blocks_to_file`].
-pub fn apply_block_for_site(
-    config_path: &Path,
-    root: &Path,
-    server_name: &str,
-    config: &BlockConfig,
-) -> Result<bool> {
-    let before = fs::read_to_string(config_path)
-        .with_context(|| format!("failed to read {}", config_path.display()))?;
-    let after = block_for_site(&before, config_path, server_name, config)?;
-    if after == before {
-        return Ok(false);
-    }
-    write_site_file(config_path, root, &after)?;
-    Ok(true)
-}
-
 /// What [`apply_block_for_site`] would make of `content`, without writing
 /// it.
 pub fn block_for_site(
@@ -3273,261 +2259,6 @@ pub fn block_for_site(
         content = apply_block(&content, block, config);
     }
     Ok(content)
-}
-
-/// One file an apply would change: its content before and after, `None`
-/// for a file that does not exist (before) or would be removed (after).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileChange {
-    pub path: PathBuf,
-    pub before: Option<String>,
-    pub after: Option<String>,
-}
-
-impl FileChange {
-    /// A unified diff of the change, labelled with the path.
-    pub fn diff(&self) -> String {
-        let label = self.path.display().to_string();
-        crate::diff::unified(
-            self.before.as_deref(),
-            self.after.as_deref(),
-            &label,
-            &label,
-        )
-    }
-
-    /// `(new)`, `(removed)` or nothing, for a summary line.
-    pub fn kind(&self) -> &'static str {
-        match (&self.before, &self.after) {
-            (None, Some(_)) => " (new)",
-            (Some(_), None) => " (removed)",
-            _ => "",
-        }
-    }
-}
-
-/// Every file [`apply_all_sites_and_reload`] would change under `root`,
-/// and how, without changing any of them: the generated files it would
-/// write or remove, and each site file it would rewrite. Through the same
-/// functions the apply uses, so a preview cannot promise something the
-/// apply then does differently.
-pub fn preview_all_sites(db: &crate::db::Db, root: &Path) -> Result<Vec<FileChange>> {
-    let sites = discover_sites(root)?;
-    let mut changes: Vec<FileChange> = Vec::new();
-    for (path, body) in planned_managed_files(db, root)? {
-        let before = fs::read_to_string(&path).ok();
-        if before.as_deref() != Some(body.as_str()) {
-            changes.push(FileChange {
-                path,
-                before,
-                after: Some(body),
-            });
-        }
-    }
-
-    let default_config = default_block_config(db)?;
-    let known_sites = db.list_sites()?;
-    let mut config_paths: Vec<_> = sites.iter().map(|s| s.config_path.clone()).collect();
-    config_paths.sort();
-    config_paths.dedup();
-    for path in config_paths {
-        // The same per-file join `apply_all_sites` makes, for its reason.
-        let site_configs: Vec<(String, BlockConfig)> = known_sites
-            .iter()
-            .filter(|s| Path::new(&s.config_path) == path.as_path())
-            .map(|s| Ok((s.server_name.clone(), block_config_for_site(db, s.id)?)))
-            .collect::<Result<_>>()?;
-        let before = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let after = blocks_for_file(&before, &path, &site_configs, &default_config)?;
-        if after != before {
-            changes.push(FileChange {
-                path,
-                before: Some(before),
-                after: Some(after),
-            });
-        }
-    }
-
-    for file in unused_managed_files(db, root)? {
-        if let Some(before) = file.read_to_string() {
-            changes.push(FileChange {
-                path: file.path().to_path_buf(),
-                before: Some(before),
-                after: None,
-            });
-        }
-    }
-    Ok(changes)
-}
-
-/// What [`apply_all_sites_and_reload`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ApplyAllOutcome {
-    pub sites: usize,
-    pub files: usize,
-    /// How many files were actually rewritten, generated ones (the trust
-    /// file, the rate-limit zone) included. Zero means NGINX has nothing
-    /// new to read, so there is no point reloading it.
-    pub changed: usize,
-    /// Whether the new config passed the test and NGINX was reloaded.
-    pub reloaded: bool,
-}
-
-/// Applies the current blocking policy to every site discovered under
-/// `root`, and — given `commands` — tests the result and reloads NGINX.
-/// The one way every front-end applies everything.
-///
-/// **A config that fails the test is put back.** Every file the apply may
-/// touch is read first ([`Snapshot`]); if the test then fails, each is
-/// restored byte for byte and each generated file this apply created is
-/// removed, before the error is returned. Writing and leaving it was
-/// survivable only in appearance: the running NGINX keeps serving the old
-/// config from memory, and the broken one is loaded by whatever reloads
-/// next — certbot's renewal hook at 3am, or a reboot — taking every site
-/// down together. A write that fails half way is put back the same way.
-///
-/// `None` writes without testing or reloading: `--no-reload` and
-/// `--no-apply`, for a host whose NGINX this process must not touch.
-///
-/// **One at a time**, across processes: it holds [`crate::applylock`]
-/// from before the snapshot to after the reload, and a second apply waits
-/// briefly and then reports that another stop-bots is applying.
-pub fn apply_all_sites_and_reload(
-    db: &crate::db::Db,
-    root: &Path,
-    commands: Option<&NginxCommands>,
-) -> Result<ApplyAllOutcome> {
-    // Before the snapshot, not after: what a failed test restores has to
-    // be the state no other apply was halfway through changing.
-    let _lock = crate::applylock::hold()?;
-    let sites = discover_sites(root)?;
-    // Resolved once, for the snapshot and the apply alike: what is put
-    // back on a failure is exactly what the apply may have changed.
-    let planned = planned_managed_files(db, root)?;
-    let unused = unused_managed_files(db, root)?;
-    let snapshot = Snapshot::of_apply(
-        root,
-        planned.iter().map(|(path, _)| path.clone()),
-        &unused,
-        sites.iter().map(|site| site.config_path.as_path()),
-    )?;
-
-    let outcome = match apply_all_sites(db, root, &sites, &planned, &unused) {
-        Ok(outcome) => outcome,
-        Err(err) => return Err(crate::hint::sudo_if_denied(snapshot.restore_after(err))),
-    };
-    let Some(commands) = commands.filter(|_| outcome.changed > 0) else {
-        return Ok(outcome);
-    };
-    test_or_restore(&snapshot, commands)?;
-    run(&commands.reload, "the NGINX reload")
-        .context("the new config passed the test, but the reload failed")?;
-    Ok(ApplyAllOutcome {
-        reloaded: true,
-        ..outcome
-    })
-}
-
-/// The writing half of [`apply_all_sites_and_reload`].
-///
-/// The ordering below is load-bearing: generated files are written
-/// *before* any config that aliases them, and unreferenced ones are
-/// deleted only *after* every config has been rewritten (see
-/// [`remove_unused_managed_files`]).
-fn apply_all_sites(
-    db: &crate::db::Db,
-    root: &Path,
-    sites: &[DiscoveredSite],
-    planned: &[(PathBuf, String)],
-    unused: &[DirFile],
-) -> Result<ApplyAllOutcome> {
-    record_managed_files(db, planned)?;
-    let mut changed = write_planned_managed_files(planned)?;
-    let default_config = default_block_config(db)?;
-    // Sites already known to the db (i.e. previously scanned) — the only
-    // ones that can carry a per-site override at all.
-    let known_sites = db.list_sites()?;
-
-    // A single config file commonly holds multiple `server` blocks for the
-    // same site (e.g. an HTTP redirect block plus the HTTPS one), so dedupe
-    // by file and apply once per file rather than once per discovered site.
-    let mut config_paths: Vec<_> = sites.iter().map(|s| s.config_path.clone()).collect();
-    config_paths.sort();
-    config_paths.dedup();
-
-    for path in &config_paths {
-        // Built fresh per file, filtered to sites that actually live in
-        // *this* file: `server_name` alone isn't unique across the whole
-        // `sites` table (two different files can share one, e.g. a stale
-        // config left behind after a rename), so a single map built once
-        // for the whole run could leak one site's override onto another's
-        // same-named block in a different file. Note this join is a
-        // textual `config_path` match, only valid when `root` here matches
-        // whatever root was used at scan time — a mismatch just falls
-        // through to `default_config`, not an error.
-        let site_configs: Vec<(String, BlockConfig)> = known_sites
-            .iter()
-            .filter(|s| Path::new(&s.config_path) == path.as_path())
-            .map(|s| Ok((s.server_name.clone(), block_config_for_site(db, s.id)?)))
-            .collect::<Result<_>>()?;
-        if apply_blocks_to_file(path, root, &site_configs, &default_config)? {
-            changed += 1;
-        }
-    }
-
-    // Only now that every config has been rewritten is it safe to delete a
-    // generated file the new config no longer references.
-    changed += remove_and_forget(db, unused)?;
-
-    Ok(ApplyAllOutcome {
-        sites: sites.len(),
-        files: config_paths.len(),
-        changed,
-        reloaded: false,
-    })
-}
-
-/// Applies one site's policy — its file and the generated files it reads —
-/// and, given `commands`, tests and reloads the way
-/// [`apply_all_sites_and_reload`] does. Returns the site's name and
-/// whether anything changed.
-pub fn apply_site_and_reload(
-    db: &crate::db::Db,
-    root: &Path,
-    site: &crate::db::Site,
-    commands: Option<&NginxCommands>,
-) -> Result<(bool, bool)> {
-    let _lock = crate::applylock::hold()?;
-    // The file found on disk for this site, not the one its row names:
-    // see `locate_site`.
-    let config_path = &locate_site(root, &site.server_name, Some(Path::new(&site.config_path)))?;
-    let managed = planned_managed_files(db, root)?;
-    record_managed_files(db, &managed)?;
-    let snapshot = Snapshot::of_apply(
-        root,
-        managed.iter().map(|(path, _)| path.clone()),
-        &[],
-        [config_path.as_path()],
-    )?;
-
-    let written = (|| -> Result<bool> {
-        let managed_changed = write_planned_managed_files(&managed)?;
-        let config = block_config_for_site(db, site.id)?;
-        let site_changed = apply_block_for_site(config_path, root, &site.server_name, &config)?;
-        Ok(managed_changed > 0 || site_changed)
-    })();
-    let changed = match written {
-        Ok(changed) => changed,
-        Err(err) => return Err(crate::hint::sudo_if_denied(snapshot.restore_after(err))),
-    };
-    let Some(commands) = commands.filter(|_| changed) else {
-        return Ok((changed, false));
-    };
-    test_or_restore(&snapshot, commands)?;
-    run(&commands.reload, "the NGINX reload")
-        .context("the new config passed the test, but the reload failed")?;
-    Ok((changed, true))
 }
 
 // ---- taking it all out again: `stop-bots uninstall` ----
@@ -3572,484 +2303,10 @@ pub fn without_injected_blocks(content: &str) -> String {
     }
 }
 
-/// Whether `path` is the console's own site file, as the `Web Access`
-/// panel writes it (see [`console_site_path`]) — by its first line, which
-/// every version has written, so that a file an operator put at the same
-/// path is left alone.
-pub fn is_console_site_file(path: &Path) -> bool {
-    use std::io::BufRead;
-    let Ok(file) = fs::File::open(path) else {
-        return false;
-    };
-    let mut first = String::new();
-    std::io::BufReader::new(file)
-        .read_line(&mut first)
-        .is_ok_and(|_| {
-            first.starts_with('#')
-                && first.contains("by stop-bots")
-                && first.contains("(`Web Access` panel)")
-        })
-}
-
-/// What [`remove_everything`] did, or would do.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Removal {
-    /// Site files that had a block taken out.
-    pub site_files: Vec<PathBuf>,
-    /// Generated files that were there and were deleted.
-    pub generated: Vec<PathBuf>,
-    /// Whether the result passed the test and NGINX was reloaded.
-    pub reloaded: bool,
-}
-
-/// Takes every injected block out of every site file under `root` and
-/// deletes `generated`, as one change: tested with `commands`, **put back
-/// byte for byte if the test fails**, and reloaded only once it passes.
-///
-/// The same machinery an apply uses ([`Snapshot`], [`test_or_restore`]),
-/// for the same reason: a config NGINX rejects is not loaded by this
-/// reload, it is loaded by the next one — certbot's at 3am.
-///
-/// The site files are rewritten before the generated files go, the
-/// reverse of an apply's order and for the same reason: nothing may be
-/// left referring to a zone or variable that is gone.
-///
-/// `commands` is `None` for a tree that is not the running NGINX's
-/// (`uninstall --prefix`); `dry_run` works out the same answer and writes
-/// nothing.
-///
-/// `generated` is held by directory descriptor ([`DirFile`]): some of it
-/// comes from the database's record, and is removed, and put back if the
-/// test fails, in the directory it was checked in.
-pub fn remove_everything(
-    root: &Path,
-    generated: &[DirFile],
-    commands: Option<&NginxCommands>,
-    dry_run: bool,
-) -> Result<Removal> {
-    // The same lock every apply holds, from the first read of a site file
-    // to the reload: a console or a cron `batch` applying while this runs
-    // would otherwise write a block back into a file this has just read.
-    // A dry run writes nothing and takes nothing.
-    let _lock = if dry_run {
-        None
-    } else {
-        Some(crate::applylock::hold()?)
-    };
-    let mut edits = Vec::new();
-    let mut paths: Vec<PathBuf> = discover_sites(root)?
-        .into_iter()
-        .map(|site| site.config_path)
-        .collect();
-    paths.sort();
-    paths.dedup();
-    for path in paths {
-        let content = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let stripped = without_injected_blocks(&content);
-        if stripped != content {
-            edits.push((path, stripped));
-        }
-    }
-    let present: Vec<DirFile> = generated
-        .iter()
-        .filter(|file| file.is_regular())
-        .cloned()
-        .collect();
-    let mut removal = Removal {
-        site_files: edits.iter().map(|(path, _)| path.clone()).collect(),
-        generated: present
-            .iter()
-            .map(|file| file.path().to_path_buf())
-            .collect(),
-        reloaded: false,
-    };
-    if dry_run || (edits.is_empty() && present.is_empty()) {
-        return Ok(removal);
-    }
-
-    let snapshot = Snapshot::of_apply(
-        root,
-        [],
-        &present,
-        edits.iter().map(|(path, _)| path.as_path()),
-    )?;
-    let written = (|| -> Result<()> {
-        for (path, content) in &edits {
-            write_site_file(path, root, content)?;
-        }
-        remove_planned_managed_files(&present)?;
-        Ok(())
-    })();
-    if let Err(err) = written {
-        return Err(snapshot.restore_after(err));
-    }
-    let Some(commands) = commands else {
-        return Ok(removal);
-    };
-    test_or_restore(&snapshot, commands)?;
-    run(&commands.reload, "the NGINX reload")
-        .context("the config without stop-bots passed the test, but the reload failed")?;
-    removal.reloaded = true;
-    Ok(removal)
-}
-
-/// Every file an apply may touch, as it was before the apply began, so
-/// that a config NGINX rejects can be taken back.
-///
-/// Holds the bytes and the mode of each regular file, and "absent" for
-/// anything else — so restoring removes a file the apply created. A
-/// symlink counts as absent: the writes here replace a link rather than
-/// following it (see [`write_atomically`]), and putting a planted one back
-/// would put back the thing that was planted.
-///
-/// A file named by the database's record is held by its directory's
-/// descriptor ([`DirFile`]) and put back through it, never through its
-/// path: a path in a directory the web console owns can lead somewhere
-/// else by the time a failed test puts it back, and root would write the
-/// held bytes there.
-pub struct Snapshot {
-    files: Vec<(Place, Option<Held>)>,
-}
-
-/// Where a [`Snapshot`]ed file is: a path this program derived itself (a
-/// site file, a generated file the settings call for), or a file held
-/// through its directory.
-enum Place {
-    Path(PathBuf),
-    Held(DirFile),
-}
-
-impl Place {
-    fn path(&self) -> &Path {
-        match self {
-            Place::Path(path) => path,
-            Place::Held(file) => file.path(),
-        }
-    }
-
-    /// The regular file there, or `None` for nothing, a link or anything
-    /// else. Opened without following a link or waiting on a FIFO.
-    fn read(&self) -> std::io::Result<Option<Held>> {
-        match self {
-            Place::Held(file) => file.read(),
-            Place::Path(path) => {
-                use std::io::Read;
-                use std::os::unix::fs::MetadataExt;
-                let mut file = match crate::db::guard::open_nofollow(path) {
-                    Ok(Some(file)) => file,
-                    Ok(None) => return Ok(None),
-                    Err(err) if err.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
-                    Err(err) => return Err(err),
-                };
-                let meta = file.metadata()?;
-                if !meta.is_file() {
-                    return Ok(None);
-                }
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)?;
-                Ok(Some((bytes, meta.mode() & 0o7777)))
-            }
-        }
-    }
-
-    fn write(&self, bytes: &[u8], mode: u32) -> Result<()> {
-        match self {
-            Place::Path(path) => write_atomically(path, bytes, mode, None),
-            Place::Held(file) => file
-                .write_atomically(bytes, mode)
-                .with_context(|| format!("failed to write {}", file.path().display())),
-        }
-    }
-
-    /// Removes the regular file there, if there is one.
-    fn remove_file(&self) -> Result<()> {
-        let removed = match self {
-            Place::Path(path) => match fs::symlink_metadata(path) {
-                Ok(meta) if meta.is_file() => fs::remove_file(path),
-                _ => Ok(()),
-            },
-            Place::Held(file) if file.is_regular() => file.remove().map(|_| ()),
-            Place::Held(_) => Ok(()),
-        };
-        removed.with_context(|| format!("failed to remove {}", self.path().display()))
-    }
-}
-
-/// A regular file's contents and permission bits, as [`Snapshot`] found
-/// them: `(bytes, mode)`.
-type Held = (Vec<u8>, u32);
-
-impl Snapshot {
-    /// Reads every file in `paths`. Fails if one exists and cannot be
-    /// read, because an apply that could not be undone should not start.
-    pub fn take(paths: impl IntoIterator<Item = PathBuf>) -> Result<Snapshot> {
-        Snapshot::take_places(paths.into_iter().map(Place::Path))
-    }
-
-    fn take_places(places: impl IntoIterator<Item = Place>) -> Result<Snapshot> {
-        let mut files: Vec<(Place, Option<Held>)> = Vec::new();
-        for place in places {
-            if files.iter().any(|(seen, _)| seen.path() == place.path()) {
-                continue;
-            }
-            let before = place
-                .read()
-                .with_context(|| format!("failed to read {}", place.path().display()))?;
-            files.push((place, before));
-        }
-        Ok(Snapshot { files })
-    }
-
-    /// A snapshot of what an apply under `root` may touch: the `planned`
-    /// generated files at their own paths, the `held` ones (those the
-    /// record names) through their directories, and each of `site_files`
-    /// where it really is, which is where [`write_site_file`] will write
-    /// it. A site file that cannot be resolved is left out; its write will
-    /// fail with the same error, and that failure is what undoes the
-    /// apply.
-    pub fn of_apply<'a>(
-        root: &Path,
-        planned: impl IntoIterator<Item = PathBuf>,
-        held: &[DirFile],
-        site_files: impl IntoIterator<Item = &'a Path>,
-    ) -> Result<Snapshot> {
-        Snapshot::take_places(
-            planned
-                .into_iter()
-                .map(Place::Path)
-                .chain(held.iter().cloned().map(Place::Held))
-                .chain(
-                    site_files
-                        .into_iter()
-                        .filter_map(|path| resolve_site_file(path, root).ok())
-                        .map(Place::Path),
-                ),
-        )
-    }
-
-    /// Puts every file back as it was. Carries on past a failure, so one
-    /// stuck file does not leave the rest half restored, and names each
-    /// one that could not be.
-    pub fn restore(&self) -> Result<()> {
-        let mut failed = Vec::new();
-        for (place, before) in &self.files {
-            let restored = match before {
-                Some((bytes, _))
-                    if place.read().ok().flatten().map(|(now, _)| now).as_ref() == Some(bytes) =>
-                {
-                    Ok(())
-                }
-                Some((bytes, mode)) => place.write(bytes, *mode),
-                None => place.remove_file(),
-            };
-            if let Err(err) = restored {
-                failed.push(format!("{err:#}"));
-            }
-        }
-        if !failed.is_empty() {
-            anyhow::bail!("{}", failed.join("; "));
-        }
-        Ok(())
-    }
-
-    /// `err`, with whether the restore that follows it worked.
-    fn restore_after(&self, err: anyhow::Error) -> anyhow::Error {
-        match self.restore() {
-            Ok(()) => err.context("nothing was applied: every file it changed was put back"),
-            Err(restore) => err.context(format!(
-                "AND PUTTING THE PREVIOUS FILES BACK FAILED, fix these by hand: {restore:#}"
-            )),
-        }
-    }
-}
-
-/// Runs the configured test against what was just written, and on a
-/// failure puts back everything `snapshot` holds before reporting.
-pub fn test_or_restore(snapshot: &Snapshot, commands: &NginxCommands) -> Result<()> {
-    test_config(commands).map_err(|err| snapshot.restore_after(err))
-}
-
-/// How to test and reload NGINX.
-///
-/// Two commands rather than two hardcoded invocations, because NGINX is
-/// not always a service on this host. The case that forced it: NGINX in a
-/// container, with its config on a bind mount this tool writes to. The
-/// files are ours to edit, but `systemctl reload nginx` reloads nothing —
-/// there is no such unit — and `nginx -t` either isn't installed or tests
-/// a different config than the one the container will read. Both become
-/// `docker exec <name> nginx ...` there.
-///
-/// Read from the host's settings ([`crate::hostconf`]), never from the
-/// database: these run as root, and the web console can write every row.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct NginxCommands {
-    /// Argv for the config check. Must exit non-zero on a bad config.
-    pub test: Vec<String>,
-    /// Argv for the reload.
-    pub reload: Vec<String>,
-}
-
-impl NginxCommands {
-    /// What a normal host install needs, and what every caller got before
-    /// these were configurable.
-    pub const DEFAULT_TEST: &'static str = "nginx -t";
-    pub const DEFAULT_RELOAD: &'static str = "systemctl reload nginx";
-
-    /// The `settings` keys these were stored under before they became host
-    /// settings. Read only by [`crate::hostconf::migrate`], once.
-    pub const TEST_KEY: &'static str = crate::db::keys::NGINX_TEST_COMMAND;
-    pub const RELOAD_KEY: &'static str = crate::db::keys::NGINX_RELOAD_COMMAND;
-    /// Where this host's site configs actually live.
-    pub const ROOT_KEY: &'static str = crate::db::keys::NGINX_ROOT;
-
-    /// The same, from the host's settings — see [`crate::hostconf`].
-    pub fn from_host(host: &crate::hostconf::HostConf) -> Result<Self> {
-        host.commands()
-    }
-}
-
-/// The stock location, and what every host had before this was configurable.
-pub const DEFAULT_ROOT: &str = "/etc/nginx";
-
-/// Where to look for site configs: the flag if one was given, else the
-/// host setting, else the stock path. See [`crate::hostconf::HostConf::root`].
-///
-/// An NGINX in a container moves three things away from their defaults —
-/// the commands that drive it, the logs it writes, and the directory its
-/// config lives in — and all three are host settings now. Flag beats
-/// setting: a one-off run against a checkout or a staging tree must not
-/// require the stored value to be changed and put back.
-pub fn root(host: &crate::hostconf::HostConf, flag: Option<&Path>) -> PathBuf {
-    host.root(flag)
-}
-
-impl Default for NginxCommands {
-    fn default() -> Self {
-        Self {
-            test: split_command(Self::DEFAULT_TEST).expect("the default test command parses"),
-            reload: split_command(Self::DEFAULT_RELOAD).expect("the default reload command parses"),
-        }
-    }
-}
-
-/// Splits a configured command into argv.
-///
-/// Deliberately *not* a shell: the string is never handed to `sh -c`, so
-/// there is no expansion, no globbing, no `;` and no pipelines. What a
-/// reload command needs is words, and words with spaces in them — a path
-/// under `/Applications/...`, a container named with a space — which is
-/// exactly single and double quotes and nothing else.
-///
-/// Keeping the shell out of it is the security-relevant half. This command
-/// runs as root; `sh -c` would turn a settings row into arbitrary code, and
-/// the settings table is reachable from the web UI.
-pub fn split_command(input: &str) -> Result<Vec<String>> {
-    let mut argv = Vec::new();
-    let mut current = String::new();
-    let mut has_word = false;
-    let mut quote: Option<char> = None;
-
-    for c in input.chars() {
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => current.push(c),
-            None if c == '\'' || c == '"' => {
-                // An empty quoted string is still an argument, so the
-                // word has to be marked as started here and not only by
-                // pushing a character.
-                quote = Some(c);
-                has_word = true;
-            }
-            None if c.is_whitespace() => {
-                if has_word {
-                    argv.push(std::mem::take(&mut current));
-                    has_word = false;
-                }
-            }
-            None => {
-                current.push(c);
-                has_word = true;
-            }
-        }
-    }
-
-    if quote.is_some() {
-        anyhow::bail!("unbalanced quote in `{input}`");
-    }
-    if has_word {
-        argv.push(current);
-    }
-    if argv.is_empty() {
-        anyhow::bail!("`{input}` is empty");
-    }
-    Ok(argv)
-}
-
-/// Runs `argv`, returning its stderr on a non-zero exit.
-///
-/// `output`, not `status`: `status` inherits stdout and stderr, so anything
-/// the command says lands directly on the TUI's alternate screen and
-/// corrupts it. Run non-root, `systemctl` additionally pulls in a polkit
-/// agent, which takes over the terminal outright to ask for a password.
-fn run(argv: &[String], what: &str) -> Result<()> {
-    let (program, args) = argv.split_first().expect("argv is never empty");
-    let output = std::process::Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|err| spawn_failure(argv, err))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "{what} (`{}`) exited with {}: {}",
-            argv.join(" "),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-/// Why `argv` could not be started, and — when its program is not there
-/// at all, the usual state of a host whose NGINX is in a container —
-/// where the commands are set.
-fn spawn_failure(argv: &[String], err: std::io::Error) -> anyhow::Error {
-    let not_found = err.kind() == std::io::ErrorKind::NotFound;
-    let err = anyhow::Error::new(err).context(format!("failed to run `{}`", argv.join(" ")));
-    if !not_found {
-        return err;
-    }
-    crate::hint::with(
-        err,
-        &format!(
-            "`{}` isn't on PATH. If NGINX runs in a container, point stop-bots at it: \
-             see `stop-bots set-nginx-commands --help`.",
-            argv[0]
-        ),
-    )
-}
-
-/// Validates the currently-installed NGINX config. Run before every
-/// [`reload_with`] so a malformed config — ours or an unrelated hand edit
-/// elsewhere in the same install — is reported as a clear error here rather
-/// than left for the admin to dig out of `systemctl status`.
-fn test_config(commands: &NginxCommands) -> Result<()> {
-    run(&commands.test, "the NGINX config test")
-}
-
-/// Reloads NGINX so a just-written blocking rule (from
-/// [`apply_blocks_to_file`] or [`apply_block_for_site`]) actually takes
-/// effect — writing the sentinel block to a site's config file alone does
-/// nothing until NGINX re-reads it. Always preceded by [`test_config`]:
-/// `systemctl reload` refuses a config that fails validation on its own too,
-/// but checking explicitly here gets a message callers can show directly
-/// rather than send the admin to `systemctl status`/`journalctl`.
-pub fn reload_with(commands: &NginxCommands) -> Result<()> {
-    test_config(commands)?;
-    run(&commands.reload, "the NGINX reload")
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::db::BlockResponse;
+    use crate::webserver::{is_robots_token, remove_managed};
     /// The gap this closes. An NGINX in a container moves three things:
     /// the commands that drive it, the logs it writes, and the directory
     /// its config lives in. The first two were stored; this one had to be
@@ -4167,7 +2424,7 @@ mod tests {
 
     #[test]
     fn nginx_commands_default_to_the_host_install() {
-        let commands = NginxCommands::default();
+        let commands = WebServer::Nginx.default_commands();
         assert_eq!(commands.test, ["nginx", "-t"]);
         assert_eq!(commands.reload, ["systemctl", "reload", "nginx"]);
     }
@@ -4179,7 +2436,7 @@ mod tests {
             ..Default::default()
         };
 
-        let commands = NginxCommands::from_host(&host).unwrap();
+        let commands = ServerCommands::from_host(&host).unwrap();
         assert_eq!(
             commands.reload,
             ["docker", "exec", "web", "nginx", "-s", "reload"]
@@ -4201,7 +2458,7 @@ mod tests {
         // Not a silent fallback: reloading the host's NGINX because the
         // container command had an unbalanced quote is the exact surprise
         // worth failing loudly over.
-        let err = NginxCommands::from_host(&host).unwrap_err();
+        let err = ServerCommands::from_host(&host).unwrap_err();
         assert!(
             err.to_string().contains("nginx_test_command"),
             "the error must name the setting at fault; it was: {err}"
@@ -4327,7 +2584,8 @@ mod tests {
         .unwrap();
 
         let config = cfg(&["BadBot", "EvilCrawler"]);
-        let changed = apply_blocks_to_file(&path, dir.path(), &[], &config).unwrap();
+        let changed =
+            apply_blocks_to_file(WebServer::Nginx, &path, dir.path(), &[], &config).unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -4337,7 +2595,8 @@ mod tests {
             "written was:\n{written}"
         );
 
-        let changed_again = apply_blocks_to_file(&path, dir.path(), &[], &config).unwrap();
+        let changed_again =
+            apply_blocks_to_file(WebServer::Nginx, &path, dir.path(), &[], &config).unwrap();
         assert!(!changed_again);
     }
 
@@ -4347,7 +2606,9 @@ mod tests {
         let path = dir.path().join("nginx.conf");
         fs::write(&path, "events {}\nhttp {\n    include conf.d/*.conf;\n}\n").unwrap();
 
-        let changed = apply_blocks_to_file(&path, dir.path(), &[], &cfg(&["BadBot"])).unwrap();
+        let changed =
+            apply_blocks_to_file(WebServer::Nginx, &path, dir.path(), &[], &cfg(&["BadBot"]))
+                .unwrap();
         assert!(!changed);
         assert!(!fs::read_to_string(&path).unwrap().contains(BLOCK_BEGIN));
     }
@@ -4366,7 +2627,9 @@ mod tests {
         )
         .unwrap();
 
-        let changed = apply_blocks_to_file(&path, dir.path(), &[], &cfg(&["BadBot"])).unwrap();
+        let changed =
+            apply_blocks_to_file(WebServer::Nginx, &path, dir.path(), &[], &cfg(&["BadBot"]))
+                .unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -4395,9 +2658,14 @@ mod tests {
             ("a.example".to_string(), cfg(&["OnlyOnA"])),
             ("b.example".to_string(), cfg(&["OnlyOnB"])),
         ];
-        let changed =
-            apply_blocks_to_file(&path, dir.path(), &site_configs, &BlockConfig::default())
-                .unwrap();
+        let changed = apply_blocks_to_file(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            &site_configs,
+            &BlockConfig::default(),
+        )
+        .unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -4422,8 +2690,14 @@ mod tests {
 
         // No entry for "unscanned.example" in site_patterns at all (as if
         // it was just discovered on disk but never scanned into the db).
-        let changed =
-            apply_blocks_to_file(&path, dir.path(), &[], &cfg(&["GlobalDefaultBot"])).unwrap();
+        let changed = apply_blocks_to_file(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            &[],
+            &cfg(&["GlobalDefaultBot"]),
+        )
+        .unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -4480,7 +2754,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot", "EvilBot"])).unwrap();
+        apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg(&["BadBot", "EvilBot"]),
+        )
+        .unwrap();
 
         let status = site_apply_status(
             &path,
@@ -4503,7 +2784,14 @@ mod tests {
             "server {\n    server_name a.example;\n    if ($http_user_agent ~* \"AdminBot\") { return 403; }\n}\n",
         )
         .unwrap();
-        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap();
+        apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg(&["BadBot"]),
+        )
+        .unwrap();
 
         let status = site_apply_status(&path, "a.example", &cfg(&["BadBot"]), no_trust_file());
         assert_eq!(status, SiteApplyStatus::UpToDate);
@@ -4518,7 +2806,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["OldBot"])).unwrap();
+        apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg(&["OldBot"]),
+        )
+        .unwrap();
 
         let status = site_apply_status(&path, "a.example", &cfg(&["NewBot"]), no_trust_file());
         assert_eq!(status, SiteApplyStatus::Stale);
@@ -4535,8 +2830,14 @@ mod tests {
         )
         .unwrap();
 
-        let changed =
-            apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["OnlyOnA"])).unwrap();
+        let changed = apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg(&["OnlyOnA"]),
+        )
+        .unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -4553,8 +2854,22 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
 
-        assert!(apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap());
-        assert!(!apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap());
+        assert!(apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg(&["BadBot"])
+        )
+        .unwrap());
+        assert!(!apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg(&["BadBot"])
+        )
+        .unwrap());
     }
 
     #[test]
@@ -4564,8 +2879,14 @@ mod tests {
         let original = "server {\n    server_name a.example;\n}\n";
         fs::write(&path, original).unwrap();
 
-        let changed =
-            apply_block_for_site(&path, dir.path(), "unknown.example", &cfg(&["BadBot"])).unwrap();
+        let changed = apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "unknown.example",
+            &cfg(&["BadBot"]),
+        )
+        .unwrap();
         assert!(!changed);
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
@@ -4681,7 +3002,7 @@ mod tests {
         .unwrap();
 
         let config = cfg(&["GoodBot", "TrailingBackslash\\"]);
-        apply_blocks_to_file(&path, dir.path(), &[], &config).unwrap();
+        apply_blocks_to_file(WebServer::Nginx, &path, dir.path(), &[], &config).unwrap();
 
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("GoodBot"), "written was:\n{written}");
@@ -4759,7 +3080,7 @@ mod tests {
         // Comfortably more than MAX_PATTERN_CHUNK_LEN once joined with `|`.
         let patterns: Vec<String> = (0..500).map(|i| format!("BadBot{i}Agent")).collect();
         let config = BlockConfig::new(patterns, BlockResponse::Forbidden);
-        apply_blocks_to_file(&path, dir.path(), &[], &config).unwrap();
+        apply_blocks_to_file(WebServer::Nginx, &path, dir.path(), &[], &config).unwrap();
 
         let written = fs::read_to_string(&path).unwrap();
         let if_count = written.matches("if ($http_user_agent").count();
@@ -4791,7 +3112,7 @@ mod tests {
 
         let patterns: Vec<String> = (0..500).map(|i| format!("BadBot{i}Agent")).collect();
         let config = BlockConfig::new(patterns, BlockResponse::Forbidden);
-        apply_block_for_site(&path, dir.path(), "a.example", &config).unwrap();
+        apply_block_for_site(WebServer::Nginx, &path, dir.path(), "a.example", &config).unwrap();
 
         let status = site_apply_status(&path, "a.example", &config, no_trust_file());
         assert_eq!(status, SiteApplyStatus::UpToDate);
@@ -4830,7 +3151,8 @@ mod tests {
         let link = root.join("a.conf");
         std::os::unix::fs::symlink(&victim, &link).unwrap();
 
-        let err = apply_blocks_to_file(&link, &root, &[], &cfg(&["BadBot"])).unwrap_err();
+        let err = apply_blocks_to_file(WebServer::Nginx, &link, &root, &[], &cfg(&["BadBot"]))
+            .unwrap_err();
 
         assert!(
             err.to_string().contains("outside the NGINX root"),
@@ -4852,7 +3174,9 @@ mod tests {
         let link = root.join("sites-enabled/a.conf");
         std::os::unix::fs::symlink("../sites-available/a.conf", &link).unwrap();
 
-        assert!(apply_blocks_to_file(&link, root, &[], &cfg(&["BadBot"])).unwrap());
+        assert!(
+            apply_blocks_to_file(WebServer::Nginx, &link, root, &[], &cfg(&["BadBot"])).unwrap()
+        );
 
         assert!(fs::read_to_string(&target).unwrap().contains("BadBot"));
         assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
@@ -4866,7 +3190,7 @@ mod tests {
         fs::write(&path, one_site()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
 
-        apply_blocks_to_file(&path, dir.path(), &[], &cfg(&["BadBot"])).unwrap();
+        apply_blocks_to_file(WebServer::Nginx, &path, dir.path(), &[], &cfg(&["BadBot"])).unwrap();
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o640);
@@ -4903,9 +3227,9 @@ mod tests {
         let path = dir.path().join("a.conf");
         fs::write(&path, one_site()).unwrap();
         let snapshot = Snapshot::of_apply(dir.path(), [], &[], [path.as_path()]).unwrap();
-        apply_blocks_to_file(&path, dir.path(), &[], &cfg(&["BadBot"])).unwrap();
+        apply_blocks_to_file(WebServer::Nginx, &path, dir.path(), &[], &cfg(&["BadBot"])).unwrap();
 
-        let err = test_or_restore(&snapshot, &commands_that(false)).unwrap_err();
+        let err = test_or_restore(WebServer::Nginx, &snapshot, &commands_that(false)).unwrap_err();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), one_site());
         assert!(
@@ -5140,7 +3464,7 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, original).unwrap();
         std::array::from_fn(|_| {
-            apply_blocks_to_file(&path, dir.path(), &[], config).unwrap();
+            apply_blocks_to_file(WebServer::Nginx, &path, dir.path(), &[], config).unwrap();
             fs::read_to_string(&path).unwrap()
         })
     }
@@ -5265,7 +3589,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap();
+        apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg(&["BadBot"]),
+        )
+        .unwrap();
 
         assert_eq!(
             site_apply_status(&path, "a.example", &cfg(&["BadBot"]), no_trust_file()),
@@ -5283,9 +3614,22 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
 
-        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap();
-        let changed =
-            apply_block_for_site(&path, dir.path(), "a.example", &cfg_444(&["BadBot"])).unwrap();
+        apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg(&["BadBot"]),
+        )
+        .unwrap();
+        let changed = apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg_444(&["BadBot"]),
+        )
+        .unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -5355,7 +3699,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap();
+        apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg(&["BadBot"]),
+        )
+        .unwrap();
 
         assert_eq!(
             site_apply_status(
@@ -5555,7 +3906,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, dir.path(), "a.example", &cfg_rate(20)).unwrap();
+        apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg_rate(20),
+        )
+        .unwrap();
 
         assert_eq!(
             site_apply_status(&path, "a.example", &cfg_rate(20), no_trust_file()),
@@ -5864,11 +4222,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["okhttp"])).unwrap();
+        apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg(&["okhttp"]),
+        )
+        .unwrap();
         let exempted = cfg_agent(&["okhttp"], &[("okhttp", "/remote.php/dav/")]);
 
         let before = site_apply_status(&path, "a.example", &exempted, no_trust_file());
-        apply_block_for_site(&path, dir.path(), "a.example", &exempted).unwrap();
+        apply_block_for_site(WebServer::Nginx, &path, dir.path(), "a.example", &exempted).unwrap();
         let after = site_apply_status(&path, "a.example", &exempted, no_trust_file());
 
         assert_eq!(
@@ -5975,7 +4340,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap();
+        apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg(&["BadBot"]),
+        )
+        .unwrap();
 
         assert_eq!(
             site_apply_status(
@@ -5988,6 +4360,7 @@ mod tests {
         );
 
         apply_block_for_site(
+            WebServer::Nginx,
             &path,
             dir.path(),
             "a.example",
@@ -6157,7 +4530,14 @@ mod tests {
         )
         .unwrap();
 
-        apply_block_for_site(&path, dir.path(), "a.example", &cfg_http1x(&["BadBot"])).unwrap();
+        apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg_http1x(&["BadBot"]),
+        )
+        .unwrap();
 
         let written = fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -6191,7 +4571,7 @@ mod tests {
         .unwrap();
 
         let config = cfg_http1x(&["BadBot"]);
-        apply_block_for_site(&path, dir.path(), "a.example", &config).unwrap();
+        apply_block_for_site(WebServer::Nginx, &path, dir.path(), "a.example", &config).unwrap();
         assert_eq!(
             site_apply_status(&path, "a.example", &config, no_trust_file()),
             SiteApplyStatus::UpToDate
@@ -6207,7 +4587,14 @@ mod tests {
             "server {\n    listen 443 ssl;\n    server_name a.example;\n}\n",
         )
         .unwrap();
-        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap();
+        apply_block_for_site(
+            WebServer::Nginx,
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg(&["BadBot"]),
+        )
+        .unwrap();
 
         assert_eq!(
             site_apply_status(
@@ -6239,9 +4626,17 @@ mod tests {
         .unwrap()
     }
 
+    fn trusted() -> Trust {
+        Trust::from_lists(
+            &["203.0.113.7".to_string(), "2001:db8::/48".to_string()],
+            &["UptimeRobot".to_string(), "Pingdom.com_bot".to_string()],
+        )
+        .unwrap()
+    }
+
     fn cfg_trusted(patterns: &[&str]) -> BlockConfig {
         BlockConfig {
-            trust: Some(trust_body()),
+            trust: Some(trusted()),
             ..cfg(patterns)
         }
     }
@@ -6387,7 +4782,7 @@ mod tests {
     #[test]
     fn a_trust_file_from_another_version_is_still_current() {
         let config = cfg_trusted(&["BadBot"]);
-        let expected = config.trust.clone().unwrap();
+        let expected = trust_body();
         let ours = format!("# {}.", crate::generated::generated_by());
         assert!(expected.starts_with(&ours), "trust file was:\n{expected}");
         for older in [
@@ -6434,7 +4829,7 @@ mod tests {
     #[test]
     fn a_site_is_current_only_when_the_trust_file_is_the_expected_one() {
         let config = cfg_trusted(&["BadBot"]);
-        let expected = config.trust.clone().unwrap();
+        let expected = trust_body();
         for (why, on_disk, current) in [
             ("the file matches", Some(expected.as_str()), true),
             ("the file is missing", None, false),
@@ -6532,7 +4927,8 @@ mod tests {
         let db = crate::db::Db::open_in_memory().unwrap();
         let host = host_with_root(dir.path().to_str().unwrap());
 
-        let unused = paths_of(&unused_managed_files(&db, &root(&host, None)).unwrap());
+        let unused =
+            paths_of(&unused_managed_files(WebServer::Nginx, &db, &root(&host, None)).unwrap());
         for name in ["stop-bots-trusted.conf", "stop-bots-limits.conf"] {
             let expected = dir.path().join("conf.d").join(name);
             assert!(
@@ -6563,7 +4959,7 @@ mod tests {
         let left_behind = rate_limit_conf_path(&old.path().join("conf.d"));
         written_and_recorded(&db, &left_behind, &rate_limit_conf_body(10, 10));
 
-        let unused = paths_of(&unused_managed_files(&db, new.path()).unwrap());
+        let unused = paths_of(&unused_managed_files(WebServer::Nginx, &db, new.path()).unwrap());
 
         assert!(
             !unused.contains(&left_behind),
@@ -6613,7 +5009,7 @@ mod tests {
             db.record_managed_file(&path, kind.id()).unwrap();
         }
 
-        let collected = unused_managed_files(&db, root.path()).unwrap();
+        let collected = unused_managed_files(WebServer::Nginx, &db, root.path()).unwrap();
         remove_planned_managed_files(&collected).unwrap();
         let unused = paths_of(&collected);
 
@@ -6649,7 +5045,7 @@ mod tests {
         db.record_managed_file(&rate_limit_conf_path(&link), ManagedKind::Limits.id())
             .unwrap();
 
-        let unused = paths_of(&unused_managed_files(&db, root.path()).unwrap());
+        let unused = paths_of(&unused_managed_files(WebServer::Nginx, &db, root.path()).unwrap());
 
         assert!(
             unused.iter().all(|path| !path.starts_with(console.path())),
@@ -6675,7 +5071,7 @@ mod tests {
         fs::write(&precious, "precious\n").unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
 
-        let unused = unused_managed_files(&db, root.path()).unwrap();
+        let unused = unused_managed_files(WebServer::Nginx, &db, root.path()).unwrap();
         let snapshot = Snapshot::of_apply(root.path(), [], &unused, []).unwrap();
         let checked = root.path().join("checked");
         fs::rename(&conf_d, &checked).unwrap();
@@ -6686,7 +5082,7 @@ mod tests {
         assert_eq!(fs::read_to_string(&precious).unwrap(), "precious\n");
         fs::remove_file(&precious).unwrap();
 
-        test_or_restore(&snapshot, &commands_that(false)).unwrap_err();
+        test_or_restore(WebServer::Nginx, &snapshot, &commands_that(false)).unwrap_err();
 
         assert_eq!(
             fs::read_to_string(rate_limit_conf_path(&checked)).unwrap(),
@@ -6719,9 +5115,9 @@ mod tests {
             db.record_managed_file(&path, kind.id()).unwrap();
         }
 
-        let changes = preview_all_sites(&db, new.path()).unwrap();
+        let changes = preview_all_sites(WebServer::Nginx, &db, new.path()).unwrap();
         let snapshot = Snapshot::take([fifo.clone()]).unwrap();
-        let unused = paths_of(&unused_managed_files(&db, new.path()).unwrap());
+        let unused = paths_of(&unused_managed_files(WebServer::Nginx, &db, new.path()).unwrap());
 
         assert!(changes.is_empty(), "{changes:#?}");
         assert!(!unused.contains(&dir), "{unused:#?}");
@@ -6743,7 +5139,7 @@ mod tests {
         )
         .unwrap();
 
-        let unused = paths_of(&unused_managed_files(&db, new.path()).unwrap());
+        let unused = paths_of(&unused_managed_files(WebServer::Nginx, &db, new.path()).unwrap());
 
         assert!(!unused.contains(&path), "unused: {unused:#?}");
     }
@@ -6768,7 +5164,7 @@ mod tests {
             written_and_recorded(&db, &path, &body);
         }
 
-        let unused = paths_of(&unused_managed_files(&db, root.path()).unwrap());
+        let unused = paths_of(&unused_managed_files(WebServer::Nginx, &db, root.path()).unwrap());
 
         let at = |path: PathBuf| unused.iter().position(|p| p == &path).unwrap();
         assert!(
@@ -6869,7 +5265,7 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
         let config = cfg_trusted(&["BadBot"]);
-        apply_block_for_site(&path, dir.path(), "a.example", &config).unwrap();
+        apply_block_for_site(WebServer::Nginx, &path, dir.path(), "a.example", &config).unwrap();
 
         assert_eq!(
             site_apply_status(&path, "a.example", &config, &conf_d),
@@ -6914,10 +5310,10 @@ mod tests {
         for rule in RequestRule::ALL {
             let text = block_text(&cfg_rules(&[rule])).unwrap();
             assert!(
-                text.contains(&rule.condition()),
+                text.contains(&condition(rule)),
                 "{} should emit {:?}; text was:\n{text}",
                 rule.label(),
-                rule.condition()
+                condition(rule)
             );
         }
     }
@@ -7092,6 +5488,7 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
         apply_block_for_site(
+            WebServer::Nginx,
             &path,
             dir.path(),
             "a.example",
@@ -7128,12 +5525,12 @@ mod tests {
     }
     // ---- reaching the console from outside ----
 
-    /// `NginxCommands` whose test either passes or fails, without needing
+    /// `ServerCommands` whose test either passes or fails, without needing
     /// a real NGINX. `/bin/true` and `/bin/false` rather than a written
     /// script: fewer moving parts, and nothing to make executable.
-    fn commands_that(pass: bool) -> NginxCommands {
+    fn commands_that(pass: bool) -> ServerCommands {
         let program = if pass { "true" } else { "false" };
-        NginxCommands {
+        ServerCommands {
             test: vec![program.to_string()],
             reload: vec!["true".to_string()],
         }
@@ -7353,6 +5750,7 @@ server {
         let path = dir.path().join("conf.d/stop-bots-console.conf");
 
         let err = write_validated(
+            WebServer::Nginx,
             &path,
             "server { broken",
             &commands_that(false),
@@ -7379,6 +5777,7 @@ server {
         fs::write(&path, TWO_BLOCK_SITE).unwrap();
 
         let _ = write_validated(
+            WebServer::Nginx,
             &path,
             "server { broken",
             &commands_that(false),
@@ -7394,7 +5793,14 @@ server {
         let path = dir.path().join("conf.d/stop-bots-console.conf");
         let block = console_server_block("console.example.com", &upstream());
 
-        write_validated(&path, &block, &commands_that(true), write_managed).unwrap();
+        write_validated(
+            WebServer::Nginx,
+            &path,
+            &block,
+            &commands_that(true),
+            write_managed,
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), block);
     }
@@ -7471,7 +5877,7 @@ server {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, TWO_BLOCK_SITE).unwrap();
-        apply_blocks_to_file(&path, dir.path(), &[], &cfg(&["BadBot"])).unwrap();
+        apply_blocks_to_file(WebServer::Nginx, &path, dir.path(), &[], &cfg(&["BadBot"])).unwrap();
         let applied = fs::read_to_string(&path).unwrap();
         assert_eq!(applied.matches(BLOCK_BEGIN).count(), 2, "{applied}");
 
@@ -7500,6 +5906,7 @@ server {
         fs::write(&limits, rate_limit_conf_body(10, 10)).unwrap();
 
         let removal = remove_everything(
+            WebServer::Nginx,
             dir.path(),
             &[held(&limits)],
             Some(&commands_that(true)),
@@ -7524,6 +5931,7 @@ server {
         fs::write(&limits, rate_limit_conf_body(10, 10)).unwrap();
 
         let err = remove_everything(
+            WebServer::Nginx,
             dir.path(),
             &[held(&limits)],
             Some(&commands_that(false)),
@@ -7544,7 +5952,14 @@ server {
         let (dir, site) = site_root_with_blocks();
         let before = fs::read_to_string(&site).unwrap();
 
-        let removal = remove_everything(dir.path(), &[], Some(&commands_that(true)), true).unwrap();
+        let removal = remove_everything(
+            WebServer::Nginx,
+            dir.path(),
+            &[],
+            Some(&commands_that(true)),
+            true,
+        )
+        .unwrap();
 
         assert_eq!(removal.site_files, std::slice::from_ref(&site));
         assert!(!removal.reloaded);

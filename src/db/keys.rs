@@ -35,7 +35,7 @@
 //! no other source file spells a key out.
 //!
 //! Some modules also name the keys they own (`web::BIND_KEY`,
-//! `NginxCommands::TEST_KEY`) so their call sites read in their own terms.
+//! `ServerCommands::TEST_KEY`) so their call sites read in their own terms.
 //! Those names are aliases of these constants, never a second spelling.
 
 // ---- the database itself ----

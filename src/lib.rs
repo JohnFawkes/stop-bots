@@ -35,6 +35,8 @@ pub mod accessstats;
 #[doc(hidden)]
 pub mod account;
 #[doc(hidden)]
+pub mod apache;
+#[doc(hidden)]
 pub mod app;
 #[doc(hidden)]
 pub mod applylock;
@@ -134,3 +136,5 @@ pub mod uninstall;
 pub mod web;
 #[doc(hidden)]
 pub mod webaccess;
+#[doc(hidden)]
+pub mod webserver;

@@ -8,11 +8,12 @@
 A TUI, a web console and a CLI that help you configure your server to stop bad bots without
 hiding behind a CDN.
 
-It works alongside NGINX and your existing firewall (nftables or iptables):
+It works alongside your web server (NGINX or Apache) and your existing firewall (nftables or
+iptables):
 
-- **NGINX config.** It classifies known bots by category (scanners, search engines, AI
+- **Web server config.** It classifies known bots by category (scanners, search engines, AI
   crawlers) and blocks or allows them by injecting a rule into your site configs. It scans the
-  NGINX log to detect bots dynamically and block them even if no ruleset tracks them yet.
+  access log to detect bots dynamically and block them even if no ruleset tracks them yet.
 - **A firewall script.** Block entire countries, datacenter IP ranges, known bot IP ranges or any
   IP address that repeatedly tries to log into your server unsuccessfully. Every block records
   why it exists.
@@ -32,8 +33,8 @@ service, and it doesn't send anything about your traffic anywhere.
 
 - **[fail2ban](https://github.com/fail2ban/fail2ban)** and **[sshguard](https://www.sshguard.net/)**
   ban addresses from log patterns at the firewall. They cover many more services (mail, FTP,
-  anything with a log line), but they don't manage NGINX bot rules and have no UI. Use one of
-  them if you need protection beyond SSH and the web.
+  anything with a log line), but they don't manage web server bot rules and have no UI. Use one
+  of them if you need protection beyond SSH and the web.
 - **[CrowdSec](https://github.com/crowdsecurity/crowdsec)** detects from logs too, enforces through
   separate firewall and NGINX bouncers, and shares signals with a central API in exchange for a
   community blocklist. Its web console is a hosted service. Use it if you run a fleet, want shared
@@ -68,14 +69,25 @@ Or `cargo install stop-bots` with Rust 1.88 or newer, or a static binary for `x8
 `aarch64` Linux from the GitHub [releases](https://github.com/ivankovic/stop-bots/releases).
 Installing starts nothing.
 
-It is tested on **Debian and Ubuntu with systemd and NGINX**. It needs `nft`, or
-`iptables-restore` and `ip6tables-restore`, for the firewall. Apache and Caddy are not
-supported.
+It is tested on **Debian and Ubuntu with systemd, and NGINX or Apache**. It needs `nft`, or
+`iptables-restore` and `ip6tables-restore`, for the firewall. Caddy is not supported.
+
+NGINX is the default. On an Apache host, say so once, and enable `mod_rewrite`, which the
+blocks are written in:
+
+```
+sudo stop-bots set-web-server apache
+sudo a2enmod rewrite
+```
+
+Apache has no rate limiting of its own, so that setting does nothing there, and the
+close-connection, tarpit and teapot responses are a 403. Putting the web console behind Apache
+from inside the app also needs `sudo a2enmod proxy_http`.
 
 ## Run it
 
-`sudo stop-bots` starts the TUI. It needs root, because it rewrites `/etc/nginx` and loads
-firewall rules. `?` shows every key on every screen.
+`sudo stop-bots` starts the TUI. It needs root, because it rewrites your web server's config and
+loads firewall rules. `?` shows every key on every screen.
 
 `stop-bots web` serves the same screens in a browser, on `127.0.0.1:8787` only. Reach it from
 your laptop over an SSH tunnel, `ssh -L 8787:127.0.0.1:8787 your-server`, then open
@@ -113,14 +125,14 @@ see every step.
 
 # What it protects against
 
-## In NGINX
+## In the web server
 
 - **Known bots**, by category (scanner, search engine, AI crawler), from
   [ArcJet's Well-Known Bots](https://github.com/arcjet/well-known-bots),
   [ai.robots.txt](https://github.com/ai-robots-txt/ai.robots.txt) and the
   [NGINX Ultimate Bad Bot Blocker](https://github.com/mitchellkrogza/nginx-ultimate-bad-bot-blocker).
   Allow or block each category, and override single bots per site.
-- **Too many requests**, with NGINX's own rate limiting.
+- **Too many requests**, with NGINX's own rate limiting (NGINX only).
 - **Requests that don't look like a browser**: six separate rules per site, such as a missing
   `Accept` header or an outdated TLS version. All are off by default.
 - **Politely, first**: a generated `robots.txt` listing every bot you block.
@@ -177,11 +189,13 @@ into is not root.
 - **The helper**, `stop-bots-helper.service`, runs as root. systemd starts it when the console
   first connects to `/run/stop-bots/helper.sock` (`stop-bots-helper.socket`). Only root and the
   `stop-bots` group can open that socket, and the helper also checks the user of each caller.
-  It writes the NGINX config and the firewall script, and runs `nginx -t`, the NGINX reload
-  and `nft`. It accepts a fixed set of requests: apply NGINX, apply the firewall, set up Web
-  Access, find the sites, check the host's health, and read the next part of the NGINX access
-  log or of sshd's login lines. No request contains a path, a command or config text. The NGINX commands, the NGINX config root and the log paths come from
-  `/etc/stop-bots/host.conf`, which only root can write, not from the database.
+  It writes the web server's config and the firewall script, and runs the web server's config
+  test and reload (`nginx -t`, or `apache2ctl configtest`) and `nft`. It accepts a fixed set
+  of requests: apply the web server config, apply the firewall, set up Web Access, find the
+  sites, check the host's health, and read the next part of the access log or of sshd's login
+  lines. No request contains a path, a command or config text. Which web server it is, its
+  commands, its config root and the log paths come from `/etc/stop-bots/host.conf`, which only
+  root can write, not from the database.
 
 **What someone who takes over the console can do, and what they cannot.** If an attacker gets
 code running in the console, they have the `stop-bots` user and what it can reach:
@@ -189,8 +203,8 @@ code running in the console, they have the `stop-bots` user and what it can reac
 - They can do what a logged-in operator can do: change the blocking policy, block or unblock
   any address, and apply. The detectors run in the console, so they can also make it block or
   unblock anything.
-- They can read what the console reads: the NGINX access log and sshd's authentication lines,
-  through the helper, and the database with the password hash. Not the rest of `/var/log`, and
+- They can read what the console reads: the web server's access log and sshd's authentication
+  lines, through the helper, and the database with the password hash. Not the rest of `/var/log`, and
   not the journal of any other service.
 - They cannot get root through the console. They cannot write to `/etc`, cron, systemd units
   or binaries, cannot ask systemd to start anything, and cannot choose what the helper runs or
@@ -199,12 +213,12 @@ code running in the console, they have the `stop-bots` user and what it can reac
   only the files stop-bots generated.
 
 The helper has the sandbox the console had before 0.1: `ProtectSystem=strict`, with write
-access only to the database, `/etc/stop-bots`, the NGINX config root, the log directories that
-config names (`nginx -t` opens them for writing) and `/run`. This stops a write to cron,
-systemd units or binaries that the helper was tricked into. It does not stop code that runs as
-the helper: that code is root, and root that can ask systemd to reload NGINX can ask it for
-more. If you later add a site that logs somewhere new, re-run `install web` so the helper's
-unit grants it.
+access only to the database, `/etc/stop-bots`, the web server's config root, the log
+directories that config names (its config test opens them for writing) and `/run`. This stops a
+write to cron, systemd units or binaries that the helper was tricked into. It does not stop
+code that runs as the helper: that code is root, and root that can ask systemd to reload the
+web server can ask it for more. If you later add a site that logs somewhere new, or switch web
+servers, re-run `install web` so the helper's unit grants it.
 
 Both processes yield to the host: they run at `Nice=10` with idle I/O priority, and systemd
 throttles each at a quarter of RAM and stops it at half. `sudo stop-bots status` warns if the

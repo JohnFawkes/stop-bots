@@ -1374,7 +1374,7 @@ async fn a_request_shape_rule_can_be_switched_on_for_one_site() {
     act(&app, &cookie, &csrf, "/nginx/scan", "").await;
     let id = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
 
-    let rule = stop_bots::nginx::RequestRule::ALL[1];
+    let rule = stop_bots::webserver::RequestRule::ALL[1];
     act(
         &app,
         &cookie,

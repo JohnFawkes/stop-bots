@@ -6008,3 +6008,550 @@ fn a_stranger_on_debian_12_goes_from_install_to_blocking_to_uninstall() {
 fn a_stranger_on_ubuntu_24_04_goes_from_install_to_blocking_to_uninstall() {
     a_stranger_follows_the_quick_start(Distro::Ubuntu2404);
 }
+
+// ---- Apache ----
+//
+// The same promise the NGINX tests above make, kept for Apache: what this
+// project writes is loaded by a real `apache2ctl configtest`, and real
+// requests are turned away or let through as the policy says. Driven
+// through the CLI exactly as an operator would, after `set-web-server
+// apache`. Nothing here needs `NET_ADMIN` or a network of its own.
+
+/// The Apache image — see `Dockerfile.apache`.
+fn apache_image() -> String {
+    tagged("stop-bots-apache")
+}
+
+fn build_apache_image() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        with_build_lock(|| build_unless_current(&apache_image(), build_apache_image_now))
+    });
+}
+
+fn build_apache_image_now() {
+    let ctx = stage_binary();
+    let out = Command::new(runtime())
+        .args([
+            "build",
+            "-q",
+            "-f",
+            &format!("{ctx}/Dockerfile.apache"),
+            "-t",
+            &apache_image(),
+            &ctx,
+        ])
+        .output()
+        .expect("failed to run the image build");
+    assert!(
+        out.status.success(),
+        "{} build (Apache image) failed:\n{}",
+        runtime(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A running Apache with one site, `test.example` on port 8080, and
+/// stop-bots told it is Apache's. Removed on drop.
+struct Apache {
+    name: String,
+}
+
+/// The site file as Debian keeps it: in `sites-available`, linked from
+/// `sites-enabled`.
+const APACHE_SITE: &str = "/etc/apache2/sites-available/test-site.conf";
+
+impl Apache {
+    fn start(name: &str) -> Apache {
+        build_apache_image();
+        let name = scoped(name);
+        remove_container(&name);
+        let out = Command::new(runtime())
+            .args(["run", "-d", "--name", &name, &apache_image()])
+            .output()
+            .expect("failed to start the container");
+        assert!(
+            out.status.success(),
+            "{} run failed:\n{}",
+            runtime(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let apache = Apache { name };
+        apache.sh("apache2ctl start");
+        apache.wait_until_serving();
+        let chosen = apache.stop_bots("set-web-server apache");
+        assert!(chosen.contains("Apache"), "set-web-server said:\n{chosen}");
+        // Debian's two disabled defaults are found too, in
+        // `sites-available`, as NGINX's are: three in all.
+        let scanned = apache.stop_bots("scan-sites");
+        assert!(
+            scanned.contains("Discovered 3 site(s)"),
+            "scan-sites said:\n{scanned}"
+        );
+        apache
+    }
+
+    fn run(&self, cmd: &str) -> (bool, String, String) {
+        exec_in(&self.name, cmd)
+    }
+
+    fn sh(&self, cmd: &str) -> String {
+        sh_in(&self.name, cmd)
+    }
+
+    fn stop_bots(&self, args: &str) -> String {
+        self.sh(&format!("stop-bots {args} --db /tmp/db.sqlite3"))
+    }
+
+    /// One blocked bot, through the real bot-list parser; see
+    /// [`Server::seed_bot`].
+    fn seed_bot(&self, id: &str, pattern: &str) {
+        let json = format!(
+            r#"[{{"id":"{id}","categories":["ai"],"pattern":{{"accepted":["{pattern}"],"forbidden":[]}},"url":"https://example.invalid/{id}"}}]"#
+        );
+        self.sh(&format!("cat > /tmp/bots.json <<'JSON'\n{json}\nJSON"));
+        self.stop_bots("update-bot-lists --source /tmp/bots.json");
+    }
+
+    /// `apply-blocks` as an operator runs it: tested with `apache2ctl
+    /// configtest` and reloaded through the `systemctl` shim, which is a
+    /// graceful restart — asynchronous, so this waits for it.
+    fn apply(&self) -> String {
+        let said = self.stop_bots("apply-blocks");
+        let (ok, stdout, stderr) = self.run("apache2ctl configtest");
+        assert!(ok, "the generated config does not load:\n{stdout}{stderr}");
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        self.wait_until_serving();
+        said
+    }
+
+    fn wait_until_serving(&self) {
+        for _ in 0..50 {
+            if self.status("/", "") != "000" {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("Apache never answered on port 8080");
+    }
+
+    /// The status Apache answers `path` with, `000` for no answer.
+    fn status(&self, path: &str, curl_args: &str) -> String {
+        let (_, stdout, _) = self.run(&format!(
+            "curl -s -o /dev/null -w '%{{http_code}}' {curl_args} http://127.0.0.1:8080{path}"
+        ));
+        stdout.trim().to_string()
+    }
+
+    fn body(&self, path: &str, curl_args: &str) -> String {
+        self.sh(&format!("curl -s {curl_args} http://127.0.0.1:8080{path}"))
+    }
+}
+
+impl Drop for Apache {
+    fn drop(&mut self) {
+        remove_container(&self.name);
+    }
+}
+
+const BAD_AGENT: &str = "-A 'Mozilla/5.0 (compatible; EvilBot/1.0)'";
+const BROWSER: &str = "-A 'Mozilla/5.0 (X11; Linux x86_64) Firefox/130.0'";
+
+#[test]
+fn apache_turns_away_a_blocked_bot_and_serves_everyone_else() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-blocks");
+    apache.seed_bot("evilbot", "EvilBot");
+    apache.apply();
+
+    assert_eq!(apache.status("/", BAD_AGENT), "403");
+    // Case-insensitive, as NGINX's `~*` is.
+    assert_eq!(apache.status("/", "-A 'evilbot'"), "403");
+    assert_eq!(apache.status("/", BROWSER), "200");
+    // Written where the site is, which the enabled link still reaches.
+    let site = apache.sh(&format!("cat {APACHE_SITE}"));
+    assert!(site.contains("# BEGIN stop-bots"), "site file:\n{site}");
+    assert!(
+        apache
+            .sh("readlink -f /etc/apache2/sites-enabled/test-site.conf")
+            .trim()
+            == APACHE_SITE,
+        "the enabled link no longer leads to the site file"
+    );
+}
+
+#[test]
+fn apache_sends_the_response_each_setting_asks_for() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-responses");
+    apache.seed_bot("evilbot", "EvilBot");
+    // `close` and `tarpit` are NGINX's, and mod_rewrite will not send a
+    // 418; on Apache each is a 403.
+    for (response, code) in [
+        ("not-found", "404"),
+        ("gone", "410"),
+        ("too-many-requests", "429"),
+        ("teapot", "403"),
+        ("close", "403"),
+        ("tarpit", "403"),
+        ("forbidden", "403"),
+    ] {
+        apache.stop_bots(&format!("set-block-response --response {response}"));
+        apache.apply();
+        assert_eq!(
+            apache.status("/", BAD_AGENT),
+            code,
+            "a blocked request under `{response}`"
+        );
+        assert_eq!(
+            apache.status("/", BROWSER),
+            "200",
+            "a browser under `{response}`"
+        );
+    }
+}
+
+#[test]
+fn apache_serves_robots_txt_even_to_a_bot_it_blocks() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-robots");
+    apache.seed_bot("evilbot", "EvilBot");
+    apache.stop_bots("set-robots-txt --enabled true");
+    apache.apply();
+
+    assert_eq!(apache.status("/robots.txt", BAD_AGENT), "200");
+    let robots = apache.body("/robots.txt", BAD_AGENT);
+    assert!(
+        robots.contains("User-agent: EvilBot"),
+        "robots.txt:\n{robots}"
+    );
+    assert!(robots.contains("Disallow: /"), "robots.txt:\n{robots}");
+    // Only that file: the rest of the site still turns the bot away.
+    assert_eq!(apache.status("/", BAD_AGENT), "403");
+}
+
+#[test]
+fn apache_lets_exempt_paths_and_trusted_clients_through() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-exempt");
+    apache.seed_bot("evilbot", "EvilBot");
+    apache.stop_bots("exempt-path --site test.example --path /api/");
+    apache.stop_bots("exempt-path --site test.example --path /dav/ --user-agent okhttp");
+    apache.stop_bots("trust --user-agent UptimeMonitor");
+    apache.apply();
+
+    // An exempt path reaches the site, which has nothing there.
+    assert_eq!(apache.status("/api/x", BAD_AGENT), "404");
+    // A `..` cannot walk out of it: the path is matched resolved.
+    assert_eq!(
+        apache.status("/api/../index.html", "--path-as-is -A EvilBot"),
+        "403"
+    );
+    // An agent exemption needs the agent and the path.
+    assert_eq!(apache.status("/dav/x", "-A 'EvilBot okhttp/4'"), "404");
+    assert_eq!(apache.status("/", "-A 'EvilBot okhttp/4'"), "403");
+    assert_eq!(apache.status("/dav/x", BAD_AGENT), "403");
+    // A trusted user agent gets through whatever else it matches.
+    assert_eq!(apache.status("/", "-A 'EvilBot UptimeMonitor'"), "200");
+    assert_eq!(apache.status("/", BAD_AGENT), "403");
+
+    apache.stop_bots("trust --address 127.0.0.1");
+    apache.apply();
+    assert_eq!(apache.status("/", BAD_AGENT), "200", "a trusted address");
+}
+
+#[test]
+fn apache_turns_away_requests_by_their_shape() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-shape");
+    apache.stop_bots("set-site-rule --site test.example --rule no-accept --enabled true");
+    apache.stop_bots("set-site-rule --site test.example --rule ip-literal-host --enabled true");
+    apache.apply();
+
+    assert_eq!(
+        apache.status(
+            "/",
+            &format!("{BROWSER} -H 'Host: test.example' -H 'Accept:'")
+        ),
+        "403"
+    );
+    assert_eq!(
+        apache.status("/", &format!("{BROWSER} -H 'Host: test.example'")),
+        "200"
+    );
+    // curl sends `Host: 127.0.0.1:8080` unless told otherwise.
+    assert_eq!(apache.status("/", BROWSER), "403");
+    // ACME's path is never turned away by a shape rule.
+    assert_eq!(
+        apache.status("/.well-known/acme-challenge/x", "-H 'Accept:'"),
+        "404"
+    );
+}
+
+#[test]
+fn apache_without_mod_rewrite_refuses_and_puts_everything_back() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-norewrite");
+    apache.sh("a2dismod -q -f rewrite && apache2ctl graceful");
+    let before = apache.sh(&format!("cat {APACHE_SITE}"));
+    apache.seed_bot("evilbot", "EvilBot");
+
+    let (ok, stdout, stderr) = apache.run("stop-bots apply-blocks --db /tmp/db.sqlite3");
+    let said = format!("{stdout}{stderr}");
+    assert!(!ok, "the apply succeeded without mod_rewrite:\n{said}");
+    assert!(said.contains("a2enmod rewrite"), "the apply said:\n{said}");
+    assert_eq!(apache.sh(&format!("cat {APACHE_SITE}")), before);
+    let status = apache.stop_bots("status --quiet || true");
+    assert!(status.contains("a2enmod rewrite"), "status said:\n{status}");
+}
+
+#[test]
+fn apache_uninstall_puts_the_site_back_byte_for_byte() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-uninstall");
+    let original = apache.sh(&format!("cat {APACHE_SITE}"));
+    apache.seed_bot("evilbot", "EvilBot");
+    apache.stop_bots("set-robots-txt --enabled true");
+    apache.stop_bots("trust --user-agent UptimeMonitor");
+    apache.apply();
+    apache.sh("test -f /etc/apache2/conf-enabled/stop-bots-trusted.conf");
+    apache.sh("test -f /etc/stop-bots/apache/robots.txt");
+
+    let said = apache.stop_bots("uninstall nginx");
+    assert_eq!(
+        apache.sh(&format!("cat {APACHE_SITE}")),
+        original,
+        "uninstall said:\n{said}"
+    );
+    apache.sh("test ! -e /etc/apache2/conf-enabled/stop-bots-trusted.conf");
+    apache.sh("test ! -e /etc/stop-bots/apache/robots.txt");
+    let (ok, stdout, stderr) = apache.run("apache2ctl configtest");
+    assert!(ok, "Apache's config no longer loads:\n{stdout}{stderr}");
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    assert_eq!(apache.status("/", BAD_AGENT), "200");
+}
+
+#[test]
+fn apache_access_log_is_read_by_the_detectors() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-log");
+    // Through mod_remoteip, so Apache logs a public client; see
+    // `Dockerfile.apache`.
+    let from = |address: &str| format!("-H 'X-Forwarded-For: {address}'");
+    apache.status(
+        "/",
+        &format!("{} -A 'ApacheLogProbe/1.0'", from("203.0.113.9")),
+    );
+    apache.status("/.env", &from("203.0.113.10"));
+
+    // Read from Apache's own log, because the host settings chose Apache.
+    let recorded = apache.stop_bots("record-access-stats");
+    let stats = apache.stop_bots("list-access-stats");
+    assert!(
+        stats.contains("ApacheLogProbe/1.0"),
+        "record-access-stats said:\n{recorded}\nlist-access-stats said:\n{stats}"
+    );
+    let detected = apache.stop_bots("block-probe-paths");
+    let rules = apache.stop_bots("list-firewall-rules");
+    assert!(
+        rules.contains("203.0.113.10") && !rules.contains("203.0.113.9"),
+        "block-probe-paths said:\n{detected}\nlist-firewall-rules said:\n{rules}"
+    );
+}
+
+impl Apache {
+    /// Starts the console in this container, as root and in one process
+    /// (no init here to run the service and its helper), and logs in.
+    fn console(&self) -> Console {
+        self.start_console();
+        let out = self.sh("cat /tmp/web.out");
+        let password = out
+            .lines()
+            .map(str::trim)
+            .find(|line| line.len() > 20 && !line.contains(' '))
+            .unwrap_or_else(|| panic!("no password in the console's output:\n{out}"))
+            .to_string();
+        let login = self.sh(&format!(
+            "curl -s -o /dev/null -w '%{{http_code}}' -c /tmp/jar \
+             --data-urlencode 'password={password}' http://127.0.0.1:8787/login"
+        ));
+        assert!(
+            login.trim().starts_with('2') || login.trim().starts_with('3'),
+            "logging in returned {login}"
+        );
+        Console {
+            name: self.name.clone(),
+        }
+    }
+
+    /// (Re)starts the console, and waits until it answers at `base`.
+    fn start_console(&self) {
+        // No procps in the image, so the pid is kept rather than looked up.
+        self.run("kill $(cat /tmp/web.pid) 2>/dev/null; sleep 0.3");
+        self.sh(
+            "nohup stop-bots web --db /tmp/db.sqlite3 >> /tmp/web.out 2>&1 & echo $! > /tmp/web.pid",
+        );
+        for _ in 0..100 {
+            let (_, code, _) = self.run(
+                "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/login \
+                 http://127.0.0.1:8787/stop-bots/login | grep -c 200",
+            );
+            if code.trim() != "0" && !code.trim().is_empty() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!(
+            "the console never answered:\n{}",
+            self.sh("cat /tmp/web.out")
+        );
+    }
+}
+
+/// Polls `status` until it is `want`, for up to five seconds: a graceful
+/// restart is asynchronous, and an old child can still answer first.
+fn eventually(want: &str, status: impl Fn() -> String) -> String {
+    let mut got = String::new();
+    for _ in 0..50 {
+        got = status();
+        if got == want {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    got
+}
+
+/// Web Access on an Apache host: the console's `<Location>` goes into the
+/// site, passes the real config test, and really proxies — and the site's
+/// own rules, which run before the proxy, leave the console alone.
+#[test]
+fn apache_web_access_path_mode_serves_the_console_through_apache() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-webaccess");
+    let console = apache.console();
+
+    let flash = console.post(
+        "/web-access",
+        &[
+            ("mode", "path"),
+            ("site", "test.example"),
+            ("prefix", "/stop-bots/"),
+            ("host", ""),
+        ],
+    );
+    let site = apache.sh(&format!("cat {APACHE_SITE}"));
+    assert!(
+        site.contains(r#"<Location "/stop-bots/">"#),
+        "no console section was written. console said:\n{flash}\nsite:\n{site}"
+    );
+    let (ok, stdout, stderr) = apache.run("apache2ctl configtest");
+    assert!(ok, "the console section does not load:\n{stdout}{stderr}");
+
+    // The prefix is read when the console starts.
+    apache.start_console();
+    let page = |path: &str| {
+        apache
+            .run(&format!(
+                "curl -s -o /dev/null -w '%{{http_code}}' -H 'Host: test.example' \
+             http://127.0.0.1:8080{path}"
+            ))
+            .1
+            .trim()
+            .to_string()
+    };
+    assert_eq!(
+        eventually("200", || page("/stop-bots/login")),
+        "200",
+        "Apache does not reach the console:\n{site}"
+    );
+    let body = apache.sh("curl -s -H 'Host: test.example' http://127.0.0.1:8080/stop-bots/login");
+    assert!(
+        body.contains("password"),
+        "not the console's login page:\n{body}"
+    );
+
+    // curl sends no Accept-Language: a rule that refuses it must refuse
+    // the site and still let the operator reach the console.
+    apache.stop_bots("set-site-rule --site test.example --rule no-accept-language --enabled true");
+    apache.apply();
+    assert_eq!(
+        eventually("403", || page("/")),
+        "403",
+        "the rule is not in force"
+    );
+    assert_eq!(
+        page("/stop-bots/login"),
+        "200",
+        "the site's own rule locks the operator out of the console:\n{}",
+        apache.sh(&format!("cat {APACHE_SITE}"))
+    );
+
+    // And uninstall takes both out again.
+    apache.stop_bots("uninstall web-server");
+    let site = apache.sh(&format!("cat {APACHE_SITE}"));
+    assert!(!site.contains("stop-bots"), "uninstall left:\n{site}");
+}
+
+#[test]
+fn apache_web_access_subdomain_mode_writes_a_site_of_its_own() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-subdomain");
+    let console = apache.console();
+    let flash = console.post(
+        "/web-access",
+        &[
+            ("mode", "subdomain"),
+            ("site", ""),
+            ("prefix", ""),
+            ("host", "console.example"),
+        ],
+    );
+    let written = "/etc/apache2/sites-enabled/zz-stop-bots-console.conf";
+    let (ok, _, _) = apache.run(&format!("test -f {written}"));
+    assert!(ok, "no console site was written. console said:\n{flash}");
+    let (ok, stdout, stderr) = apache.run("apache2ctl configtest");
+    assert!(ok, "the console site does not load:\n{stdout}{stderr}");
+
+    let through = || {
+        apache
+            .run(
+                "curl -s -o /dev/null -w '%{http_code}' -H 'Host: console.example' \
+                 http://127.0.0.1:80/login",
+            )
+            .1
+            .trim()
+            .to_string()
+    };
+    assert_eq!(
+        eventually("200", through),
+        "200",
+        "Apache does not reach the console"
+    );
+    // The site on 8080 is still the site.
+    assert_eq!(apache.status("/", BROWSER), "200");
+
+    apache.stop_bots("uninstall web-server");
+    let (gone, _, _) = apache.run(&format!("test ! -e {written}"));
+    assert!(gone, "uninstall left the console's site behind");
+}

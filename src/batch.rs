@@ -77,6 +77,7 @@ use crate::cron::CronJob;
 use crate::db::Db;
 use crate::firewall::{self, FirewallBackend};
 use crate::protection::Detector;
+use crate::webserver;
 use crate::{nginx, refresh};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -175,7 +176,10 @@ pub async fn run(db: &Db, options: &BatchOptions) -> BatchReport {
     let mut steps = Vec::new();
 
     steps.push(Step::new("built-in bot list", store_built_in_list(db)));
-    steps.push(Step::new("scan sites", scan_sites(db, &options.root)));
+    steps.push(Step::new(
+        "scan sites",
+        scan_sites(options.host.web_server(), db, &options.root),
+    ));
     if !options.no_fetch {
         steps.extend(update_lists(db).await);
     }
@@ -206,8 +210,8 @@ fn store_built_in_list(db: &Db) -> Result<String> {
     ))
 }
 
-fn scan_sites(db: &Db, root: &Path) -> Result<String> {
-    let sites = nginx::discover_sites(root)?;
+fn scan_sites(server: webserver::WebServer, db: &Db, root: &Path) -> Result<String> {
+    let sites = server.discover_sites(root)?;
     for site in &sites {
         db.upsert_site(&site.server_name, &site.config_path.to_string_lossy())?;
     }
@@ -358,9 +362,14 @@ fn apply_nginx(db: &Db, options: &BatchOptions) -> Step {
         // next reload to find.
         let commands = options
             .apply
-            .then(|| nginx::NginxCommands::from_host(&options.host))
+            .then(|| webserver::ServerCommands::from_host(&options.host))
             .transpose()?;
-        let applied = nginx::apply_all_sites_and_reload(db, &options.root, commands.as_ref())?;
+        let applied = webserver::apply_all_sites_and_reload(
+            options.host.web_server(),
+            db,
+            &options.root,
+            commands.as_ref(),
+        )?;
         let mut summary = format!(
             "{} site(s), {} file(s) changed",
             applied.sites, applied.changed

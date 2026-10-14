@@ -823,9 +823,15 @@ fn firewall_panel(view: &View, ctx: &Ctx) -> Markup {
 /// console has a password form and a session cookie, so "inherits the
 /// existing TLS" is worth more than "has a tidier URL".
 fn web_access_panel(view: &View, ctx: &Ctx) -> Markup {
+    let server = ctx.chrome.web_server;
+    let apache = server == crate::webserver::WebServer::Apache;
+    let subtitle = format!(
+        "Reach this console from outside, through {}",
+        server.label()
+    );
     layout::panel(
         "Web Access",
-        Some("Reach this console from outside, through NGINX"),
+        Some(subtitle.as_str()),
         html! {
             table {
                 tbody {
@@ -909,12 +915,12 @@ fn web_access_panel(view: &View, ctx: &Ctx) -> Markup {
                         "Subdomain host"
                         input type="text" name="host" placeholder="console.example.com" size="26";
                     }
-                    button .primary type="submit" { "Set up NGINX" }
+                    button .primary type="submit" { "Set up " (server.label()) }
                 }
 
                 p .hint {
                     "Path mode adds a "
-                    code { "location" }
+                    code { (if apache { "<Location>" } else { "location" }) }
                     " block to the site you pick, so the console inherits that site\u{2019}s "
                     "certificate. It also records the prefix and the host name, because this "
                     "server matches the full path including the prefix and refuses a request "
@@ -931,9 +937,9 @@ fn web_access_panel(view: &View, ctx: &Ctx) -> Markup {
                 }
                 p .hint {
                     "Subdomain mode writes a new "
-                    code { "server" }
+                    code { (if apache { "<VirtualHost>" } else { "server" }) }
                     " block on port 80. Until you run "
-                    code { "certbot --nginx -d <host>" }
+                    code { (if apache { "certbot --apache -d <host>" } else { "certbot --nginx -d <host>" }) }
                     ", the password form and the session cookie cross the network in the "
                     "clear \u{2014} which is why path mode is the default."
                 }
@@ -1030,9 +1036,10 @@ async fn set_web_access(
                 &state,
                 "/",
                 &format!(
-                    "Wrote {} and recorded the host. NGINX {note}. {} Restart the \
+                    "Wrote {} and recorded the host. {} {note}. {} Restart the \
                      console for a changed path prefix to take effect.",
                     report.path.display(),
+                    crate::webserver::WebServer::configured().label(),
                     report.note
                 ),
                 true,

@@ -27,7 +27,7 @@
 //! different things depending on whether the list happened to be empty.)
 //!
 //! `a` triggers a Cancel/Apply-now popup that applies just the selected
-//! site's rule to its own config file (`nginx::apply_block_for_site`),
+//! site's rule to its own config file (`webserver::apply_block_for_site`),
 //! without touching any other site's block even if they share a file. `A`
 //! does the same for every known site in one go (looping the same
 //! per-site call, not a single bulk operation — see `apply_all`). Each row
@@ -55,9 +55,11 @@
 //! normally root-owned) with a "Try running as root" suggestion.
 
 use crate::db::{BlockResponse, Db, Site};
-use crate::nginx::{self, SiteApplyStatus};
+use crate::nginx;
 use crate::tui::site_detail::SiteDetail;
 use crate::tui::{centered_rect, KeyOutcome, Theme};
+use crate::webserver::SiteApplyStatus;
+use crate::webserver::{self, WebServer};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -212,6 +214,7 @@ struct SettingPopup {
 
 #[derive(Debug)]
 pub struct Nginx {
+    server: WebServer,
     root: PathBuf,
     sites: Vec<Site>,
     /// Parallel to `sites`: whether each site's on-disk config currently
@@ -243,8 +246,9 @@ pub struct Nginx {
 }
 
 impl Nginx {
-    pub fn new(root: PathBuf) -> Self {
+    pub fn new(server: WebServer, root: PathBuf) -> Self {
         Self {
+            server,
             root,
             sites: Vec::new(),
             statuses: Vec::new(),
@@ -405,7 +409,11 @@ impl Nginx {
 
         let focused = self.focus == Focus::Settings;
         let list = crate::tui::select_in(
-            List::new(items).block(crate::tui::panel("NGINX settings", focused, theme)),
+            List::new(items).block(crate::tui::panel(
+                format!("{} settings", self.server.label()),
+                focused,
+                theme,
+            )),
             focused,
             theme,
         );
@@ -883,6 +891,11 @@ impl Nginx {
         &self.root
     }
 
+    /// The web server whose sites this screen manages.
+    pub fn server(&self) -> WebServer {
+        self.server
+    }
+
     /// Resolves everything an apply needs out of `Db`, so the filesystem
     /// half can run where `Db` cannot go.
     ///
@@ -906,7 +919,7 @@ impl Nginx {
                 Ok(PlannedSite {
                     server_name: site.server_name.clone(),
                     config_path: PathBuf::from(&site.config_path),
-                    config: nginx::block_config_for_site(db, site.id)?,
+                    config: webserver::block_config_for_site(db, site.id)?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -915,19 +928,22 @@ impl Nginx {
         // files under a different one than the site files are being
         // written to is the bug `conf_d_dir` exists to prevent, one layer
         // up.
-        let managed_writes = nginx::planned_managed_files(db, &self.root)?;
+        let managed_writes = self.server.planned_managed_files(db, &self.root)?;
         // Recorded here, with the `Db` in hand, because the write happens
         // on a thread that has none. Before the write is the safe side:
-        // see `nginx::record_managed_files`.
-        nginx::record_managed_files(db, &managed_writes)?;
+        // see `webserver::record_managed_files`.
+        webserver::record_managed_files(db, &managed_writes)?;
         Ok(ApplyPlan {
             managed_writes,
             managed_removals: match action {
-                SiteAction::ApplyAll => nginx::unused_managed_files(db, &self.root)?,
+                SiteAction::ApplyAll => {
+                    webserver::unused_managed_files(self.server, db, &self.root)?
+                }
                 _ => Vec::new(),
             },
             sites,
             every_site: action == SiteAction::ApplyAll,
+            server: self.server,
             root: self.root.clone(),
             validate: None,
         })
@@ -1027,7 +1043,7 @@ impl Nginx {
     pub fn finish_scan(
         &self,
         db: &Db,
-        sites: Result<Vec<nginx::DiscoveredSite>, String>,
+        sites: Result<Vec<webserver::DiscoveredSite>, String>,
     ) -> String {
         let root = self.root.display();
         let stored = sites.and_then(|sites| {
@@ -1053,7 +1069,7 @@ impl Nginx {
                 Ok(PlannedSite {
                     server_name: site.server_name.clone(),
                     config_path: PathBuf::from(&site.config_path),
-                    config: nginx::block_config_for_site(db, site.id)?,
+                    config: webserver::block_config_for_site(db, site.id)?,
                 })
             })
             .collect()
@@ -1082,11 +1098,15 @@ impl Nginx {
 /// reads the trust file, which lives beside the site configs rather than
 /// in `/etc/nginx` (see [`nginx::conf_d_dir`]), and working that out needs
 /// the database this function deliberately cannot see.
-pub fn run_status_check(sites: &[PlannedSite], conf_d: &Path) -> Vec<SiteApplyStatus> {
+pub fn run_status_check(
+    server: WebServer,
+    sites: &[PlannedSite],
+    root: &Path,
+) -> Vec<SiteApplyStatus> {
     sites
         .iter()
         .map(|site| {
-            nginx::site_apply_status(&site.config_path, &site.server_name, &site.config, conf_d)
+            server.site_apply_status(&site.config_path, &site.server_name, &site.config, root)
         })
         .collect()
 }
@@ -1108,26 +1128,28 @@ pub enum SiteAction {
 pub struct PlannedSite {
     pub server_name: String,
     pub config_path: PathBuf,
-    pub config: nginx::BlockConfig,
+    pub config: webserver::BlockConfig,
 }
 
 /// Everything a background apply needs, with every `Db` read already done.
 pub struct ApplyPlan {
     pub managed_writes: Vec<(PathBuf, String)>,
     /// Empty except for `ApplyAll`, and applied only if every site
-    /// succeeded — see [`nginx::remove_unused_managed_files`] for why the
+    /// succeeded — see [`webserver::remove_unused_managed_files`] for why the
     /// ordering is load-bearing rather than tidy. Each held through its
-    /// directory, as [`nginx::unused_managed_files`] checked it.
-    pub managed_removals: Vec<nginx::DirFile>,
+    /// directory, as [`webserver::unused_managed_files`] checked it.
+    pub managed_removals: Vec<webserver::DirFile>,
     pub sites: Vec<PlannedSite>,
     pub every_site: bool,
-    /// The NGINX root, which a symlinked site file may only point into.
+    /// The web server the sites are served by.
+    pub server: WebServer,
+    /// The config root, which a symlinked site file may only point into.
     pub root: PathBuf,
     /// The test to run once everything is written, and to undo the apply
-    /// on failure (see `nginx::test_or_restore`). `None` under
+    /// on failure (see `webserver::test_or_restore`). `None` under
     /// `--no-reload`, which leaves NGINX alone entirely; `App` fills it
     /// in, since the plan is built by a screen that does not know.
-    pub validate: Option<nginx::NginxCommands>,
+    pub validate: Option<webserver::ServerCommands>,
 }
 
 /// What one site's write did.
@@ -1150,7 +1172,7 @@ pub struct ApplyOutcome {
     /// Generated files (the trust file, the rate-limit zone) written or
     /// removed because their contents changed. Counted apart from the
     /// sites because it can be the only change there is — see
-    /// [`nginx::write_planned_managed_files`].
+    /// [`webserver::write_planned_managed_files`].
     pub managed_changed: usize,
     /// Set when the config test failed and every file was put back: why,
     /// or why putting them back failed too.
@@ -1166,7 +1188,7 @@ pub struct ApplyOutcome {
 /// means they all will, and reporting them together is more use than
 /// stopping at the first.
 pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
-    let snapshot = nginx::Snapshot::of_apply(
+    let snapshot = webserver::Snapshot::of_apply(
         &plan.root,
         plan.managed_writes.iter().map(|(path, _)| path.clone()),
         &plan.managed_removals,
@@ -1175,7 +1197,7 @@ pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
     // Same ordering as the CLI's apply: a managed file has to exist before
     // a config that aliases it is reloaded.
     let managed = match &snapshot {
-        Ok(_) => nginx::write_planned_managed_files(&plan.managed_writes),
+        Ok(_) => webserver::write_planned_managed_files(&plan.managed_writes),
         Err(err) => Err(anyhow::anyhow!("{err:#}")),
     };
     let results: Vec<SiteResult> = plan
@@ -1183,7 +1205,8 @@ pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
         .iter()
         .map(|site| {
             let outcome = managed.as_ref().map_err(clone_error).and_then(|_| {
-                nginx::apply_block_for_site(
+                webserver::apply_block_for_site(
+                    plan.server,
                     &site.config_path,
                     &plan.root,
                     &site.server_name,
@@ -1206,7 +1229,7 @@ pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
     let mut managed_changed = managed.as_ref().copied().unwrap_or(0);
     let mut cleanup_error = None;
     if all_ok && !plan.managed_removals.is_empty() {
-        match nginx::remove_planned_managed_files(&plan.managed_removals) {
+        match webserver::remove_planned_managed_files(&plan.managed_removals) {
             Ok(removed) => managed_changed += removed,
             Err(err) => cleanup_error = Some(err.to_string()),
         }
@@ -1217,9 +1240,11 @@ pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
     // next reload to find broken.
     let changed_any = managed_changed > 0 || results.iter().any(|r| r.changed == Ok(true));
     let rolled_back = match (&plan.validate, &snapshot) {
-        (Some(commands), Ok(snapshot)) if changed_any => nginx::test_or_restore(snapshot, commands)
-            .err()
-            .map(|err| format!("{err:#}")),
+        (Some(commands), Ok(snapshot)) if changed_any => {
+            webserver::test_or_restore(plan.server, snapshot, commands)
+                .err()
+                .map(|err| format!("{err:#}"))
+        }
         _ => None,
     };
 
@@ -1238,12 +1263,12 @@ pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
 ///
 /// A site file that cannot be read is left out here; the apply names it
 /// when it fails on it.
-pub fn preview_apply(plan: &ApplyPlan) -> Vec<nginx::FileChange> {
+pub fn preview_apply(plan: &ApplyPlan) -> Vec<webserver::FileChange> {
     let mut changes = Vec::new();
     for (path, body) in &plan.managed_writes {
         let before = std::fs::read_to_string(path).ok();
         if before.as_deref() != Some(body.as_str()) {
-            changes.push(nginx::FileChange {
+            changes.push(webserver::FileChange {
                 path: path.clone(),
                 before,
                 after: Some(body.clone()),
@@ -1277,7 +1302,7 @@ pub fn preview_apply(plan: &ApplyPlan) -> Vec<nginx::FileChange> {
         files
             .into_iter()
             .filter(|(_, before, after)| before != after)
-            .map(|(path, before, after)| nginx::FileChange {
+            .map(|(path, before, after)| webserver::FileChange {
                 path,
                 before: Some(before),
                 after: Some(after),
@@ -1286,7 +1311,7 @@ pub fn preview_apply(plan: &ApplyPlan) -> Vec<nginx::FileChange> {
 
     for file in &plan.managed_removals {
         if let Some(before) = file.read_to_string() {
-            changes.push(nginx::FileChange {
+            changes.push(webserver::FileChange {
                 path: file.path().to_path_buf(),
                 before: Some(before),
                 after: None,
@@ -1314,7 +1339,7 @@ fn status_tag(status: Option<&SiteApplyStatus>) -> Span<'static> {
 }
 
 /// Whether `err` (or anything in its causal chain — `fs::write`'s error is
-/// wrapped in context by `nginx::apply_block_for_site`) is an OS
+/// wrapped in context by `webserver::apply_block_for_site`) is an OS
 /// permission-denied error, e.g. writing to a root-owned `/etc/nginx` file
 /// without being root.
 fn is_permission_denied(err: &anyhow::Error) -> bool {
@@ -1338,7 +1363,10 @@ mod tests {
     fn perform(screen: &mut Nginx, db: &Db, action: SiteAction) -> (String, bool) {
         match action {
             SiteAction::Scan => {
-                let sites = nginx::discover_sites(screen.root()).map_err(|err| err.to_string());
+                let sites = screen
+                    .server()
+                    .discover_sites(screen.root())
+                    .map_err(|err| err.to_string());
                 (screen.finish_scan(db, sites), false)
             }
             _ => {
@@ -1356,8 +1384,7 @@ mod tests {
     fn refresh_with_statuses(screen: &mut Nginx, db: &Db) {
         screen.refresh(db).unwrap();
         let plan = screen.plan_status_check(db).unwrap();
-        let conf_d = nginx::conf_d_dir(screen.root());
-        screen.finish_status_check(run_status_check(&plan, &conf_d));
+        screen.finish_status_check(run_status_check(screen.server(), &plan, screen.root()));
     }
 
     /// Presses Enter on an open confirm popup and carries out whatever it
@@ -1399,7 +1426,7 @@ mod tests {
     }
 
     fn test_screen() -> Nginx {
-        Nginx::new(PathBuf::from("tests/fixtures/nginx"))
+        Nginx::new(WebServer::Nginx, PathBuf::from("tests/fixtures/nginx"))
     }
 
     #[test]
@@ -1547,7 +1574,10 @@ mod tests {
     #[test]
     fn scanning_a_missing_root_reports_the_failure_rather_than_zero_sites() {
         let db = Db::open_in_memory().unwrap();
-        let mut screen = Nginx::new(PathBuf::from("/nonexistent/does-not-exist"));
+        let mut screen = Nginx::new(
+            WebServer::Nginx,
+            PathBuf::from("/nonexistent/does-not-exist"),
+        );
         let mut message = None;
 
         screen
@@ -1728,11 +1758,11 @@ mod tests {
         std::fs::write(&path, original).unwrap();
         db.upsert_site("example.com", path.to_str().unwrap())
             .unwrap();
-        let mut screen = Nginx::new(dir.path().to_path_buf());
+        let mut screen = Nginx::new(WebServer::Nginx, dir.path().to_path_buf());
         screen.refresh(&db).unwrap();
 
         let plan = ApplyPlan {
-            validate: Some(nginx::NginxCommands {
+            validate: Some(webserver::ServerCommands {
                 test: vec!["false".to_string()],
                 reload: vec!["true".to_string()],
             }),

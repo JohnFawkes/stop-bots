@@ -23,7 +23,7 @@
 //! whose root changed kept a full set in the old `conf.d`, still live if
 //! NGINX reads it, and nothing would ever remove them; the same goes for
 //! any file a later release stops writing. A row here is written *before*
-//! the file is (see `nginx::record_managed_files`), so every file that can
+//! the file is (see `webserver::record_managed_files`), so every file that can
 //! exist has one, even if the process died between the two.
 
 use std::path::{Path, PathBuf};
@@ -37,7 +37,7 @@ use super::{now, Db};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedFile {
     pub path: PathBuf,
-    /// What the file is, as `nginx::ManagedKind::id` spells it. Stored as
+    /// What the file is, as `webserver::ManagedKind::id` spells it. Stored as
     /// text so a kind a later release adds is still a row this one can
     /// list and remove.
     pub kind: String,

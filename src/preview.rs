@@ -30,7 +30,7 @@
 //! firewall half is a [`crate::firewall::FirewallRun`] with `dry_run` set.
 
 use crate::firewall::{FirewallOutcome, FirewallRun, SshLog};
-use crate::nginx::FileChange;
+use crate::webserver::FileChange;
 use std::path::Path;
 
 /// Both halves of a preview. Each is its own `Result`, as the apply's two
@@ -135,13 +135,15 @@ pub fn nginx_diff(changes: &[FileChange]) -> String {
 /// and the console inside one `with_db`. `run` is the firewall run the
 /// apply would make; it is turned into a dry run here.
 pub fn apply_everything(
+    server: crate::webserver::WebServer,
     db: &crate::db::Db,
     root: &Path,
     run: FirewallRun,
     ssh_log: SshLog<'_>,
 ) -> ApplyPreview {
     ApplyPreview {
-        nginx: crate::nginx::preview_all_sites(db, root).map_err(|err| format!("{err:#}")),
+        nginx: crate::webserver::preview_all_sites(server, db, root)
+            .map_err(|err| format!("{err:#}")),
         firewall: crate::firewall::render_and_apply(db, run.dry_run(true), ssh_log)
             .map_err(|err| format!("{err:#}")),
     }
@@ -182,7 +184,13 @@ mod tests {
         let (db, root, run) = fixture(dir.path());
         let site = std::fs::read_to_string(root.join("site.conf")).unwrap();
 
-        let preview = apply_everything(&db, &root, run, SshLog::Text(Some("")));
+        let preview = apply_everything(
+            crate::webserver::WebServer::Nginx,
+            &db,
+            &root,
+            run,
+            SshLog::Text(Some("")),
+        );
 
         assert_eq!(
             std::fs::read_to_string(root.join("site.conf")).unwrap(),
@@ -202,7 +210,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db, root, run) = fixture(dir.path());
 
-        let lines = apply_everything(&db, &root, run, SshLog::Text(None)).lines();
+        let lines = apply_everything(
+            crate::webserver::WebServer::Nginx,
+            &db,
+            &root,
+            run,
+            SshLog::Text(None),
+        )
+        .lines();
         let text = lines.join("\n");
 
         for (what, expected) in [
@@ -224,7 +239,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (db, root, run) = fixture(dir.path());
 
-        let diff = apply_everything(&db, &root, run, SshLog::Text(Some(""))).diff();
+        let diff = apply_everything(
+            crate::webserver::WebServer::Nginx,
+            &db,
+            &root,
+            run,
+            SshLog::Text(Some("")),
+        )
+        .diff();
 
         assert!(
             diff.contains(&format!("+++ {}", root.join("site.conf").display())),
@@ -240,7 +262,13 @@ mod tests {
     fn the_apply_writes_exactly_what_the_preview_showed() {
         let dir = tempfile::tempdir().unwrap();
         let (db, root, run) = fixture(dir.path());
-        let before = apply_everything(&db, &root, run.clone(), SshLog::Text(Some("")));
+        let before = apply_everything(
+            crate::webserver::WebServer::Nginx,
+            &db,
+            &root,
+            run.clone(),
+            SshLog::Text(Some("")),
+        );
         let sites: Vec<_> = before
             .nginx
             .as_ref()
@@ -254,12 +282,13 @@ mod tests {
         // The site file alone, through the apply's own function: the
         // generated files live under `/etc`, which a test must not touch.
         let site_path = root.join("site.conf");
-        let configs: Vec<(String, crate::nginx::BlockConfig)> = Vec::new();
-        crate::nginx::apply_blocks_to_file(
+        let configs: Vec<(String, crate::webserver::BlockConfig)> = Vec::new();
+        crate::webserver::apply_blocks_to_file(
+            crate::webserver::WebServer::Nginx,
             &site_path,
             &root,
             &configs,
-            &crate::nginx::default_block_config(&db).unwrap(),
+            &crate::webserver::default_block_config(&db).unwrap(),
         )
         .unwrap();
 

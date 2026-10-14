@@ -78,9 +78,9 @@ use stop_bots::app::App;
 use stop_bots::db::{
     BotStatus, Category, Db, FirewallAction, GeoMode, NewBot, NewFirewallRule, Policy, Source,
 };
-use stop_bots::nginx::SiteApplyStatus;
 use stop_bots::tui::{self, Screen, Theme};
 use stop_bots::web::{auth, server, state::AppState};
+use stop_bots::webserver::SiteApplyStatus;
 
 /// Wide enough that no panel elides, short enough to stay readable when
 /// GitHub scales the image into a README column.
@@ -164,6 +164,9 @@ async fn main() -> Result<()> {
             console_helper: None,
             console_unreadable_logs: Vec::new(),
             nginx_commands: None,
+            web_server: stop_bots::webserver::WebServer::Nginx,
+            config_root: None,
+            apache_rewrite_enabled: None,
         },
     )?;
 

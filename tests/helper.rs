@@ -645,12 +645,12 @@ async fn managed_files_rows_outside_the_managed_directories_delete_nothing() {
     {
         let db = host.open_db();
         for (path, kind) in [
-            (victim.clone(), stop_bots::nginx::ManagedKind::Limits),
-            (link.clone(), stop_bots::nginx::ManagedKind::Trusted),
-            (climbing, stop_bots::nginx::ManagedKind::Limits),
+            (victim.clone(), stop_bots::webserver::ManagedKind::Limits),
+            (link.clone(), stop_bots::webserver::ManagedKind::Trusted),
+            (climbing, stop_bots::webserver::ManagedKind::Limits),
             (
                 PathBuf::from("/etc/passwd"),
-                stop_bots::nginx::ManagedKind::Limits,
+                stop_bots::webserver::ManagedKind::Limits,
             ),
         ] {
             db.record_managed_file(&path, kind.id()).unwrap();

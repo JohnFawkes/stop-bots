@@ -51,9 +51,9 @@
 //! - the NGINX commands, the NGINX root and the log paths come from the
 //!   host settings file, which only root can write;
 //! - sites are rediscovered on disk under that root, and a row's id only
-//!   picks one of them ([`crate::nginx::locate_site`]);
+//!   picks one of them ([`crate::webserver::locate_site`]);
 //! - a `managed_files` row is acted on only inside the managed directories
-//!   ([`crate::nginx::unused_managed_files`]);
+//!   ([`crate::webserver::unused_managed_files`]);
 //! - the firewall script goes to the fixed path for its backend;
 //! - every value rendered from a row is validated where it is rendered.
 //!
@@ -69,7 +69,8 @@ use serde::{Deserialize, Serialize};
 use crate::db::Db;
 use crate::firewall::{self, FirewallRun, SshLog, WriteStep};
 use crate::hostconf::HostConf;
-use crate::nginx::{self, ApplyAllOutcome, SiteApplyStatus};
+use crate::webserver;
+use crate::webserver::{ApplyAllOutcome, SiteApplyStatus};
 
 /// One privileged operation, as the console asks for it. The exact set the
 /// console needs, and nothing more.
@@ -311,7 +312,7 @@ pub fn execute(settings: &Settings, db: &impl DbAccess, op: Op) -> Result<Reply>
         }
         // Rows: none read. Writes a row per site found on disk.
         Op::ScanSites => {
-            let sites = nginx::discover_sites(&root)?;
+            let sites = host.web_server().discover_sites(&root)?;
             db.with(|db| {
                 for site in &sites {
                     db.upsert_site(&site.server_name, &site.config_path.to_string_lossy())?;
@@ -323,9 +324,11 @@ pub fn execute(settings: &Settings, db: &impl DbAccess, op: Op) -> Result<Reply>
         // Rows: `sites` (a name and a path, matched against what is on
         // disk; the file judged is the one found there) and the policy
         // rows a site's block is rendered from.
-        Op::SiteStatuses => Ok(Reply::SiteStatuses(
-            db.with(|db| nginx::site_statuses(db, &root))?,
-        )),
+        Op::SiteStatuses => {
+            Ok(Reply::SiteStatuses(db.with(|db| {
+                webserver::site_statuses(host.web_server(), db, &root)
+            })?))
+        }
         // Rows: the site's (to pick the file found on disk), the policy
         // rows every block is rendered from — validated where rendered —
         // and `managed_files`, acted on only inside the managed
@@ -336,7 +339,14 @@ pub fn execute(settings: &Settings, db: &impl DbAccess, op: Op) -> Result<Reply>
                 .transpose()?;
             match site {
                 None => db
-                    .with(|db| nginx::apply_all_sites_and_reload(db, &root, commands.as_ref()))
+                    .with(|db| {
+                        webserver::apply_all_sites_and_reload(
+                            host.web_server(),
+                            db,
+                            &root,
+                            commands.as_ref(),
+                        )
+                    })
                     .map(Reply::AppliedAll),
                 Some(id) => db.with(|db| {
                     let site = db
@@ -344,8 +354,13 @@ pub fn execute(settings: &Settings, db: &impl DbAccess, op: Op) -> Result<Reply>
                         .into_iter()
                         .find(|s| s.id == id)
                         .ok_or_else(|| anyhow!("no site with id {id}"))?;
-                    let (changed, reloaded) =
-                        nginx::apply_site_and_reload(db, &root, &site, commands.as_ref())?;
+                    let (changed, reloaded) = webserver::apply_site_and_reload(
+                        host.web_server(),
+                        db,
+                        &root,
+                        &site,
+                        commands.as_ref(),
+                    )?;
                     Ok(Reply::AppliedSite {
                         name: site.server_name,
                         changed,
@@ -359,7 +374,8 @@ pub fn execute(settings: &Settings, db: &impl DbAccess, op: Op) -> Result<Reply>
         // read the NGINX config can read anyway.
         Op::Preview { diff } => {
             let (nginx, prepared) = db.with(|db| {
-                let nginx = nginx::preview_all_sites(db, &root).map_err(|err| format!("{err:#}"));
+                let nginx = webserver::preview_all_sites(host.web_server(), db, &root)
+                    .map_err(|err| format!("{err:#}"));
                 let run = firewall_run(settings, db, true, &[])?.dry_run(true);
                 Ok((
                     nginx,
@@ -413,7 +429,7 @@ pub fn execute(settings: &Settings, db: &impl DbAccess, op: Op) -> Result<Reply>
             let path = crate::webaccess::apply(&plan, &root)?;
             db.with(|db| crate::webaccess::record(db, &plan))?;
             let reloaded = if reload && settings.for_real {
-                nginx::reload_with(&plan.commands)
+                webserver::reload_with(host.web_server(), &plan.commands)
                     .map(|()| true)
                     .map_err(|err| format!("{err:#}"))
             } else {

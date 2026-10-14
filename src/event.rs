@@ -129,7 +129,7 @@ pub enum AppEvent {
     /// `upsert_site` calls it implies happen on the main thread, `Db` not
     /// being `Sync`.
     SitesScanned {
-        sites: Result<Vec<crate::nginx::DiscoveredSite>, String>,
+        sites: Result<Vec<crate::webserver::DiscoveredSite>, String>,
     },
     /// A background apply of one or every site's config has finished.
     ///
@@ -168,7 +168,7 @@ pub enum AppEvent {
     /// of them still match what their settings render to (see
     /// `App::start_site_status_check`). In the site list's order.
     SiteStatusesChecked {
-        statuses: Vec<crate::nginx::SiteApplyStatus>,
+        statuses: Vec<crate::webserver::SiteApplyStatus>,
     },
 }
 

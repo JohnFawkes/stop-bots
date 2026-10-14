@@ -40,8 +40,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::db::Db;
-use crate::nginx::{self, ConsoleAccess, NginxCommands};
+use crate::nginx;
 use crate::web::BasePath;
+use crate::webserver;
+use crate::webserver::{ConsoleAccess, ServerCommands};
 
 /// The prefix both front-ends offer first. Path mode is the default
 /// because it inherits the site's certificate, and this is the prefix the
@@ -89,8 +91,10 @@ pub struct Plan {
     /// subdomain mode, whose block is plain HTTP until certbot has run —
     /// and it is only certbot that knows when that is.
     pub tls: bool,
-    /// How to test and reload NGINX on this host.
-    pub commands: NginxCommands,
+    /// How to test and reload the web server on this host.
+    pub commands: ServerCommands,
+    /// The web server the config is for.
+    pub server: crate::webserver::WebServer,
 }
 
 /// Checks `request` against the host and gathers what applying it needs.
@@ -110,8 +114,21 @@ pub fn plan(
     root: &Path,
     request: &Request,
 ) -> Result<Plan> {
+    let server = host.web_server();
+    if server == crate::webserver::WebServer::Apache {
+        // Checked here, not left to the config test: Apache with
+        // `mod_proxy` but not its HTTP half takes the config, and then
+        // answers every request for the console with a 500.
+        let mods = root.join("mods-enabled");
+        if mods.is_dir() && !mods.join("proxy_http.load").exists() {
+            anyhow::bail!(
+                "Apache reaches the console through mod_proxy_http, which is not enabled. \
+                 Run `a2enmod proxy_http`, then try again."
+            );
+        }
+    }
     let upstream = crate::web::resolve_bind(db, None)?;
-    let commands = NginxCommands::from_host(host)?;
+    let commands = ServerCommands::from_host(host)?;
 
     match request {
         Request::Subdomain { host } => {
@@ -126,6 +143,7 @@ pub fn plan(
                 upstream,
                 commands,
                 tls: false,
+                server,
             })
         }
         Request::Path { site, prefix } => {
@@ -143,11 +161,14 @@ pub fn plan(
                 .with_context(|| {
                     format!("No scanned site called {server_name}. Re-scan sites first.")
                 })?;
-            let config_path = nginx::locate_site(root, &server_name, Some(&recorded))?;
+            let config_path =
+                webserver::locate_site(host.web_server(), root, &server_name, Some(&recorded))?;
             // Every name on the block this location is going into, not
             // just the one the database happens to store.
-            let hosts = nginx::server_names_for(&config_path, &server_name);
-            let tls = nginx::serves_tls(&config_path, &server_name);
+            let hosts = host
+                .web_server()
+                .server_names_for(&config_path, &server_name);
+            let tls = host.web_server().serves_tls(&config_path, &server_name);
             Ok(Plan {
                 tls,
                 access: ConsoleAccess::Path {
@@ -159,6 +180,7 @@ pub fn plan(
                 base_path: Some(prefix),
                 upstream,
                 commands,
+                server,
             })
         }
     }
@@ -183,7 +205,14 @@ pub fn path_prefix(raw: &str) -> Result<BasePath> {
 /// Touches no `Db`, on purpose: this is the step that runs a subprocess,
 /// and it is the one a front-end moves off its main thread.
 pub fn apply(plan: &Plan, root: &Path) -> Result<PathBuf> {
-    nginx::apply_console_access(root, &plan.access, &plan.upstream, &plan.commands)
+    match plan.server {
+        webserver::WebServer::Nginx => {
+            nginx::apply_console_access(root, &plan.access, &plan.upstream, &plan.commands)
+        }
+        webserver::WebServer::Apache => {
+            crate::apache::apply_console_access(root, &plan.access, &plan.upstream, &plan.commands)
+        }
+    }
 }
 
 /// Records the address the console now answers to, and what a console
@@ -243,7 +272,7 @@ impl Plan {
 /// A cheap plausibility check on a host name, not a validator: it only has
 /// to keep a blank field and an obvious typo out of a generated
 /// `server_name` directive. NGINX itself is the real parser, and
-/// `nginx::write_validated` is what makes running it safe.
+/// `webserver::write_validated` is what makes running it safe.
 pub fn is_plausible_host(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= 253
@@ -562,6 +591,34 @@ mod tests {
             crate::web::configured_hosts(&db).unwrap(),
             vec!["console.example.com".to_string()]
         );
+    }
+
+    /// Apache takes a config naming `ProxyPass` with only `mod_proxy`
+    /// loaded, and then answers the console with a 500: refused up front,
+    /// with the command that fixes it.
+    #[test]
+    fn apache_path_mode_needs_mod_proxy_http_and_plans_for_apache() {
+        let (dir, db) = scanned(
+            "<VirtualHost *:443>\n    ServerName example.com\n    SSLEngine on\n</VirtualHost>\n",
+        );
+        let apache = crate::hostconf::HostConf {
+            web_server: Some(webserver::WebServer::Apache),
+            ..Default::default()
+        };
+        let mods = dir.path().join("mods-enabled");
+        std::fs::create_dir(&mods).unwrap();
+
+        let err = super::plan(&db, &apache, dir.path(), &path_mode()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("a2enmod proxy_http"),
+            "was: {err:#}"
+        );
+
+        std::fs::write(mods.join("proxy_http.load"), "").unwrap();
+        let plan = super::plan(&db, &apache, dir.path(), &path_mode()).unwrap();
+        assert_eq!(plan.server, webserver::WebServer::Apache);
+        assert!(plan.tls, "the site's host terminates TLS");
+        assert_eq!(plan.commands.test, ["apache2ctl", "configtest"]);
     }
 
     #[test]

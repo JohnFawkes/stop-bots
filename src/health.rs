@@ -53,6 +53,7 @@ use anyhow::Result;
 
 use crate::db::Db;
 use crate::firewall::{self, FirewallBackend};
+use crate::webserver;
 
 /// How much a check wants the operator's attention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -260,7 +261,20 @@ pub struct Probe {
     /// a probe taken before they were carried here, or when the setting
     /// does not parse; read as the defaults.
     #[serde(default)]
-    pub nginx_commands: Option<crate::nginx::NginxCommands>,
+    pub nginx_commands: Option<crate::webserver::ServerCommands>,
+    /// Which web server the host settings choose. NGINX in a probe taken
+    /// before there was a choice, which is what that host ran.
+    #[serde(default)]
+    pub web_server: crate::webserver::WebServer,
+    /// The web server's config root, as the host settings resolve it.
+    /// `None` in a probe from before it was carried here.
+    #[serde(default)]
+    pub config_root: Option<String>,
+    /// Apache only: whether `mod_rewrite`, which every block is written
+    /// in, is enabled. `None` for NGINX, or where Debian's `mods-enabled`
+    /// is not there to ask.
+    #[serde(default)]
+    pub apache_rewrite_enabled: Option<bool>,
 }
 
 /// How much of the access log a probe reads: its last 32 MB. Every
@@ -385,7 +399,15 @@ pub fn probe(
         NginxHome::Container { name } => Some(name.clone()),
         _ => None,
     };
+    let server = host.web_server();
+    let config_root = host.root(None);
+    let mods_enabled = config_root.join("mods-enabled");
     Probe {
+        web_server: server,
+        config_root: Some(config_root.display().to_string()),
+        apache_rewrite_enabled: (server == crate::webserver::WebServer::Apache
+            && mods_enabled.is_dir())
+        .then(|| mods_enabled.join("rewrite.load").exists()),
         nginx_commands: host.commands().ok(),
         live_rules,
         live_backend,
@@ -974,7 +996,12 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     checks.push(firewall_persistence(probe, backend));
     checks.push(script_freshness(db, expected, backend)?);
     checks.push(nginx_applied(db, probe)?);
-    checks.push(generated_files_reachable(probe));
+    if probe.web_server == webserver::WebServer::Nginx {
+        checks.push(generated_files_reachable(probe));
+    }
+    if let Some(check) = apache_rewrite(probe) {
+        checks.push(check);
+    }
     checks.push(service_health(probe));
     checks.extend(console_account(probe));
     checks.extend(console_helper(probe));
@@ -1001,8 +1028,10 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     if let Some(check) = firewall_reaches_containers(probe) {
         checks.push(check);
     }
-    if let Some(check) = nginx_deployment(db, probe)? {
-        checks.push(check);
+    if probe.web_server == webserver::WebServer::Nginx {
+        if let Some(check) = nginx_deployment(db, probe)? {
+            checks.push(check);
+        }
     }
     if let Some(check) = console_proxy(db)? {
         checks.push(check);
@@ -1432,8 +1461,27 @@ pub fn format_utc(secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
 }
 
+/// Apache's blocks are `mod_rewrite` rules, and Debian ships the module
+/// switched off. Without it the config test fails, so an apply is refused
+/// and nothing is protected — which this says before an apply does.
+fn apache_rewrite(probe: &Probe) -> Option<Check> {
+    let enabled = probe.apache_rewrite_enabled?;
+    Some(Check {
+        id: "apache-rewrite",
+        title: "Apache can run the blocks",
+        level: if enabled { Level::Ok } else { Level::Critical },
+        detail: if enabled {
+            "mod_rewrite is enabled".to_string()
+        } else {
+            "mod_rewrite is not enabled, so no block can be applied".to_string()
+        },
+        fix: (!enabled).then(|| "run `a2enmod rewrite`, then apply".to_string()),
+    })
+}
+
 fn nginx_applied(db: &Db, probe: &Probe) -> Result<Check> {
-    use crate::nginx::{self, SiteApplyStatus};
+    use crate::nginx;
+    use crate::webserver::SiteApplyStatus;
 
     let sites = db.list_sites()?;
     let total = sites.len();
@@ -1449,13 +1497,16 @@ fn nginx_applied(db: &Db, probe: &Probe) -> Result<Check> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| nginx::conf_d_dir(Path::new(nginx::DEFAULT_ROOT)));
     for site in sites {
-        let config = nginx::block_config_for_site(db, site.id)?;
-        let status = nginx::site_apply_status(
-            Path::new(&site.config_path),
-            &site.server_name,
-            &config,
-            &conf_d,
-        );
+        let config = webserver::block_config_for_site(db, site.id)?;
+        let path = Path::new(&site.config_path);
+        let status = match (probe.web_server, &probe.config_root) {
+            (webserver::WebServer::Nginx, _) | (_, None) => {
+                nginx::site_apply_status(path, &site.server_name, &config, &conf_d)
+            }
+            (server, Some(root)) => {
+                server.site_apply_status(path, &site.server_name, &config, Path::new(root))
+            }
+        };
         if status != SiteApplyStatus::UpToDate {
             stale.push(site.server_name);
         }
@@ -1481,8 +1532,13 @@ fn nginx_applied(db: &Db, probe: &Probe) -> Result<Check> {
         )
     };
     Ok(Check {
+        // The id predates there being a choice, and is kept for whatever
+        // reads it; the title names the server.
         id: "nginx-applied",
-        title: "NGINX blocks are applied",
+        title: match probe.web_server {
+            webserver::WebServer::Nginx => "NGINX blocks are applied",
+            webserver::WebServer::Apache => "Apache blocks are applied",
+        },
         level,
         detail,
         fix,
@@ -2031,7 +2087,10 @@ fn skipped_entries(db: &Db) -> Result<Option<Check>> {
 ///   Only while `robots.txt` is served: that `alias` is the one thing the
 ///   generated config reads from it.
 fn nginx_deployment(db: &Db, probe: &Probe) -> Result<Option<Check>> {
-    let commands = probe.nginx_commands.clone().unwrap_or_default();
+    let commands = probe
+        .nginx_commands
+        .clone()
+        .unwrap_or_else(|| webserver::WebServer::Nginx.default_commands());
     let targets_a_container = |argv: &[String]| {
         argv.iter()
             .any(|word| word.contains("docker") || word.contains("podman"))
@@ -2351,6 +2410,9 @@ mod tests {
             console_helper: Some(true),
             console_unreadable_logs: Vec::new(),
             nginx_commands: None,
+            web_server: crate::webserver::WebServer::Nginx,
+            config_root: None,
+            apache_rewrite_enabled: None,
         }
     }
 
@@ -2591,9 +2653,9 @@ mod tests {
     /// the container `web`.
     fn configured_for_docker(probe: Probe) -> Probe {
         Probe {
-            nginx_commands: Some(crate::nginx::NginxCommands {
-                test: crate::nginx::split_command("docker exec web nginx -t").unwrap(),
-                reload: crate::nginx::split_command("docker exec web nginx -s reload").unwrap(),
+            nginx_commands: Some(crate::webserver::ServerCommands {
+                test: crate::webserver::split_command("docker exec web nginx -t").unwrap(),
+                reload: crate::webserver::split_command("docker exec web nginx -s reload").unwrap(),
             }),
             ..probe
         }

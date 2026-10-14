@@ -165,7 +165,18 @@ jobs:
           cp "target/${{ matrix.target }}/release/stop-bots" README.md LICENSE "dist/${name}/"
           tar -czf "dist/${name}.tar.gz" -C dist "${name}"
           rm -rf "dist/${name}"
-          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+
+      # One `.sha256` beside every asset, the .deb included: someone who
+      # downloads a single file should not need a second, all-assets file to
+      # check it. packaging/bump.py reads the tarballs' ones for the AUR
+      # `-bin` package. `release` adds a SHA256SUMS covering all of them.
+      - name: Checksums
+        working-directory: dist
+        run: |
+          for asset in *.tar.gz *.deb; do
+            sha256sum "$asset" > "$asset.sha256"
+          done
+          cat ./*.sha256
 
       - name: Inspect the package
         run: |
@@ -190,10 +201,23 @@ jobs:
           merge-multiple: true
           path: dist
 
+      # Each build job wrote a `.sha256` per asset; checking them here
+      # proves the bytes survived the artifact round trip, and SHA256SUMS
+      # puts every asset of the release in one file for `sha256sum -c`.
+      - name: Verify the checksums and write SHA256SUMS
+        working-directory: dist
+        run: |
+          for sum in *.sha256; do
+            sha256sum --check --strict "$sum"
+          done
+          sha256sum *.tar.gz *.deb > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*
+          fail_on_unmatched_files: true
           generate_release_notes: true
           # Marked as a pre-release while the version is 0.0.x — cargo treats
           # every 0.0.z bump as breaking, and the release page should say the

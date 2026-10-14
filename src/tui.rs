@@ -243,12 +243,14 @@ impl Screen {
         }
     }
 
-    pub fn title(self) -> &'static str {
+    /// The tab's name. The sites screen is named for the web server it
+    /// manages, so the name needs it: there is no answer without one.
+    pub fn title(self, server: crate::webserver::WebServer) -> &'static str {
         match self {
             Screen::Dashboard => "Dashboard",
             Screen::BotSettings => "Bot settings",
             Screen::Firewall => "Firewall",
-            Screen::Nginx => "NGINX",
+            Screen::Nginx => server.label(),
             Screen::Blocks => "Blocks",
             Screen::Help => "Help",
         }
@@ -532,11 +534,7 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
                 }),
         );
         tabs.push(" ".into());
-        // The sites screen is named for the web server it manages.
-        let title = match screen {
-            Screen::Nginx => app.nginx.server().label(),
-            screen => screen.title(),
-        };
+        let title = screen.title(app.nginx.server());
         tabs.push(if active {
             title.fg(theme.accent()).bold().underlined()
         } else {
@@ -657,6 +655,15 @@ fn busy_label(jobs: &std::collections::HashSet<crate::app::Job>) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sites_screen_is_named_for_the_hosts_web_server() {
+        use crate::webserver::WebServer;
+        for server in WebServer::ALL {
+            assert_eq!(Screen::Nginx.title(server), server.label());
+        }
+        assert_eq!(Screen::Firewall.title(WebServer::Apache), "Firewall");
+    }
 
     /// Which job gets named when several are out has to be stable across
     /// redraws — `HashSet` iteration order is arbitrary, so without the

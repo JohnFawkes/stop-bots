@@ -62,6 +62,7 @@ impl Fixture {
     fn cmd(&self, args: &[&str]) -> Command {
         let mut cmd = stop_bots_bin();
         cmd.env("STOP_BOTS_NGINX_DIR", &self.managed)
+            .env("STOP_BOTS_APACHE_DIR", &self.managed)
             .env("STOP_BOTS_NGINX_CONF_D", &self.conf_d)
             .env("STOP_BOTS_HOST_CONF", self.host_conf())
             .args(args)
@@ -187,7 +188,7 @@ fn fake_tools(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let bin = dir.join("fakebin");
     fs::create_dir_all(&bin).unwrap();
     let log = dir.join("calls.log");
-    for tool in ["nginx", "systemctl", "nft", "docker"] {
+    for tool in ["nginx", "apache2ctl", "systemctl", "nft", "docker"] {
         let path = bin.join(tool);
         fs::write(
             &path,
@@ -3840,6 +3841,302 @@ fn uninstall_needs_root_without_a_prefix() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("needs root"));
+}
+
+// ---- Apache ----
+//
+// The same binary driving a fake Apache tree, with a fake `apache2ctl` and
+// `systemctl` on PATH: what is written, what is run, in what order, and
+// what is refused. The container suite runs the real Apache.
+
+/// Debian's `apache2.conf`, as far as what it includes.
+const DEBIAN_APACHE2_CONF: &str = "IncludeOptional mods-enabled/*.load\n\
+     IncludeOptional mods-enabled/*.conf\n\
+     IncludeOptional conf-enabled/*.conf\n\
+     IncludeOptional sites-enabled/*.conf\n";
+
+/// RHEL's `conf/httpd.conf`, as far as what it includes.
+const RHEL_HTTPD_CONF: &str = "ServerRoot \"/etc/httpd\"\n\
+     Include conf.modules.d/*.conf\n\
+     IncludeOptional conf.d/*.conf\n";
+
+/// A `<VirtualHost>` for `name`.
+fn apache_site(name: &str) -> String {
+    format!("<VirtualHost *:80>\n    ServerName {name}\n    DocumentRoot /var/www/{name}\n</VirtualHost>\n")
+}
+
+impl Fixture {
+    /// Debian's Apache tree in this fixture, with one site, `example.com`,
+    /// in `sites-available`, and Apache chosen in its host settings.
+    /// Returns the root and the site file.
+    fn debian_apache(&self) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = self._tmp.path().join("apache2");
+        for dir in ["conf-enabled", "sites-enabled", "sites-available"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        fs::write(root.join("apache2.conf"), DEBIAN_APACHE2_CONF).unwrap();
+        let site = root.join("sites-available/example.conf");
+        fs::write(&site, apache_site("example.com")).unwrap();
+        self.choose_apache(&root);
+        (root, site)
+    }
+
+    /// RHEL's Apache tree, the same way: `conf/httpd.conf`, which reads its
+    /// sites and everything else from `conf.d`.
+    fn rhel_apache(&self) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = self._tmp.path().join("httpd");
+        fs::create_dir_all(root.join("conf")).unwrap();
+        fs::create_dir_all(root.join("conf.d")).unwrap();
+        fs::write(root.join("conf/httpd.conf"), RHEL_HTTPD_CONF).unwrap();
+        let site = root.join("conf.d/example.conf");
+        fs::write(&site, apache_site("example.com")).unwrap();
+        self.choose_apache(&root);
+        (root, site)
+    }
+
+    fn choose_apache(&self, root: &Path) {
+        fs::write(
+            self.host_conf(),
+            format!("web_server = apache\napache_root = {}\n", root.display()),
+        )
+        .unwrap();
+    }
+
+    /// `apply-blocks` against the stored root, with `bin` first on PATH:
+    /// tested and reloaded through the fakes there.
+    fn apply_with(&self, bin: &Path) -> assert_cmd::assert::Assert {
+        self.cmd(&["apply-blocks"])
+            .env("PATH", path_with(bin))
+            .assert()
+    }
+}
+
+#[test]
+fn apache_apply_tests_with_apache2ctl_then_reloads_apache() {
+    let fx = Fixture::new();
+    let (_, site) = fx.debian_apache();
+    let (bin, calls) = fake_tools(fx._tmp.path());
+    fx.seed_bots();
+    fx.run(&["scan-sites"]);
+
+    fx.apply_with(&bin).success();
+
+    let log = fs::read_to_string(&calls).unwrap();
+    assert_eq!(
+        log.lines().collect::<Vec<_>>(),
+        ["apache2ctl configtest", "systemctl reload apache2"],
+        "log was: {log}"
+    );
+    let written = fs::read_to_string(&site).unwrap();
+    assert!(
+        written.starts_with("<VirtualHost *:80>\n    # BEGIN stop-bots (DO NOT EDIT)\n"),
+        "site was:\n{written}"
+    );
+}
+
+#[test]
+fn apache_refusing_the_config_puts_the_site_back_and_says_what_to_enable() {
+    let fx = Fixture::new();
+    let (_, site) = fx.debian_apache();
+    let (bin, calls) = fake_tools(fx._tmp.path());
+    fs::write(
+        fx._tmp.path().join("fail-apache2ctl"),
+        "AH00526: Syntax error: Invalid command 'RewriteEngine', perhaps misspelled",
+    )
+    .unwrap();
+    fx.seed_bots();
+    fx.run(&["scan-sites"]);
+
+    fx.apply_with(&bin)
+        .failure()
+        .stderr(predicate::str::contains("a2enmod rewrite"));
+
+    assert_eq!(
+        fs::read_to_string(&site).unwrap(),
+        apache_site("example.com")
+    );
+    let log = fs::read_to_string(&calls).unwrap();
+    assert!(!log.contains("systemctl"), "reloaded anyway: {log}");
+}
+
+/// The config test passes a block a later `RewriteEngine Off` switches
+/// off; the apply must not.
+#[test]
+fn apache_apply_refuses_a_site_that_switches_rewriting_off() {
+    let fx = Fixture::new();
+    let (_, site) = fx.debian_apache();
+    let switched_off = apache_site("example.com")
+        .replace("</VirtualHost>", "    RewriteEngine Off\n</VirtualHost>");
+    fs::write(&site, &switched_off).unwrap();
+    let (bin, _) = fake_tools(fx._tmp.path());
+    fx.seed_bots();
+    fx.run(&["scan-sites"]);
+
+    fx.apply_with(&bin)
+        .failure()
+        .stderr(predicate::str::contains("RewriteEngine Off"));
+    assert_eq!(fs::read_to_string(&site).unwrap(), switched_off);
+}
+
+#[test]
+fn apache_on_rhel_writes_the_trust_file_to_conf_d() {
+    let fx = Fixture::new();
+    let (root, site) = fx.rhel_apache();
+    fx.seed_bots();
+    fx.run(&["scan-sites"]);
+    fx.run(&["trust", "--user-agent", "UptimeRobot"]);
+
+    fx.run(&["apply-blocks", "--no-reload"]);
+
+    let trust = root.join("conf.d/stop-bots-trusted.conf");
+    let written = fs::read_to_string(&trust).unwrap_or_default();
+    assert!(
+        written.contains("UptimeRobot"),
+        "trust file was:\n{written}"
+    );
+    assert!(fs::read_to_string(&site)
+        .unwrap()
+        .contains("stop_bots_trusted"));
+}
+
+/// RHEL with a `conf-enabled` made by hand: `httpd.conf` never reads it,
+/// and a trust file there would leave every trusted client blocked.
+#[test]
+fn apache_refuses_a_trust_file_where_apache_never_reads_it() {
+    let fx = Fixture::new();
+    let (root, site) = fx.rhel_apache();
+    fs::create_dir_all(root.join("conf-enabled")).unwrap();
+    fx.seed_bots();
+    fx.run(&["scan-sites"]);
+    fx.run(&["trust", "--user-agent", "UptimeRobot"]);
+
+    fx.cmd(&["apply-blocks", "--no-reload"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("never read"));
+    assert!(!root.join("conf-enabled/stop-bots-trusted.conf").exists());
+    assert_eq!(
+        fs::read_to_string(&site).unwrap(),
+        apache_site("example.com")
+    );
+}
+
+#[test]
+fn apache_refuses_to_turn_rate_limiting_on() {
+    let fx = Fixture::new();
+    fx.debian_apache();
+    fx.cmd(&["set-rate-limit", "--enabled", "true"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no rate limiting"));
+    // Off is always fine: it is what Apache has.
+    fx.run(&["set-rate-limit", "--enabled", "false"]);
+}
+
+/// Everything that would find NGINX's blocks again works on the server
+/// chosen, so choosing Apache first would strand them.
+#[test]
+fn switching_web_server_is_refused_while_the_old_one_has_blocks() {
+    let fx = Fixture::new();
+    fx.run(&[
+        "set-nginx-commands",
+        "--root",
+        fx.nginx_root.to_str().unwrap(),
+    ]);
+    let site = fx.write_site("a.example");
+    let before = fs::read_to_string(&site).unwrap();
+    fx.seed_bots();
+    fx.scan_sites();
+    fx.apply_blocks();
+
+    fx.cmd(&["set-web-server", "apache"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("uninstall web-server"))
+        .stderr(predicate::str::contains(site.to_str().unwrap()));
+    let host = fs::read_to_string(fx.host_conf()).unwrap();
+    assert!(!host.contains("web_server"), "switched anyway:\n{host}");
+
+    // With the block gone, nothing stands in the way.
+    fs::write(&site, before).unwrap();
+    fx.run(&["set-web-server", "apache"]);
+    let host = fs::read_to_string(fx.host_conf()).unwrap();
+    assert!(host.contains("web_server = apache"), "host.conf:\n{host}");
+}
+
+/// NGINX is stored as no choice at all, so a host that never chose
+/// Apache keeps a host.conf the releases before the choice can read.
+#[test]
+fn choosing_nginx_writes_no_web_server_line() {
+    let fx = Fixture::new();
+    fx.run(&["set-web-server", "nginx"]);
+    let host = fs::read_to_string(fx.host_conf()).unwrap_or_default();
+    assert!(!host.contains("web_server"), "host.conf:\n{host}");
+}
+
+/// `uninstall web-server` on an Apache host takes out what an Apache apply
+/// wrote, byte for byte. Under `--prefix`, which runs no system program.
+#[test]
+fn apache_uninstall_takes_a_prefix_back_to_how_it_was() {
+    let tmp = tempfile::tempdir().unwrap();
+    let prefix = tmp.path();
+    let host_conf = prefix.join("etc/stop-bots/host.conf");
+    let db = prefix.join("var/lib/stop-bots/db.sqlite3");
+    let managed = prefix.join("etc/stop-bots/apache");
+    let run = |args: &[&str]| {
+        stop_bots_bin()
+            .env("STOP_BOTS_APACHE_DIR", &managed)
+            .env("STOP_BOTS_HOST_CONF", &host_conf)
+            .args(args)
+            .args(["--db", db.to_str().unwrap()])
+            .assert()
+            .success()
+    };
+    let root = prefix.join("etc/apache2");
+    for dir in ["conf-enabled", "sites-available"] {
+        fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    fs::write(root.join("apache2.conf"), DEBIAN_APACHE2_CONF).unwrap();
+    let site = root.join("sites-available/example.conf");
+    fs::write(&site, apache_site("example.com")).unwrap();
+    // Stored as the host's own path, which `--prefix` reads inside the tree.
+    fs::create_dir_all(host_conf.parent().unwrap()).unwrap();
+    fs::write(
+        &host_conf,
+        "web_server = apache\napache_root = /etc/apache2\n",
+    )
+    .unwrap();
+    run(&["trust", "--user-agent", "UptimeRobot"]);
+    run(&["set-robots-txt", "--enabled", "true"]);
+    run(&[
+        "apply-blocks",
+        "--root",
+        root.to_str().unwrap(),
+        "--no-reload",
+    ]);
+    let trust = root.join("conf-enabled/stop-bots-trusted.conf");
+    assert!(trust.exists(), "nothing was applied");
+
+    let out = run(&[
+        "uninstall",
+        "web-server",
+        "--prefix",
+        prefix.to_str().unwrap(),
+    ]);
+
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert_eq!(
+        fs::read_to_string(&site).unwrap(),
+        apache_site("example.com"),
+        "{stdout}"
+    );
+    for gone in [&trust, &managed] {
+        assert!(
+            !gone.exists(),
+            "{} is still there:\n{stdout}",
+            gone.display()
+        );
+    }
 }
 
 // ---- auto-apply ----

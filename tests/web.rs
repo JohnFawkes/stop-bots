@@ -1107,6 +1107,46 @@ async fn the_nginx_settings_round_trip() {
     assert_eq!(db.get_rate_limit_burst().unwrap(), 21);
 }
 
+/// Chooses Apache in the console's own host settings file.
+fn choose_apache(tmp: &tempfile::TempDir) {
+    std::fs::write(tmp.path().join("host.conf"), "web_server = apache\n").unwrap();
+}
+
+/// Apache has no rate limiting of its own, and nothing writes one for it:
+/// a switch that read as on would limit nothing.
+#[tokio::test]
+async fn an_apache_host_refuses_to_turn_rate_limiting_on() {
+    let (app, password, tmp, db_path) = app_with_db();
+    choose_apache(&tmp);
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/nginx/rate-limit",
+        "enabled=1&rps=7&burst=21",
+    )
+    .await;
+    assert!(flash.contains("no rate limiting"), "was: {flash}");
+    assert!(!Db::open(&db_path)
+        .unwrap()
+        .get_rate_limit_enabled()
+        .unwrap());
+}
+
+#[tokio::test]
+async fn an_apache_hosts_settings_say_why_there_is_no_rate_limit() {
+    let (app, password, tmp, _db_path) = app_with_db();
+    choose_apache(&tmp);
+    let (cookie, _) = login(&app, &password).await;
+
+    let html = page_html(&app, &cookie, "/nginx").await;
+    assert!(html.contains("no rate limiting"), "page was:\n{html}");
+    assert!(!html.contains("/nginx/rate-limit"), "page was:\n{html}");
+    assert!(html.contains("<title>Apache"), "page was:\n{html}");
+}
+
 #[tokio::test]
 async fn a_rate_limit_of_zero_is_refused() {
     let (app, password, _tmp, db_path) = app_with_db();

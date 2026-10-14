@@ -1039,7 +1039,7 @@ async fn set_web_access(
                     "Wrote {} and recorded the host. {} {note}. {} Restart the \
                      console for a changed path prefix to take effect.",
                     report.path.display(),
-                    crate::webserver::WebServer::configured().label(),
+                    state.host().web_server().label(),
                     report.note
                 ),
                 true,

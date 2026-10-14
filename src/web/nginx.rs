@@ -166,7 +166,7 @@ const RESPONSES: [(BlockResponse, &str); 7] = [
 
 fn nginx_settings_panel(view: &View, ctx: &Ctx) -> Markup {
     layout::panel(
-        "NGINX settings",
+        &format!("{} settings", ctx.chrome.web_server.label()),
         Some("Host-wide, and applied to every site on the next Apply"),
         html! {
             table {
@@ -245,6 +245,15 @@ fn nginx_settings_panel(view: &View, ctx: &Ctx) -> Markup {
                             br;
                             span .hint { "Enforced by NGINX at request time, unlike everything else here" }
                         }
+                        @if let Some(why) = ctx.chrome.web_server.without_rate_limiting() {
+                            // Not offered where it would store a limit
+                            // nothing writes.
+                            td {
+                                (layout::pill("NONE", PillKind::Neutral))
+                                " "
+                                span .hint { (why) }
+                            }
+                        } @else {
                         td {
                             form .row method="post" action=(ctx.url("/nginx/rate-limit")) style="gap:8px" {
                                 (layout::csrf_field(ctx))
@@ -268,6 +277,7 @@ fn nginx_settings_panel(view: &View, ctx: &Ctx) -> Markup {
                                     @if view.rate_limit { "Save and turn off" } @else { "Save and turn on" }
                                 }
                             }
+                        }
                         }
                     }
                 }
@@ -932,6 +942,14 @@ async fn set_rate_limit(
         );
     }
     let on = form.enabled == "1";
+    if let Some(why) = state
+        .host()
+        .web_server()
+        .without_rate_limiting()
+        .filter(|_| on)
+    {
+        return back_with(&state, "/nginx", why, false);
+    }
     let (rps, burst) = (form.rps, form.burst);
     match state
         .with_db(move |db| {

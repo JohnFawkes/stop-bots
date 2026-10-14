@@ -2699,6 +2699,15 @@ fn set_rate_limit(
     burst: Option<i64>,
 ) -> Result<()> {
     let db = open_db(db_path)?;
+    // Refused rather than stored where nothing would write it: a limit
+    // that reads as on and limits nothing is worse than none.
+    if let Some(why) = host_settings()?
+        .web_server()
+        .without_rate_limiting()
+        .filter(|_| enabled)
+    {
+        anyhow::bail!("{why}");
+    }
     // Parameters are stored even when disabling, so `--enabled false
     // --rps 5` then `--enabled true` uses 5 rather than silently
     // reverting to the default.
@@ -4326,7 +4335,39 @@ fn store_server_settings(
     } = settings;
     let changing = choose || reset || root.is_some() || test.is_some() || reload.is_some();
     if choose {
-        host.web_server = Some(server);
+        // Nothing is switched while the server chosen now still has
+        // stop-bots in its config: once the other is chosen, nothing would
+        // ever find it there again (see `webserver::leftovers`). Taking it
+        // out is `uninstall web-server`'s job, with its `--dry-run`, rather
+        // than something a settings command does on the side.
+        let current = host.web_server();
+        if current != server {
+            let current_root = HostConf {
+                web_server: Some(current),
+                ..host.clone()
+            }
+            .root(None);
+            let left = webserver::leftovers(current, &current_root);
+            if !left.is_empty() {
+                let listed: Vec<String> = left
+                    .iter()
+                    .map(|path| format!("  {}", path.display()))
+                    .collect();
+                anyhow::bail!(
+                    "{current} still has stop-bots in its config:\n{}\n\n\
+                     Take it out first with `sudo stop-bots uninstall web-server` (it works on \
+                     {current}, the web server chosen now; `--dry-run` shows what it would do), \
+                     then choose {server} again.",
+                    listed.join("\n"),
+                    current = current.label(),
+                    server = server.id(),
+                );
+            }
+        }
+        // NGINX is stored as no choice at all, which it is: the line is
+        // left out, and a host that never chose Apache keeps a file the
+        // releases before the choice existed can still read.
+        host.web_server = (server != webserver::WebServer::Nginx).then_some(server);
     }
     let (test_field, reload_field, root_field) = match server {
         webserver::WebServer::Nginx => (

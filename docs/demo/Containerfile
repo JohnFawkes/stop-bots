@@ -1,0 +1,16 @@
+# The `make demo` sandbox: a disposable server to try stop-bots on.
+#
+# Built on top of the container suite's own image (tests/container/Dockerfile:
+# Ubuntu 24.04, NGINX serving one site on port 8080, nftables and iptables,
+# and a `systemctl` shim so a reload works without an init system), which
+# `make demo` builds first and passes in as BASE. Reusing it means the demo
+# runs on the same server the integration tests check the generated config
+# against, rather than a second one that could drift from it.
+#
+# All this layer adds is the start script, which starts NGINX, gives the
+# detectors something to find, and leaves you in a shell.
+ARG BASE=stop-bots-demo-base
+FROM ${BASE}
+
+COPY start.sh /usr/local/bin/stop-bots-demo
+CMD ["sh", "/usr/local/bin/stop-bots-demo"]

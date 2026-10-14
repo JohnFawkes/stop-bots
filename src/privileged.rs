@@ -383,7 +383,11 @@ pub fn execute(settings: &Settings, db: &impl DbAccess, op: Op) -> Result<Reply>
                 ))
             })?;
             let firewall = prepared.map(|prepared| firewall::execute(prepared, SshLog::Read(&ssh)));
-            let preview = crate::preview::ApplyPreview { nginx, firewall };
+            let preview = crate::preview::ApplyPreview {
+                server: host.web_server(),
+                nginx,
+                firewall,
+            };
             Ok(Reply::Preview(preview.summary(diff)))
         }
         // Rows: `firewall:backend`, the rules, trusted addresses, feeds

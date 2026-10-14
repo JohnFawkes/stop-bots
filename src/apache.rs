@@ -27,33 +27,64 @@
 //!
 //! `mod_rewrite` is the one module every Apache has that can look at the
 //! user agent, the path and the client's trust all at once, and it runs in
-//! the translate-name phase, before `Alias`, `<Location>` or `.htaccess`
-//! can route the request anywhere. The block uses the same flag idiom the
-//! NGINX block does, with an environment variable as the flag: each reason
-//! to block sets it, each exemption clears it, and one last rule acts on
-//! it. Order is the whole mechanism, and every rule but the last carries
-//! no `[L]`, so the site's own rewrite rules after the block still run.
+//! the translate-name phase, before `Alias`, `ProxyPass`, `<Location>` or
+//! `.htaccess` can route the request anywhere. The block uses the same flag
+//! idiom the NGINX block does, with an environment variable as the flag:
+//! each reason to block sets it, each exemption clears it, and one last
+//! rule acts on it. Order is the whole mechanism, and every rule but the
+//! last carries no `[L]`, so the site's own rewrite rules after the block
+//! still run.
 //!
 //! ```apache
 //! # BEGIN stop-bots (DO NOT EDIT)
 //! RewriteEngine On
 //! RewriteCond %{HTTP_USER_AGENT} "(?:BadBot|EvilBot)" [NC]
 //! RewriteRule ^ - [E=stop_bots_block:1]
-//! RewriteCond %{REQUEST_URI} "^(/robots\.txt$)" [NC]
+//! RewriteCond %{REQUEST_URI} "(?:^(/api/))" [NC]
 //! RewriteRule ^ - [E=stop_bots_block:0]
+//! RewriteCond %{ENV:REDIRECT_STATUS} ^$
 //! RewriteCond %{ENV:stop_bots_block} =1
-//! RewriteRule ^ - [R=403,L]
+//! RewriteRule ^ - [R=403,L,NS]
 //! # END stop-bots
 //! ```
+//!
+//! **The decision is made once, on the request the client sent.** Rules in
+//! a `<VirtualHost>` run again on every internal redirect — a front
+//! controller's `.htaccess` sending `/wp-json/x` on to `/index.php`, an
+//! `ErrorDocument` — and on every subrequest (`DirectoryIndex` looking for
+//! `index.php`), each time with the *new* path. An exemption for `/wp-json/`
+//! would pass the first round and lose the second, and a blocked request's
+//! own error page would be blocked in turn. So the last rule acts only on
+//! the original request: not when `REDIRECT_STATUS` is set, which Apache
+//! does on every internal redirect, and not in a subrequest (`NS`). That
+//! lets nothing through that was turned away: a redirect or a subrequest
+//! only ever happens on behalf of a request the first round let through, or
+//! to send a blocked one its error page.
 //!
 //! ## What Apache cannot do that NGINX can
 //!
 //! - **Rate limiting.** Apache has no request-rate limit of its own (only
-//!   third-party modules), so the setting is not rendered here.
+//!   third-party modules), so the setting is not rendered here, and the
+//!   front-ends do not offer it on an Apache host.
 //! - **Closing the connection (444), the tarpit and the teapot (418).**
 //!   Each answers `403` instead: a block still blocks, only less cheaply.
 //!   `mod_rewrite` refuses `[R=418]` outright, which the config test
 //!   reports and the apply then undoes.
+//!
+//! ## What the config test does not catch, and an apply refuses
+//!
+//! A block can pass `apache2ctl configtest` and still do nothing, or do far
+//! more than asked. Each case below is read from the config on disk
+//! ([`Tree`]) and refused, by the apply, with what to change, and never
+//! reported as up to date by status:
+//!
+//! - a generated file in a directory Apache does not `Include` — RHEL's
+//!   `httpd.conf` reads `conf.d`, never a `conf-enabled` (see
+//!   [`conf_enabled_dir`]);
+//! - a `RewriteEngine Off` later in the same `<VirtualHost>`, which
+//!   switches the whole block off;
+//! - the HTTP/1.x rule on a host that does not speak HTTP/2, where it
+//!   would turn away every visitor.
 //!
 //! ## Requirements
 //!
@@ -62,6 +93,11 @@
 //! missing `mod_rewrite` fails the config test, and the apply puts every
 //! file back and says so — a block that silently did nothing would be
 //! worse.
+//!
+//! ## Layouts
+//!
+//! Debian's (`/etc/apache2`, with `conf-enabled` and `sites-enabled`), and
+//! RHEL's (`/etc/httpd`, which reads everything of its own from `conf.d`).
 
 use crate::webserver::*;
 use anyhow::Result;
@@ -125,6 +161,13 @@ pub const CONF_ENABLED_DIR_ENV: &str = "STOP_BOTS_APACHE_CONF_D";
 /// root inside the stock tree (`/etc/apache2/sites-available`) — the same
 /// rule, and for the same reasons, as `nginx::conf_d_dir`.
 ///
+/// **And `conf.d` for a root that has that and no `conf-enabled`**: RHEL's
+/// layout, whose `httpd.conf` ends in `IncludeOptional conf.d/*.conf` and
+/// reads no `conf-enabled` at all. A trust file written to one there passed
+/// the config test, read as up to date, and was never loaded, so every
+/// trusted monitor was blocked. Whatever this picks, an apply then checks
+/// that Apache loads it ([`unloaded_file`]).
+///
 /// A plain file in `conf-enabled` rather than one in `conf-available` and
 /// a link: `a2enconf` is how an operator enables their own files, and one
 /// file is one thing to remove.
@@ -133,6 +176,10 @@ pub fn conf_enabled_dir(root: &Path) -> PathBuf {
         return PathBuf::from(dir);
     }
     let beside_the_sites = root.join("conf-enabled");
+    let rhel = root.join("conf.d");
+    if !beside_the_sites.is_dir() && rhel.is_dir() {
+        return rhel;
+    }
     let in_stock_tree = root.starts_with(DEFAULT_ROOT)
         && !root
             .components()
@@ -216,6 +263,23 @@ struct VirtualHost {
     /// Every directive inside, nested sections' included, as its name
     /// (lowercased) and its arguments.
     directives: Vec<(String, Vec<String>)>,
+    /// The directives that set something for the host as a whole, in
+    /// order: those outside every `<Directory>`, `<Location>`, `<Files>`,
+    /// `<If>` or `<Proxy>`, though maybe inside an `<IfModule>` or another
+    /// section that only decides whether its lines are read. A
+    /// `RewriteEngine Off` here switches the block off; one inside a
+    /// `<Directory>` is about that directory's `.htaccess`-style rules and
+    /// does not.
+    server_scope: Vec<(String, Vec<String>)>,
+}
+
+/// Whether a section named `name` (lowercased) only decides whether the
+/// lines inside it are read, leaving them in the scope around it.
+fn is_conditional(name: &str) -> bool {
+    matches!(
+        name,
+        "ifmodule" | "ifdefine" | "ifversion" | "iffile" | "ifdirective" | "ifsection"
+    )
 }
 
 /// Splits a directive's arguments the way Apache's `ap_getword_conf`
@@ -288,8 +352,8 @@ fn bare_name(name: &str) -> String {
 /// never be read as structure, whatever a quoted pattern in it holds.
 fn virtual_hosts(content: &str) -> Vec<VirtualHost> {
     let mut hosts = Vec::new();
-    // The open `<VirtualHost>`, and how deep inside it nested sections go.
-    let mut current: Option<(VirtualHost, usize)> = None;
+    // The open `<VirtualHost>`, and the sections open inside it.
+    let mut current: Option<(VirtualHost, Vec<String>)> = None;
     for line in lines(content) {
         let text = line.text.trim();
         if text.is_empty() || text.starts_with('#') {
@@ -306,28 +370,34 @@ fn virtual_hosts(content: &str) -> Vec<VirtualHost> {
                             open: line.end,
                             close: line.end,
                             directives: Vec::new(),
+                            server_scope: Vec::new(),
                         },
-                        0,
+                        Vec::new(),
                     ));
                 }
-                (Some((host, 0)), "virtualhost", true) => {
+                (Some((host, open)), "virtualhost", true) if open.is_empty() => {
                     host.close = line.start;
                     let (mut host, _) = current.take().expect("a host is open");
                     finish(&mut host);
                     hosts.push(host);
                 }
-                (Some((_, depth)), _, false) => *depth += 1,
-                (Some((_, depth)), _, true) => *depth = depth.saturating_sub(1),
+                (Some((_, open)), _, false) => open.push(name),
+                (Some((_, open)), _, true) => {
+                    open.pop();
+                }
                 (None, _, _) => {}
             }
             continue;
         }
-        if let Some((host, _)) = &mut current {
+        if let Some((host, open)) = &mut current {
             let mut parts = words(text);
             if parts.is_empty() {
                 continue;
             }
             let name = parts.remove(0).to_ascii_lowercase();
+            if open.iter().all(|section| is_conditional(section)) {
+                host.server_scope.push((name.clone(), parts.clone()));
+            }
             host.directives.push((name, parts));
         }
     }
@@ -383,6 +453,432 @@ pub fn discover_sites(root: &Path) -> Result<Vec<DiscoveredSite>> {
         }
     }
     Ok(sites)
+}
+
+// ---- what the rest of the config says ----
+
+/// Where Apache's main config file is, relative to the directory relative
+/// paths in it are relative to: Debian's, a source build's, and RHEL's,
+/// which keeps it under `conf/` with the server root above that.
+const MAIN_CONFIGS: [&str; 3] = ["apache2.conf", "httpd.conf", "conf/httpd.conf"];
+
+/// How many directories above a root the main config is looked for: a root
+/// of `/etc/apache2/sites-available`, or RHEL's `/etc/httpd/conf.d`, is
+/// still that tree.
+const MAIN_CONFIG_LEVELS_UP: usize = 2;
+
+/// The directory Apache's main config is in, at or up to
+/// [`MAIN_CONFIG_LEVELS_UP`] above `root`, and the file: `/etc/httpd` and
+/// `/etc/httpd/conf/httpd.conf` for any root in RHEL's tree. `None` when
+/// there is none — a root that is not Apache's, as far as this can tell.
+fn main_config(root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let root = std::path::absolute(root).ok()?;
+    root.ancestors()
+        .take(MAIN_CONFIG_LEVELS_UP + 1)
+        .find_map(|dir| {
+            MAIN_CONFIGS
+                .iter()
+                .map(|name| dir.join(name))
+                .find(|main| main.is_file())
+                .map(|main| (dir.to_path_buf(), main))
+        })
+}
+
+/// The directory of Apache's main config for `root` ([`main_config`]):
+/// the tree `root` is part of, which is what the root helper's sandbox
+/// checks a root under `/etc` against.
+pub fn config_tree(root: &Path) -> Option<PathBuf> {
+    main_config(root).map(|(dir, _)| dir)
+}
+
+/// Apache's configuration as Apache reads it under one root: its main
+/// file, then everything that `Include`s, transitively.
+///
+/// Read because the config test passes configs that do nothing: a file in
+/// a directory nothing includes, a block a later `RewriteEngine Off`
+/// switches off, a rule for HTTP/2 that the server never speaks. Each of
+/// those is checked against this, and refused.
+///
+/// What it does not know, it says it does not know, and nothing is refused
+/// on it: a root with no main file at or just above it ([`Tree::find`]), or
+/// an include it cannot resolve. Everything else is approximate on purpose
+/// in the one direction that is safe: a conditional section's lines all
+/// count as read, so a file this says is included may not be — but a file
+/// this says is *not* included is not, whatever the conditions say.
+struct Tree {
+    /// The main file.
+    main: PathBuf,
+    /// What relative paths are relative to: the server root.
+    base: PathBuf,
+    /// The `ServerRoot` the main file declares, when it is not `base`: a
+    /// config on a bind mount names the paths it has inside its container,
+    /// and those are read as the same paths under `base`.
+    declared_root: Option<PathBuf>,
+    /// Every `Include` and `IncludeOptional` pattern, made absolute.
+    includes: Vec<PathBuf>,
+    /// Whether an include could not be resolved (it holds a `${VAR}`), in
+    /// which case no file can be said to be left out.
+    unresolved: bool,
+    /// Every file read, in the order Apache reads them, with its text.
+    files: Vec<(PathBuf, String)>,
+}
+
+impl Tree {
+    /// The tree whose main file is at `root`, or a level or two above it,
+    /// read; `None` when there is none.
+    fn find(root: &Path) -> Option<Tree> {
+        let (dir, main) = main_config(root)?;
+        let text = fs::read_to_string(&main).ok()?;
+        let declared = lines(&text).into_iter().find_map(|line| {
+            let parts = words(line.text.trim());
+            (parts.len() == 2 && parts[0].eq_ignore_ascii_case("serverroot"))
+                .then(|| PathBuf::from(&parts[1]))
+        });
+        // The declared root is the base when the main file is inside it, as
+        // on RHEL; otherwise it names the container's paths, and the base is
+        // the directory the main file was found from.
+        let (base, declared_root) = match declared {
+            Some(declared) if main.starts_with(&declared) => (declared, None),
+            declared => (dir, declared.filter(|d| d.is_absolute())),
+        };
+        let mut tree = Tree {
+            main: main.clone(),
+            base,
+            declared_root,
+            includes: Vec::new(),
+            unresolved: false,
+            files: Vec::new(),
+        };
+        tree.load(&main, 0);
+        Some(tree)
+    }
+
+    /// Reads `file` and, depth first, what it includes, as Apache does.
+    fn load(&mut self, file: &Path, depth: usize) {
+        const MAX_DEPTH: usize = 16;
+        const MAX_FILES: usize = 4096;
+        if depth > MAX_DEPTH
+            || self.files.len() >= MAX_FILES
+            || self.files.iter().any(|(read, _)| read == file)
+        {
+            return;
+        }
+        let Ok(text) = fs::read_to_string(file) else {
+            return;
+        };
+        self.files.push((file.to_path_buf(), text.clone()));
+        for line in lines(&text) {
+            let parts = words(line.text.trim());
+            let [name, argument] = parts.as_slice() else {
+                continue;
+            };
+            if !name.eq_ignore_ascii_case("include")
+                && !name.eq_ignore_ascii_case("includeoptional")
+            {
+                continue;
+            }
+            let Some(pattern) = self.resolve(argument) else {
+                self.unresolved = true;
+                continue;
+            };
+            self.includes.push(pattern.clone());
+            for included in expand(&pattern) {
+                self.load(&included, depth + 1);
+            }
+        }
+    }
+
+    /// A path as the config writes it, as a path on this host; `None` for
+    /// one holding a variable, whose value only Apache's environment knows.
+    fn resolve(&self, written: &str) -> Option<PathBuf> {
+        if written.contains("${") {
+            return None;
+        }
+        let path = Path::new(written);
+        if !path.is_absolute() {
+            return Some(self.base.join(path));
+        }
+        Some(
+            match self
+                .declared_root
+                .as_ref()
+                .and_then(|declared| path.strip_prefix(declared).ok())
+            {
+                Some(inside) => self.base.join(inside),
+                None => path.to_path_buf(),
+            },
+        )
+    }
+
+    /// Whether Apache reads `file`, which need not exist yet: `None` when
+    /// that cannot be told.
+    fn includes(&self, file: &Path) -> Option<bool> {
+        let file = std::path::absolute(file).ok()?;
+        if file == self.main || self.includes.iter().any(|pattern| matches(pattern, &file)) {
+            return Some(true);
+        }
+        (!self.unresolved).then_some(false)
+    }
+
+    /// Whether some file Apache reads loads the module `name`
+    /// (`http2_module`).
+    fn loads_module(&self, name: &str) -> bool {
+        self.directives_outside_hosts().any(|(directive, args)| {
+            directive == "loadmodule" && args.first().is_some_and(|m| m == name)
+        })
+    }
+
+    /// The last `Protocols` the main server sets, which every
+    /// `<VirtualHost>` without one of its own inherits.
+    fn main_protocols(&self) -> Option<Vec<String>> {
+        self.directives_outside_hosts()
+            .filter(|(directive, _)| directive == "protocols")
+            .last()
+            .map(|(_, args)| args)
+    }
+
+    /// Every directive outside a `<VirtualHost>`, in the order Apache reads
+    /// them, as its name (lowercased) and arguments.
+    fn directives_outside_hosts(&self) -> impl Iterator<Item = (String, Vec<String>)> + '_ {
+        self.files.iter().flat_map(|(_, text)| {
+            let mut in_host = false;
+            lines(text).into_iter().filter_map(move |line| {
+                let text = line.text.trim();
+                if text.starts_with('#') {
+                    return None;
+                }
+                if let Some((name, closing, _)) = section(text) {
+                    if name == "virtualhost" {
+                        in_host = !closing;
+                    }
+                    return None;
+                }
+                if in_host {
+                    return None;
+                }
+                let mut parts = words(text);
+                (!parts.is_empty()).then(|| {
+                    let name = parts.remove(0).to_ascii_lowercase();
+                    (name, parts)
+                })
+            })
+        })
+    }
+}
+
+/// Whether a path holds a wildcard Apache expands.
+fn has_wildcard(text: &str) -> bool {
+    text.contains(['*', '?', '['])
+}
+
+/// The files an `Include` of `pattern` reads, in the order it reads them:
+/// a wildcard in any part of the path is matched against what is there,
+/// and a directory is every file under it. A wildcard does not match a
+/// leading dot, as Apache's does not — which is what keeps the temporary
+/// files [`write_atomically`] makes out of the config.
+fn expand(pattern: &Path) -> Vec<PathBuf> {
+    let mut found = vec![PathBuf::from("/")];
+    for part in pattern.components() {
+        let std::path::Component::Normal(part) = part else {
+            if part == std::path::Component::ParentDir {
+                found.iter_mut().for_each(|dir| dir.push(".."));
+            }
+            continue;
+        };
+        let part = part.to_string_lossy();
+        if !has_wildcard(&part) {
+            found.iter_mut().for_each(|dir| dir.push(part.as_ref()));
+            continue;
+        }
+        found = found
+            .iter()
+            .flat_map(|dir| sorted_entries(dir))
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name_matches(&part, &name.to_string_lossy()))
+            })
+            .collect();
+    }
+    found
+        .into_iter()
+        .flat_map(|path| {
+            if path.is_dir() {
+                WalkDir::new(&path)
+                    .sort_by_file_name()
+                    .into_iter()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| !e.file_type().is_dir())
+                    .map(|e| e.into_path())
+                    .collect()
+            } else if path.exists() {
+                vec![path]
+            } else {
+                Vec::new()
+            }
+        })
+        .collect()
+}
+
+/// What is in `dir`, by name.
+fn sorted_entries(dir: &Path) -> Vec<PathBuf> {
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+        .map(|entries| entries.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    entries.sort();
+    entries
+}
+
+/// Whether `file`, which need not exist, is one an `Include` of `pattern`
+/// reads: `pattern` itself, a file under it if it is a directory, or one
+/// its wildcards match part for part.
+fn matches(pattern: &Path, file: &Path) -> bool {
+    if !has_wildcard(&pattern.to_string_lossy()) {
+        return file == pattern || (pattern.is_dir() && file.starts_with(pattern));
+    }
+    let wanted: Vec<_> = pattern.components().collect();
+    let parts: Vec<_> = file.components().collect();
+    wanted.len() == parts.len()
+        && wanted
+            .iter()
+            .zip(&parts)
+            .all(|(want, part)| match (want, part) {
+                (std::path::Component::Normal(want), std::path::Component::Normal(part)) => {
+                    name_matches(&want.to_string_lossy(), &part.to_string_lossy())
+                }
+                (want, part) => want == part,
+            })
+}
+
+/// `fnmatch` for one path component, as Apache's include does it: `*`,
+/// `?` and `[...]` (with `!` or `^` to negate, and ranges), and no
+/// wildcard matching a leading dot.
+fn name_matches(pattern: &str, name: &str) -> bool {
+    if name.starts_with('.') && !pattern.starts_with('.') {
+        return false;
+    }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    glob(&pattern, &name)
+}
+
+fn glob(pattern: &[char], name: &[char]) -> bool {
+    match pattern.split_first() {
+        None => name.is_empty(),
+        Some(('*', rest)) => (0..=name.len()).any(|skip| glob(rest, &name[skip..])),
+        Some(('?', rest)) => !name.is_empty() && glob(rest, &name[1..]),
+        Some(('[', rest)) => {
+            let Some(close) = rest.iter().skip(1).position(|&c| c == ']').map(|at| at + 1) else {
+                // No closing bracket: a literal `[`.
+                return name.first() == Some(&'[') && glob(rest, &name[1..]);
+            };
+            let Some(&c) = name.first() else {
+                return false;
+            };
+            let (negated, set) = match rest[..close].split_first() {
+                Some(('!' | '^', set)) => (true, set),
+                _ => (false, &rest[..close]),
+            };
+            let mut hit = false;
+            let mut i = 0;
+            while i < set.len() {
+                if i + 2 < set.len() && set[i + 1] == '-' {
+                    hit |= set[i] <= c && c <= set[i + 2];
+                    i += 3;
+                } else {
+                    hit |= set[i] == c;
+                    i += 1;
+                }
+            }
+            hit != negated && glob(&rest[close + 1..], &name[1..])
+        }
+        Some((&literal, rest)) => name.first() == Some(&literal) && glob(rest, &name[1..]),
+    }
+}
+
+/// Why Apache would not read `file`, a file this project writes under
+/// `root` for it to load: `None` when it would, or when that cannot be
+/// told. Every write of one is refused on this, and no status reads one as
+/// up to date: the config test passes a file it never opens.
+pub fn unloaded_file(root: &Path, file: &Path) -> Option<String> {
+    let tree = Tree::find(root)?;
+    if tree.includes(file)? {
+        return None;
+    }
+    let dir = file.parent().unwrap_or(Path::new("/"));
+    Some(format!(
+        "Apache would never read {}: nothing {} includes names {}. Add \
+         `IncludeOptional {}/*.conf` to {}, or point stop-bots at the directory \
+         holding Apache's own config with `stop-bots set-web-server apache --root <dir>`.",
+        file.display(),
+        tree.main.display(),
+        dir.display(),
+        dir.display(),
+        tree.main.display(),
+    ))
+}
+
+/// Why `host` would not be answered over HTTP/2, if it would not: the
+/// HTTP/1.x rule turns away every visitor of a host that only speaks
+/// HTTP/1.1. Debian enables neither `mod_http2` nor `Protocols h2` by
+/// default, and `mod_http2` serves nothing under the prefork MPM.
+fn without_h2(tree: Option<&Tree>, host: &VirtualHost) -> Option<&'static str> {
+    let Some(tree) = tree else {
+        return Some(
+            "stop-bots cannot find Apache's main config (apache2.conf, or conf/httpd.conf) \
+             to check that it speaks HTTP/2",
+        );
+    };
+    if !tree.loads_module("http2_module") {
+        return Some("mod_http2 is not enabled (`a2enmod http2`)");
+    }
+    if tree.loads_module("mpm_prefork_module") {
+        return Some("mod_http2 serves nothing under the prefork MPM");
+    }
+    let protocols = host
+        .server_scope
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "protocols")
+        .map(|(_, args)| args.clone())
+        .or_else(|| tree.main_protocols());
+    if !protocols.is_some_and(|p| p.iter().any(|p| p.eq_ignore_ascii_case("h2"))) {
+        return Some("its `Protocols` do not include `h2` (`Protocols h2 http/1.1`)");
+    }
+    None
+}
+
+/// Whether a later `RewriteEngine Off` in `host` switches its rewrite
+/// rules — the block among them — off. The last one in the host's own
+/// scope decides, and the block's own `RewriteEngine On` is the first.
+fn rewrite_switched_off(host: &VirtualHost) -> bool {
+    host.server_scope
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "rewriteengine")
+        .is_some_and(|(_, args)| args.first().is_some_and(|v| v.eq_ignore_ascii_case("off")))
+}
+
+/// Why `config` (as [`for_host`] narrowed it) cannot be written into `host`
+/// as it asks, if it cannot. Both cases pass the config test.
+fn refusal(config: &BlockConfig, host: &VirtualHost, tree: Option<&Tree>) -> Option<String> {
+    let name = &host.names[0];
+    if config.request_rules.contains(&RequestRule::Http1x) {
+        if let Some(why) = without_h2(tree, host) {
+            return Some(format!(
+                "the HTTP/1.x rule is on for {name}, but {why}: Apache answers every \
+                 visitor of it over HTTP/1.1, and the rule would turn every one of them \
+                 away. Turn HTTP/2 on for it, or switch the rule off for the site."
+            ));
+        }
+    }
+    if block_text(config).is_some() && rewrite_switched_off(host) {
+        return Some(format!(
+            "the <VirtualHost> for {name} says `RewriteEngine Off`, which switches the \
+             stop-bots block off while the config test still passes. Take that line out \
+             (the site's own rewrite rules can stay), then apply again."
+        ));
+    }
+    None
 }
 
 // ---- writing a block ----
@@ -488,14 +984,32 @@ fn block_text(config: &BlockConfig) -> Option<String> {
         return None;
     }
     let mut out = format!("    {BLOCK_BEGIN}\n    RewriteEngine On\n");
-    if config.serve_robots_txt {
-        let robots = robots_txt_path();
+    if let Some(robots) = config.serve_robots_txt.then(robots_txt_path) {
+        // A rewrite to the file, not an `Alias`: `mod_rewrite` answers the
+        // translate-name phase before `mod_proxy` and `mod_alias` are asked,
+        // so this serves the file on a site that hands everything else to
+        // `ProxyPass /` — where an `Alias` lost, and the generated file was
+        // never seen. `[L]`, so no rule after this one, the site's included,
+        // routes it anywhere else.
+        //
+        // Written bare, because `mod_rewrite` reads its own arguments and
+        // has no escape for a quote in one: a path with anything but the
+        // characters below (which the stock one never has; only a test's
+        // override could) serves nothing rather than something misread.
+        let plain = |path: &Path| {
+            path.to_str().is_some_and(|text| {
+                text.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+            })
+        };
         let dir = robots.parent().unwrap_or(Path::new("/"));
-        out.push_str(&format!(
-            "    Alias \"/robots.txt\" {}\n    <Directory {}>\n        Require all granted\n    </Directory>\n",
-            conf_quoted(&robots.display().to_string()),
-            conf_quoted(&dir.display().to_string()),
-        ));
+        if plain(&robots) {
+            out.push_str(&format!(
+                "    RewriteRule ^/robots\\.txt$ {} [L]\n    <Directory {}>\n        Require all granted\n    </Directory>\n",
+                robots.display(),
+                conf_quoted(&dir.display().to_string()),
+            ));
+        }
     }
     if blocks_something {
         let set = |value: u8| format!("    RewriteRule ^ - [E={BLOCK_VAR}:{value}]\n");
@@ -524,8 +1038,10 @@ fn block_text(config: &BlockConfig) -> Option<String> {
                 set(0)
             ));
         }
+        // Only on the request the client sent: see "The decision is made
+        // once" in the module docs.
         out.push_str(&format!(
-            "    RewriteCond %{{ENV:{BLOCK_VAR}}} =1\n    RewriteRule ^ - [R={},L]\n",
+            "    RewriteCond %{{ENV:REDIRECT_STATUS}} ^$\n    RewriteCond %{{ENV:{BLOCK_VAR}}} =1\n    RewriteRule ^ - [R={},L,NS]\n",
             status_code(config.response)
         ));
     }
@@ -623,8 +1139,20 @@ fn locate_marked(
 }
 
 /// Inserts, replaces or removes the block inside `host`. Idempotent.
-fn apply_block(content: &str, host: &VirtualHost, config: &BlockConfig) -> String {
-    let new_block = block_text(&for_host(config, content, host));
+/// Refuses a block that would pass the config test and not do what it
+/// says ([`refusal`]).
+fn apply_block(
+    content: &str,
+    host: &VirtualHost,
+    config: &BlockConfig,
+    tree: Option<&Tree>,
+    config_path: &Path,
+) -> Result<String> {
+    let config = for_host(config, content, host);
+    if let Some(why) = refusal(&config, host, tree) {
+        anyhow::bail!("refusing to write {}: {why}", config_path.display());
+    }
+    let new_block = block_text(&config);
     let (start, end) = locate_existing_block(content, host).unwrap_or((host.open, host.open));
     let mut out = String::with_capacity(content.len() + new_block.as_ref().map_or(0, String::len));
     out.push_str(&content[..start]);
@@ -632,7 +1160,7 @@ fn apply_block(content: &str, host: &VirtualHost, config: &BlockConfig) -> Strin
         out.push_str(block);
     }
     out.push_str(&content[end..]);
-    out
+    Ok(out)
 }
 
 /// Host `i` of `hosts`, which must still number `expected` — the guard
@@ -654,12 +1182,16 @@ fn nth_host<'a>(
 
 /// What applying `site_configs` (and `default_config` for every host
 /// they do not name) to every `<VirtualHost>` in `content` makes of it.
+/// `root` is Apache's config root, which says what the file alone cannot
+/// (see [`Tree`]).
 pub fn blocks_for_file(
     content: &str,
     config_path: &Path,
+    root: &Path,
     site_configs: &[(String, BlockConfig)],
     default_config: &BlockConfig,
 ) -> Result<String> {
+    let tree = Tree::find(root);
     let mut content = content.to_string();
     let count = virtual_hosts(&content).len();
     for i in 0..count {
@@ -669,7 +1201,7 @@ pub fn blocks_for_file(
             .iter()
             .find(|(name, _)| *name == host.names[0])
             .map_or(default_config, |(_, config)| config);
-        content = apply_block(&content, host, config);
+        content = apply_block(&content, host, config, tree.as_ref(), config_path)?;
     }
     Ok(content)
 }
@@ -679,16 +1211,18 @@ pub fn blocks_for_file(
 pub fn block_for_site(
     content: &str,
     config_path: &Path,
+    root: &Path,
     server_name: &str,
     config: &BlockConfig,
 ) -> Result<String> {
+    let tree = Tree::find(root);
     let mut content = content.to_string();
     let count = virtual_hosts(&content).len();
     for i in 0..count {
         let hosts = virtual_hosts(&content);
         let host = nth_host(&hosts, i, count, config_path)?;
         if host.names[0] == server_name {
-            content = apply_block(&content, host, config);
+            content = apply_block(&content, host, config, tree.as_ref(), config_path)?;
         }
     }
     Ok(content)
@@ -700,6 +1234,11 @@ pub fn block_for_site(
 /// `SetEnvIfExpr` with `-R` for addresses, because it is the one CIDR-aware
 /// match `mod_setenvif` has. User agents match as an escaped,
 /// case-insensitive substring, as they do everywhere else.
+///
+/// Server-wide, which is also what makes trust survive an internal
+/// redirect: Apache runs the server's `SetEnvIf`s again for the request it
+/// redirects to, where a variable set on the first round has been renamed
+/// `REDIRECT_stop_bots_trusted`.
 pub fn trusted_conf_body(trust: &Trust) -> String {
     let mut out = managed_header();
     for address in &trust.addresses {
@@ -716,19 +1255,26 @@ pub fn trusted_conf_body(trust: &Trust) -> String {
     out
 }
 
-/// Whether the trust file on disk is the one `config` expects; see
-/// `nginx::trust_file_is_current`, which this is for Apache.
-fn trust_file_is_current(config: &BlockConfig, on_disk: Option<&str>) -> bool {
+/// Whether the trust file on disk is the one `config` expects, where
+/// Apache reads it; see `nginx::trust_file_is_current`, which this is for
+/// Apache.
+fn trust_file_is_current(config: &BlockConfig, root: &Path) -> bool {
     match (&config.trust, block_text(config)) {
-        (Some(trust), Some(_)) => on_disk.is_some_and(|text| {
-            crate::generated::same_but_for_the_version(text, &trusted_conf_body(trust))
-        }),
+        (Some(trust), Some(_)) => {
+            let path = trusted_conf_path(&conf_enabled_dir(root));
+            unloaded_file(root, &path).is_none()
+                && fs::read_to_string(&path).is_ok_and(|text| {
+                    crate::generated::same_but_for_the_version(&text, &trusted_conf_body(trust))
+                })
+        }
         _ => true,
     }
 }
 
 /// Whether what is written for `server_name` in `config_path` is what
-/// `config` renders to.
+/// `config` renders to — and does what it says: a block an apply would
+/// refuse to write ([`refusal`]) is never up to date, nor one that leans on
+/// a trust file Apache does not read.
 pub fn site_apply_status(
     config_path: &Path,
     server_name: &str,
@@ -743,15 +1289,15 @@ pub fn site_apply_status(
     if matching.is_empty() {
         return SiteApplyStatus::NotFound;
     }
-    let trust_on_disk = config
-        .trust
-        .as_ref()
-        .and_then(|_| fs::read_to_string(trusted_conf_path(&conf_enabled_dir(root))).ok());
+    let tree = Tree::find(root);
     let current = matching.iter().all(|host| {
-        locate_existing_block(&content, host).map(|(start, end)| content[start..end].to_string())
-            == block_text(&for_host(config, &content, host))
+        let config = for_host(config, &content, host);
+        refusal(&config, host, tree.as_ref()).is_none()
+            && locate_existing_block(&content, host)
+                .map(|(start, end)| content[start..end].to_string())
+                == block_text(&config)
     });
-    if current && trust_file_is_current(config, trust_on_disk.as_deref()) {
+    if current && trust_file_is_current(config, root) {
         SiteApplyStatus::UpToDate
     } else {
         SiteApplyStatus::Stale
@@ -760,12 +1306,14 @@ pub fn site_apply_status(
 
 /// `content` with every block this project injected taken out: the exact
 /// inverse of an insertion, which puts the block's lines right after the
-/// `<VirtualHost>` line and adds nothing else.
+/// `<VirtualHost>` line, or the console's right before `</VirtualHost>`,
+/// and adds nothing else.
 pub fn without_injected_blocks(content: &str) -> String {
     let mut content = content.to_string();
     loop {
-        // Both kinds are inserted right after the `<VirtualHost>` line, so
-        // the one nearest it was inserted last and goes first.
+        // One whole section at a time, the first in the file first: taking
+        // it out moves only what is after it, and the rest are found again
+        // on the next round.
         let found = virtual_hosts(&content).iter().find_map(|host| {
             [
                 locate_existing_block(&content, host),
@@ -784,16 +1332,22 @@ pub fn without_injected_blocks(content: &str) -> String {
 
 /// The generated files the current settings call for: the trust file and
 /// `robots.txt`.
+///
+/// Refuses a trust file in a directory Apache does not read
+/// ([`unloaded_file`]): every apply and every preview starts here, so
+/// nothing is written that leaves each trusted client blocked while the
+/// config test passes.
 pub fn planned_managed_files(db: &crate::db::Db, root: &Path) -> Result<Vec<(PathBuf, String)>> {
     let mut files = Vec::new();
     if db.get_serve_robots_txt()? {
         files.push((robots_txt_path(), robots_txt_body(db)?));
     }
     if let Some(trust) = Trust::of(db)? {
-        files.push((
-            trusted_conf_path(&conf_enabled_dir(root)),
-            trusted_conf_body(&trust),
-        ));
+        let path = trusted_conf_path(&conf_enabled_dir(root));
+        if let Some(why) = unloaded_file(root, &path) {
+            anyhow::bail!("refusing to write the trusted clients' file: {why}");
+        }
+        files.push((path, trusted_conf_body(&trust)));
     }
     Ok(files)
 }
@@ -882,11 +1436,26 @@ pub fn serves_tls(config_path: &Path, server_name: &str) -> bool {
     })
 }
 
+/// Where Debian's `envvars` points `${APACHE_LOG_DIR}`.
+const DEBIAN_LOG_DIR: &str = "/var/log/apache2";
+
+/// Where RHEL's `httpd.conf` logs, through the `logs` link in its server
+/// root.
+const RHEL_LOG_DIR: &str = "/var/log/httpd";
+
 /// The directories `CustomLog` and `ErrorLog` write to under `root`, for
 /// the helper's sandbox. `${APACHE_LOG_DIR}` is Debian's `envvars`
-/// default, and a relative path is relative to the server root.
+/// default, and a relative path is relative to the server root — which is
+/// the root's own, found from its main file ([`Tree`]), not Debian's: RHEL
+/// logs to `logs/access_log` in `/etc/httpd`. Each is given with its links
+/// resolved, as the sandbox will see it.
 pub fn log_dirs(root: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from("/var/log/apache2")];
+    let tree = Tree::find(root);
+    let debian = tree
+        .as_ref()
+        .is_none_or(|tree| tree.main.ends_with("apache2.conf"));
+    let stock = if debian { DEBIAN_LOG_DIR } else { RHEL_LOG_DIR };
+    let mut dirs = vec![PathBuf::from(stock)];
     for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
             continue;
@@ -903,21 +1472,25 @@ pub fn log_dirs(root: &Path) -> Vec<PathBuf> {
             if name != "customlog" && name != "errorlog" {
                 continue;
             }
-            let target = parts[0].replace("${APACHE_LOG_DIR}", "/var/log/apache2");
+            let target = parts[0].replace("${APACHE_LOG_DIR}", DEBIAN_LOG_DIR);
             // A pipe or syslog is not a file.
             if target.starts_with('|') || target.starts_with("syslog") {
                 continue;
             }
-            let path = Path::new(&target);
-            let path = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                Path::new(DEFAULT_ROOT).join(path)
+            let path = match &tree {
+                Some(tree) => match tree.resolve(&target) {
+                    Some(path) => path,
+                    None => continue,
+                },
+                None if Path::new(&target).is_absolute() => PathBuf::from(&target),
+                None => root.join(&target),
             };
-            if let Some(dir) = path.parent() {
-                if !dirs.iter().any(|d| d == dir) {
-                    dirs.push(dir.to_path_buf());
-                }
+            let Some(dir) = path.parent() else {
+                continue;
+            };
+            let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
             }
         }
     }
@@ -956,8 +1529,19 @@ pub fn missing_module_hint(err: &anyhow::Error) -> Option<&'static str> {
 /// that asks for a bare address — Apache answers with the first
 /// `<VirtualHost>` it read for that address and port, and Debian reads
 /// `sites-enabled` in name order. The console must never be that site.
+///
+/// In `conf.d` on a root that has that and no `sites-enabled` — RHEL's,
+/// whose `httpd.conf` reads its sites from there, also in name order — for
+/// the reason [`conf_enabled_dir`] gives.
 pub fn console_site_path(root: &Path) -> PathBuf {
-    root.join("sites-enabled").join("zz-stop-bots-console.conf")
+    let sites = root.join("sites-enabled");
+    let rhel = root.join("conf.d");
+    let dir = if !sites.is_dir() && rhel.is_dir() {
+        rhel
+    } else {
+        sites
+    };
+    dir.join("zz-stop-bots-console.conf")
 }
 
 /// The `<Location>` that proxies to the console, shared by both modes.
@@ -1005,24 +1589,34 @@ pub fn console_server_block(host: &str, upstream: &std::net::SocketAddr) -> Stri
 /// host in `content`, preferring the one that terminates TLS, as
 /// `nginx::with_console_location` does. `None` when no host there declares
 /// the name.
+///
+/// **Last in the host**, unlike the block. `<Location>` sections are merged
+/// in the order they are written, a later one overriding an earlier one,
+/// so a site that proxies everything from a `<Location "/">` of its own
+/// would take the console's prefix back from a section written above it.
+/// Written last, the console's wins; and a site that proxies with a bare
+/// `ProxyPass /` instead loses to any `<Location>` that proxies, wherever
+/// it is.
 fn with_console_location(
     content: &str,
     server_name: &str,
     prefix: &str,
     upstream: &std::net::SocketAddr,
 ) -> Option<String> {
-    let hosts = virtual_hosts(content);
-    let host = hosts
-        .iter()
-        .filter(|h| h.names.iter().any(|n| n == server_name))
-        .max_by_key(|h| h.is_tls)?;
-    let (start, end) =
-        locate_marked(content, host, CONSOLE_BEGIN, CONSOLE_END).unwrap_or((host.open, host.open));
-    let mut out = String::with_capacity(content.len() + 256);
-    out.push_str(&content[..start]);
-    out.push_str(&console_location(prefix, upstream));
-    out.push_str(&content[end..]);
-    Some(out)
+    let pick = |content: &str| {
+        virtual_hosts(content)
+            .into_iter()
+            .filter(|h| h.names.iter().any(|n| n == server_name))
+            .max_by_key(|h| h.is_tls)
+    };
+    let host = pick(content)?;
+    let mut content = content.to_string();
+    if let Some((start, end)) = locate_marked(&content, &host, CONSOLE_BEGIN, CONSOLE_END) {
+        content.replace_range(start..end, "");
+    }
+    let host = pick(&content)?;
+    content.insert_str(host.close, &console_location(prefix, upstream));
+    Some(content)
 }
 
 /// Sets the console up to be reachable through Apache, validated before
@@ -1038,6 +1632,9 @@ pub fn apply_console_access(
     match access {
         ConsoleAccess::Subdomain { host } => {
             let path = console_site_path(root);
+            if let Some(why) = unloaded_file(root, &path) {
+                anyhow::bail!("refusing to write the console's site: {why}");
+            }
             write_validated(
                 WebServer::Apache,
                 &path,
@@ -1079,6 +1676,10 @@ mod tests {
     use super::*;
     use crate::db::BlockResponse;
     use crate::services::Service;
+
+    /// A root that is no Apache tree and has none above it: what a test
+    /// about one file alone renders against.
+    const NO_TREE: &str = "/nonexistent/stop-bots/apache";
 
     const SITE: &str = "\
 <VirtualHost *:80>
@@ -1217,8 +1818,22 @@ mod tests {
 
     #[test]
     fn applying_inserts_after_the_opening_line_and_is_idempotent() {
-        let once = blocks_for_file(SITE, Path::new("site.conf"), &[], &cfg(&["BadBot"])).unwrap();
-        let twice = blocks_for_file(&once, Path::new("site.conf"), &[], &cfg(&["BadBot"])).unwrap();
+        let once = blocks_for_file(
+            SITE,
+            Path::new("site.conf"),
+            Path::new(NO_TREE),
+            &[],
+            &cfg(&["BadBot"]),
+        )
+        .unwrap();
+        let twice = blocks_for_file(
+            &once,
+            Path::new("site.conf"),
+            Path::new(NO_TREE),
+            &[],
+            &cfg(&["BadBot"]),
+        )
+        .unwrap();
         assert_eq!(once, twice);
         assert!(
             once.starts_with(&format!("<VirtualHost *:80>\n    {BLOCK_BEGIN}\n")),
@@ -1228,8 +1843,16 @@ mod tests {
 
     #[test]
     fn nothing_to_block_takes_the_block_out_byte_for_byte() {
-        let applied = blocks_for_file(SITE, Path::new("s"), &[], &cfg(&["BadBot"])).unwrap();
-        let removed = blocks_for_file(&applied, Path::new("s"), &[], &cfg(&[])).unwrap();
+        let applied = blocks_for_file(
+            SITE,
+            Path::new("s"),
+            Path::new(NO_TREE),
+            &[],
+            &cfg(&["BadBot"]),
+        )
+        .unwrap();
+        let removed =
+            blocks_for_file(&applied, Path::new("s"), Path::new(NO_TREE), &[], &cfg(&[])).unwrap();
         assert_eq!(removed, SITE);
         assert_eq!(without_injected_blocks(&applied), SITE);
     }
@@ -1237,12 +1860,13 @@ mod tests {
     #[test]
     fn each_site_gets_its_own_config_and_tls_rules_only_where_tls_is() {
         let strict = BlockConfig {
-            request_rules: vec![RequestRule::Http1x],
+            request_rules: vec![RequestRule::OldTls],
             ..cfg(&["BadBot"])
         };
         let applied = blocks_for_file(
             TWO_HOSTS,
             Path::new("s"),
+            Path::new(NO_TREE),
             &[("example.com".to_string(), strict)],
             &cfg(&[]),
         )
@@ -1251,8 +1875,8 @@ mod tests {
         let block = |i: usize| {
             locate_existing_block(&applied, &hosts[i]).map(|(s, e)| applied[s..e].to_string())
         };
-        assert!(!block(0).unwrap().contains("SERVER_PROTOCOL"), "{applied}");
-        assert!(block(1).unwrap().contains("SERVER_PROTOCOL"), "{applied}");
+        assert!(!block(0).unwrap().contains("SSL_PROTOCOL"), "{applied}");
+        assert!(block(1).unwrap().contains("SSL_PROTOCOL"), "{applied}");
         assert_eq!(block(2), None, "{applied}");
     }
 
@@ -1261,6 +1885,7 @@ mod tests {
         let applied = block_for_site(
             TWO_HOSTS,
             Path::new("s"),
+            Path::new(NO_TREE),
             "other.example",
             &cfg(&["BadBot"]),
         )
@@ -1302,7 +1927,7 @@ mod tests {
                 ..cfg(&["BadBot"])
             })
             .unwrap();
-            assert!(text.contains("[R=403,L]"), "{response:?} gave:\n{text}");
+            assert!(text.contains("[R=403,L,NS]"), "{response:?} gave:\n{text}");
         }
     }
 
@@ -1325,7 +1950,11 @@ mod tests {
             site_apply_status(&path, "example.com", &config, dir.path()),
             SiteApplyStatus::Stale
         );
-        fs::write(&path, blocks_for_file(SITE, &path, &[], &config).unwrap()).unwrap();
+        fs::write(
+            &path,
+            blocks_for_file(SITE, &path, Path::new(NO_TREE), &[], &config).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             site_apply_status(&path, "example.com", &config, dir.path()),
             SiteApplyStatus::UpToDate
@@ -1407,7 +2036,14 @@ mod tests {
 
         // A blocked bot whose pattern names an application says nothing.
         let plain = "<VirtualHost *:80>\n    ServerName blog.example\n</VirtualHost>\n";
-        let blocked = blocks_for_file(plain, &path, &[], &cfg(&["nextcloud-crawler"])).unwrap();
+        let blocked = blocks_for_file(
+            plain,
+            &path,
+            Path::new(NO_TREE),
+            &[],
+            &cfg(&["nextcloud-crawler"]),
+        )
+        .unwrap();
         assert!(blocked.contains("nextcloud-crawler"), "applied:\n{blocked}");
         fs::write(&path, blocked).unwrap();
         assert_eq!(site_service(&path, "blog.example"), None);
@@ -1467,7 +2103,14 @@ mod tests {
     fn the_console_prefix_is_exempt_from_the_block() {
         let mounted =
             with_console_location(SITE, "example.com", "/stop-bots/", &upstream()).unwrap();
-        let applied = blocks_for_file(&mounted, Path::new("s"), &[], &cfg(&["BadBot"])).unwrap();
+        let applied = blocks_for_file(
+            &mounted,
+            Path::new("s"),
+            Path::new(NO_TREE),
+            &[],
+            &cfg(&["BadBot"]),
+        )
+        .unwrap();
         assert!(
             applied.contains(r#"%{REQUEST_URI} "(?:^(/stop-bots/))" [NC]"#),
             "applied:\n{applied}"
@@ -1486,7 +2129,14 @@ mod tests {
     fn uninstalling_takes_the_console_out_too() {
         let mounted =
             with_console_location(SITE, "example.com", "/stop-bots/", &upstream()).unwrap();
-        let applied = blocks_for_file(&mounted, Path::new("s"), &[], &cfg(&["BadBot"])).unwrap();
+        let applied = blocks_for_file(
+            &mounted,
+            Path::new("s"),
+            Path::new(NO_TREE),
+            &[],
+            &cfg(&["BadBot"]),
+        )
+        .unwrap();
         assert_eq!(without_injected_blocks(&applied), SITE);
     }
 
@@ -1554,5 +2204,386 @@ mod tests {
                 PathBuf::from("/srv/logs/example")
             ]
         );
+    }
+
+    // ---- what the rest of the config says ----
+
+    /// One file of a test's config tree: its path under the root, and its
+    /// text.
+    type ConfigFile = (&'static str, &'static str);
+
+    /// An Apache config tree in a temporary directory: `files`, each at its
+    /// path under the root, the main file among them.
+    fn tree(files: &[ConfigFile]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text) in files {
+            let path = dir.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        dir
+    }
+
+    /// Debian's `apache2.conf`, as far as what it includes.
+    const DEBIAN_MAIN: (&str, &str) = (
+        "apache2.conf",
+        "IncludeOptional mods-enabled/*.load\n\
+         IncludeOptional mods-enabled/*.conf\n\
+         Include ports.conf\n\
+         IncludeOptional conf-enabled/*.conf\n\
+         IncludeOptional sites-enabled/*.conf\n",
+    );
+
+    /// RHEL's `conf/httpd.conf`, as far as what it includes and where it
+    /// logs. Its `ServerRoot` is the host's, not the test's, which is what
+    /// a config on a bind mount looks like too.
+    const RHEL_MAIN: (&str, &str) = (
+        "conf/httpd.conf",
+        "ServerRoot \"/etc/httpd\"\n\
+         Include conf.modules.d/*.conf\n\
+         ErrorLog \"logs/error_log\"\n\
+         CustomLog \"logs/access_log\" combined\n\
+         IncludeOptional conf.d/*.conf\n",
+    );
+
+    /// `LoadModule http2_module`, as Debian's `a2enmod http2` links it.
+    const HTTP2_LOAD: (&str, &str) = (
+        "mods-enabled/http2.load",
+        "LoadModule http2_module /usr/lib/apache2/modules/mod_http2.so\n",
+    );
+
+    /// The `Protocols` Debian's `http2.conf` sets for the whole server.
+    const HTTP2_CONF: (&str, &str) = (
+        "mods-enabled/http2.conf",
+        "<IfModule !mpm_prefork>\n    Protocols h2 h2c http/1.1\n</IfModule>\n",
+    );
+
+    const PREFORK_LOAD: (&str, &str) = (
+        "mods-enabled/mpm_prefork.load",
+        "LoadModule mpm_prefork_module /usr/lib/apache2/modules/mod_mpm_prefork.so\n",
+    );
+
+    const TLS_SITE: &str = "\
+<VirtualHost *:443>
+    ServerName example.com
+    SSLEngine on
+</VirtualHost>
+";
+
+    #[test]
+    fn a_rhel_root_keeps_its_files_in_conf_d_which_it_reads() {
+        let root = tree(&[RHEL_MAIN, ("conf.d/welcome.conf", "")]);
+        let conf_d = root.path().join("conf.d");
+        assert_eq!(conf_enabled_dir(root.path()), conf_d);
+        assert_eq!(
+            console_site_path(root.path()),
+            conf_d.join("zz-stop-bots-console.conf")
+        );
+        for file in [
+            trusted_conf_path(&conf_enabled_dir(root.path())),
+            console_site_path(root.path()),
+        ] {
+            assert_eq!(
+                unloaded_file(root.path(), &file),
+                None,
+                "{}",
+                file.display()
+            );
+        }
+    }
+
+    #[test]
+    fn debian_reads_conf_enabled_and_sites_enabled() {
+        let root = tree(&[
+            DEBIAN_MAIN,
+            ("conf-enabled/x.conf", ""),
+            ("sites-enabled/x.conf", ""),
+        ]);
+        for file in [
+            trusted_conf_path(&conf_enabled_dir(root.path())),
+            console_site_path(root.path()),
+        ] {
+            assert_eq!(
+                unloaded_file(root.path(), &file),
+                None,
+                "{}",
+                file.display()
+            );
+        }
+    }
+
+    /// RHEL with a `conf-enabled` someone made by hand: its `httpd.conf`
+    /// reads none, and the config test would pass a trust file there.
+    #[test]
+    fn a_file_where_apache_never_reads_says_what_to_include() {
+        let root = tree(&[RHEL_MAIN, ("conf-enabled/.keep", "")]);
+        let file = trusted_conf_path(&conf_enabled_dir(root.path()));
+        let why = unloaded_file(root.path(), &file).expect("conf-enabled is not read");
+        assert!(
+            why.contains("IncludeOptional") && why.contains("conf-enabled"),
+            "said: {why}"
+        );
+    }
+
+    #[test]
+    fn planning_a_trust_file_apache_never_reads_is_refused() {
+        let root = tree(&[RHEL_MAIN, ("conf-enabled/.keep", "")]);
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.trust_user_agent("UptimeRobot").unwrap();
+        let err = planned_managed_files(&db, root.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("never read"), "said: {err:#}");
+    }
+
+    #[test]
+    fn a_site_whose_trust_file_apache_never_reads_is_never_up_to_date() {
+        let root = tree(&[RHEL_MAIN, ("conf-enabled/.keep", "")]);
+        let path = root.path().join("conf.d/site.conf");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let config = BlockConfig {
+            trust: Trust::from_lists(&[], &["UptimeRobot".to_string()]),
+            ..cfg(&["BadBot"])
+        };
+        let applied = blocks_for_file(SITE, &path, root.path(), &[], &config).unwrap();
+        fs::write(&path, applied).unwrap();
+        fs::write(
+            trusted_conf_path(&conf_enabled_dir(root.path())),
+            trusted_conf_body(config.trust.as_ref().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            site_apply_status(&path, "example.com", &config, root.path()),
+            SiteApplyStatus::Stale
+        );
+    }
+
+    #[test]
+    fn a_root_inside_the_tree_still_finds_its_main_file() {
+        let root = tree(&[DEBIAN_MAIN, ("sites-available/x.conf", "")]);
+        let found = Tree::find(&root.path().join("sites-available")).expect("found from below");
+        assert_eq!(found.main, root.path().join("apache2.conf"));
+    }
+
+    #[test]
+    fn includes_follow_wildcards_and_nested_files_but_not_dot_files() {
+        let root = tree(&[
+            ("httpd.conf", "Include extra/*.conf\n"),
+            ("extra/vhosts.conf", "IncludeOptional sites/[a-m]*.conf\n"),
+        ]);
+        let found = Tree::find(root.path()).unwrap();
+        for (file, read) in [
+            ("sites/blog.conf", Some(true)),
+            ("sites/zz.conf", Some(false)),
+            ("sites/.blog.conf", Some(false)),
+            ("elsewhere/blog.conf", Some(false)),
+        ] {
+            assert_eq!(found.includes(&root.path().join(file)), read, "{file}");
+        }
+    }
+
+    #[test]
+    fn an_include_through_a_variable_leaves_inclusion_unknown() {
+        let root = tree(&[("apache2.conf", "IncludeOptional ${CONF}/*.conf\n")]);
+        let file = root.path().join("conf-enabled/stop-bots-trusted.conf");
+        assert_eq!(unloaded_file(root.path(), &file), None);
+    }
+
+    #[test]
+    fn a_root_with_no_main_file_refuses_nothing_on_what_it_includes() {
+        let file = Path::new(NO_TREE).join("conf-enabled/stop-bots-trusted.conf");
+        assert_eq!(unloaded_file(Path::new(NO_TREE), &file), None);
+    }
+
+    #[test]
+    fn names_match_as_apache_include_matches_them() {
+        for (pattern, name, matched) in [
+            ("*.conf", "site.conf", true),
+            ("*.conf", "site.load", false),
+            ("*.conf", ".site.conf", false),
+            (".*.conf", ".site.conf", true),
+            ("site?.conf", "site1.conf", true),
+            ("[a-c]*", "blog", true),
+            ("[!a-c]*", "blog", false),
+            ("[^a-c]*", "zone", true),
+            ("[x", "[x", true),
+        ] {
+            assert_eq!(
+                name_matches(pattern, name),
+                matched,
+                "{pattern} against {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rhel_root_logs_where_its_logs_link_leads() {
+        let root = tree(&[RHEL_MAIN]);
+        let logs = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(logs.path(), root.path().join("logs")).unwrap();
+        assert_eq!(
+            log_dirs(root.path()),
+            vec![
+                PathBuf::from(RHEL_LOG_DIR),
+                fs::canonicalize(logs.path()).unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_block_acts_only_on_the_request_the_client_sent() {
+        let text = block_text(&cfg(&["BadBot"])).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[lines.len() - 4..lines.len() - 1],
+            [
+                "    RewriteCond %{ENV:REDIRECT_STATUS} ^$",
+                "    RewriteCond %{ENV:stop_bots_block} =1",
+                "    RewriteRule ^ - [R=403,L,NS]",
+            ],
+            "block was:\n{text}"
+        );
+    }
+
+    /// An `Alias` loses to a site's `ProxyPass /`; a rewrite answers first.
+    #[test]
+    fn robots_txt_is_rewritten_to_the_file_ahead_of_every_other_rule() {
+        let text = block_text(&BlockConfig {
+            serve_robots_txt: true,
+            ..cfg(&["BadBot"])
+        })
+        .unwrap();
+        let first_rule = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("RewriteRule"))
+            .unwrap();
+        assert_eq!(
+            first_rule,
+            format!(
+                "    RewriteRule ^/robots\\.txt$ {} [L]",
+                robots_txt_path().display()
+            ),
+            "block was:\n{text}"
+        );
+        assert!(!text.contains("Alias"), "block was:\n{text}");
+    }
+
+    /// `site` with every block `config` asks for, against no tree.
+    fn applied(site: &str, config: &BlockConfig) -> Result<String> {
+        blocks_for_file(site, Path::new("s"), Path::new(NO_TREE), &[], config)
+    }
+
+    #[test]
+    fn a_later_rewrite_engine_off_is_refused() {
+        let site = SITE.replace("</VirtualHost>", "    RewriteEngine Off\n</VirtualHost>");
+        let err = applied(&site, &cfg(&["BadBot"])).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("RewriteEngine Off"),
+            "said: {err:#}"
+        );
+        // Nothing to write is nothing to switch off.
+        assert!(applied(&site, &cfg(&[])).is_ok());
+    }
+
+    #[test]
+    fn a_block_a_later_rewrite_engine_off_switches_off_is_never_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        let config = cfg(&["BadBot"]);
+        fs::write(
+            &path,
+            applied(SITE, &config)
+                .unwrap()
+                .replace("</VirtualHost>", "    RewriteEngine off\n</VirtualHost>"),
+        )
+        .unwrap();
+        assert_eq!(
+            site_apply_status(&path, "example.com", &config, Path::new(NO_TREE)),
+            SiteApplyStatus::Stale
+        );
+    }
+
+    #[test]
+    fn rewrite_engine_off_for_one_directory_leaves_the_block_alone() {
+        let site = SITE.replace(
+            "</VirtualHost>",
+            "    <Directory /var/www/example/static>\n        RewriteEngine Off\n    </Directory>\n</VirtualHost>",
+        );
+        assert!(applied(&site, &cfg(&["BadBot"])).is_ok());
+    }
+
+    #[test]
+    fn the_http_1x_rule_is_written_only_where_http2_is_spoken() {
+        let host_h2 = TLS_SITE.replace("SSLEngine on", "SSLEngine on\n    Protocols h2 http/1.1");
+        let cases: [(&str, &[ConfigFile], &str, bool); 6] = [
+            ("no main config to check", &[], TLS_SITE, false),
+            ("mod_http2 off", &[DEBIAN_MAIN, HTTP2_CONF], TLS_SITE, false),
+            (
+                "no Protocols h2",
+                &[DEBIAN_MAIN, HTTP2_LOAD],
+                TLS_SITE,
+                false,
+            ),
+            (
+                "the prefork MPM",
+                &[DEBIAN_MAIN, HTTP2_LOAD, HTTP2_CONF, PREFORK_LOAD],
+                TLS_SITE,
+                false,
+            ),
+            (
+                "h2 for the whole server",
+                &[DEBIAN_MAIN, HTTP2_LOAD, HTTP2_CONF],
+                TLS_SITE,
+                true,
+            ),
+            (
+                "h2 for the host",
+                &[DEBIAN_MAIN, HTTP2_LOAD],
+                &host_h2,
+                true,
+            ),
+        ];
+        let strict = BlockConfig {
+            request_rules: vec![RequestRule::Http1x],
+            ..cfg(&[])
+        };
+        for (what, files, site, written) in cases {
+            let root = tree(files);
+            let path = root.path().join("sites-available/site.conf");
+            let result = blocks_for_file(
+                site,
+                &path,
+                root.path(),
+                &[("example.com".to_string(), strict.clone())],
+                &cfg(&[]),
+            );
+            assert_eq!(result.is_ok(), written, "{what}: {result:?}");
+            if let Err(err) = result {
+                assert!(format!("{err:#}").contains("HTTP/1.x"), "{what}: {err:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_console_goes_last_in_its_host_after_the_sites_own_locations() {
+        let site = "<VirtualHost *:80>\n    ServerName example.com\n    <Location />\n        ProxyPass http://127.0.0.1:3000/\n    </Location>\n</VirtualHost>\n";
+        let mounted =
+            with_console_location(site, "example.com", "/stop-bots/", &upstream()).unwrap();
+        assert!(
+            mounted.ends_with(&format!("    {CONSOLE_END}\n</VirtualHost>\n")),
+            "mounted:\n{mounted}"
+        );
+        assert_eq!(without_injected_blocks(&mounted), site);
+    }
+
+    #[test]
+    fn a_console_site_apache_would_not_read_is_refused_unwritten() {
+        // RHEL, with a `sites-enabled` someone made by hand.
+        let root = tree(&[RHEL_MAIN, ("sites-enabled/.keep", "")]);
+        let access = ConsoleAccess::Subdomain {
+            host: "console.example.com".to_string(),
+        };
+        let err = apply_console_access(root.path(), &access, &upstream(), &commands_that(true))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("never read"), "said: {err:#}");
+        assert!(!console_site_path(root.path()).exists());
     }
 }

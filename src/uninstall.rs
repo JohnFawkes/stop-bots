@@ -211,6 +211,9 @@ impl Plan {
             webserver::WebServer::Apache => vec![
                 crate::apache::conf_enabled_dir(&nginx_root),
                 nginx_root.join("conf-enabled"),
+                // RHEL's, which `conf_enabled_dir` picks only while there
+                // is no `conf-enabled` beside it.
+                nginx_root.join("conf.d"),
                 base.join(crate::apache::CONF_ENABLED_DIR.trim_start_matches('/')),
             ],
         };
@@ -423,8 +426,9 @@ pub fn run(plan: &Plan, target: Target, options: &Options) -> Report {
         removed_a_unit |= remove_unit(plan, options, &mut report, HELPER_UNIT);
     } else if plan.unit_dir.join(WEB_UNIT).exists() {
         report.kept.push(format!(
-            "{WEB_UNIT} is still installed, and its internal cron re-applies the NGINX \
-             blocks and re-renders the firewall script. `stop-bots uninstall web` removes it."
+            "{WEB_UNIT} is still installed, and its internal cron re-applies the {} \
+             blocks and re-renders the firewall script. `stop-bots uninstall web` removes it.",
+            plan.server.label()
         ));
     }
     if target.firewall() {
@@ -741,18 +745,23 @@ fn remove_nginx(plan: &Plan, options: &Options, report: &mut Report) {
                 }
                 if removal.reloaded {
                     report.steps.push(Step {
-                        what: "test and reload NGINX".to_string(),
+                        what: format!("test and reload {}", plan.server.label()),
                         outcome: Outcome::Done,
                     });
                 } else if options.dry_run && plan.host {
                     report.steps.push(Step {
-                        what: format!("test and reload NGINX ({})", plan.nginx.test.join(" ")),
+                        what: format!(
+                            "test and reload {} ({})",
+                            plan.server.label(),
+                            plan.nginx.test.join(" ")
+                        ),
                         outcome: Outcome::Planned,
                     });
                 } else if !plan.host {
+                    let server = plan.server.label();
                     report.skip(
-                        "test and reload NGINX",
-                        "--prefix is not the running NGINX's config",
+                        format!("test and reload {server}"),
+                        format!("--prefix is not the running {server}'s config"),
                     );
                 }
             }
@@ -887,7 +896,7 @@ fn host_settings(plan: &Plan, options: &Options, report: &mut Report) {
         remove_file_step(plan, options, report, &plan.host_conf);
     } else {
         report.kept.push(format!(
-            "the host settings (the NGINX commands and root, the log paths): {}. `--purge` \
+            "the host settings (the web server's commands and root, the log paths): {}. `--purge` \
              removes it too.",
             plan.host_conf.display()
         ));

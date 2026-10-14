@@ -1172,6 +1172,48 @@ const LIMIT_KEY_VAR: &str = "$stop_bots_limit_key";
 /// before every read, so no `map` or `http`-level declaration is needed.
 const AGENT_EXEMPT_VAR: &str = "$stop_bots_exempt";
 
+/// The path every exemption is matched against: the path of the request
+/// the client sent. See [`path_of_the_request_sent`].
+const PATH_VAR: &str = "$stop_bots_path";
+
+/// Sets [`PATH_VAR`] to the path of the request the client sent, for the
+/// exemptions to be matched against instead of `$uri`.
+///
+/// **Why not `$uri`.** An internal redirect starts the request again at
+/// NGINX's server-rewrite phase (`ngx_http_handler` sets `phase_handler`
+/// to `server_rewrite_index` for an internal request), which is exactly
+/// where these server-level `if`s run — and `$uri` is the *new* path
+/// then. A WordPress site's `try_files $uri $uri/ /index.php?$args` sends
+/// `/wp-json/wp/v2/posts` on to `/index.php`, so an exemption for
+/// `/wp-json/` let the request through on the first pass and blocked it
+/// on the second: every exemption on a front-controller application was
+/// undone. Trust is not affected; it is
+/// decided by address and user agent, which a redirect does not change.
+/// (`rewrite ... last` and a named `@location` go back to the location
+/// phases only, past these.)
+///
+/// **Why not `$request_uri` either.** It is the same on every pass, and on
+/// a subrequest, but it is the request line as sent: undecoded, with `..`
+/// and `//` unresolved. `/wp-json/../wp-login.php` starts with an exempt
+/// prefix and is served as `/wp-login.php`; see [`exemption_regexes`] for
+/// when that bypass was found.
+///
+/// So the path is taken from `$request_uri` only where it cannot differ
+/// from what `$uri` was on the first pass: the whole path before any `?`,
+/// with no `%` (nothing to decode), no `#` or `\`, no `//` (nothing to
+/// merge) and no `.` or `..` segment (nothing to resolve). That is every
+/// path an application routes in practice. Anything else falls back to
+/// `$uri`, which is what every exemption used before: on the first pass
+/// the same thing, and after a redirect at worst an exemption lost, never
+/// one gained.
+fn path_of_the_request_sent() -> String {
+    format!(
+        "    set {PATH_VAR} $uri;\n    if ($request_uri ~ {}) {{\n        set {PATH_VAR} $1;\n    }}\n    if ({PATH_VAR} ~ {}) {{\n        set {PATH_VAR} $uri;\n    }}\n",
+        nginx_quoted(r"^(/[^?%#\\]*)(\?.*)?$"),
+        nginx_quoted(r"//|/\.\.?(/|$)"),
+    )
+}
+
 /// The zone a site's `limit_req` uses while anything is trusted: keyed on
 /// [`LIMIT_KEY_VAR`], in a file of its own
 /// ([`untrusted_rate_limit_conf_path`]).
@@ -1527,9 +1569,12 @@ fn block_text(config: &BlockConfig) -> Option<String> {
             condition(*rule)
         ));
     }
+    if !exemptions.is_empty() || !agent_clears.is_empty() {
+        out.push_str(&path_of_the_request_sent());
+    }
     for exemptions in &exemptions {
         out.push_str(&format!(
-            "    if ($uri ~* {}) {{\n        set $stop_bots_block 0;\n    }}\n",
+            "    if ({PATH_VAR} ~* {}) {{\n        set $stop_bots_block 0;\n    }}\n",
             nginx_quoted(exemptions)
         ));
     }
@@ -1650,7 +1695,7 @@ fn console_prefix_in(content: &str, block: &ServerBlock) -> Option<String> {
     is_stored_as_valid(&prefix, crate::db::validate_exempt_path).then_some(prefix)
 }
 
-/// Builds the `$uri` regexes that clear the block flag, none when there
+/// Builds the path regexes that clear the block flag, none when there
 /// are no usable exemptions: `prefixes` match anything under them, `exact`
 /// only themselves.
 ///
@@ -1673,10 +1718,12 @@ fn console_prefix_in(content: &str, block: &ServerBlock) -> Option<String> {
 /// trusted, so a row an older release stored without that check is left
 /// out (see [`skipped_entries`]) instead of written.
 ///
-/// Matched against `$uri`, never `$request_uri`, for the reason
-/// [`agent_exemption_clears`] gives: the raw request line is not the path
-/// NGINX serves, and `/robots.txt/../wp-login.php` begins with an exempt
-/// prefix while resolving to a blocked one.
+/// Matched against [`PATH_VAR`], never `$request_uri` as it stands, for the
+/// reason [`agent_exemption_clears`] gives: the raw request line is not
+/// the path NGINX serves, and `/robots.txt/../wp-login.php` begins with an
+/// exempt prefix while resolving to a blocked one. [`PATH_VAR`] is the
+/// request line's path only where it is the path NGINX serves; see
+/// [`path_of_the_request_sent`].
 pub(crate) fn exemption_regexes(prefixes: &[String], exact: &[&str]) -> Vec<String> {
     let usable = |p: &&str| is_stored_as_valid(p, crate::db::validate_exempt_path);
     let escaped: Vec<String> = prefixes
@@ -1708,7 +1755,7 @@ pub(crate) fn exemption_regexes(prefixes: &[String], exact: &[&str]) -> Vec<Stri
 ///
 /// ```nginx
 /// set $stop_bots_exempt "";
-/// if ($http_user_agent ~* "okhttp") { set $stop_bots_exempt $uri; }
+/// if ($http_user_agent ~* "okhttp") { set $stop_bots_exempt $stop_bots_path; }
 /// if ($stop_bots_exempt ~* "^(/remote\.php/dav/)") { set $stop_bots_block 0; }
 /// ```
 ///
@@ -1716,13 +1763,15 @@ pub(crate) fn exemption_regexes(prefixes: &[String], exact: &[&str]) -> Vec<Stri
 /// holding the path by one group's user agent would otherwise let the next
 /// group's paths through for a client that never matched it.
 ///
-/// `$uri`, not `$request_uri`, like the plain exemptions. `$uri` has had
-/// `..` and `//` resolved and is decoded, so `/remote.php/dav/../../login`
-/// is `/login` and matches nothing here; `$request_uri` is the raw request
-/// line, where that same string starts with the exempt prefix while the
-/// application behind the proxy resolves it to somewhere else. The plain
-/// exemptions read `$request_uri` too until the same bypass was found
-/// there.
+/// [`PATH_VAR`], not `$request_uri`, like the plain exemptions. `$uri` has
+/// had `..` and `//` resolved and is decoded, so
+/// `/remote.php/dav/../../login` is `/login` and matches nothing here;
+/// `$request_uri` is the raw request line, where that same string starts
+/// with the exempt prefix while the application behind the proxy resolves
+/// it to somewhere else. The plain exemptions read `$request_uri` too until
+/// the same bypass was found there. [`PATH_VAR`] takes the request line's
+/// path only when it has nothing to resolve, and `$uri` otherwise
+/// ([`path_of_the_request_sent`]), so the bypass stays closed.
 ///
 /// The user agent is matched as an escaped, case-insensitive substring,
 /// the same as a trusted one, and checked again here rather than trusting
@@ -1741,7 +1790,7 @@ fn agent_exemption_clears(exemptions: &[crate::db::AgentExemption]) -> String {
             continue;
         }
         out.push_str(&format!(
-            "    set {AGENT_EXEMPT_VAR} \"\";\n    if ($http_user_agent ~* {}) {{\n        set {AGENT_EXEMPT_VAR} $uri;\n    }}\n",
+            "    set {AGENT_EXEMPT_VAR} \"\";\n    if ($http_user_agent ~* {}) {{\n        set {AGENT_EXEMPT_VAR} {PATH_VAR};\n    }}\n",
             nginx_quoted(&crate::db::escape_regex_literal(user_agent)),
         ));
         for paths in &paths {
@@ -2235,6 +2284,97 @@ pub fn site_apply_status(
     } else {
         SiteApplyStatus::Stale
     }
+}
+
+// ---- the HTTP/1.x rule where nothing speaks HTTP/2 ----
+
+/// How many directories above a root `nginx.conf` is looked for: a root of
+/// `/etc/nginx/sites-enabled` is still `/etc/nginx`'s tree.
+const MAIN_CONFIG_LEVELS_UP: usize = 2;
+
+/// Whether the NGINX config around `root` turns HTTP/2 on anywhere: an
+/// `http2 on;` (NGINX 1.25.1 and later, in `http` or a `server`), or a
+/// `listen` with the `http2` parameter (before that, and still read). The
+/// whole tree from `nginx.conf`'s directory down, because either may be
+/// in another file: `http2 on;` in `nginx.conf`'s `http` block, or the
+/// `listen ... http2` of another `server` on the same port, which turns
+/// HTTP/2 on for every `server` on it.
+///
+/// `None` when there is no `nginx.conf` at or just above `root` to read
+/// from — a root whose main config is somewhere this cannot see, as in a
+/// container — and nothing is refused on that.
+///
+/// Read with [`lex`], so a commented-out `# listen 443 ssl http2;` does
+/// not count.
+fn enables_http2(root: &Path) -> Option<bool> {
+    let root = std::path::absolute(root).ok()?;
+    let top = root
+        .ancestors()
+        .take(MAIN_CONFIG_LEVELS_UP + 1)
+        .find(|dir| dir.join("nginx.conf").is_file())?;
+    let files = WalkDir::new(top)
+        .max_depth(4)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            fs::metadata(entry.path()).is_ok_and(|meta| meta.is_file() && meta.len() < 1 << 20)
+        });
+    for entry in files {
+        let Ok(content) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let mut statement: Vec<String> = Vec::new();
+        for (token, _) in lex(&content).tokens {
+            if matches!(token.as_str(), ";" | "{" | "}") {
+                let words: Vec<&str> = statement.iter().map(String::as_str).collect();
+                match words.as_slice() {
+                    ["http2", "on"] => return Some(true),
+                    ["listen", rest @ ..] if rest.contains(&"http2") => return Some(true),
+                    _ => {}
+                }
+                statement.clear();
+            } else {
+                statement.push(token);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// Why an apply cannot write `content`'s blocks as `config_for` asks, if
+/// it cannot: the HTTP/1.x rule in a TLS `server` of a host on which
+/// nothing turns HTTP/2 on, where NGINX answers every visitor over
+/// HTTP/1.1 and the rule would turn every one of them away. `nginx -t`
+/// passes it, so it is refused here, as Apache's is without `mod_http2`.
+///
+/// `config_for` is the config a block is written with, or `None` for a
+/// block the apply leaves alone. A block without TLS is not asked: the
+/// rule is never written there (see [`for_block`]).
+pub fn refusal<'a>(
+    content: &str,
+    config_path: &Path,
+    root: &Path,
+    config_for: impl Fn(&ServerBlock) -> Option<&'a BlockConfig>,
+) -> Option<String> {
+    let blocks = parse_server_blocks(content);
+    let wants_http1x = blocks.iter().find(|block| {
+        config_for(block).is_some_and(|config| {
+            for_block(config, content, block)
+                .request_rules
+                .contains(&RequestRule::Http1x)
+        })
+    })?;
+    if enables_http2(root) != Some(false) {
+        return None;
+    }
+    let name = wants_http1x.names.first().map_or("a site", String::as_str);
+    Some(format!(
+        "refusing to write {}: the HTTP/1.x rule is on for {name}, but nothing in the NGINX \
+         config turns HTTP/2 on (`http2 on;`, or `listen 443 ssl http2;` before NGINX \
+         1.25.1): NGINX answers every visitor of it over HTTP/1.1, and the rule would turn \
+         every one of them away. Turn HTTP/2 on for it, or switch the rule off for the site.",
+        config_path.display()
+    ))
 }
 
 /// What [`apply_block_for_site`] would make of `content`, without writing
@@ -3155,7 +3295,7 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            err.to_string().contains("outside the NGINX root"),
+            err.to_string().contains("outside the config root"),
             "error was: {err}"
         );
         assert_eq!(fs::read_to_string(&victim).unwrap(), one_site());
@@ -3989,7 +4129,7 @@ mod tests {
         );
         assert!(clear < act, "act last");
         assert!(
-            text.contains("if ($uri ~* \"^(/blog)\")"),
+            text.contains("if ($stop_bots_path ~* \"^(/blog)\")"),
             "text was:\n{text}"
         );
         assert!(text.contains("return 403;"), "text was:\n{text}");
@@ -3998,15 +4138,58 @@ mod tests {
     /// `$request_uri` is the raw request line. `GET
     /// /blog/../wp-login.php` starts with `/blog` there, while NGINX and the
     /// application behind it serve `/wp-login.php` — a blocked bot reaching
-    /// any path by prefixing an exempt one. `$uri` is already resolved.
+    /// any path by prefixing an exempt one. So it is read once, into the
+    /// path an exemption is matched against, and only through the capture
+    /// that takes a path with nothing to resolve; then anything with a `//`
+    /// or a dot segment in it goes back to `$uri`.
     #[test]
-    fn a_plain_exemption_matches_the_resolved_path_not_the_raw_one() {
+    fn a_plain_exemption_reads_the_raw_path_only_where_it_is_the_resolved_one() {
         let text = block_text(&cfg_exempt(&["BadBot"], &["/blog"])).unwrap();
+        let expected = [
+            "    set $stop_bots_path $uri;\n",
+            "    if ($request_uri ~ \"^(/[^?%#\\\\\\]*)(\\?.*)?$\") {\n        set $stop_bots_path $1;\n    }\n",
+            "    if ($stop_bots_path ~ \"//|/\\.\\.?(/|$)\") {\n        set $stop_bots_path $uri;\n    }\n",
+            "    if ($stop_bots_path ~* \"^(/blog)\") {\n",
+        ];
+        let at: Vec<Option<usize>> = expected.iter().map(|line| text.find(line)).collect();
         assert!(
-            text.contains("if ($uri ~* \"^(/blog)\")"),
-            "text was:\n{text}"
+            at.iter().all(Option::is_some) && at.windows(2).all(|w| w[0] < w[1]),
+            "expected, in this order:\n{}\ntext was:\n{text}",
+            expected.concat()
         );
-        assert!(!text.contains("$request_uri"), "text was:\n{text}");
+        assert_eq!(text.matches("$request_uri").count(), 1, "text was:\n{text}");
+    }
+
+    /// A front controller's `try_files ... /index.php` is an internal
+    /// redirect, which runs these `if`s again with `$uri` the new path. So
+    /// nothing that clears the flag may read `$uri` directly, or the
+    /// redirect undoes the exemption the request was let in on.
+    #[test]
+    fn no_exemption_reads_the_path_an_internal_redirect_changes() {
+        let config = BlockConfig {
+            serve_robots_txt: true,
+            ..cfg_agent(&["okhttp"], &[("okhttp", "/remote.php/dav/")])
+        };
+        let config = BlockConfig {
+            exempt_paths: vec!["/wp-json/".to_string()],
+            ..config
+        };
+        let text = block_text(&config).unwrap();
+        for line in text.lines().filter(|line| line.contains("$uri")) {
+            assert_eq!(
+                line.trim(),
+                "set $stop_bots_path $uri;",
+                "only the fallback reads $uri; text was:\n{text}"
+            );
+        }
+    }
+
+    /// A site with no exemption has nothing to match a path against, and
+    /// its block keeps the text it had.
+    #[test]
+    fn a_block_with_no_exemption_works_out_no_path() {
+        let text = block_text(&cfg(&["BadBot"])).unwrap();
+        assert!(!text.contains("stop_bots_path"), "text was:\n{text}");
     }
 
     /// `/robots.txt` is one file, not a prefix: `/robots.txt/../x` and
@@ -4019,7 +4202,7 @@ mod tests {
         };
         let text = block_text(&config).unwrap();
         assert!(
-            text.contains("if ($uri ~* \"^(/blog|/robots\\.txt$)\")"),
+            text.contains("if ($stop_bots_path ~* \"^(/blog|/robots\\.txt$)\")"),
             "text was:\n{text}"
         );
     }
@@ -4152,15 +4335,18 @@ mod tests {
 
     /// `$request_uri` is the raw request line: `/remote.php/dav/../../x`
     /// starts with the exempt prefix there, and the application resolves it
-    /// to `/x`. `$uri` has already been resolved by NGINX.
+    /// to `/x`. The agent exemptions read the same path the plain ones do,
+    /// which is the raw one only where it has nothing to resolve.
     #[test]
-    fn an_agent_exemption_matches_the_resolved_path_not_the_raw_one() {
+    fn an_agent_exemption_matches_the_same_path_as_a_plain_one() {
         let text = block_text(&cfg_agent(&["okhttp"], &[("okhttp", "/remote.php/dav/")])).unwrap();
+        let worked_out = text.find("    if ($stop_bots_path ~ \"//");
+        let read = text.find("set $stop_bots_exempt $stop_bots_path;");
         assert!(
-            text.contains("set $stop_bots_exempt $uri;"),
-            "text was:\n{text}"
+            worked_out.is_some() && read.is_some() && worked_out < read,
+            "the path must be worked out before the agent exemption reads it:\n{text}"
         );
-        assert!(!text.contains("$request_uri"), "text was:\n{text}");
+        assert_eq!(text.matches("$request_uri").count(), 1, "text was:\n{text}");
     }
 
     #[test]
@@ -4331,7 +4517,7 @@ mod tests {
         assert!(ifs > 1, "expected chunking, got {ifs}");
         // Every chunk sets the flag; exactly one clears it and one acts.
         assert_eq!(text.matches("set $stop_bots_block 1;").count(), ifs);
-        assert_eq!(text.matches("if ($uri ").count(), 1);
+        assert_eq!(text.matches("if ($stop_bots_path ~* ").count(), 1);
         assert_eq!(text.matches("if ($stop_bots_block) {").count(), 1);
     }
 
@@ -5340,6 +5526,83 @@ mod tests {
         }
     }
 
+    /// An NGINX tree in a temporary directory: `nginx.conf` and one site,
+    /// each with the text given.
+    fn nginx_tree(main: &str, site: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("sites-enabled")).unwrap();
+        fs::write(dir.path().join("nginx.conf"), main).unwrap();
+        fs::write(dir.path().join("sites-enabled/site.conf"), site).unwrap();
+        dir
+    }
+
+    const HTTP: &str = "http {\n    include sites-enabled/*;\n}\n";
+    const TLS_SITE: &str =
+        "server {\n    listen 443 ssl;\n    server_name a.example;\n    ssl_certificate x.pem;\n}\n";
+
+    /// Either spelling turns HTTP/2 on, wherever in the tree it is; a
+    /// comment or `off` does not; and with no `nginx.conf` to start from,
+    /// nothing can be said.
+    #[test]
+    fn http2_is_found_wherever_the_tree_turns_it_on() {
+        for (main, site, expected) in [
+            (HTTP, TLS_SITE, Some(false)),
+            ("http {\n    http2 on;\n}\n", TLS_SITE, Some(true)),
+            (HTTP, &TLS_SITE.replace("ssl;", "ssl http2;"), Some(true)),
+            (
+                HTTP,
+                &TLS_SITE.replace("ssl;", "ssl;\n    http2 on;"),
+                Some(true),
+            ),
+            (
+                HTTP,
+                &TLS_SITE.replace("ssl;", "ssl;\n    # listen 443 ssl http2;"),
+                Some(false),
+            ),
+            (
+                HTTP,
+                &TLS_SITE.replace("ssl;", "ssl;\n    http2 off;"),
+                Some(false),
+            ),
+        ] {
+            let tree = nginx_tree(main, site);
+            assert_eq!(
+                enables_http2(&tree.path().join("sites-enabled")),
+                expected,
+                "nginx.conf:\n{main}\nsite:\n{site}"
+            );
+        }
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(enables_http2(bare.path()), None);
+    }
+
+    /// The HTTP/1.x rule where nothing speaks HTTP/2 passes `nginx -t` and
+    /// then turns away every visitor, so it is refused; where something
+    /// does, or the rule is only asked of a plain block, it is not.
+    #[test]
+    fn the_http_1x_rule_is_refused_only_where_nothing_speaks_http2() {
+        let config = cfg_rules(&[RequestRule::Http1x]);
+        let plain = TLS_SITE
+            .replace("443 ssl", "80")
+            .replace("    ssl_certificate x.pem;\n", "");
+        for (site, http2_on, refused) in [
+            (TLS_SITE.to_string(), false, true),
+            (TLS_SITE.to_string(), true, false),
+            (plain, false, false),
+        ] {
+            let main = if http2_on {
+                "http {\n    http2 on;\n}\n"
+            } else {
+                HTTP
+            };
+            let tree = nginx_tree(main, &site);
+            let why = refusal(&site, Path::new("site.conf"), tree.path(), |_| {
+                Some(&config)
+            });
+            assert_eq!(why.is_some(), refused, "site:\n{site}\nrefusal: {why:?}");
+        }
+    }
+
     /// Only the two rules that depend on TLS are dropped in a plain block.
     /// The header-shape rules work identically over HTTP, so dropping them
     /// there would silently disable them on a redirect block.
@@ -5679,7 +5942,7 @@ server {
         .unwrap_err();
 
         assert!(
-            format!("{err:#}").contains("outside the NGINX root"),
+            format!("{err:#}").contains("outside the config root"),
             "error was: {err:#}"
         );
         assert_eq!(fs::read_to_string(&victim).unwrap(), TWO_BLOCK_SITE);
@@ -6157,7 +6420,7 @@ server {
     fn a_stored_path_exemption_that_is_not_a_literal_path_is_left_out() {
         let text = block_text(&cfg_exempt(&["BadBot"], &[r"/x\|", r"/x\(", "/blog"])).unwrap();
         assert!(
-            text.contains(r#"if ($uri ~* "^(/blog)") {"#),
+            text.contains(r#"if ($stop_bots_path ~* "^(/blog)") {"#),
             "text was:\n{text}"
         );
         assert!(!text.contains("/x"), "text was:\n{text}");
@@ -6168,7 +6431,7 @@ server {
     #[test]
     fn a_path_exemption_reaches_pcre_as_a_literal_prefix() {
         let text = block_text(&cfg_exempt(&["BadBot"], &["/a.b+(c)"])).unwrap();
-        let rest = text.split("if ($uri ~* ").nth(1).unwrap();
+        let rest = text.split("if ($stop_bots_path ~* ").nth(1).unwrap();
         let end = closing_quote(rest).unwrap();
         assert_eq!(nginx_unquoted(&rest[1..end]), r"^(/a\.b\+\(c\))");
     }
@@ -6219,7 +6482,7 @@ server {
         let plain = blocks.iter().find(|b| !b.is_tls).unwrap();
         let tls_block = current_block_text(&applied, tls).unwrap();
         assert!(
-            tls_block.contains(r#"if ($uri ~* "^(/stop-bots/|/\.well-known/)") {"#),
+            tls_block.contains(r#"if ($stop_bots_path ~* "^(/stop-bots/|/\.well-known/)") {"#),
             "the console's server must exempt it:\n{tls_block}"
         );
         // Only there: the redirect block serves no console.

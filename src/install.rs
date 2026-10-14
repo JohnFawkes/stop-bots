@@ -286,6 +286,14 @@ impl Layout {
     /// Apache's config root, under this layout's prefix, when the host
     /// settings choose Apache: the directory the helper rewrites instead
     /// of NGINX's.
+    ///
+    /// The stored root is given back when it is Debian's, when it is
+    /// [`grantable`], or when it is an Apache tree of its own directly
+    /// under `/etc` ([`own_apache_root`]) — RHEL's `/etc/httpd`. Without
+    /// the last, every root under `/etc` but Debian's fell back to
+    /// `/etc/apache2`: on RHEL the unit granted a directory that does not
+    /// exist, the helper could write none of the config it was asked to,
+    /// and the logs it granted were Debian's too.
     fn stored_apache_root(&self) -> Option<PathBuf> {
         let host = crate::hostconf::HostConf::load_from(&self.host_conf).ok()?;
         if host.web_server() != crate::webserver::WebServer::Apache {
@@ -293,7 +301,13 @@ impl Layout {
         }
         let stock = self.nginx_dir.with_file_name("apache2");
         Some(match host.apache_root {
-            Some(root) if root.starts_with(crate::apache::DEFAULT_ROOT) || grantable(&root) => root,
+            Some(root)
+                if root.starts_with(crate::apache::DEFAULT_ROOT)
+                    || grantable(&root)
+                    || own_apache_root(&root, Path::new("/etc")) =>
+            {
+                root
+            }
             _ => stock,
         })
     }
@@ -463,6 +477,30 @@ fn grantable(dir: &Path) -> bool {
             let never = Path::new(never);
             dir.starts_with(never) || never.starts_with(dir)
         })
+}
+
+/// Whether `root` is inside an Apache tree of its own directly under
+/// `etc` (`/etc` on a host; a parameter for the tests): `/etc/httpd`, or
+/// `/etc/httpd/conf.d`, shown to be Apache's by the main config at its top
+/// (`conf/httpd.conf`, `httpd.conf` or `apache2.conf`).
+///
+/// [`grantable`] refuses all of `/etc` for the reason it gives, and that
+/// stands: a stored `/etc`, or `/etc/systemd`, must never become a grant.
+/// This is the one exception, and as narrow as it can be made. The
+/// directory has to be one level below `etc` and has to hold Apache's
+/// main config, so `/etc` itself (its parent is `/`), `/etc/systemd` and
+/// `/etc/cron.d` (no main config in them, or within two levels above) are
+/// still refused, and what is granted is the server's own tree, which the
+/// helper rewrites anyway. The root comes from `host.conf`, which only
+/// root writes (see [`crate::hostconf`]); the main config is checked as
+/// well so that a typo in that file does not open some other directory.
+fn own_apache_root(root: &Path, etc: &Path) -> bool {
+    let Ok(root) = std::path::absolute(root) else {
+        return false;
+    };
+    root.starts_with(etc)
+        && crate::apache::config_tree(&root)
+            .is_some_and(|tree| tree.parent() == Some(etc) && root.starts_with(&tree))
 }
 
 /// The directories the log directives in one config file name.
@@ -3169,6 +3207,86 @@ mod tests {
         for path in ["/etc/cron.d/x", "/var/spool/cron/crontabs/root"] {
             assert!(!writable_in(&unit, path), "{path} was given back:\n{unit}");
         }
+    }
+
+    /// RHEL's Apache lives in `/etc/httpd`, which `grantable` refuses with
+    /// the rest of `/etc`. Its own tree is given back; `/etc` itself, and
+    /// a directory there that is not an Apache tree, are not.
+    #[test]
+    fn an_apache_tree_directly_under_etc_is_its_own_and_nothing_else_there_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let etc = dir.path().join("etc");
+        let write = |path: &str, text: &str| {
+            let path = etc.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("httpd/conf/httpd.conf", "IncludeOptional conf.d/*.conf\n");
+        write("httpd/conf.d/site.conf", "");
+        write("apache2/apache2.conf", "");
+        write("systemd/system/x.service", "");
+        write("srv/httpd/conf/httpd.conf", "");
+        // An Apache main config dropped straight into /etc.
+        write("httpd.conf", "");
+
+        for (root, own) in [
+            ("httpd", true),
+            ("httpd/conf.d", true),
+            ("apache2", true),
+            ("systemd", false),
+            ("systemd/system", false),
+            ("srv/httpd", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                own_apache_root(&etc.join(root), &etc),
+                own,
+                "etc/{root} judged wrongly"
+            );
+        }
+    }
+
+    /// The whole of it on a host set to RHEL's Apache: the unit gives back
+    /// the configured tree, and the log directory its relative
+    /// `CustomLog` reaches through the `logs` link — not Debian's.
+    #[test]
+    fn an_rhel_apache_hosts_unit_grants_its_tree_and_its_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        let httpd = dir.path().join("etc/httpd");
+        let logs = dir.path().join("var/log/httpd");
+        std::fs::create_dir_all(httpd.join("conf")).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        std::os::unix::fs::symlink(&logs, httpd.join("logs")).unwrap();
+        std::fs::write(
+            httpd.join("conf/httpd.conf"),
+            format!(
+                "ServerRoot \"{}\"\nCustomLog logs/access_log combined\n",
+                httpd.display()
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(layout.host_conf.parent().unwrap()).unwrap();
+        std::fs::write(
+            &layout.host_conf,
+            format!("web_server = apache\napache_root = {}\n", httpd.display()),
+        )
+        .unwrap();
+
+        install_web(&layout, &Options::default()).unwrap();
+
+        let unit = std::fs::read_to_string(layout.unit_dir.join(HELPER_UNIT)).unwrap();
+        for path in [httpd.join("conf.d/x.conf"), logs.join("access_log")] {
+            assert!(
+                writable_in(&unit, path.to_str().unwrap()),
+                "{} was not given back:\n{unit}",
+                path.display()
+            );
+        }
+        assert!(
+            !writable_in(&unit, dir.path().join("etc/apache2/x").to_str().unwrap()),
+            "Debian's root was given back instead:\n{unit}"
+        );
     }
 
     /// `--root` and a 0.0.x unit's `--root` are given back as well, before

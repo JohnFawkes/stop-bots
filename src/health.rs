@@ -1015,10 +1015,10 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
         checks.push(check);
     }
     checks.push(ssh_login_allowlist(db)?);
-    if let Some(check) = trusted_by_hand(db)? {
+    if let Some(check) = trusted_by_hand(db, probe.web_server)? {
         checks.push(check);
     }
-    if let Some(check) = skipped_entries(db)? {
+    if let Some(check) = skipped_entries(db, probe.web_server)? {
         checks.push(check);
     }
     if let Some(check) = turned_away_clients(db, probe)? {
@@ -1819,10 +1819,11 @@ fn access_log_clients(probe: &Probe) -> Check {
             format!(
                 "all {parsed} logged request(s) came from a private address \u{2014} every detector skips those, so none of them can see anything"
             ),
-            Some(
-                "NGINX is logging its proxy's address, not the client's. If it runs behind a container port mapping, a load balancer or a CDN, set `set_real_ip_from` and `real_ip_header` so $remote_addr is the visitor again."
-                    .to_string(),
-            ),
+            Some(match probe.web_server {
+                webserver::WebServer::Nginx => "NGINX is logging its proxy's address, not the client's. If it runs behind a container port mapping, a load balancer or a CDN, set `set_real_ip_from` and `real_ip_header` so $remote_addr is the visitor again.",
+                webserver::WebServer::Apache => "Apache is logging its proxy's address, not the client's. If it runs behind a container port mapping, a load balancer or a CDN, enable mod_remoteip (`sudo a2enmod remoteip`), set `RemoteIPHeader` and `RemoteIPTrustedProxy`, and log `%a` in place of `%h` so the log names the visitor again.",
+            }
+            .to_string()),
         ),
         // One private address among public ones is ordinary: a monitoring
         // cron on the host hits its own site. Only *all* of them is the
@@ -1875,12 +1876,21 @@ fn cdn_edges(probe: &Probe) -> Option<Check> {
              detectors never block those, so behind it they cannot block anyone",
             crate::cdn::NAME
         ),
-        fix: Some(format!(
-            "Tell NGINX to log the visitor's address, from the header {} adds, in the \
-             `http` block (ngx_http_realip_module): {}",
-            crate::cdn::NAME,
-            crate::cdn::real_ip_config()
-        )),
+        fix: Some(match probe.web_server {
+            webserver::WebServer::Nginx => format!(
+                "Tell NGINX to log the visitor's address, from the header {} adds, in the \
+                 `http` block (ngx_http_realip_module): {}",
+                crate::cdn::NAME,
+                crate::cdn::real_ip_config()
+            ),
+            webserver::WebServer::Apache => format!(
+                "Tell Apache to log the visitor's address, from the header {} adds, with \
+                 mod_remoteip (`sudo a2enmod remoteip`): {}, and `%a` in place of `%h` in the \
+                 log format",
+                crate::cdn::NAME,
+                crate::cdn::apache_real_ip_config()
+            ),
+        }),
     })
 }
 
@@ -1916,10 +1926,21 @@ fn access_log_format(probe: &Probe) -> Check {
                     "only {parsed} of {lines} recent line(s) are in a format the detectors read{sample}"
                 ),
                 Some(
-                    "log in NGINX's `combined` format, or a JSON `log_format ... escape=json` \
-                     keyed by the variable names (remote_addr, status, request_uri or request, \
-                     http_referer, http_user_agent, time_local or time_iso8601)"
-                        .to_string(),
+                    match probe.web_server {
+                        webserver::WebServer::Nginx => {
+                            "log in NGINX's `combined` format, or a JSON `log_format ... \
+                             escape=json` keyed by the variable names (remote_addr, status, \
+                             request_uri or request, http_referer, http_user_agent, time_local \
+                             or time_iso8601)"
+                        }
+                        // The JSON form is NGINX's `log_format` variables;
+                        // Apache's stock format is the one to point at.
+                        webserver::WebServer::Apache => {
+                            "log in Apache's `combined` format (`CustomLog <path> combined`), \
+                             which is the format the detectors read"
+                        }
+                    }
+                    .to_string(),
                 ),
             )
         }
@@ -1985,7 +2006,8 @@ fn ssh_login_allowlist(db: &Db) -> Result<Check> {
 ///
 /// Never a warning, for the same reason as the SSH list: trusting
 /// something is a decision, not a fault.
-fn trusted_by_hand(db: &Db) -> Result<Option<Check>> {
+fn trusted_by_hand(db: &Db, server: webserver::WebServer) -> Result<Option<Check>> {
+    let server = server.label();
     let addresses = db.list_trusted_addresses()?;
     let user_agents = db.list_trusted_user_agents()?;
     if addresses.is_empty() && user_agents.is_empty() {
@@ -1994,14 +2016,14 @@ fn trusted_by_hand(db: &Db) -> Result<Option<Check>> {
     let mut parts = Vec::new();
     if !addresses.is_empty() {
         parts.push(format!(
-            "{} address(es), past the firewall and NGINX: {}",
+            "{} address(es), past the firewall and {server}: {}",
             addresses.len(),
             addresses.join(", ")
         ));
     }
     if !user_agents.is_empty() {
         parts.push(format!(
-            "{} user agent(s), past NGINX only: {}",
+            "{} user agent(s), past {server} only: {}",
             user_agents.len(),
             user_agents.join(", ")
         ));
@@ -2015,9 +2037,9 @@ fn trusted_by_hand(db: &Db) -> Result<Option<Check>> {
     }))
 }
 
-/// Stored blocks, exemptions and trusted agents that the NGINX config
-/// leaves out, because they would not mean what they say there (see
-/// `nginx::skipped_entries`).
+/// Stored blocks, exemptions and trusted agents that the web server's
+/// config leaves out, because they would not mean what they say there (see
+/// `nginx::skipped_entries`, whose checks Apache's render shares).
 ///
 /// A warning, not critical: what is written is correct, and leaving an
 /// entry out is the safe failure. But each one is something the operator
@@ -2026,7 +2048,7 @@ fn trusted_by_hand(db: &Db) -> Result<Option<Check>> {
 /// check them, and upgrading is exactly when nobody is looking.
 ///
 /// Absent when there is nothing, like its neighbours.
-fn skipped_entries(db: &Db) -> Result<Option<Check>> {
+fn skipped_entries(db: &Db, server: webserver::WebServer) -> Result<Option<Check>> {
     let skipped = crate::nginx::skipped_entries(db)?;
     if skipped.is_empty() {
         return Ok(None);
@@ -2040,7 +2062,10 @@ fn skipped_entries(db: &Db) -> Result<Option<Check>> {
     };
     Ok(Some(Check {
         id: "skipped-entries",
-        title: "Entries left out of the NGINX config",
+        title: match server {
+            webserver::WebServer::Nginx => "Entries left out of the NGINX config",
+            webserver::WebServer::Apache => "Entries left out of the Apache config",
+        },
         level: Level::Warn,
         detail: format!(
             "{} stored entr(ies) are not written: {}{}",
@@ -2249,7 +2274,13 @@ fn console_proxy(db: &Db) -> Result<Option<Check>> {
 fn log_sources(probe: &Probe) -> Check {
     let missing: Vec<&str> = [
         (probe.ssh_log_readable, "the SSH log"),
-        (probe.access_log_readable, "the NGINX access log"),
+        (
+            probe.access_log_readable,
+            match probe.web_server {
+                webserver::WebServer::Nginx => "the NGINX access log",
+                webserver::WebServer::Apache => "the Apache access log",
+            },
+        ),
     ]
     .into_iter()
     .filter_map(|(readable, name)| (readable == Some(false)).then_some(name))

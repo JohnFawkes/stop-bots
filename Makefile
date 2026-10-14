@@ -1,7 +1,7 @@
 # Every target here is a name, not a file. Without this a directory named
 # `build` or `test` — both plausible — would make `make test` say
 # "up to date" and run nothing.
-.PHONY: help unit-test integration-test stranger-test test hooks screenshots build deploy
+.PHONY: help unit-test integration-test stranger-test test hooks screenshots demo build deploy
 
 # `cargo nextest run` where it is installed, plain `cargo test` otherwise.
 # They run the same tests; nextest additionally enforces the per-test
@@ -32,6 +32,7 @@ help:
 	@echo 'test              both, unit first'
 	@echo 'hooks             install the pre-commit hook (fmt + clippy)'
 	@echo 'screenshots       regenerate docs/screenshots/ from seeded fiction'
+	@echo 'demo              a disposable NGINX container with stop-bots in it, to try it on'
 	@echo 'build             release binary, after unit-test'
 	@echo 'deploy            build, then install it on $$DEPLOY_HOST and restart the service'
 	@echo
@@ -99,6 +100,31 @@ hooks:
 # change to a screen's layout, and commit the diff.
 screenshots:
 	cargo run --example screenshots
+
+# A disposable server to try stop-bots on, for someone who has cloned the
+# repository and would rather not point it at a real one first. Ubuntu
+# 24.04 with NGINX on port 8080, a log with something in it for the
+# detectors, and a shell; docs/demo/start.sh says what to try. `exit`
+# deletes the container.
+#
+# The image is the container suite's (tests/container/Dockerfile) with the
+# start script on top, and the binary is built here and copied in, the way
+# `integration-test` does it, so it needs a Rust toolchain as well as the
+# runtime, and has the same limit: a binary built against a newer glibc
+# than Ubuntu 24.04's (2.39) will not start in it. NET_ADMIN is for the container's own network namespace: the
+# firewall rules it applies never reach the host's.
+DEMO_DIR := target/demo
+
+demo:
+	cargo build --release
+	rm -rf $(DEMO_DIR)
+	mkdir -p $(DEMO_DIR)/base
+	cp tests/container/Dockerfile tests/container/site.conf $(DEMO_DIR)/base/
+	cp target/release/stop-bots $(DEMO_DIR)/base/stop-bots
+	cp docs/demo/Containerfile docs/demo/start.sh $(DEMO_DIR)/
+	$(STOP_BOTS_CONTAINER_RUNTIME) build -q -t stop-bots-demo-base $(DEMO_DIR)/base
+	$(STOP_BOTS_CONTAINER_RUNTIME) build -q -t stop-bots-demo -f $(DEMO_DIR)/Containerfile $(DEMO_DIR)
+	$(STOP_BOTS_CONTAINER_RUNTIME) run --rm -it --cap-add=NET_ADMIN --hostname stop-bots-demo stop-bots-demo
 
 build: unit-test
 	cargo build --release

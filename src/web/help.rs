@@ -42,6 +42,8 @@ struct View {
     nginx_root: String,
     /// How this console does what needs root.
     privileged: String,
+    /// The web server the host runs, which this page names.
+    server: crate::webserver::WebServer,
 }
 
 pub async fn page(
@@ -52,6 +54,7 @@ pub async fn page(
     let apply_for_real = state.apply_for_real;
     let nginx_root = state.nginx_root.display().to_string();
     let privileged = state.privileged().describe();
+    let server = state.host().web_server();
     // Shown, never acted on here: the host settings are root's, and this
     // console only reads them.
     let commands =
@@ -72,6 +75,7 @@ pub async fn page(
                 apply_for_real,
                 nginx_root,
                 privileged,
+                server,
             })
         })
         .await;
@@ -86,6 +90,7 @@ pub async fn page(
 }
 
 fn body(view: &View) -> Markup {
+    let server = view.server.label();
     html! {
         .cols {
 
@@ -147,8 +152,8 @@ fn body(view: &View) -> Markup {
                         }
                     } @else {
                         p .hint {
-                            "This console can rewrite the firewall and the NGINX config of the host "
-                            "it runs on. Exposed, it should sit behind TLS and behind this tool's own "
+                            "This console can rewrite the firewall and the " (server) " config of "
+                            "the host it runs on. Exposed, it should sit behind TLS and behind this tool's own "
                             "protection — and the host allowlist above should name exactly the name "
                             "you use, because that is what makes DNS rebinding fail."
                         }
@@ -206,12 +211,11 @@ fn body(view: &View) -> Markup {
                         "If the config does not parse",
                         html! {
                             "It is validated with "
-                            code { "nginx -t" }
+                            code { (view.nginx_test) }
                             " before it can take effect, and rolled back if that fails \u{2014} a new "
-                            code { "server" }
-                            " block that does not parse would otherwise leave the whole config "
-                            "unloadable while the running NGINX carried on serving from memory, so "
-                            "the breakage would surface at somebody else\u{2019}s reload."
+                            "block that does not parse would otherwise leave the whole config "
+                            "unloadable while the running " (server) " carried on serving from "
+                            "memory, so the breakage would surface at somebody else\u{2019}s reload."
                         },
                     ))
                 } }
@@ -223,12 +227,12 @@ fn body(view: &View) -> Markup {
             None,
             html! {
                 table { tbody {
-                    tr { td { "NGINX config root" } td .mono { (view.nginx_root) } }
+                    tr { td { (server) " config root" } td .mono { (view.nginx_root) } }
                     tr { td { "Changes to the host" } td { "made " (view.privileged) } }
                     tr { td { "Config test" } td .mono { (view.nginx_test) } }
                     tr { td { "Reload" } td .mono { (view.nginx_reload) } }
                     tr {
-                        td { "Applying reloads NGINX" }
+                        td { "Applying reloads " (server) }
                         td {
                             @if view.apply_for_real {
                                 "yes"
@@ -240,8 +244,11 @@ fn body(view: &View) -> Markup {
                 } }
                 .panel-body {
                     p .hint {
-                        "Running NGINX in a container? Point both commands at it with "
-                        code { "stop-bots set-nginx-commands --test \"docker exec web nginx -t\" --reload \"docker exec web nginx -s reload\"" }
+                        "Running " (server) " in a container? Point both commands at it with "
+                        code { (match view.server {
+                            crate::webserver::WebServer::Nginx => "stop-bots set-nginx-commands --test \"docker exec web nginx -t\" --reload \"docker exec web nginx -s reload\"",
+                            crate::webserver::WebServer::Apache => "stop-bots set-web-server apache --test \"docker exec web apachectl configtest\" --reload \"docker exec web apachectl graceful\"",
+                        }) }
                         "."
                     }
                 }
@@ -258,7 +265,7 @@ fn body(view: &View) -> Markup {
                         "enabled reputation feed, the crawler IP ranges, and the ranges for "
                         "every country you selected \u{2014} one source failing does not stop "
                         "the rest. \u{201c}Apply everything\u{201d} then writes and reloads "
-                        "the NGINX config and writes and runs the firewall script, the same "
+                        "the " (server) " config and writes and runs the firewall script, the same "
                         "two halves, and in the same order, as "
                         code { "stop-bots batch --apply" }
                         "."
@@ -268,11 +275,11 @@ fn body(view: &View) -> Markup {
                     (row(
                         "Apply everything",
                         html! {
-                            "Writes and reloads the NGINX config, then writes and "
+                            "Writes and reloads the " (server) " config, then writes and "
                             strong { "runs" }
                             " the firewall script. The two are independent: whichever fails, the "
                             "other still gets its turn, because a half-applied host beats one where "
-                            "an NGINX syntax error also left the firewall stale. Applying the "
+                            "a " (server) " syntax error also left the firewall stale. Applying the "
                             "firewall used to be deliberately absent from this console; it is here "
                             "now, behind the guards below."
                         },
@@ -333,7 +340,8 @@ fn body(view: &View) -> Markup {
                             " lists every step, and without "
                             code { "--dry-run" }
                             " takes them: both units stopped and removed, the firewall rules and "
-                            "every NGINX block taken out (tested, and put back if NGINX refuses), "
+                            "every " (server) " block taken out (tested, and put back if " (server)
+                            " refuses), "
                             "and the generated files deleted. The database is kept unless "
                             code { "--purge" }
                             " is given. This console is one of the things it stops."
@@ -392,8 +400,8 @@ fn body(view: &View) -> Markup {
                         "and the third-party IP feeds."
                     }
                     p {
-                        "The NGINX screen owns everything that ends up in "
-                        strong { "NGINX config" }
+                        "The " (server) " screen owns everything that ends up in "
+                        strong { (server) " config" }
                         ": what a blocked request gets back, the generated robots.txt, rate limiting, "
                         "and each site's own overrides."
                     }
@@ -438,7 +446,35 @@ mod tests {
             apply_for_real: true,
             nginx_root: "/etc/nginx".into(),
             privileged: "in this process, which runs as root".into(),
+            server: crate::webserver::WebServer::Nginx,
         }
+    }
+
+    #[test]
+    fn an_apache_hosts_page_names_apache_and_its_own_commands() {
+        let v = View {
+            nginx_test: "apache2ctl configtest".into(),
+            nginx_reload: "systemctl reload apache2".into(),
+            nginx_root: "/etc/httpd".into(),
+            server: crate::webserver::WebServer::Apache,
+            ..view(true)
+        };
+        let rendered = body(&v).into_string();
+        for expected in [
+            "Apache config root",
+            "Applying reloads Apache",
+            "apache2ctl configtest",
+            "stop-bots set-web-server apache --test",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "no {expected:?} in:\n{rendered}"
+            );
+        }
+        assert!(
+            !rendered.contains("NGINX") && !rendered.contains("nginx -t"),
+            "an Apache host's help names NGINX:\n{rendered}"
+        );
     }
 
     #[test]

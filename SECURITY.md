@@ -29,23 +29,27 @@ maintainer, so please treat that as the honest figure rather than a service leve
 
 ## What counts as a vulnerability here
 
-This tool writes firewall scripts and NGINX configuration on a server it has root-ish
-access to, and it runs unattended from cron. The interesting failures are therefore
+This tool writes firewall scripts and NGINX or Apache configuration on a server it has
+root-ish access to, and it runs unattended from cron. The interesting failures are therefore
 mostly *integrity* failures, not memory safety:
 
 - **Lockout and denial of service against the operator.** A rule that blocks the
-  administrator's own SSH access, or a generated NGINX config that `nginx -t` accepts and
-  that then refuses legitimate traffic wholesale. The code has explicit lockout guards; a
+  administrator's own SSH access, or a generated web server config that the config test
+  (`nginx -t`, `apache2ctl configtest`) accepts and that then refuses legitimate traffic
+  wholesale. The code has explicit lockout guards; a
   way around one is in scope.
 - **Injection into generated config.** A bot name, user agent, hostname or IP address
   from a downloaded list or from a parsed log that escapes quoting and becomes a directive
-  in the generated NGINX config or firewall script. Both parsers are fed untrusted input
-  by design.
+  in the generated NGINX or Apache config or firewall script. Both parsers are fed
+  untrusted input by design.
 - **Trusting a compromised upstream list.** The bot lists and IP-range feeds are fetched
   over the network from third parties. A response that causes something worse than a bad
   block rule is in scope.
 - **Privilege escalation** via the files the tool writes, the database it opens, or the
-  subprocesses it spawns (`nginx`, `systemctl`, `nft`, `iptables`).
+  subprocesses it spawns: the web server's config test and graceful reload (`nginx -t`,
+  `apache2ctl configtest`, `systemctl reload nginx` or `apache2`, or the commands root
+  stored with `set-web-server` or `set-nginx-commands`), `systemctl`, `nft` and
+  `iptables`.
 
 ## What does not
 
@@ -56,7 +60,7 @@ mostly *integrity* failures, not memory safety:
   has a threshold or a signature that ordinary visitors do not reach; the rest start
   off. A default that blocks clearly legitimate traffic on an ordinary site is worth a
   normal bug report, not a security one.
-- **Requiring root.** Writing firewall rules and NGINX config needs privilege. That is the
+- **Requiring root.** Writing firewall rules and web server config needs privilege. That is the
   job, not a flaw.
 - **The absence of a request-path component.** There is deliberately no runtime component
   in the request path, so anything requiring one (JS challenges, TLS fingerprinting) is a

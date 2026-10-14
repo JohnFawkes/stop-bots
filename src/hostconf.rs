@@ -293,6 +293,17 @@ impl HostConf {
             .unwrap_or_else(|| PathBuf::from(server.default_root()))
     }
 
+    /// The stored config root of the web server this host runs — the
+    /// setting [`Self::root`] reads — for a command that stores one.
+    /// `nginx_root` on an NGINX host, `apache_root` on an Apache one: a
+    /// root written to the other server's key is never read by anything.
+    pub fn root_setting_mut(&mut self) -> &mut Option<PathBuf> {
+        match self.web_server() {
+            WebServer::Nginx => &mut self.nginx_root,
+            WebServer::Apache => &mut self.apache_root,
+        }
+    }
+
     /// The two log paths, as [`LogPaths`] resolves them.
     pub fn log_paths(&self) -> LogPaths {
         LogPaths {

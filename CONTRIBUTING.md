@@ -8,7 +8,7 @@ Contributions are welcome, and bug reports most of all.
 
 - which version (`stop-bots --version`) and which distribution you run it on;
 - what you did, what you expected, and what happened instead;
-- for a wrongly blocked or wrongly allowed client, the relevant lines from the SSH or NGINX log,
+- for a wrongly blocked or wrongly allowed client, the relevant lines from the SSH or web server log,
   with anything private (your hostnames, your own IP addresses) redacted.
 
 A security problem is the exception: don't open a public issue, follow
@@ -39,7 +39,7 @@ document, [`RELEASING.md`](RELEASING.md).
 
 The project is completely written in Rust, and needs Rust 1.88 or newer to build: `cargo install
 --path .` from a checkout. It is Linux only in practice: it shells out to `systemctl`, `nginx -t`
-and `nft`/`iptables`, so while it compiles elsewhere it won't be much use there.
+or `apache2ctl`, and `nft`/`iptables`, so while it compiles elsewhere it won't be much use there.
 
 SQLite is used to store user configuation and other runtime data.
 
@@ -142,8 +142,10 @@ coverage: the container suite (`make integration-test`) runs a binary inside Doc
 its coverage never comes back.
 
 It is a check, not a boast — but the check and the achieved figure are deliberately two
-different numbers. CI runs the same command with `--fail-under-lines 90`, and the badge
-at the top of the README claims that **floor**, not this snapshot.
+different numbers. CI runs the same command with `--fail-under-lines 90`: that **floor**
+is the promise, not this snapshot. The README carries no coverage badge, because CI
+publishes no coverage figure for one to read, and a hand-written number is a claim
+nothing keeps true.
 
 A floor set at today's figure would be a trap rather than a check: with no headroom, one
 ordinary function landing slightly under-tested turns CI red on an unrelated pull
@@ -152,7 +154,7 @@ the rot the floor exists to prevent. 90% is low enough to survive normal develop
 (about 850 lines of headroom today) and high enough that a real collapse is a red build.
 
 Raising the floor as the achieved figure rises is welcome. It just has to move together
-with the badge in `README.md` and this paragraph.
+with this paragraph.
 
 **No test touches the network**, which is where the remaining gap is and why it is there.
 Every downloader takes a `--source <file>` override that parses the same format the server
@@ -172,7 +174,8 @@ Ideally, the real implementation is used. Where it can't be, in order of prefere
 - **In-memory fakes** for storage: SQLite's in-memory database (`Db::open_in_memory`) and
   tempdirs. These *are* the real implementation, just on throwaway backing.
 - **Injected inputs** for everything the product reads from the system: `--ssh-log`,
-  `--access-log`, `--root`, `STOP_BOTS_NGINX_DIR`/`STOP_BOTS_NGINX_CONF_D`. These are real
+  `--access-log`, `--root`, `STOP_BOTS_NGINX_DIR`/`STOP_BOTS_NGINX_CONF_D` and their
+  `STOP_BOTS_APACHE_*` twins. These are real
   product flags, not test back-doors — the same override an admin with a non-standard layout
   would use. A test must never read the host's real logs or config; auto-detection can shell
   out to `journalctl`, which is nondeterministic and slow.
@@ -182,8 +185,8 @@ Ideally, the real implementation is used. Where it can't be, in order of prefere
   process spawn, argument building, exit-code and ordering logic all execute for real; only
   the binary PATH finds is ours. See `fake_tools` in tests/cli.rs.
 - **Golden files** (tests/golden/) for every generated artifact: firewall scripts, NGINX
-  blocks, robots.txt. They lock exact bytes, and double as the samples to hand to the real
-  `nft -c -f` / `nginx -t` once per change on a machine that has them. Regenerate with
+  and Apache blocks, robots.txt. They lock exact bytes, and double as the samples to hand
+  to the real `nft -c -f` / `nginx -t` / `apache2ctl configtest` once per change on a machine that has them. Regenerate with
   `UPDATE_GOLDENS=1 cargo test`, then review the diff.
 
 The pty harness that drives the TUI end to end lives in tests/tui.rs itself (on raw `libc`);
@@ -192,7 +195,7 @@ see the comment there for why it isn't a crate.
 ### The web UI
 
 `src/web/` is a third front-end over the same core as the CLI and the TUI. Nothing
-in it knows how to block a bot — `nginx`, `firewall`, `dynamic`, `protection` and
+in it knows how to block a bot — `webserver`, `firewall`, `dynamic`, `protection` and
 `cron` already carry those decisions, because the other two front-ends needed them.
 A behaviour that belongs to the product goes in one of those, not in a handler.
 
@@ -231,7 +234,7 @@ Run it against a throwaway database while working on it:
 cargo run -- web --db /tmp/stop-bots-dev.db --root ./tests/fixtures/nginx --no-apply
 ```
 
-`--no-apply` is the important half: without it, applying a site reloads the NGINX
+`--no-apply` is the important half: without it, applying a site reloads the web server
 on your development machine.
 
 ### Screenshots
@@ -252,7 +255,7 @@ into PNG. With neither installed it says so and leaves the previous PNGs alone. 
 TUI is shown dark and the console light on purpose: one of each palette.
 
 Two reasons it works this way rather than someone pressing a key and cropping a
-terminal. The first is that this tool reads real SSH and NGINX logs: a hand-taken
+terminal. The first is that this tool reads real SSH and web server logs: a hand-taken
 screenshot of the Firewall screen publishes the addresses currently attacking the
 maintainer's server and the hostname of every site on it. The second is that the
 output is a pure function of the seed, so a screenshot that has gone stale shows up
@@ -275,11 +278,11 @@ break is a red build rather than a surprise the next time somebody runs
 
 ### Container tests
 
-`tests/container.rs` runs the generated output through a **real NGINX and a real nftables**,
-in Docker, and checks the result by sending actual requests — including from a second
-container with its own address, so a firewall rule is verified by packets that genuinely
-don't arrive. It is the only place the two parsers this project writes for are exercised at
-all; everything else asserts the text we hoped would satisfy them, which is exactly the check
+`tests/container.rs` runs the generated output through a **real NGINX, a real Apache and a
+real nftables**, in Docker, and checks the result by sending actual requests — including from
+a second container with its own address, so a firewall rule is verified by packets that
+genuinely don't arrive. It is the only place the parsers this project writes for are exercised
+at all; everything else asserts the text we hoped would satisfy them, which is exactly the check
 that keeps passing when the text is wrong.
 
 It needs Docker and `NET_ADMIN` and takes ~20s, so it is off by default:
@@ -372,7 +375,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- main.rs        <- CLI entry point (clap subcommands) and their handlers
         |- lib.rs         <- Every module below, for main.rs and tests/; not a supported API
         |- app.rs         <- The TUI app controller, responds to events and controls the UI
-        |- applylock.rs   <- One NGINX or firewall apply at a time, across processes (flock)
+        |- applylock.rs   <- One web server or firewall apply at a time, across processes (flock)
         |- event.rs       <- Terminal event plumbing (ticks, key events, app events)
         |- tui.rs         <- Outer TUI chrome (tab bar, footer) and screen dispatch
         |- tui/           <- One file per TUI screen (Dashboard, Bot settings, Firewall, ...)
@@ -385,8 +388,11 @@ Some directories don't exist yet but should be created if the need arises.
         |- botlist/       <- One file per bot-list source parser
         |- fetch.rs       <- The one place an outbound HTTP request is made
         |- refresh.rs     <- "Update everything": every downloadable list as fetch-then-store, one at a time
-        |- nginx.rs       <- NGINX site discovery, config injection and generated files
-        |- webaccess.rs   <- Putting the web console behind NGINX, for both front-ends
+        |- webserver.rs   <- What NGINX and Apache share: the policy, the apply (test, put back, reload), uninstall
+        |- nginx.rs       <- NGINX: finding server blocks, rendering and placing its blocks and generated files
+        |- apache.rs      <- Apache: finding <VirtualHost>s, its mod_rewrite blocks, trust file and robots.txt
+        |- hostconf.rs    <- /etc/stop-bots/host.conf: the web server, its commands and root, the logs
+        |- webaccess.rs   <- Putting the web console behind NGINX or Apache, for both front-ends
         |- logpaths.rs    <- Where this host's SSH and access logs are, remembered
         |- logscan.rs     <- One pass over the logs: plan, read (no Db), store
         |- logread.rs     <- Reading a log a line at a time, from where the last read stopped
@@ -394,7 +400,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- logtime.rs     <- When a log line says it happened
         |- evidence.rs    <- What each detector counts, and the one decision over it
         |- sshlog.rs      <- SSH log parsing and scan detection
-        |- accesslog.rs   <- NGINX access log parsing, the web-log detectors, UA tallying
+        |- accesslog.rs   <- Access log parsing (NGINX's and Apache's), the web-log detectors, UA tallying
         |- injection.rs   <- Recognising an exploit payload in a logged request
         |- accessstats.rs <- What one pass tallied into the access-log UA stats
         |- cdn.rs         <- A CDN's edge addresses, which no detector blocks

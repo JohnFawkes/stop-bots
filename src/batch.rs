@@ -321,7 +321,7 @@ fn scan_logs(db: &Db, options: &BatchOptions) -> Vec<Step> {
             applied.stats.distinct_user_agents
         ))
     } else {
-        Ok("skipped: no NGINX access log".to_string())
+        Ok("skipped: no access log".to_string())
     };
     steps.push(Step::new("access stats", stats));
 

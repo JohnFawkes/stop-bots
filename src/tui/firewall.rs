@@ -627,8 +627,10 @@ impl Firewall {
                 if row.status.is_blocked() {
                     db.unblock_user_agent(&row.user_agent)?;
                     *message = Some(format!(
-                        "Unblocked user agent \"{}\" — run apply-blocks to remove it from NGINX config.",
-                        row.user_agent
+                        "Unblocked user agent \"{}\" — run apply-blocks to remove it from the {} \
+                         config.",
+                        row.user_agent,
+                        crate::webserver::WebServer::configured().label()
                     ));
                 } else {
                     if let Err(err) = db.block_user_agent(&row.user_agent) {
@@ -1088,14 +1090,18 @@ fn wrapped(text: &str, width: usize) -> Vec<String> {
 }
 
 /// What makes a trust change take effect. An address reaches both the
-/// firewall and NGINX; a user agent only ever NGINX, which never sees a
-/// packet's user agent to begin with.
-fn apply_hint(entry: &TrustedEntry) -> &'static str {
+/// firewall and the web server; a user agent only ever the web server,
+/// as the firewall never sees a packet's user agent to begin with. Named
+/// as the host settings name it, NGINX or Apache.
+fn apply_hint(entry: &TrustedEntry) -> String {
+    let server = crate::webserver::WebServer::configured().label();
     match entry {
         TrustedEntry::Address(_) => {
-            "apply everything (a on the Dashboard) to put it in the firewall and NGINX."
+            format!("apply everything (a on the Dashboard) to put it in the firewall and {server}.")
         }
-        TrustedEntry::UserAgent(_) => "apply everything (a on the Dashboard) to put it in NGINX.",
+        TrustedEntry::UserAgent(_) => {
+            format!("apply everything (a on the Dashboard) to put it in {server}.")
+        }
     }
 }
 

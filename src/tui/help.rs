@@ -68,8 +68,19 @@ const LINES: [&str; MAX_LINES] = [
     "  q Esc / t / ?      quit, go back or close a popup / light/dark theme / toggle this help screen",
 ];
 
-pub fn render(frame: &mut Frame, area: Rect, theme: crate::tui::Theme) {
-    let lines: Vec<Line> = LINES.iter().map(|line| Line::from(*line)).collect();
+/// Draws the reference. "NGINX" in [`LINES`] is the sites screen and the
+/// server it writes, so it is drawn as the server the host runs, as that
+/// screen's tab is.
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    theme: crate::tui::Theme,
+    server: crate::webserver::WebServer,
+) {
+    let lines: Vec<Line> = LINES
+        .iter()
+        .map(|line| Line::from(line.replace("NGINX", server.label())))
+        .collect();
     let paragraph = Paragraph::new(lines).block(crate::tui::panel("Help", true, theme));
     frame.render_widget(paragraph, area);
 }
@@ -86,23 +97,30 @@ mod tests {
     fn every_help_line_fits_the_smallest_terminal_the_tests_drive() {
         // The body area the app hands this screen at the pty tests' 32x100:
         // 32 rows less a 3-row header and a 1-row footer.
-        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
-        terminal
-            .draw(|frame| render(frame, frame.area(), crate::tui::Theme::Dark))
-            .unwrap();
+        for server in crate::webserver::WebServer::ALL {
+            let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+            terminal
+                .draw(|frame| render(frame, frame.area(), crate::tui::Theme::Dark, server))
+                .unwrap();
 
-        let content: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
+            let content: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
 
-        assert!(
-            content.contains("toggle this help screen"),
-            "the last help line was cut off:\n{content}"
-        );
+            assert!(
+                content.contains("toggle this help screen"),
+                "the last help line was cut off:\n{content}"
+            );
+            // Every mention is the server the host runs, as its tab is.
+            assert!(
+                content.contains(&format!("put this console behind {}", server.label())),
+                "{server:?}'s help was:\n{content}"
+            );
+        }
     }
 
     /// The keys the reference lists for `section`, and for the Global

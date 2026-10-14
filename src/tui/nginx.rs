@@ -55,7 +55,6 @@
 //! normally root-owned) with a "Try running as root" suggestion.
 
 use crate::db::{BlockResponse, Db, Site};
-use crate::nginx;
 use crate::tui::site_detail::SiteDetail;
 use crate::tui::{centered_rect, KeyOutcome, Theme};
 use crate::webserver::SiteApplyStatus;
@@ -78,7 +77,7 @@ const RATE_LIMIT_PRESETS: [(i64, i64); 3] = [(5, 10), (10, 20), (30, 60)];
 /// The popup title and its options, in the order [`SettingPopup::selected`]
 /// indexes them. One function so the renderer and the key handler can never
 /// disagree about how many options there are or what index means what.
-fn setting_options(setting: NginxSetting) -> (&'static str, Vec<String>) {
+fn setting_options(setting: NginxSetting, server: WebServer) -> (&'static str, Vec<String>) {
     match setting {
         // Each option carries what it's *for*, not just its number: the
         // list would otherwise read as five interchangeable status codes,
@@ -110,7 +109,10 @@ fn setting_options(setting: NginxSetting) -> (&'static str, Vec<String>) {
             "Apply config changes automatically",
             vec![
                 "Off \u{2014} apply by hand with a/A".to_string(),
-                "On \u{2014} the internal cron applies and reloads NGINX, hourly".to_string(),
+                format!(
+                    "On \u{2014} the internal cron applies and reloads {}, hourly",
+                    server.label()
+                ),
             ],
         ),
         NginxSetting::RateLimit => (
@@ -352,7 +354,7 @@ impl Nginx {
             self.render_popup(frame, area, popup, theme);
         }
         if let Some(popup) = &self.setting_popup {
-            let (title, options) = setting_options(popup.setting);
+            let (title, options) = setting_options(popup.setting, self.server);
             crate::tui::dashboard::render_option_list(
                 frame,
                 area,
@@ -371,7 +373,9 @@ impl Nginx {
     /// list. Only highlights its selection while it actually has focus, so
     /// there's never a second reversed row competing with the site list's.
     fn render_settings(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
-        let rate_limit_label = if self.rate_limit_enabled {
+        let rate_limit_label = if self.server.without_rate_limiting().is_some() {
+            format!("none on {}", self.server.label())
+        } else if self.rate_limit_enabled {
             format!(
                 "{} req/s, burst {}",
                 self.rate_limit_rps, self.rate_limit_burst
@@ -448,7 +452,10 @@ impl Nginx {
         }
         match self.focus {
             Focus::Settings => (
-                "NGINX settings",
+                match self.server {
+                    WebServer::Nginx => "NGINX settings",
+                    WebServer::Apache => "Apache settings",
+                },
                 vec![
                     ("\u{2191}\u{2193}", "move"),
                     ("Enter", "change"),
@@ -584,7 +591,7 @@ impl Nginx {
         }
 
         match self.focus {
-            Focus::Settings => self.handle_settings_panel_key(key),
+            Focus::Settings => self.handle_settings_panel_key(key, message),
             Focus::Sites => self.handle_site_list_key(key, db),
         }
     }
@@ -642,7 +649,7 @@ impl Nginx {
         let Some(popup) = &mut self.setting_popup else {
             unreachable!("dispatched on this popup")
         };
-        let option_count = setting_options(popup.setting).1.len();
+        let option_count = setting_options(popup.setting, self.server).1.len();
         match key.code {
             KeyCode::Esc => {
                 self.setting_popup = None;
@@ -670,7 +677,11 @@ impl Nginx {
     }
 
     /// Keys for the NGINX settings panel, when it has focus.
-    fn handle_settings_panel_key(&mut self, key: KeyEvent) -> Result<KeyOutcome> {
+    fn handle_settings_panel_key(
+        &mut self,
+        key: KeyEvent,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
         Ok(match key.code {
             KeyCode::Esc => KeyOutcome::Back,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -684,7 +695,17 @@ impl Nginx {
                 KeyOutcome::Consumed
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                self.open_setting_popup();
+                let focused = self
+                    .settings_state
+                    .selected()
+                    .and_then(|i| NginxSetting::ALL.get(i).copied());
+                // Not offered where it would store a limit nothing writes.
+                match self.server.without_rate_limiting() {
+                    Some(why) if focused == Some(NginxSetting::RateLimit) => {
+                        *message = Some(why.to_string());
+                    }
+                    _ => self.open_setting_popup(),
+                }
                 KeyOutcome::Consumed
             }
             _ => KeyOutcome::Ignored,
@@ -844,9 +865,11 @@ impl Nginx {
                 }
                 db.set_auto_apply(auto)?;
                 *message = Some(if auto {
-                    "Auto-apply on \u{2014} the internal cron will write these configs and \
-                     reload NGINX within the hour, and after every change from now on."
-                        .to_string()
+                    format!(
+                        "Auto-apply on \u{2014} the internal cron will write these configs and \
+                         reload {} within the hour, and after every change from now on.",
+                        self.server.label()
+                    )
                 } else {
                     "Auto-apply off \u{2014} config changes wait for a/A again".to_string()
                 });
@@ -965,11 +988,12 @@ impl Nginx {
             rolled_back,
         } = outcome;
         if let Some(err) = rolled_back {
+            let server = self.server.label();
             self.alert = Some(format!(
-                "The NGINX config test failed, so nothing was applied:\n{err}"
+                "The {server} config test failed, so nothing was applied:\n{err}"
             ));
             return (
-                "Nothing applied: the NGINX config test failed".to_string(),
+                format!("Nothing applied: the {server} config test failed"),
                 false,
             );
         }
@@ -1096,7 +1120,7 @@ impl Nginx {
 ///
 /// `conf_d` is resolved by the caller for that reason: the comparison also
 /// reads the trust file, which lives beside the site configs rather than
-/// in `/etc/nginx` (see [`nginx::conf_d_dir`]), and working that out needs
+/// in `/etc/nginx` (see [`crate::nginx::conf_d_dir`]), and working that out needs
 /// the database this function deliberately cannot see.
 pub fn run_status_check(
     server: WebServer,
@@ -1294,7 +1318,10 @@ pub fn preview_apply(plan: &ApplyPlan) -> Vec<webserver::FileChange> {
             },
         };
         let (path, _, current) = &mut files[at];
-        if let Ok(next) = nginx::block_for_site(current, path, &site.server_name, &site.config) {
+        if let Ok(next) =
+            plan.server
+                .block_for_site(current, path, &plan.root, &site.server_name, &site.config)
+        {
             *current = next;
         }
     }
@@ -2082,6 +2109,61 @@ mod tests {
         assert_eq!(db.get_block_response().unwrap(), BlockResponse::Close);
         // Unchanged, so nothing worth telling the user about.
         assert!(message.is_none());
+    }
+
+    /// What an Apache host's screen draws, as one string.
+    fn apache_screen_text(db: &Db) -> String {
+        let mut screen = Nginx::new(WebServer::Apache, PathBuf::from("tests/fixtures/nginx"));
+        screen.refresh(db).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area(), Theme::Dark))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn an_apache_host_shows_no_rate_limit_even_one_stored_earlier() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_rate_limit_enabled(true).unwrap();
+        let content = apache_screen_text(&db);
+        assert!(
+            content.contains("none on Apache"),
+            "content was:\n{content}"
+        );
+        assert!(!content.contains("req/s"), "content was:\n{content}");
+    }
+
+    #[test]
+    fn an_apache_host_says_why_instead_of_offering_a_rate_limit() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = Nginx::new(WebServer::Apache, PathBuf::from("tests/fixtures/nginx"));
+        screen.refresh(&db).unwrap();
+        let mut message = None;
+        for key in [KeyCode::Tab, KeyCode::Down, KeyCode::Down, KeyCode::Enter] {
+            screen
+                .handle_key(KeyEvent::from(key), &db, &mut message)
+                .unwrap();
+        }
+        assert!(screen.setting_popup.is_none(), "a rate limit was offered");
+        let said = message.unwrap_or_default();
+        assert!(said.contains("no rate limiting"), "said: {said}");
+        assert!(!db.get_rate_limit_enabled().unwrap());
+    }
+
+    #[test]
+    fn an_apache_hosts_settings_are_called_apaches() {
+        let content = apache_screen_text(&Db::open_in_memory().unwrap());
+        assert!(
+            content.contains("Apache settings"),
+            "content was:\n{content}"
+        );
     }
 
     #[test]

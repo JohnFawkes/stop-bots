@@ -243,12 +243,14 @@ impl Screen {
         }
     }
 
-    pub fn title(self) -> &'static str {
+    /// The tab's name. The sites screen is named for the web server it
+    /// manages, so the name needs it: there is no answer without one.
+    pub fn title(self, server: crate::webserver::WebServer) -> &'static str {
         match self {
             Screen::Dashboard => "Dashboard",
             Screen::BotSettings => "Bot settings",
             Screen::Firewall => "Firewall",
-            Screen::Nginx => "NGINX",
+            Screen::Nginx => server.label(),
             Screen::Blocks => "Blocks",
             Screen::Help => "Help",
         }
@@ -464,7 +466,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             .render(frame, body, app.theme, &app.jobs_in_flight),
         Screen::Nginx => app.nginx.render(frame, body, app.theme),
         Screen::Blocks => app.blocks.render(frame, body, app.theme),
-        Screen::Help => help::render(frame, body, app.theme),
+        Screen::Help => help::render(frame, body, app.theme, app.nginx.server()),
     }
 
     // Over the body, under the footer: the footer is what tells you the
@@ -505,7 +507,7 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         brand.push(notice.clone().fg(Color::Yellow));
     }
     frame.render_widget(Paragraph::new(Line::from(brand)), brand_area);
-    if let Some(busy) = busy_label(&app.jobs_in_flight) {
+    if let Some(busy) = busy_label(&app.jobs_in_flight, app.nginx.server()) {
         let activity =
             Line::from(format!("{} {busy}", spinner_frame()).fg(theme.live())).right_aligned();
         frame.render_widget(Paragraph::new(activity), brand_area);
@@ -532,11 +534,7 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
                 }),
         );
         tabs.push(" ".into());
-        // The sites screen is named for the web server it manages.
-        let title = match screen {
-            Screen::Nginx => app.nginx.server().label(),
-            screen => screen.title(),
-        };
+        let title = screen.title(app.nginx.server());
         tabs.push(if active {
             title.fg(theme.accent()).bold().underlined()
         } else {
@@ -644,8 +642,11 @@ pub type Hints = (&'static str, Vec<(&'static str, &'static str)>);
 /// waiting on an NGINX reload does not need the scheduled log read
 /// itemised. Sorted so which one gets named doesn't flicker between
 /// redraws of the same set, `HashSet` iteration order being arbitrary.
-fn busy_label(jobs: &std::collections::HashSet<crate::app::Job>) -> Option<String> {
-    let mut labels: Vec<String> = jobs.iter().map(crate::app::Job::label).collect();
+fn busy_label(
+    jobs: &std::collections::HashSet<crate::app::Job>,
+    server: crate::webserver::WebServer,
+) -> Option<String> {
+    let mut labels: Vec<String> = jobs.iter().map(|job| job.label(server)).collect();
     labels.sort();
     let first = labels.first()?;
     Some(match labels.len() {
@@ -658,6 +659,15 @@ fn busy_label(jobs: &std::collections::HashSet<crate::app::Job>) -> Option<Strin
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_sites_screen_is_named_for_the_hosts_web_server() {
+        use crate::webserver::WebServer;
+        for server in WebServer::ALL {
+            assert_eq!(Screen::Nginx.title(server), server.label());
+        }
+        assert_eq!(Screen::Firewall.title(WebServer::Apache), "Firewall");
+    }
+
     /// Which job gets named when several are out has to be stable across
     /// redraws — `HashSet` iteration order is arbitrary, so without the
     /// sort the footer would flicker between two labels 30 times a second
@@ -666,11 +676,12 @@ mod tests {
     fn the_footer_names_one_job_stably_and_counts_the_rest() {
         use crate::app::Job;
         use crate::cron::CronJob;
+        use crate::webserver::WebServer::Nginx;
 
-        assert_eq!(busy_label(&std::collections::HashSet::new()), None);
+        assert_eq!(busy_label(&std::collections::HashSet::new(), Nginx), None);
 
         let one = std::collections::HashSet::from([Job::ReloadNginx]);
-        assert_eq!(busy_label(&one).as_deref(), Some("reloading NGINX"));
+        assert_eq!(busy_label(&one, Nginx).as_deref(), Some("reloading NGINX"));
 
         let several = std::collections::HashSet::from([
             Job::ReloadNginx,
@@ -680,9 +691,23 @@ mod tests {
         // Sorted, so this is the answer every time and not just this time.
         for _ in 0..10 {
             assert_eq!(
-                busy_label(&several).as_deref(),
+                busy_label(&several, Nginx).as_deref(),
                 Some("Update crawler IP ranges (scheduled) (+2 more)")
             );
+        }
+    }
+
+    #[test]
+    fn the_footer_names_the_web_server_the_host_runs() {
+        use crate::app::Job;
+        use crate::webserver::WebServer::Apache;
+        for (job, expected) in [
+            (Job::ReloadNginx, "reloading Apache"),
+            (Job::ScanSites, "scanning the Apache config"),
+            (Job::ApplyWebAccess, "setting up Apache for this console"),
+        ] {
+            let jobs = std::collections::HashSet::from([job]);
+            assert_eq!(busy_label(&jobs, Apache).as_deref(), Some(expected));
         }
     }
 

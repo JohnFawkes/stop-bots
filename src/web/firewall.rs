@@ -442,7 +442,11 @@ fn body(
 fn trusted_panel(trusted: &[TrustedEntry], ctx: &Ctx) -> Markup {
     layout::panel(
         "Trusted",
-        Some("Never blocked. An address gets past the firewall and NGINX; a user agent gets past NGINX"),
+        Some(&format!(
+            "Never blocked. An address gets past the firewall and {server}; a user agent gets \
+             past {server}",
+            server = ctx.chrome.web_server.label()
+        )),
         html! {
             @if trusted.is_empty() {
                 (layout::empty("Nothing is trusted."))

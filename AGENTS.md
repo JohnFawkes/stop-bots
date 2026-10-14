@@ -1,4 +1,4 @@
-# Developement Workflow
+# Development Workflow
 
 - Always read the README.md file in the root of the repository. Always.
 - Always read README.md in any directory in this repository before you read or write any files in

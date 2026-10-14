@@ -2,34 +2,222 @@
 
 [![CI](https://github.com/ivankovic/stop-bots/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ivankovic/stop-bots/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/stop-bots.svg)](https://crates.io/crates/stop-bots)
-[![Coverage](https://img.shields.io/badge/coverage-%E2%89%A590%25-brightgreen)](https://github.com/ivankovic/stop-bots/blob/main/CONTRIBUTING.md#coverage)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](https://github.com/ivankovic/stop-bots/blob/main/LICENSE)
 
 A TUI, a web console and a CLI that help you configure your server to stop bad bots without
-hiding behind a CDN.
+hiding behind a CDN. It is a fancy UI for your existing web server (nginx or Apache) and your
+firewall (nftables or iptables). For those of us that don't want to hide behind Cloudflare and give
+one company the keys to all kingdoms.
 
-It works alongside your web server (NGINX or Apache) and your existing firewall (nftables or
-iptables):
+It protects you in two ways:
 
-- **Web server config.** It classifies known bots by category (scanners, search engines, AI
-  crawlers) and blocks or allows them by injecting a rule into your site configs. It scans the
-  access log to detect bots dynamically and block them even if no ruleset tracks them yet.
-- **A firewall script.** Block entire countries, datacenter IP ranges, known bot IP ranges or any
-  IP address that repeatedly tries to log into your server unsuccessfully. Every block records
-  why it exists.
+- Preventative - It downloads known bot lists and IP ranges and blocks them. I particularly
+  recommend using Geo-blocking. For private servers, you can use an allowlist and block more than
+  90% of all attacks.
+- Responsive - It monitors access logs and detects attackers and kicks them out. Note that this
+  means a few packets will reach your server before they are detected, but at least it will stop
+  them from escalating.
 
-![Each screen in sequence: Dashboard, Bot settings, Firewall, NGINX and Blocks](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/tour.gif)
+It **tries** to keep you from doing something self-destructive. You will always see what changes
+first before you apply it, and you can use the `--dry-run` flag for extra safety. But I suspect
+eventually you will want to enable auto-apply, for convenience. Because of this, the app also tries
+not to lock you out. IP addresses with successful SSH logins are never blocked, webserver configs
+are always tested before application and it tries to recognize apps running behind HTTP proxies and
+adapts the dynamic detection rules to the apps.
 
-The app tries its best to not lock you out of the server, but you use it at your own risk. And
-note that it is licensed under AGPL, so if you are using it commercially, make sure you obey the
-license, or [get an alternative license](#cant-use-agpl-software).
+**Big red button**: `sudo stop-bots uninstall all`
 
-## How it compares
+![Each screen in sequence: Dashboard, Bot settings, Firewall, the web server's sites and Blocks](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/tour.gif)
+
+The rest of this readme was written by the AI. Feel free to ask your own AI to summarize it, I won't
+mind.
+
+## What happens to my server
+
+Installing starts nothing, and nothing is written until you apply. On the first apply, with
+the settings a new database starts with:
+
+- **Blocked by user agent:** the Scanner and AI crawler categories. Search engines are allowed.
+- **Watching the logs:** five detectors are on: SSH scanners, web scanners, forged crawlers,
+  probes for secrets and injection attempts. The rest are off (see
+  [From your logs](#from-your-logs)).
+- **Blocked by address:** nothing yet. Countries, reputation feeds and hosting providers are
+  all off until you turn them on, so the firewall starts with only what the detectors find.
+
+And this is what gets written where:
+
+| What | Where |
+|---|---|
+| The blocking rule | inside each site's `server` block, between `# BEGIN stop-bots` and `# END stop-bots` |
+| Files the rule needs, when a setting needs one (`robots.txt`, rate limiting) | `/etc/stop-bots/nginx/` and NGINX's `conf.d` (for Apache, `/etc/stop-bots/apache/` and `conf-enabled`) |
+| The firewall script | `/etc/stop-bots/firewall.next.nft` (or `.next.sh` for iptables), copied to `firewall.nft` once applied; it only touches its own `inet stop_bots` table |
+| Settings, blocks and why each exists | `/var/lib/stop-bots/db.sqlite3` |
+
+Here is `sudo stop-bots batch --dry-run --diff` on a fresh database and a one-site NGINX,
+trimmed (the real user-agent pattern is a few hundred names long):
+
+```
+Dry run: nothing is downloaded, scanned, written, applied or recorded. Against the database as it is, `batch` would:
+NGINX: 1 file(s) would change:
+  /etc/nginx/sites-enabled/example.com
+Firewall (nftables): 0 rule(s), 0 kernel entries; no applied script at /etc/stop-bots/firewall.nft yet, so all of it is new
+lockout check passed: the SSH log was read, and no connected client would be blocked
+would write 0 rule(s) to /etc/stop-bots/firewall.next.nft; not applied — review it, then apply it (“Apply everything” or `stop-bots render-firewall --apply`)
+--- /etc/nginx/sites-enabled/example.com
++++ /etc/nginx/sites-enabled/example.com
+@@ -1,4 +1,10 @@
+ server {
++    # BEGIN stop-bots (DO NOT EDIT)
++    if ($http_user_agent ~* "AgentReadinessScanner|AIScan|ArgusScanner|…|xAI-Grok|zmap-proxy-probe") {
++        return 403;
++    }
++    # END stop-bots
++
+     listen 443 ssl;
+     server_name example.com;
+     root /var/www/example.com;
+--- /etc/stop-bots/firewall.nft (does not exist)
++++ /etc/stop-bots/firewall.next.nft
+@@ -0,0 +1,29 @@
++#!/usr/sbin/nft -f
++# Generated by stop-bots 0.2.0. Not executed automatically — review, then run
++# with: nft -f <this file>
+…
++add table inet stop_bots
++delete table inet stop_bots
++add table inet stop_bots
++add chain inet stop_bots bot_block { type filter hook input priority -1; policy accept; }
+…
+```
+
+# Quick start
+
+## Install
+
+On Debian or Ubuntu, from the APT repository:
+
+```
+curl -fsSL https://ivankovic.github.io/stop-bots/key.gpg \
+  | sudo tee /usr/share/keyrings/stop-bots.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/stop-bots.gpg] \
+https://ivankovic.github.io/stop-bots stable main" \
+  | sudo tee /etc/apt/sources.list.d/stop-bots.list
+sudo apt update && sudo apt install stop-bots
+```
+
+Or `cargo install stop-bots` with Rust 1.88 or newer, or a static binary for `x86_64` or
+`aarch64` Linux from the GitHub [releases](https://github.com/ivankovic/stop-bots/releases),
+each with a checksum and a build provenance attestation
+([verifying a download](https://github.com/ivankovic/stop-bots/blob/main/RELEASING.md#verifying-a-download)).
+Installing starts nothing.
+
+It is tested on **Debian and Ubuntu with systemd, and NGINX or Apache**. It needs `nft`, or
+`iptables-restore` and `ip6tables-restore`, for the firewall. Caddy is not supported.
+
+NGINX is the default. On an Apache host, say so once, and enable `mod_rewrite`, which the
+blocks are written in:
+
+```
+sudo stop-bots set-web-server apache
+sudo a2enmod rewrite
+```
+
+Apache support is newer than NGINX's and has been tested on the Debian and Ubuntu layout
+(`/etc/apache2`). A few features are NGINX-only, rate limiting among them.
+
+## Try it without a server
+
+From a clone of this repository, with Podman (or `STOP_BOTS_CONTAINER_RUNTIME=docker`) and a
+Rust toolchain:
+
+```
+make demo
+```
+
+That builds the binary and drops you into a shell in a throwaway Ubuntu container running
+NGINX, with a few bad requests already in its log and a list of things to try. The firewall
+rules it applies stay inside the container, and `exit` deletes it.
+
+## Run it
+
+`sudo stop-bots` starts the TUI. It needs root, because it rewrites your web server's config and
+loads firewall rules. `?` shows every key on every screen.
+
+`sudo stop-bots web` serves the same screens in a browser, on `127.0.0.1:8787` only. Reach it
+from your laptop over an SSH tunnel, `ssh -L 8787:127.0.0.1:8787 your-server`, then open
+<http://127.0.0.1:8787/>. The first run prints a password for it, once; only a hash is stored,
+and `sudo stop-bots web --set-password` issues a new one.
+
+Run every command with `sudo`. Without root, stop-bots cannot open
+`/var/lib/stop-bots/db.sqlite3` and falls back to a database of your own (it prints which),
+with none of your settings in it.
+
+![The web console's Dashboard: category policies, detectors, countries and scheduled tasks](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/web-dashboard.png)
+
+Or from the CLI, for scripts:
+
+```
+sudo stop-bots status
+sudo stop-bots batch --dry-run --diff
+sudo stop-bots batch --apply
+sudo stop-bots install firewall
+sudo stop-bots status
+```
+
+`stop-bots --help` lists every command.
+
+## Keep it running
+
+**Nothing re-runs on its own.** Detection, list updates and the rest run on an internal
+schedule that only ticks while the TUI or the web console is open. On a server you don't sit
+in front of, pick one of these.
+
+The console as a service, which runs the detectors every minute and refreshes the lists every
+week:
+
+```
+sudo stop-bots install web --dry-run    # read the plan
+sudo stop-bots install web              # prints the console password at the end
+```
+
+It still only *writes* what it finds until you let it apply, and there are two switches for
+that because the risks are different. NGINX config is re-applied at most once an hour, after
+`nginx -t`; the firewall script is applied within minutes of a new block, and only when the
+lockout check could actually read the SSH log:
+
+```
+sudo stop-bots set-auto-apply --enabled true
+sudo stop-bots set-auto-apply-firewall --enabled true
+```
+
+Or cron, without the console:
+
+```
+# One full pass a night. Refreshes the lists, scans the logs, applies both.
+0 4 * * * root /usr/bin/stop-bots batch --apply
+
+# And detection every ten minutes, without re-downloading lists that change weekly.
+*/10 * * * * root /usr/bin/stop-bots batch --apply --no-fetch
+```
+
+Either way, `sudo stop-bots install firewall` adds a unit that loads the applied firewall
+script again at boot.
+
+## Undo
+
+`sudo stop-bots uninstall all` puts the host back as it was. Run it with `--dry-run` first to
+see every step. The database is kept unless you add `--purge`.
+
+This tool edits your web server config and your firewall, and you use it at your own risk.
+The first time you apply firewall rules, keep a way into the server that does not depend on
+SSH, such as your provider's console.
+
+# How it compares
 
 Stop Bots covers ground that usually takes two or three tools: blocking at the HTTP layer in
-NGINX, at the IP layer in the firewall, and detection from your logs. It does this in one local
-binary, with a screen to review and undo every block. It doesn't need an account or a cloud
-service, and it doesn't send anything about your traffic anywhere.
+the web server, at the IP layer in the firewall, and detection from your logs. It does this in
+one local binary, with a screen to review and undo every block. It doesn't need an account or a
+cloud service, and it doesn't send anything about your traffic anywhere.
 
 - **[fail2ban](https://github.com/fail2ban/fail2ban)** and **[sshguard](https://www.sshguard.net/)**
   ban addresses from log patterns at the firewall. They cover many more services (mail, FTP,
@@ -49,79 +237,6 @@ service, and it doesn't send anything about your traffic anywhere.
 - **Cloudflare**, even on the free plan, filters bots and AI crawlers at its edge with no work
   on your server, as long as all your traffic goes through it. Stop Bots is for when you don't
   want that.
-
-# Quick start
-
-## Install
-
-On Debian or Ubuntu, from the APT repository:
-
-```
-curl -fsSL https://ivankovic.github.io/stop-bots/key.gpg \
-  | sudo tee /usr/share/keyrings/stop-bots.gpg > /dev/null
-echo "deb [signed-by=/usr/share/keyrings/stop-bots.gpg] \
-https://ivankovic.github.io/stop-bots stable main" \
-  | sudo tee /etc/apt/sources.list.d/stop-bots.list
-sudo apt update && sudo apt install stop-bots
-```
-
-Or `cargo install stop-bots` with Rust 1.88 or newer, or a static binary for `x86_64` or
-`aarch64` Linux from the GitHub [releases](https://github.com/ivankovic/stop-bots/releases).
-Installing starts nothing.
-
-It is tested on **Debian and Ubuntu with systemd, and NGINX or Apache**. It needs `nft`, or
-`iptables-restore` and `ip6tables-restore`, for the firewall. Caddy is not supported.
-
-NGINX is the default. On an Apache host, say so once, and enable `mod_rewrite`, which the
-blocks are written in:
-
-```
-sudo stop-bots set-web-server apache
-sudo a2enmod rewrite
-```
-
-Apache has no rate limiting of its own, so that setting does nothing there, and the
-close-connection, tarpit and teapot responses are a 403. Putting the web console behind Apache
-from inside the app also needs `sudo a2enmod proxy_http`.
-
-## Run it
-
-`sudo stop-bots` starts the TUI. It needs root, because it rewrites your web server's config and
-loads firewall rules. `?` shows every key on every screen.
-
-`stop-bots web` serves the same screens in a browser, on `127.0.0.1:8787` only. Reach it from
-your laptop over an SSH tunnel, `ssh -L 8787:127.0.0.1:8787 your-server`, then open
-<http://127.0.0.1:8787/>. `sudo stop-bots install web` runs it as a service.
-
-Or from the CLI, for scripts:
-
-```
-sudo stop-bots status
-sudo stop-bots batch --dry-run --diff
-sudo stop-bots batch --apply
-sudo stop-bots install firewall
-sudo stop-bots status
-```
-
-`stop-bots --help` lists every command.
-
-## Keep it running
-
-The detectors read your logs every minute, **but only while the TUI or the web console is
-running.** On a server where neither is, let cron do it:
-
-```
-# One full pass a night. Refreshes the lists, scans the logs, applies both.
-0 4 * * * root /usr/bin/stop-bots batch --apply
-
-# And detection every ten minutes, without re-downloading lists that change weekly.
-*/10 * * * * root /usr/bin/stop-bots batch --apply --no-fetch
-```
-
-## Undo
-
-`sudo stop-bots uninstall all` puts the host back as it was. Run it with `--dry-run` first to
-see every step.
 
 # What it protects against
 
@@ -176,54 +291,85 @@ automatically is a setting, and it is off.
 
 # The web console's security model
 
-`sudo stop-bots install web` runs the console as a service, split so that the part you log
-into is not root.
+`sudo stop-bots install web` splits the console in two: the part you log into runs as an
+unprivileged `stop-bots` user in a systemd sandbox, and a small root helper, started on demand,
+does the few things that need root from a fixed list of requests. Taking over the console gets
+an attacker the operator's powers over blocking, not root.
+[docs/security-model.md](https://github.com/ivankovic/stop-bots/blob/main/docs/security-model.md)
+has the details and the limits.
 
-**Two processes, and only one of them is root:**
+# FAQ
 
-- **The console**, `stop-bots-web.service`, runs as the `stop-bots` user. It writes its
-  database and nothing else, and reads no host file: `/var/log` is hidden from it, and it
-  gets the two logs its detectors need from the helper. It holds no Linux capability, has no
-  access to netlink, so it cannot change the firewall, sees `/run` read-only, and cannot see
-  systemd's sockets or D-Bus.
-- **The helper**, `stop-bots-helper.service`, runs as root. systemd starts it when the console
-  first connects to `/run/stop-bots/helper.sock` (`stop-bots-helper.socket`). Only root and the
-  `stop-bots` group can open that socket, and the helper also checks the user of each caller.
-  It writes the web server's config and the firewall script, and runs the web server's config
-  test and reload (`nginx -t`, or `apache2ctl configtest`) and `nft`. It accepts a fixed set
-  of requests: apply the web server config, apply the firewall, set up Web Access, find the
-  sites, check the host's health, and read the next part of the access log or of sshd's login
-  lines. No request contains a path, a command or config text. Which web server it is, its
-  commands, its config root and the log paths come from `/etc/stop-bots/host.conf`, which only
-  root can write, not from the database.
+### Why does it need root?
 
-**What someone who takes over the console can do, and what they cannot.** If an attacker gets
-code running in the console, they have the `stop-bots` user and what it can reach:
+It rewrites your web server's config, reloads it, and loads firewall rules, and each of those
+needs root. The TUI and the CLI run as root because you started them with `sudo`. The console,
+once installed as a service, does not: it runs as its own user and asks a root helper for those
+few things, as described [above](#the-web-consoles-security-model).
 
-- They can do what a logged-in operator can do: change the blocking policy, block or unblock
-  any address, and apply. The detectors run in the console, so they can also make it block or
-  unblock anything.
-- They can read what the console reads: the web server's access log and sshd's authentication
-  lines, through the helper, and the database with the password hash. Not the rest of `/var/log`, and
-  not the journal of any other service.
-- They cannot get root through the console. They cannot write to `/etc`, cron, systemd units
-  or binaries, cannot ask systemd to start anything, and cannot choose what the helper runs or
-  which files it writes or deletes. The helper treats the database as hostile: it finds the
-  sites to change on disk, checks again everything it writes from the database, and deletes
-  only the files stop-bots generated.
+### My NGINX runs in Docker.
 
-The helper has the sandbox the console had before 0.1: `ProtectSystem=strict`, with write
-access only to the database, `/etc/stop-bots`, the web server's config root, the log
-directories that config names (its config test opens them for writing) and `/run`. This stops a
-write to cron, systemd units or binaries that the helper was tricked into. It does not stop
-code that runs as the helper: that code is root, and root that can ask systemd to reload the
-web server can ask it for more. If you later add a site that logs somewhere new, or switch web
-servers, re-run `install web` so the helper's unit grants it.
+That works, and is a setup it was written for. Point it at the config on the bind mount and
+tell it how to test and reload NGINX inside the container, and where the logs end up:
 
-Both processes yield to the host: they run at `Nice=10` with idle I/O priority, and systemd
-throttles each at a quarter of RAM and stops it at half. `sudo stop-bots status` warns if the
-console runs as root, if it has no helper, or if the helper cannot read a log the detectors
-need.
+```
+sudo stop-bots set-nginx-commands --root /srv/app/nginx \
+  --test "docker exec web nginx -t" --reload "docker exec web nginx -s reload"
+sudo stop-bots set-log-paths --access-log /srv/app/logs/access.log
+```
+
+The firewall script hooks `forward` as well as `input` (and `DOCKER-USER` with iptables), so
+its blocks also cover a container's published ports. `sudo stop-bots status` says whether the
+ruleset that is actually loaded does.
+
+### Caddy, Traefik, HAProxy?
+
+Not supported, and not on the [roadmap](https://github.com/ivankovic/stop-bots/blob/main/ROADMAP.md).
+NGINX and Apache are the two it writes config for.
+
+### I'm behind Cloudflare, or another reverse proxy.
+
+Then your web server logs the proxy's address, not the visitor's, unless you tell it
+otherwise. The detectors don't read `X-Forwarded-For` or `CF-Connecting-IP` themselves; they
+take the client address your web server logs. Set up NGINX's real-IP module
+(`set_real_ip_from` and `real_ip_header`) so that address is the visitor's. Until you do, the
+detectors never block Cloudflare's edge addresses (or private ones), so behind it they block no
+one; `sudo stop-bots status` warns when most of the log comes from Cloudflare and prints the
+NGINX lines to add. (`set-web --trust-forwarded-for` is a different thing: it is for a proxy in
+front of the web console itself.)
+
+The user-agent blocks in the web server work either way. Firewall blocks of a visitor's
+address do not: behind a proxy, the connection reaching your server comes from the proxy.
+
+### What does it cost in performance?
+
+In NGINX, one case-insensitive regular expression match against the user agent per request,
+plus the request-shape rules you switch on. In the firewall, nftables keeps the addresses in
+sets, so a lookup stays cheap however many there are. The iptables backend writes one rule per
+address, which grows linearly with the list; for large lists (whole countries, the reputation
+feeds) prefer nftables. In both, established connections are accepted before any rule is
+checked. None of this has been benchmarked here, so measure it on your own traffic if it
+matters.
+
+### Does the AGPL mean my sites have to be AGPL?
+
+No. Running Stop Bots on your server doesn't change the license of anything it protects. The
+AGPL's obligations apply to Stop Bots itself: if you modify it and let others use your
+modified version over a network, you must offer them its source.
+
+Code contributions need a one-time [Contributor License Agreement](https://github.com/ivankovic/stop-bots/blob/main/CLA.md).
+You keep your copyright; the CLA lets the project also be offered under a
+[commercial license](#cant-use-agpl-software) to people who can't use the AGPL, which is only
+possible if every line can be licensed both ways.
+
+### Does it work on Arch, Fedora, Alpine...?
+
+Debian and Ubuntu are what is tested. The release binaries are static, so they run on any
+x86_64 or aarch64 Linux, and `cargo install stop-bots` builds anywhere Rust does. Beyond that
+you are on your own: `install web` assumes systemd, and the log paths it looks for first are
+Debian's. Packaging for Arch (PKGBUILDs) and Gentoo (an ebuild) is in
+[packaging/](https://github.com/ivankovic/stop-bots/tree/main/packaging), but neither is
+published or tested yet.
 
 # Contributing
 

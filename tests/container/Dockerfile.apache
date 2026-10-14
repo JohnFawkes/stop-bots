@@ -5,7 +5,7 @@ FROM ubuntu:24.04
 
 RUN apt-get update -qq && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-        apache2 curl ca-certificates && \
+        apache2 curl ca-certificates ssl-cert && \
     rm -rf /var/lib/apt/lists/*
 
 # Debian's stock layout, as an operator has it: the site in
@@ -15,12 +15,19 @@ RUN apt-get update -qq && \
 # And mod_remoteip, as a server behind a proxy has it, so a test can make
 # Apache log a public client: every request here comes from loopback,
 # which the detectors rightly never count. And mod_proxy_http, which Web
-# Access puts the console behind.
+# Access puts the console behind. And mod_ssl, with the snakeoil
+# certificate `ssl-cert` makes, for the TLS-only rules — but not
+# mod_http2, which Debian ships off: the HTTP/1.x rule is refused until a
+# test turns it on.
+#
+# The sites a test adds of its own listen on the ports after 8080; see
+# `Apache::add_site` in container.rs.
 COPY site-apache.conf /etc/apache2/sites-available/test-site.conf
-RUN a2enmod -q rewrite remoteip proxy_http && a2dissite -q 000-default && a2ensite -q test-site && \
+RUN a2enmod -q rewrite remoteip proxy_http ssl && a2dissite -q 000-default && a2ensite -q test-site && \
     printf '%s\n' 'RemoteIPHeader X-Forwarded-For' 'RemoteIPInternalProxy 127.0.0.1' \
         > /etc/apache2/conf-enabled/remoteip.conf && \
-    printf '%s\n' 'Listen 8080' 'Listen 80' > /etc/apache2/ports.conf && \
+    printf '%s\n' 'Listen 8080' 'Listen 80' 'Listen 8081' 'Listen 8082' 'Listen 8083' \
+        'Listen 8084' > /etc/apache2/ports.conf && \
     echo 'ServerName localhost' > /etc/apache2/conf-enabled/servername.conf && \
     mkdir -p /var/www/test /etc/stop-bots && \
     echo '<h1>hello</h1>' > /var/www/test/index.html

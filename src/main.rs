@@ -74,8 +74,8 @@ const ROOT_HELP: &str = "The web server's config root. Defaults to the one store
 `set-web-server --root` (or `set-nginx-commands --root`), else /etc/nginx, or /etc/apache2 for Apache";
 
 /// Help text shared by every detector subcommand's `--access-log`.
-const ACCESS_LOG_HELP: &str = "Read this NGINX access log instead of the stored one \
-(`set-log-paths`), else /var/log/nginx/access.log";
+const ACCESS_LOG_HELP: &str = "Read this access log instead of the stored one \
+(`set-log-paths`), else /var/log/nginx/access.log, or /var/log/apache2/access.log for Apache";
 
 /// Help text shared by every detector subcommand's `--dry-run`.
 const DRY_RUN_HELP: &str = "Show what would be blocked without storing anything";
@@ -84,6 +84,21 @@ const DRY_RUN_HELP: &str = "Show what would be blocked without storing anything"
 const TTL_HELP: &str = "How many days a block lasts. Defaults to this detector's stored TTL \
 (`set-detector`)";
 
+/// Printed under the list of commands by `-h` and `--help`. The list is
+/// long and flat — clap 4 has one heading for every subcommand — so this
+/// is the order to read it in, for someone who has just installed it.
+const GETTING_STARTED: &str = "\
+Getting started:
+  sudo stop-bots set-web-server apache    Only on an Apache host; NGINX is the default
+  sudo stop-bots batch --dry-run --diff   Show what a full pass would change, change nothing
+  sudo stop-bots batch --apply            Fetch the lists, scan the logs, apply both
+  sudo stop-bots install firewall         Load the applied firewall script at boot
+  sudo stop-bots install web              Run the web console as a service
+  sudo stop-bots uninstall all --dry-run  Show every step that puts the host back
+
+`sudo stop-bots` with no command starts the TUI. `stop-bots <command> --help` says
+more about one command.";
+
 #[derive(Parser)]
 // `version` is not decoration: this ships as a tagged GitHub release
 // binary, so "is the thing on the server the thing I built?" is a
@@ -91,7 +106,8 @@ const TTL_HELP: &str = "How many days a block lasts. Defaults to this detector's
 #[command(
     name = "stop-bots",
     version,
-    about = "Configure your server to stop bad bots"
+    about = "Configure your server to stop bad bots, in NGINX or Apache and the firewall",
+    after_help = GETTING_STARTED
 )]
 struct Cli {
     // Global, so it works before or after the subcommand, and read from
@@ -141,7 +157,7 @@ enum Command {
     ApplyBlocks {
         #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
-        /// Skip reloading NGINX after writing config changes (e.g. for
+        /// Skip reloading the web server after writing config changes (e.g. for
         /// tests, or to review the written config before it goes live).
         /// Applying is a no-op without a reload, so real usage wants this
         /// left on.
@@ -173,11 +189,11 @@ enum Command {
     /// A trusted address (an IP or a CIDR range) becomes an allow rule
     /// ahead of every other firewall rule — a detector's block, a
     /// reputation feed, a country, the allow-list catch-all — clears every
-    /// NGINX block and rate limit, and is skipped by the detectors.
+    /// web server block and rate limit, and is skipped by the detectors.
     ///
-    /// A trusted user agent clears every NGINX block and rate limit for
-    /// any client whose user agent contains it, ignoring case. Only NGINX:
-    /// a client chooses its own user agent, so letting one past the log
+    /// A trusted user agent clears every web server block and rate limit
+    /// for any client whose user agent contains it, ignoring case. Only the
+    /// web server's: a client chooses its own user agent, so letting one past the log
     /// detectors too would let any scanner past them by copying it. Trust
     /// the address for that.
     ///
@@ -200,11 +216,11 @@ enum Command {
     },
     /// List the user agents this host's blocking policy is turning away.
     ///
-    /// Reads the NGINX access log and counts, per user agent, how many
+    /// Reads the web server's access log and counts, per user agent, how many
     /// requests came back with the configured block response and how many
     /// were served. A client with refusals and nothing served is being
     /// stopped at the door; one with plenty served and a few refused is
-    /// being told no by the application behind NGINX.
+    /// being told no by the application behind the web server.
     ///
     /// Bots appearing here is the policy working. What this is for is the
     /// other kind: a first-party app matching a pattern in a public bad-bot
@@ -365,7 +381,7 @@ enum Command {
     },
     /// Block addresses that asked for many nonexistent URLs.
     ///
-    /// Scans the NGINX access log for addresses that requested many
+    /// Scans the web server's access log for addresses that requested many
     /// distinct URLs answered 404 — the signature of a vulnerability
     /// scanner, not a person clicking a dead link — and stores a temporary
     /// block for each. Unlike `block-ssh-scanners`, a successful response
@@ -392,7 +408,7 @@ enum Command {
     },
     /// Block addresses faking a Googlebot, Bingbot or GPTBot user agent.
     ///
-    /// Scans the NGINX access log for addresses that claim, in their user
+    /// Scans the web server's access log for addresses that claim, in their user
     /// agent, to be Googlebot, Bingbot or GPTBot while connecting from an
     /// address that crawler's operator does not publish — the cheapest and
     /// most common bot disguise there is — and stores a temporary block for
@@ -422,7 +438,7 @@ enum Command {
     },
     /// Block addresses that asked for /.env, /.git/config and friends.
     ///
-    /// Scans the NGINX access log for addresses that requested a path
+    /// Scans the web server's access log for addresses that requested a path
     /// nothing legitimate asks for — `/.env`, `/.git/config`,
     /// `/wp-config.php`, `/vendor/phpunit/...` and similar — and stores a
     /// temporary block for each.
@@ -461,7 +477,7 @@ enum Command {
     ListProbePaths,
     /// Block anything that fetched the honeypot trap path.
     ///
-    /// Scans the NGINX access log for anything that fetched the honeypot
+    /// Scans the web server's access log for anything that fetched the honeypot
     /// trap path and stores a temporary block for each.
     ///
     /// The trap path is published as `Disallow:` in the robots.txt this
@@ -552,7 +568,7 @@ enum Command {
     },
     /// Tally which user agents are getting through successfully.
     ///
-    /// Reads the NGINX access log and adds up, per user agent, the requests
+    /// Reads the web server's access log and adds up, per user agent, the requests
     /// that were answered successfully (anything but 4xx and 5xx) — a view
     /// of who is actually visiting, next to the detectors' view of who is
     /// misbehaving. Additive across runs: re-reading an overlapping or
@@ -687,7 +703,7 @@ enum Command {
     /// default` removes the override again.
     ///
     /// Only changes what would be written: run `apply-blocks` to put it
-    /// into the NGINX config. While "humans only" is on, every category is
+    /// into the web server's config. While "humans only" is on, every category is
     /// blocked whatever is stored here.
     SetCategory {
         /// scanner, search or ai
@@ -713,7 +729,7 @@ enum Command {
     /// overrides the bot for that one site only.
     ///
     /// Find a bot's slug with `list-bots`. Run `apply-blocks` afterwards to
-    /// write the change into the NGINX config.
+    /// write the change into the web server's config.
     SetBot {
         /// The bot's slug, as `list-bots` shows it
         #[arg(long)]
@@ -801,8 +817,9 @@ enum Command {
     /// Turn generation of a robots.txt on or off.
     ///
     /// When on, `apply-blocks` writes one to /etc/stop-bots/nginx/robots.txt
-    /// and adds a `location = /robots.txt` block to each site that serves
-    /// it: one `User-agent:` line per currently-blocked bot under a shared
+    /// (/etc/stop-bots/apache/robots.txt on Apache) and has each site serve
+    /// it, with a `location = /robots.txt` block on NGINX or an `Alias` on
+    /// Apache: one `User-agent:` line per currently-blocked bot under a shared
     /// `Disallow: /`, plus a `Disallow:` for the honeypot trap path.
     ///
     /// Off by default, because it *replaces* whatever the site already
@@ -816,11 +833,11 @@ enum Command {
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
-    /// Turn automatic applying of NGINX config on or off.
+    /// Turn automatic applying of the web server's config on or off.
     ///
     /// When on, the internal cron (the one inside `stop-bots web` or the
     /// TUI, not this command) re-writes every site's generated block and
-    /// reloads NGINX once an hour, whenever they have fallen behind the
+    /// reloads the web server once an hour, whenever they have fallen behind the
     /// database. That happens constantly on a busy host: every user agent
     /// a detector blocks changes the generated block, which puts every
     /// site back to STALE within the minute.
@@ -828,18 +845,19 @@ enum Command {
     /// Off by default. It reloads a live web server with nobody watching,
     /// which is not something an upgrade should start doing on its own.
     ///
-    /// NGINX only. The firewall script has its own switch,
-    /// `set-auto-apply-firewall`.
+    /// The web server's config only. The firewall script has its own
+    /// switch, `set-auto-apply-firewall`.
     SetAutoApply {
-        /// Whether the internal cron applies NGINX config
+        /// Whether the internal cron applies the web server's config
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
     /// Turn automatic applying of the firewall script on or off.
     ///
     /// Separate from `set-auto-apply`, and separately off by default,
-    /// because the risks are not comparable: a bad NGINX config is caught
-    /// by `nginx -t` and costs a failed reload, while a bad firewall
+    /// because the risks are not comparable: a bad web server config is
+    /// caught by its config test (`nginx -t`, `apache2ctl configtest`) and
+    /// costs a failed reload, while a bad firewall
     /// ruleset locks you out of the host and no care taken here can undo
     /// that remotely.
     ///
@@ -903,8 +921,8 @@ enum Command {
     ///
     /// Binds 127.0.0.1:8787 by default, which is reachable only from this
     /// machine. That default is the safe one and staying on it is the
-    /// recommendation: the console can rewrite your firewall and your
-    /// NGINX config, so it is worth reaching over an SSH tunnel
+    /// recommendation: the console can rewrite your firewall and your web
+    /// server's config, so it is worth reaching over an SSH tunnel
     /// (`ssh -L 8787:127.0.0.1:8787 you@host`) rather than exposing.
     ///
     /// The flags here apply to this run only. To change how every later
@@ -923,12 +941,14 @@ enum Command {
         #[arg(long)]
         ssh_log: Option<PathBuf>,
         /// Where the console's "Write script" button and its internal cron
-        /// write the firewall script.
+        /// write the firewall script. Not with --helper, which writes it to
+        /// the fixed path for the host's firewall backend.
         ///
-        /// Set here rather than in the console because the console runs as
-        /// root and the script is executable: a destination taken from a
-        /// form field would let anyone who reaches the login page create a
-        /// root-owned file anywhere on the host.
+        /// Only a console that runs as root itself, without --helper, reads
+        /// this. Set here rather than in the console because the script is
+        /// executable and that console writes it as root: a destination
+        /// taken from a form field would let anyone who reaches the login
+        /// page create a root-owned file anywhere on the host.
         #[arg(long)]
         firewall_out: Option<PathBuf>,
         /// Address to bind for this run, as `address:port`. Defaults to the
@@ -966,7 +986,7 @@ enum Command {
         #[arg(long)]
         set_password: bool,
         /// Never touch the system: applying writes the database and the
-        /// config files but does not reload NGINX or run the firewall
+        /// config files but does not reload the web server or run the firewall
         /// script. The same escape hatch the TUI's --no-reload is.
         #[arg(long)]
         no_apply: bool,
@@ -986,9 +1006,10 @@ enum Command {
     /// reads these. Give no flags to print what is stored.
     ///
     /// A non-loopback --bind is refused unless exposure is on, given here
-    /// or stored: the console can rewrite this host's firewall and NGINX
-    /// config. The intended deployment for exposing it is behind the same
-    /// NGINX this tool is protecting, with TLS and the Host allowlist set:
+    /// or stored: the console can rewrite this host's firewall and web
+    /// server config. The intended deployment for exposing it is behind the
+    /// same NGINX or Apache this tool is protecting, with TLS and the Host
+    /// allowlist set:
     ///
     ///   stop-bots set-web --bind 0.0.0.0:8787 --expose true \
     ///     --allowed-hosts admin.example.com --secure-cookie true
@@ -999,8 +1020,8 @@ enum Command {
         /// Whether binding an address that is not loopback is permitted
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         expose: Option<bool>,
-        /// Serve under a path prefix, for an NGINX location block like
-        /// `https://example.com/stop-bots/`. `/` removes it.
+        /// Serve under a path prefix, for a proxy that mounts the console at
+        /// a path like `https://example.com/stop-bots/`. `/` removes it.
         ///
         /// The proxy must NOT strip the prefix — this server matches the
         /// full path including it, and generates links that do too:
@@ -1012,7 +1033,15 @@ enum Command {
         ///
         /// A `proxy_pass` *with* a trailing slash strips the prefix, and
         /// then every link this server generates points outside the
-        /// location block. A subdomain needs none of this and is the
+        /// location block. On Apache, keep the prefix in the target:
+        ///
+        ///   <Location "/stop-bots/">
+        ///       ProxyPass "http://127.0.0.1:8787/stop-bots/"
+        ///       ProxyPreserveHost On
+        ///   </Location>
+        ///
+        /// The Web Access panel, in the TUI or the console, writes either
+        /// for you. A subdomain needs none of this and is the
         /// simpler deployment if you can take it.
         #[arg(long)]
         base_path: Option<String>,
@@ -1038,10 +1067,11 @@ enum Command {
     },
     /// Remember where this host's logs actually are.
     ///
-    /// The companion to `set-nginx-commands`, for the other half of a
-    /// containerised NGINX. A container that bind-mounts its log directory
-    /// writes the access log somewhere that is not
-    /// /var/log/nginx/access.log on the host, and `--access-log` on a
+    /// The companion to `set-web-server` and `set-nginx-commands`, for the
+    /// other half of a containerised web server. A container that
+    /// bind-mounts its log directory writes the access log somewhere that
+    /// is not /var/log/nginx/access.log (or /var/log/apache2/access.log) on
+    /// the host, and `--access-log` on a
     /// single command cannot reach the two things that actually run the
     /// detectors: the web console and the TUI take no arguments for it, so
     /// their internal cron reads the default and finds nothing.
@@ -1050,7 +1080,7 @@ enum Command {
     /// empty string to clear one. Give neither flag to print what is
     /// stored.
     SetLogPaths {
-        /// The NGINX access log every web-side detector reads.
+        /// The web server's access log every web-side detector reads.
         #[arg(long)]
         access_log: Option<String>,
         /// The SSH authentication log, feeding the SSH scanner detector
@@ -1059,6 +1089,9 @@ enum Command {
         ssh_log: Option<String>,
     },
     /// Set the commands used to test and reload NGINX, and its config root.
+    ///
+    /// NGINX only. `set-web-server` takes the same flags for either
+    /// server, Apache included.
     ///
     /// Defaults are `nginx -t` and `systemctl reload nginx`, which is what
     /// a normal host install needs. Change them when NGINX is not a
@@ -1105,9 +1138,15 @@ enum Command {
     ///
     /// Takes the chosen server's own commands and config root as
     /// `set-nginx-commands` does NGINX's, for a server that is not where a
-    /// stock install puts it:
+    /// stock install puts it. On RHEL and its relatives, whose Apache
+    /// reads conf.d and logs to /var/log/httpd:
     ///
-    ///   set-web-server apache --root /etc/httpd --test "apachectl -t"
+    ///   set-web-server apache --root /etc/httpd --test "apachectl configtest" --reload "systemctl reload httpd"
+    ///
+    ///   set-log-paths --access-log /var/log/httpd/access_log
+    ///
+    /// Refused while the web server chosen now still has stop-bots in its
+    /// config: take that out first with `uninstall web-server`.
     ///
     /// Pass no server to print what is in effect.
     SetWebServer {
@@ -1152,8 +1191,8 @@ enum Command {
     },
     /// One unattended pass over everything, for a real cron entry.
     ///
-    /// Refreshes every list, scans the logs, writes the NGINX blocking
-    /// rules and the firewall script — and, with --apply, puts both into
+    /// Refreshes every list, scans the logs, writes the web server's
+    /// blocking rules and the firewall script — and, with --apply, puts both into
     /// effect.
     ///
     /// Without --apply nothing is enforced: the config and the script are
@@ -1182,7 +1221,7 @@ enum Command {
     Batch {
         #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
-        /// Reload NGINX and run the generated firewall script, rather than
+        /// Reload the web server and run the generated firewall script, rather than
         /// only writing both
         #[arg(long)]
         apply: bool,
@@ -1220,13 +1259,13 @@ enum Command {
         /// also print the diffs --diff prints
         #[arg(long, short)]
         verbose: bool,
-        /// Print what the NGINX and firewall steps would change — the
+        /// Print what the web server and firewall steps would change — the
         /// files, the rules added and removed against the applied script,
         /// the lockout check's verdict — and change nothing: nothing is
         /// downloaded, scanned, written, applied or recorded. The one
         /// exception is the bot list built into this binary, which is
-        /// stored first, as every other command that renders NGINX config
-        /// does
+        /// stored first, as every other command that renders web server
+        /// config does
         #[arg(long)]
         dry_run: bool,
         /// With --dry-run, also print a unified diff of every file that
@@ -1254,8 +1293,9 @@ enum Command {
     /// them the same way, because the service it starts reads them from
     /// the database.
     Install {
-        /// What to install. `web` writes a systemd unit for the web
-        /// console and enables it.
+        /// What to install. `web` writes the web console's units and
+        /// enables them; `firewall` writes the unit that loads the applied
+        /// firewall script at boot.
         #[arg(value_enum)]
         target: InstallTarget,
         /// Print every step and change nothing.
@@ -1275,8 +1315,11 @@ enum Command {
         /// next `cargo clean`.
         #[arg(long)]
         binary: Option<PathBuf>,
-        /// NGINX config root the service will scan. Defaults to the one
-        /// stored by `set-nginx-commands --root`, else /etc/nginx.
+        /// The web server's config root the service will scan, stored as
+        /// `set-web-server --root` would: NGINX's on an NGINX host, Apache's
+        /// on an Apache one (choose Apache with `set-web-server apache`
+        /// first). Defaults to the one already stored, else the stock path,
+        /// /etc/nginx or /etc/apache2.
         #[arg(long)]
         root: Option<PathBuf>,
         /// Pin the service to this SSH log instead of letting it find one.
@@ -1298,8 +1341,8 @@ enum Command {
         /// would, not written into the unit — the server re-reads it.
         #[arg(long)]
         bind: Option<String>,
-        /// Serve under a path prefix, for an NGINX `location` block. See
-        /// `set-web --base-path`.
+        /// Serve under a path prefix, for a proxy that mounts the console
+        /// at a path. See `set-web --base-path`.
         #[arg(long)]
         base_path: Option<String>,
         /// Permit the service to bind an address that is not loopback, and
@@ -1320,9 +1363,10 @@ enum Command {
     /// Remove stop-bots from this host and put it back as it was.
     ///
     /// Stops and removes every unit it installed, deletes the live nft table or
-    /// iptables chain, takes the injected blocks out of every NGINX site
-    /// (tested with `nginx -t`, put back if that fails, then reloaded),
-    /// and deletes the generated NGINX files and firewall scripts. Every
+    /// iptables chain, takes the injected blocks out of every site of the
+    /// web server the host settings choose (tested with `nginx -t` or
+    /// `apache2ctl configtest`, put back if that fails, then reloaded), and
+    /// deletes the generated web server files and firewall scripts. Every
     /// step is reported, a failed one does not stop the rest, and any
     /// failure makes the exit status non-zero.
     ///
@@ -1331,8 +1375,10 @@ enum Command {
     /// says where it is. Needs root, except with
     /// --prefix. Run it with --dry-run first.
     Uninstall {
-        /// What to remove: `nginx`, `firewall`, `web`, or `all` (the
-        /// default), which is all three plus /etc/stop-bots itself.
+        /// What to remove: `nginx` (also spelled `web-server`, and on an
+        /// Apache host it is Apache's blocks it removes), `firewall`, `web`,
+        /// or `all` (the default), which is all three plus /etc/stop-bots
+        /// itself.
         #[arg(value_enum, default_value = "all")]
         target: UninstallTarget,
         /// Print every step and change nothing.
@@ -1344,7 +1390,7 @@ enum Command {
         purge: bool,
         /// Remove from this prefix instead of `/`, as `install --prefix`
         /// wrote it. Nothing outside it is touched, and no systemctl, nft,
-        /// iptables or NGINX test or reload is run.
+        /// iptables or web server test or reload is run.
         #[arg(long)]
         prefix: Option<PathBuf>,
         #[arg(long, help = ROOT_HELP)]
@@ -1377,9 +1423,9 @@ enum Command {
     Tui {
         #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
-        /// Skip reloading NGINX after the NGINX screen applies blocking
+        /// Skip reloading the web server after its screen applies blocking
         /// rules (e.g. for tests driving the TUI end to end against a
-        /// throwaway fixture root, where there's no real NGINX to reload)
+        /// throwaway fixture root, where there's no real server to reload)
         #[arg(long)]
         no_reload: bool,
         /// Read this SSH log file instead of auto-detecting one — the same
@@ -1977,6 +2023,15 @@ fn host_settings() -> Result<stop_bots::hostconf::HostConf> {
     stop_bots::hostconf::HostConf::load()
 }
 
+/// How the host's web server is named in what a command prints — "NGINX"
+/// or "Apache" — for a command with no host settings of its own at hand.
+/// A `host.conf` that cannot be read is NGINX here, as it is everywhere
+/// that asks [`webserver::WebServer::configured`]: a sentence is no place
+/// to fail a command that has already done its work.
+fn server_label() -> &'static str {
+    webserver::WebServer::configured().label()
+}
+
 fn open_default_db() -> Result<Db> {
     open_or_fallback(Path::new(DEFAULT_DB_PATH), user_db_path)
 }
@@ -2288,23 +2343,25 @@ fn preview_apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, diff: boo
     let changes = webserver::preview_all_sites(host.web_server(), &db, &root);
     say!("Dry run: nothing is written or reloaded.");
     let changes = changes.map_err(|err| format!("{err:#}"));
-    for line in stop_bots::preview::nginx_lines(&changes) {
+    for line in stop_bots::preview::nginx_lines(host.web_server(), &changes) {
         say!("{line}");
     }
     let changes = changes.map_err(|err| anyhow::anyhow!(err))?;
     if diff {
         say_inline!("{}", stop_bots::preview::nginx_diff(&changes));
     }
-    print_skipped_entries(&db)
+    print_skipped_entries(&db, host.web_server())
 }
 
-/// Says which stored entries the NGINX config leaves out (see
-/// `nginx::skipped_entries`), on stderr, one per line. An apply writes
-/// everything else, so this is a warning and not a failure.
-fn print_skipped_entries(db: &Db) -> Result<()> {
+/// Says which stored entries the web server's config leaves out (see
+/// `nginx::skipped_entries`, whose checks Apache's render shares), on
+/// stderr, one per line. An apply writes everything else, so this is a
+/// warning and not a failure.
+fn print_skipped_entries(db: &Db, server: webserver::WebServer) -> Result<()> {
     for entry in nginx::skipped_entries(db)? {
         say_err!(
-            "warning: left out of the NGINX config: {}",
+            "warning: left out of the {} config: {}",
+            server.label(),
             terminal_safe(&entry.to_string())
         );
     }
@@ -2369,9 +2426,9 @@ fn apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, no_reload: bool) 
         outcome.changed
     );
     if outcome.reloaded {
-        say!("Reloaded NGINX");
+        say!("Reloaded {}", host.web_server().label());
     }
-    print_skipped_entries(&db)
+    print_skipped_entries(&db, host.web_server())
 }
 
 fn add_firewall_rule(
@@ -2699,6 +2756,12 @@ fn set_rate_limit(
     burst: Option<i64>,
 ) -> Result<()> {
     let db = open_db(db_path)?;
+    let server = host_settings()?.web_server();
+    // Refused rather than stored where nothing would write it: a limit
+    // that reads as on and limits nothing is worse than none.
+    if let Some(why) = server.without_rate_limiting().filter(|_| enabled) {
+        anyhow::bail!("{why}");
+    }
     // Parameters are stored even when disabling, so `--enabled false
     // --rps 5` then `--enabled true` uses 5 rather than silently
     // reverting to the default.
@@ -2718,7 +2781,10 @@ fn set_rate_limit(
     } else {
         say!("Rate limiting off.");
     }
-    say!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
+    say!(
+        "Run `stop-bots apply-blocks` to write it into the {} config.",
+        server.label()
+    );
     Ok(())
 }
 
@@ -2829,7 +2895,10 @@ fn trust(
     match (address, user_agent, remove) {
         (Some(address), _, false) => {
             let stored = db.trust_address(&address)?;
-            say!("Trusting {stored}: never blocked by the firewall or NGINX.");
+            say!(
+                "Trusting {stored}: never blocked by the firewall or {}.",
+                server_label()
+            );
             say!(
                 "Run `stop-bots render-firewall` and apply the script, and `stop-bots \
                  apply-blocks`, to put it in effect."
@@ -2849,7 +2918,8 @@ fn trust(
             let stored = db.trust_user_agent(&user_agent)?;
             say!(
                 "Trusting any user agent containing {stored:?}, ignoring case: never blocked \
-                 by NGINX."
+                 by {}.",
+                server_label()
             );
             // Said every time, because it is the part that surprises: the
             // firewall and the detectors still treat this client by its
@@ -2930,7 +3000,8 @@ fn set_auto_apply(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
     let db = open_db(db_path)?;
     db.set_auto_apply(enabled)?;
     say!(
-        "Automatic NGINX applying {}",
+        "Automatic {} applying {}",
+        server_label(),
         if enabled { "enabled" } else { "disabled" }
     );
     if enabled {
@@ -2970,8 +3041,11 @@ fn set_humans_only(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
             "  \u{2022} The three category policies are forced and cannot be edited until this \
              is off. Their stored values are kept."
         );
+        // The screen is named for the server, so the sentence is too.
+        let server = server_label();
         say!(
-            "\nRun apply-blocks (or the NGINX screen's `a`/`A`) to write it into the NGINX config."
+            "\nRun apply-blocks (or the {server} screen's `a`/`A`) to write it into the {server} \
+             config."
         );
     } else {
         say!("Humans only is OFF. The stored category policies are back in force.");
@@ -3232,7 +3306,10 @@ fn set_category(
     if db.get_humans_only()? {
         say!("{HUMANS_ONLY_NOTE}");
     }
-    say!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
+    say!(
+        "Run `stop-bots apply-blocks` to write it into the {} config.",
+        server_label()
+    );
     Ok(())
 }
 
@@ -3347,7 +3424,10 @@ fn set_bot(
     if db.get_humans_only()? {
         say!("{HUMANS_ONLY_NOTE}");
     }
-    say!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
+    say!(
+        "Run `stop-bots apply-blocks` to write it into the {} config.",
+        server_label()
+    );
     Ok(())
 }
 
@@ -3473,8 +3553,9 @@ impl WebSettings {
                 if !web::is_loopback(&addr) && !exposed {
                     anyhow::bail!(
                         "refusing to store {addr}, which is reachable from the network, while \
-                         exposure is off. The console can rewrite this host's firewall and NGINX \
-                         config. If that is what you want, add --expose true."
+                         exposure is off. The console can rewrite this host's firewall and {} \
+                         config. If that is what you want, add --expose true.",
+                        server_label()
                     );
                 }
                 Some(addr)
@@ -3816,7 +3897,7 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
 
     // Not named in ExecStart: the running service reads the stored root
     // itself, so `--root` (or the old unit's) is stored below, as
-    // `set-nginx-commands --root` would. The unit only has to let the
+    // `set-web-server --root` would. The unit only has to let the
     // service write there; `install_web` adds the root already stored.
     layout.nginx_roots = options.root.iter().chain(&legacy_root).cloned().collect();
 
@@ -3858,7 +3939,8 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
             anyhow::bail!(
                 "refusing to install a service bound to {addr}, which is reachable \
                  from the network, without --expose. The console can rewrite this \
-                 host's firewall and NGINX config."
+                 host's firewall and {} config.",
+                server_label()
             );
         }
         db.set_text_setting(web::BIND_KEY, &addr.to_string())?;
@@ -3885,10 +3967,15 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
         // only root writes, not in the database the console writes.
         let mut host = stop_bots::hostconf::HostConf::load_from(&host_path)?;
         if let Some(root) = &options.root {
-            host.nginx_root = Some(std::path::absolute(root)?);
+            // The root of the server this host runs. It used to be NGINX's
+            // whatever the host ran, so on an Apache host `--root
+            // /etc/httpd` was stored where nothing reads it and the
+            // console went on scanning /etc/apache2.
+            *host.root_setting_mut() = Some(std::path::absolute(root)?);
             host.save_to(&host_path)?;
             steps.push(format!(
-                "NGINX root {} recorded in {}",
+                "{} root {} recorded in {}",
+                host.web_server().label(),
                 root.display(),
                 host_path.display()
             ));
@@ -3990,11 +4077,19 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
         return Ok(());
     }
 
+    let server = stop_bots::hostconf::HostConf::load_from(&layout.host_conf)
+        .unwrap_or_default()
+        .web_server()
+        .label();
+
     if options.start {
         say!("The console is on loopback. Reach it over an SSH tunnel:\n");
         say!("    ssh -L 8787:127.0.0.1:8787 <this-host>\n");
         say!("then open http://127.0.0.1:8787/.\n");
-        say!("To put it behind the NGINX it is protecting, use its Web Access panel, or `w` in the TUI.");
+        say!(
+            "To put it behind the {} it is protecting, use its Web Access panel, or `w` in the TUI.",
+            server
+        );
     } else {
         // Telling someone to open a URL for a service that is not running
         // is how a working install gets reported as broken.
@@ -4005,7 +4100,7 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
     }
     say!();
     say!(
-        "The console runs as the {} user. What needs root -- the NGINX config, the",
+        "The console runs as the {} user. What needs root -- the {server} config, the",
         layout.user
     );
     say!(
@@ -4069,7 +4164,7 @@ async fn run_web(
     } = run;
 
     // The helper takes nothing from the console but the operation: where
-    // NGINX is, where the script goes and which logs it reads are root's
+    // the web server is, where the script goes and which logs it reads are root's
     // to say, in the host settings. A flag that would be ignored is
     // refused instead.
     if helper.is_some() {
@@ -4083,7 +4178,7 @@ async fn run_web(
                 anyhow::bail!(
                     "{flag} cannot be combined with --helper: the helper does what needs root, \
                      and reads the logs, with the host's own settings (`stop-bots \
-                     set-nginx-commands`, `stop-bots set-log-paths`), and takes none from \
+                     set-web-server`, `stop-bots set-log-paths`), and takes none from \
                      the console"
                 );
             }
@@ -4130,12 +4225,13 @@ async fn run_web(
     if !web::is_loopback(&addr) && !exposed {
         anyhow::bail!(
             "refusing to bind {addr}, which is reachable from the network.\n\n\
-             The web UI can rewrite this host's firewall and NGINX config, so exposing it \n\
+             The web UI can rewrite this host's firewall and {} config, so exposing it \n\
              is a deliberate act rather than a default. If that is what you want:\n\n    \
              stop-bots set-web --bind {addr} --expose true --allowed-hosts <your-hostname>\n    \
              stop-bots web\n\n\
              Otherwise reach it over an SSH tunnel and leave it on loopback:\n\n    \
-             ssh -L 8787:127.0.0.1:8787 <this-host>"
+             ssh -L 8787:127.0.0.1:8787 <this-host>",
+            server_label()
         );
     }
 
@@ -4326,7 +4422,39 @@ fn store_server_settings(
     } = settings;
     let changing = choose || reset || root.is_some() || test.is_some() || reload.is_some();
     if choose {
-        host.web_server = Some(server);
+        // Nothing is switched while the server chosen now still has
+        // stop-bots in its config: once the other is chosen, nothing would
+        // ever find it there again (see `webserver::leftovers`). Taking it
+        // out is `uninstall web-server`'s job, with its `--dry-run`, rather
+        // than something a settings command does on the side.
+        let current = host.web_server();
+        if current != server {
+            let current_root = HostConf {
+                web_server: Some(current),
+                ..host.clone()
+            }
+            .root(None);
+            let left = webserver::leftovers(current, &current_root);
+            if !left.is_empty() {
+                let listed: Vec<String> = left
+                    .iter()
+                    .map(|path| format!("  {}", path.display()))
+                    .collect();
+                anyhow::bail!(
+                    "{current} still has stop-bots in its config:\n{}\n\n\
+                     Take it out first with `sudo stop-bots uninstall web-server` (it works on \
+                     {current}, the web server chosen now; `--dry-run` shows what it would do), \
+                     then choose {server} again.",
+                    listed.join("\n"),
+                    current = current.label(),
+                    server = server.id(),
+                );
+            }
+        }
+        // NGINX is stored as no choice at all, which it is: the line is
+        // left out, and a host that never chose Apache keeps a file the
+        // releases before the choice existed can still read.
+        host.web_server = (server != webserver::WebServer::Nginx).then_some(server);
     }
     let (test_field, reload_field, root_field) = match server {
         webserver::WebServer::Nginx => (
@@ -4828,7 +4956,9 @@ fn read_access_log(db: &Db, access_log: Option<&Path>) -> Result<String> {
     // detector invoked by hand would still go to the default -- two answers
     // to one question, which is the shape of bug this whole type removes.
     let _ = db;
-    let paths = host_settings().unwrap_or_default().log_paths();
+    let host = host_settings().unwrap_or_default();
+    let server = host.web_server().label();
+    let paths = host.log_paths();
     match paths.access_source(access_log) {
         accesslog::LogSource::Found(text) => Ok(text),
         // Name the path that was actually tried, not the one the reader
@@ -4838,15 +4968,15 @@ fn read_access_log(db: &Db, access_log: Option<&Path>) -> Result<String> {
             let tried = paths.access_description(access_log);
             match (access_log, &paths.access) {
                 (Some(_), _) => anyhow::bail!(
-                    "couldn't read the NGINX access log at {tried} — pass a different \
+                    "couldn't read the {server} access log at {tried} — pass a different \
                      --access-log, or run as root, for this to work"
                 ),
                 (None, Some(_)) => anyhow::bail!(
-                    "couldn't read the NGINX access log at {tried}, the path stored by \
+                    "couldn't read the {server} access log at {tried}, the path stored by \
                      `set-log-paths` — check it exists, or run as root"
                 ),
                 (None, None) => anyhow::bail!(
-                    "couldn't read the NGINX access log (tried {tried}) — set one with \
+                    "couldn't read the {server} access log (tried {tried}) — set one with \
                      `stop-bots set-log-paths --access-log <path>`, pass --access-log, \
                      or run as root"
                 ),
@@ -4943,17 +5073,19 @@ fn record_access_stats(db_path: Option<PathBuf>, access_log: Option<PathBuf>) ->
     // The same pass the internal cron makes, from the same cursor, keyed by
     // the path actually read: what the console already tallied is not
     // tallied again, and what this reads the detectors see too.
+    let host = host_settings()?;
     let flags = stop_bots::logscan::Flags {
         ssh_log: None,
         access_log,
-        stored: host_settings()?.log_paths(),
+        stored: host.log_paths(),
     };
     let applied =
         stop_bots::logscan::run(&db, &[stop_bots::cron::CronJob::RecordAccessStats], &flags)?;
     if let stop_bots::logscan::Availability::Unavailable(tried) = &applied.access {
         anyhow::bail!(
-            "couldn't read the NGINX access log at {tried} — pass --access-log, set one with \
-             `stop-bots set-log-paths --access-log <path>`, or run as root"
+            "couldn't read the {} access log at {tried} — pass --access-log, set one with \
+             `stop-bots set-log-paths --access-log <path>`, or run as root",
+            host.web_server().label()
         );
     }
     say!("{}", applied.stats.summary());

@@ -4953,6 +4953,49 @@ fn exempt_paths_and_well_known_stay_reachable_for_a_blocked_client() {
     );
 }
 
+/// A WordPress-style front controller: `try_files` sends every path that
+/// is not a file on to one page, an internal redirect on which NGINX runs
+/// the `server`'s `if`s again with the new `$uri`. The exemption decided
+/// on the path the client asked for must stand, and must not stretch to
+/// a path that only starts with it before `..` is resolved.
+#[test]
+fn an_exempt_path_stays_exempt_through_a_front_controller() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-frontctl");
+    server.sh(
+        "mkdir -p /var/www/wp && echo front > /var/www/wp/index.html && \
+         printf 'server {\n    listen 8081;\n    server_name wp.example;\n    \
+         root /var/www/wp;\n    location / { try_files $uri $uri/ /index.html; }\n}\n' \
+         > /etc/nginx/sites-enabled/wp.conf && nginx -s reload",
+    );
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    server.seed_bot("badbot", "BadBot");
+    server.stop_bots("exempt-path --site wp.example --path /wp-json/");
+    server.apply_and_reload();
+
+    let bot = "-A 'BadBot/1.0'";
+    assert_eq!(
+        server.status_on(8081, "/wp-json/wp/v2/posts", bot),
+        "200",
+        "the redirect to /index.html undid the exemption"
+    );
+    for (path, why) in [
+        ("/about/", "a path that is not exempt"),
+        (
+            "/wp-json/../about/",
+            "a path that resolves out of the exempt one",
+        ),
+    ] {
+        assert_eq!(
+            server.status_on(8081, path, &format!("--path-as-is {bot}")),
+            "403",
+            "{why} let the bot through: {path}"
+        );
+    }
+}
+
 /// `s` in single quotes for `sh -c`, so none of it is shell syntax.
 fn sh_quoted(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -6554,4 +6597,332 @@ fn apache_web_access_subdomain_mode_writes_a_site_of_its_own() {
     apache.stop_bots("uninstall web-server");
     let (gone, _, _) = apache.run(&format!("test ! -e {written}"));
     assert!(gone, "uninstall left the console's site behind");
+}
+
+// ---- Apache: sites as operators write them ----
+
+impl Apache {
+    /// Writes `conf` as a site of its own, enables it, restarts Apache
+    /// gracefully and scans again. The image listens on 8081-8084 for
+    /// these; a TLS site brings its own `Listen`.
+    fn add_site(&self, name: &str, conf: &str) {
+        self.sh(&format!(
+            "cat > /etc/apache2/sites-available/{name}.conf <<'CONF'\n{conf}CONF\n\
+             a2ensite -q {name} && apache2ctl configtest && apache2ctl graceful"
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        self.wait_until_serving();
+        self.stop_bots("scan-sites");
+    }
+
+    /// The status `url` answers with for `host`, `000` for no answer.
+    fn status_at(&self, url: &str, host: &str, curl_args: &str) -> String {
+        let (_, stdout, _) = self.run(&format!(
+            "curl -sk -o /dev/null -w '%{{http_code}}' -H 'Host: {host}' {curl_args} {url}"
+        ));
+        stdout.trim().to_string()
+    }
+
+    fn body_at(&self, url: &str, host: &str, curl_args: &str) -> String {
+        self.run(&format!("curl -sk -H 'Host: {host}' {curl_args} {url}"))
+            .1
+    }
+}
+
+/// One file holding a plain host, a TLS one inside `<IfModule mod_ssl.c>`
+/// as certbot and Debian's `default-ssl` write it, and a second site: each
+/// gets a block of its own.
+const MULTI_SITE: &str = "\
+<VirtualHost *:8081>
+    ServerName multi.example
+    DocumentRoot /var/www/test
+</VirtualHost>
+
+<IfModule mod_ssl.c>
+Listen 8443
+<VirtualHost *:8443>
+    ServerName multi.example
+    DocumentRoot /var/www/test
+    SSLEngine on
+    SSLCertificateFile /etc/ssl/certs/ssl-cert-snakeoil.pem
+    SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key
+</VirtualHost>
+</IfModule>
+
+<VirtualHost *:8081>
+    ServerName other.example
+    DocumentRoot /var/www/test
+</VirtualHost>
+";
+
+#[test]
+fn apache_blocks_in_every_host_of_a_file_the_tls_one_included() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-multi");
+    apache.add_site("multi", MULTI_SITE);
+    apache.seed_bot("evilbot", "EvilBot");
+    apache.apply();
+
+    for (url, host) in [
+        ("http://127.0.0.1:8081/", "multi.example"),
+        ("https://127.0.0.1:8443/", "multi.example"),
+        ("http://127.0.0.1:8081/", "other.example"),
+    ] {
+        assert_eq!(
+            apache.status_at(url, host, BAD_AGENT),
+            "403",
+            "{host} at {url}"
+        );
+        assert_eq!(
+            apache.status_at(url, host, BROWSER),
+            "200",
+            "{host} at {url}"
+        );
+    }
+    let file = apache.sh("cat /etc/apache2/sites-available/multi.conf");
+    assert_eq!(
+        file.matches("# BEGIN stop-bots").count(),
+        3,
+        "file:\n{file}"
+    );
+}
+
+/// The TLS rule a host without HTTP/2 must never get: every visitor is
+/// HTTP/1.1 there. Refused until `a2enmod http2`, then turns HTTP/1.1 away
+/// and lets HTTP/2 through.
+#[test]
+fn apache_writes_the_http_1x_rule_only_once_http2_is_on() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-http2");
+    apache.add_site("multi", MULTI_SITE);
+    apache.stop_bots("set-site-rule --site multi.example --rule http-1x --enabled true");
+    let before = apache.sh("cat /etc/apache2/sites-available/multi.conf");
+
+    let (ok, stdout, stderr) = apache.run("stop-bots apply-blocks --db /tmp/db.sqlite3");
+    assert!(!ok, "applied without HTTP/2:\n{stdout}{stderr}");
+    assert!(stderr.contains("HTTP/1.x"), "said:\n{stderr}");
+    assert_eq!(
+        apache.sh("cat /etc/apache2/sites-available/multi.conf"),
+        before
+    );
+
+    apache.sh("a2enmod -q http2 && apache2ctl graceful");
+    apache.apply();
+    let tls = "https://127.0.0.1:8443/";
+    assert_eq!(
+        eventually("403", || apache.status_at(
+            tls,
+            "multi.example",
+            "--http1.1"
+        )),
+        "403"
+    );
+    assert_eq!(apache.status_at(tls, "multi.example", "--http2"), "200");
+    // The port-80 host never gets it: everything there is HTTP/1.1.
+    assert_eq!(
+        apache.status_at("http://127.0.0.1:8081/", "multi.example", BROWSER),
+        "200"
+    );
+}
+
+/// `ProxyPass /` answers the translate phase too; an `Alias` lost to it,
+/// and the site served the backend's robots.txt, or nothing. Nothing
+/// listens on port 9, so whatever is proxied is a 503.
+#[test]
+fn apache_serves_robots_txt_on_a_site_that_proxies_everything() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-proxied");
+    apache.add_site(
+        "proxied",
+        "<VirtualHost *:8082>\n    ServerName proxied.example\n    ProxyPass / http://127.0.0.1:9/\n</VirtualHost>\n",
+    );
+    apache.seed_bot("evilbot", "EvilBot");
+    apache.stop_bots("set-robots-txt --enabled true");
+    apache.apply();
+
+    let site = "http://127.0.0.1:8082";
+    assert_eq!(
+        apache.status_at(&format!("{site}/"), "proxied.example", BROWSER),
+        "503",
+        "the site does not proxy"
+    );
+    let robots = apache.body_at(&format!("{site}/robots.txt"), "proxied.example", BAD_AGENT);
+    assert!(
+        robots.contains("User-agent: EvilBot"),
+        "robots.txt:\n{robots}"
+    );
+    assert_eq!(
+        apache.status_at(&format!("{site}/"), "proxied.example", BAD_AGENT),
+        "403"
+    );
+}
+
+/// A WordPress-style front controller: `.htaccess` sends every path that
+/// is not a file on to one page, an internal redirect on which the
+/// vhost's rules run again with the new path. The decision made on the
+/// path the client asked for must stand.
+const FRONT_CONTROLLER_SITE: &str = "\
+<VirtualHost *:8083>
+    ServerName wp.example
+    DocumentRoot /var/www/wp
+    ErrorDocument 403 /blocked.html
+    <Directory /var/www/wp>
+        AllowOverride All
+    </Directory>
+</VirtualHost>
+";
+
+fn with_front_controller(apache: &Apache) {
+    apache.sh(
+        "mkdir -p /var/www/wp && echo front > /var/www/wp/index.html && \
+         echo 'turned away' > /var/www/wp/blocked.html && \
+         printf '%s\\n' 'RewriteEngine On' 'RewriteBase /' \
+             'RewriteCond %{REQUEST_FILENAME} !-f' 'RewriteCond %{REQUEST_FILENAME} !-d' \
+             'RewriteRule . /index.html [L]' > /var/www/wp/.htaccess",
+    );
+    apache.add_site("wp", FRONT_CONTROLLER_SITE);
+}
+
+#[test]
+fn apache_keeps_an_exempt_path_exempt_through_a_front_controller() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-frontctl");
+    with_front_controller(&apache);
+    apache.seed_bot("evilbot", "EvilBot");
+    apache.stop_bots("exempt-path --site wp.example --path /wp-json/");
+    apache.apply();
+
+    let site = "http://127.0.0.1:8083";
+    let (status, body) = (
+        apache.status_at(
+            &format!("{site}/wp-json/wp/v2/posts"),
+            "wp.example",
+            BAD_AGENT,
+        ),
+        apache.body_at(
+            &format!("{site}/wp-json/wp/v2/posts"),
+            "wp.example",
+            BAD_AGENT,
+        ),
+    );
+    assert_eq!((status.as_str(), body.trim()), ("200", "front"));
+    // Everything else still turns the bot away.
+    assert_eq!(
+        apache.status_at(&format!("{site}/about/"), "wp.example", BAD_AGENT),
+        "403"
+    );
+}
+
+#[test]
+fn apache_lets_a_trusted_client_through_a_front_controller() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-frontctl-trust");
+    with_front_controller(&apache);
+    apache.seed_bot("evilbot", "EvilBot");
+    apache.stop_bots("trust --user-agent UptimeMonitor");
+    apache.apply();
+
+    let page = "http://127.0.0.1:8083/about/";
+    assert_eq!(
+        apache.status_at(page, "wp.example", "-A 'EvilBot UptimeMonitor'"),
+        "200"
+    );
+    assert_eq!(apache.status_at(page, "wp.example", BAD_AGENT), "403");
+}
+
+/// A blocked request's own error page is an internal redirect too, and
+/// must be served, not blocked in turn.
+#[test]
+fn apache_serves_a_blocked_request_its_error_document() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-errordoc");
+    with_front_controller(&apache);
+    apache.seed_bot("evilbot", "EvilBot");
+    apache.apply();
+
+    let page = "http://127.0.0.1:8083/";
+    assert_eq!(apache.status_at(page, "wp.example", BAD_AGENT), "403");
+    let body = apache.body_at(page, "wp.example", BAD_AGENT);
+    assert_eq!(body.trim(), "turned away", "the error page was:\n{body}");
+}
+
+/// Web Access on a site that proxies everything from a `<Location "/">`
+/// of its own: the console's section goes last, so its prefix is the
+/// console's, not the site's backend's.
+#[test]
+fn apache_web_access_reaches_the_console_on_a_site_that_proxies_from_a_location() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-webaccess-proxied");
+    apache.add_site(
+        "located",
+        "<VirtualHost *:8084>\n    ServerName located.example\n    <Location \"/\">\n        ProxyPass http://127.0.0.1:9/\n    </Location>\n</VirtualHost>\n",
+    );
+    let console = apache.console();
+    let flash = console.post(
+        "/web-access",
+        &[
+            ("mode", "path"),
+            ("site", "located.example"),
+            ("prefix", "/stop-bots/"),
+            ("host", ""),
+        ],
+    );
+    let (ok, stdout, stderr) = apache.run("apache2ctl configtest");
+    assert!(
+        ok,
+        "the console section does not load:\n{flash}\n{stdout}{stderr}"
+    );
+    apache.start_console();
+
+    let site = "http://127.0.0.1:8084";
+    assert_eq!(
+        eventually("200", || apache.status_at(
+            &format!("{site}/stop-bots/login"),
+            "located.example",
+            ""
+        )),
+        "200",
+        "{}",
+        apache.sh("cat /etc/apache2/sites-available/located.conf")
+    );
+    assert_eq!(
+        apache.status_at(&format!("{site}/"), "located.example", ""),
+        "503",
+        "the site no longer proxies"
+    );
+}
+
+/// The config test passes a block a later `RewriteEngine Off` switches
+/// off; the apply refuses it, and the site keeps serving as it was.
+#[test]
+fn apache_refuses_a_site_that_switches_rewriting_off() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-rewrite-off");
+    apache.add_site(
+        "off",
+        "<VirtualHost *:8081>\n    ServerName off.example\n    DocumentRoot /var/www/test\n    RewriteEngine Off\n</VirtualHost>\n",
+    );
+    apache.seed_bot("evilbot", "EvilBot");
+
+    let (ok, stdout, stderr) = apache.run("stop-bots apply-blocks --db /tmp/db.sqlite3");
+    assert!(!ok, "applied anyway:\n{stdout}{stderr}");
+    assert!(stderr.contains("RewriteEngine Off"), "said:\n{stderr}");
+    let file = apache.sh("cat /etc/apache2/sites-available/off.conf");
+    assert!(!file.contains("stop-bots"), "file:\n{file}");
 }

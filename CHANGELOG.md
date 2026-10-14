@@ -8,6 +8,33 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Added
+
+- **Old browsers, a list with a switch of its own.** `sudo stop-bots set-old-browsers
+  --enabled true` blocks, on every site, the user agents of browsers too old for anyone
+  to still run: Opera 5 to 12, Firefox 1 to 9, Chrome 1 to 39, Internet Explorer 2 to 9,
+  Android 1 to 3, early Lynx and ELinks, and feature phones (NetFront, UP.Browser,
+  J2ME, Symbian, BlackBerry OS). Scanners rotate through these to pass for people; on
+  one host a single scanner asked for `/.env`, `.git` and credentials files 1,150 times
+  from 637 addresses, never twice with the same one, and no bot list can carry them
+  because none is a bot's name. It is a row of the Policy panel in the TUI and the
+  console, and `list-categories` shows it. **Off by default**, on new hosts as well as
+  upgraded ones, because a few of these strings are still a person somewhere (Opera Mini
+  sends `Opera/9.80`); and humans only does not turn it on. Old iOS, Windows XP and
+  Android 4 are left out on purpose: Bing's and Yandex's mobile crawlers send old iOS,
+  and Gmail's image proxy sends XP. It is a setting rather than a schema change, so a
+  host can still go back to 0.1.1.
+- **88 more bots in the stop-bots enhanced list**, from a third pass over a real host's
+  log (April to October, 474,041 requests): scanners and exploit kits that name
+  themselves (`Go Web Pentest Tool`, `EnvScanner`, `Hello, World`, `r00ts3c`), probes for
+  VPN and appliance logins (`PAN GlobalProtect`, `ncsrv`, `WinRM Client`, Cisco's),
+  "research" scanners, SEO, lead and ads.txt crawlers, and two scanners calling
+  themselves `MistralBot` and `CohereBot`, which asked only for framework manifests. All
+  are scanners for policy, so they are blocked by default. YaCy's crawler, which now
+  sends `yacycrawler` where the upstream list has `yacybot`, is added as a search engine. The list is
+  compiled in and loaded when the upgraded binary first opens the database, so every
+  site reads as not applied until the next apply writes the new names in.
+
 ## [0.2.0-rc.2] — 2026-10-14
 
 Also corrected since rc.1's release notes, in its section below: with the console

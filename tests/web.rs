@@ -1147,6 +1147,29 @@ async fn an_apache_hosts_settings_say_why_there_is_no_rate_limit() {
     assert!(html.contains("<title>Apache"), "page was:\n{html}");
 }
 
+/// The old-browser switch is a row of the Policy panel, and its button
+/// turns the list on and off again.
+#[tokio::test]
+async fn the_old_browser_switch_turns_the_list_on_and_off() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    let html = page_html(&app, &cookie, "/").await;
+    assert!(html.contains("Old browsers"), "page was:\n{html}");
+
+    let (_, flash) = act(&app, &cookie, &csrf, "/old-browsers", "enabled=true").await;
+    assert!(flash.contains("blocked on every site"), "was: {flash}");
+    let blocked = || {
+        stop_bots::db::Db::open(&db_path)
+            .unwrap()
+            .get_block_old_browsers()
+            .unwrap()
+    };
+    assert!(blocked(), "the button did not turn the list on");
+
+    act(&app, &cookie, &csrf, "/old-browsers", "enabled=false").await;
+    assert!(!blocked(), "the button did not turn the list off");
+}
+
 /// What the console says after a change, and on the help page, names the
 /// server the host runs: "Apply on the NGINX screen" sends an Apache
 /// host's operator looking for a tab that is not there.

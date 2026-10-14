@@ -888,6 +888,20 @@ enum Command {
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
+    /// Block the user agents of browsers too old for anyone to still run.
+    ///
+    /// Opera 5 to 12, Firefox 1 to 9, Chrome 1 to 39, Internet Explorer 2
+    /// to 9, feature phones (NetFront, UP.Browser, J2ME, Symbian,
+    /// BlackBerry OS) and the like: the strings scanners rotate through to
+    /// look like people, which no bot list can carry because none of them
+    /// is a bot's name. One switch for every site, off by default, because
+    /// a few are still a person somewhere (Opera Mini sends `Opera/9.80`).
+    /// Humans only does not turn it on.
+    SetOldBrowsers {
+        /// Whether old browser agents are blocked
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
     /// Print the robots.txt that would be generated now, without writing it
     ShowRobotsTxt,
     /// Set what the web server sends a blocked request.
@@ -1975,6 +1989,7 @@ async fn run() -> Result<()> {
         Some(Command::SetAutoApply { enabled }) => set_auto_apply(db, enabled),
         Some(Command::SetAutoApplyFirewall { enabled }) => set_auto_apply_firewall(db, enabled),
         Some(Command::SetHumansOnly { enabled }) => set_humans_only(db, enabled),
+        Some(Command::SetOldBrowsers { enabled }) => set_old_browsers(db, enabled),
         Some(Command::ShowRobotsTxt) => show_robots_txt(db),
         Some(Command::GenerateDocs { out }) => {
             use clap::CommandFactory;
@@ -3054,6 +3069,22 @@ fn set_humans_only(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+fn set_old_browsers(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    db.set_block_old_browsers(enabled)?;
+    let count = stop_bots::botlist::old_browsers::substrings().len();
+    if enabled {
+        say!("Old browsers are BLOCKED on every site: {count} user-agent strings.");
+    } else {
+        say!("Old browsers are allowed again.");
+    }
+    say!(
+        "Run `stop-bots apply-blocks` to write it into the {} config.",
+        server_label()
+    );
+    Ok(())
+}
+
 fn set_auto_apply_firewall(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
     let db = open_db(db_path)?;
     db.set_auto_apply_firewall(enabled)?;
@@ -3344,6 +3375,18 @@ fn list_categories(db_path: Option<PathBuf>, site: Option<String>) -> Result<()>
             }
         }
     }
+
+    // Not a category, so not a row of the table: one switch for every
+    // site, which no site's override reaches.
+    say!();
+    say!(
+        "Old browsers: {} on every site (set-old-browsers)",
+        if db.get_block_old_browsers()? {
+            "blocked"
+        } else {
+            "allowed"
+        }
+    );
 
     if let Some(site) = &site {
         let overrides = db.site_bot_overrides(site.id)?;

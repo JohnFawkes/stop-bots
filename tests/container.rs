@@ -7509,8 +7509,13 @@ impl Host {
 /// **Upgrading changes nothing by itself, and tells the truth about what
 /// the next apply will change.** The host 0.1.1 set up keeps every site
 /// file and its loaded ruleset byte for byte across the upgrade, keeps its
-/// host settings free of a `web_server` line, and `status` names the two
-/// sites whose block the release changed, and only those, as not applied.
+/// host settings free of a `web_server` line, and the sites `status` calls
+/// not applied are exactly the sites the next apply then rewrites.
+///
+/// Which sites those are depends on the release: one that changes the
+/// block's shape changes the sites that exempt a path, and one whose
+/// built-in list grew changes them all. So the test compares the two
+/// rather than naming either.
 #[test]
 fn upgrading_a_0_1_1_nginx_host_changes_nothing_until_it_is_applied() {
     if !enabled() {
@@ -7534,9 +7539,33 @@ fn upgrading_a_0_1_1_nginx_host_changes_nothing_until_it_is_applied() {
     let status = host
         .run_uncontended(&format!("stop-bots status --db {HOST_DB}"))
         .1;
+    let not_applied: std::collections::BTreeSet<String> = status
+        .lines()
+        .find_map(|line| line.split_once("site(s) not applied: "))
+        .map(|(_, names)| {
+            names
+                .split(", ")
+                .map(|name| name.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let hash = |file: &str| host.sh(&format!("sha256sum /etc/nginx/sites-enabled/{file}"));
+    let hashes: Vec<String> = UPGRADE_SITES.iter().map(|(file, _)| hash(file)).collect();
+    host.stop_bots("apply-blocks");
+    let rewritten: std::collections::BTreeSet<String> = UPGRADE_SITES
+        .iter()
+        .zip(&hashes)
+        .filter(|((file, _), before)| hash(file) != **before)
+        .map(|((file, _), _)| format!("{}.example", file.trim_end_matches("-site.conf")))
+        .collect();
     assert!(
-        status.contains("2 of 3 site(s) not applied: other.example, test.example"),
-        "status does not name exactly the sites with an exemption as not applied:\n{status}"
+        !rewritten.is_empty(),
+        "the release changed no site's block, so this proves nothing"
+    );
+    assert_eq!(
+        not_applied, rewritten,
+        "status's not-applied sites are not the ones the apply rewrote. status:\n{status}"
     );
 }
 
@@ -7817,4 +7846,72 @@ fn apache_on_rhel_detects_from_httpds_access_log() {
         rules.contains("203.0.113.10") && !rules.contains("203.0.113.9"),
         "block-probe-paths said:\n{detected}\nlist-firewall-rules said:\n{rules}"
     );
+}
+
+// ---- the old-browser list, under both servers ----
+
+/// An old browser, a feature phone, and two browsers people run now.
+const OLD_AND_NEW: [(&str, &str, &str); 4] = [
+    (
+        "Opera/9.80 (Windows NT 6.1; U; en) Presto/2.8.131 Version/11.11",
+        "403",
+        "Presto-era Opera",
+    ),
+    (
+        "SonyEricssonT650i/R7AA Browser/NetFront/3.3 Profile/MIDP-2.0",
+        "403",
+        "a feature phone",
+    ),
+    (
+        "Mozilla/5.0 (X11; Linux x86_64; rv:158.0) Gecko/20100101 Firefox/158.0",
+        "200",
+        "Firefox now",
+    ),
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
+         Chrome/140.0.0.0 Safari/537.36",
+        "200",
+        "Chrome now",
+    ),
+];
+
+/// **Switched on, the list turns old browsers away under a real NGINX and
+/// serves browsers people run**: its escaped literals reach PCRE as the
+/// strings they are.
+#[test]
+fn nginx_turns_away_old_browsers_once_the_list_is_on() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-old-browsers");
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    server.stop_bots("set-old-browsers --enabled true");
+    server.apply_and_reload();
+
+    for (user_agent, expected, what) in OLD_AND_NEW {
+        assert_eq!(
+            server.status("/", &format!("-A {}", sh_quoted(user_agent))),
+            expected,
+            "{what}"
+        );
+    }
+}
+
+/// The same under a real Apache, through `mod_rewrite`'s own quoting.
+#[test]
+fn apache_turns_away_old_browsers_once_the_list_is_on() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-old-browsers");
+    apache.stop_bots("set-old-browsers --enabled true");
+    apache.apply();
+
+    for (user_agent, expected, what) in OLD_AND_NEW {
+        assert_eq!(
+            apache.status("/", &format!("-A {}", sh_quoted(user_agent))),
+            expected,
+            "{what}"
+        );
+    }
 }

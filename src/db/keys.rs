@@ -54,6 +54,10 @@ pub const DEFAULT_STATUS_SEARCH: &str = "default_status_search";
 pub const DEFAULT_STATUS_AI: &str = "default_status_ai";
 /// Whether this host serves humans and nothing else.
 pub const HUMANS_ONLY: &str = "humans_only";
+/// Whether [`crate::botlist::old_browsers`] is blocked. A setting of its
+/// own rather than a category: those entries are not bots and have no
+/// `bots` rows to carry a category flag.
+pub const BLOCK_OLD_BROWSERS: &str = "block_old_browsers";
 /// `GeoMode`: what the selected countries mean. Seeded by the schema.
 pub const GEO_MODE: &str = "geo_mode";
 
@@ -137,6 +141,7 @@ pub const ALL: &[&str] = &[
     DEFAULT_STATUS_SEARCH,
     DEFAULT_STATUS_AI,
     HUMANS_ONLY,
+    BLOCK_OLD_BROWSERS,
     GEO_MODE,
     BLOCK_RESPONSE,
     SERVE_ROBOTS_TXT,

@@ -590,21 +590,32 @@ pub struct UaVerdicts {
     search: Policy,
     scanner: Policy,
     trusted: Vec<String>,
+    /// Whether the old-browser list is blocked: see
+    /// [`crate::botlist::old_browsers`].
+    old_browsers: bool,
 }
 
 impl UaVerdicts {
     /// The status `user_agent` would have as a row: the same precedence
-    /// [`build_ua_rows`] applies, and trust over all of it.
+    /// [`build_ua_rows`] applies, trust over all of it, and the old-browser
+    /// list as one more blocked list when it is switched on.
     pub fn status_of(&self, user_agent: &str) -> RowStatus {
         if user_agent_is_trusted(user_agent, &self.trusted) {
             return RowStatus::Trusted;
         }
-        ua_status(
+        match ua_status(
             user_agent,
             &self.blocked,
             &self.bots,
             [self.ai, self.search, self.scanner],
-        )
+        ) {
+            RowStatus::Pending | RowStatus::Unknown
+                if self.old_browsers && crate::botlist::old_browsers::matches(user_agent) =>
+            {
+                RowStatus::Blocklist
+            }
+            status => status,
+        }
     }
 }
 
@@ -646,6 +657,7 @@ impl LiveInputs {
                 search: db.get_category_default(Category::Search)?,
                 scanner: db.get_category_default(Category::Scanner)?,
                 trusted: db.list_trusted_user_agents()?,
+                old_browsers: db.get_block_old_browsers()?,
             },
         })
     }
@@ -1184,6 +1196,23 @@ mod tests {
         assert_eq!(status("UptimeRobot/2.0"), RowStatus::Trusted);
         assert_eq!(status("SomeNewBot/1.0"), RowStatus::Unknown);
         assert_eq!(status("Mozilla/5.0"), RowStatus::Pending);
+    }
+
+    /// An old browser reads as blocked by a list once that list is on, and
+    /// as nothing in particular before.
+    #[test]
+    fn an_old_browser_is_on_the_blocklist_only_once_the_list_is_on() {
+        let db = Db::open_in_memory().unwrap();
+        let old = "Opera/9.80 (Windows NT 6.1; U; en) Presto/2.8.131 Version/11.11";
+        let status = |db: &Db| {
+            LiveInputs::read(db, Vec::new())
+                .unwrap()
+                .verdicts()
+                .status_of(old)
+        };
+        assert_eq!(status(&db), RowStatus::Pending, "blocked with the list off");
+        db.set_block_old_browsers(true).unwrap();
+        assert_eq!(status(&db), RowStatus::Blocklist, "not blocked with it on");
     }
 
     /// The row itself says which detector blocked it; a block by hand

@@ -1807,6 +1807,21 @@ impl Db {
         self.set_bool_setting(HUMANS_ONLY_KEY, on)
     }
 
+    /// Whether the old-browser list ([`crate::botlist::old_browsers`]) is
+    /// blocked, on every site.
+    ///
+    /// Off by default, on new and existing hosts alike: some of those
+    /// strings are still a person somewhere, and a new way to turn
+    /// visitors away arrives off. Humans-only does not turn it on, because
+    /// it blocks bots and these may not be.
+    pub fn get_block_old_browsers(&self) -> Result<bool> {
+        self.get_bool_setting(keys::BLOCK_OLD_BROWSERS, false)
+    }
+
+    pub fn set_block_old_browsers(&self, on: bool) -> Result<()> {
+        self.set_bool_setting(keys::BLOCK_OLD_BROWSERS, on)
+    }
+
     pub fn set_category_default(&self, category: Category, policy: Policy) -> Result<()> {
         self.conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
@@ -3816,6 +3831,12 @@ impl Db {
             if blocked {
                 patterns.push(bot.user_agent_pattern);
             }
+        }
+        // Host-wide and after every override: the old-browser list has no
+        // `bots` rows, so no per-bot or per-site setting can reach it, and
+        // its one switch is the whole of its policy.
+        if self.get_block_old_browsers()? {
+            patterns.extend(crate::botlist::old_browsers::patterns());
         }
         patterns.extend(
             self.list_blocked_user_agents()?
@@ -6463,6 +6484,58 @@ mod tests {
                 "{expected} was not blocked: {patterns:?}"
             );
         }
+    }
+
+    /// The old-browser list is off until it is switched on, and then joins
+    /// the block on every site, whatever the categories say.
+    #[test]
+    fn old_browsers_are_blocked_only_once_switched_on() {
+        let db = db_with_a_mixed_bot_list();
+        let has_them = |db: &Db| {
+            db.compute_blocked_patterns(Policy::Allowed, Policy::Allowed, Policy::Allowed, &[])
+                .unwrap()
+                .iter()
+                .any(|p| p == r"NetFront")
+        };
+        assert!(!has_them(&db), "on before anyone switched it on");
+        db.set_block_old_browsers(true).unwrap();
+        assert!(has_them(&db), "switched on and not in the block");
+        db.set_block_old_browsers(false).unwrap();
+        assert!(!has_them(&db), "still blocked after switching it off");
+    }
+
+    /// A site's own overrides cannot lift it: the list has no bots and no
+    /// category for them to reach.
+    #[test]
+    fn old_browsers_are_blocked_on_a_site_that_allows_every_category() {
+        let db = db_with_a_mixed_bot_list();
+        db.upsert_site("a.example", "/tmp/a").unwrap();
+        let site = db.list_sites().unwrap()[0].id;
+        for category in [Category::Ai, Category::Search, Category::Scanner] {
+            db.set_site_category_override(site, category, Some(Policy::Allowed))
+                .unwrap();
+        }
+        db.set_block_old_browsers(true).unwrap();
+        let patterns = db.blocked_user_agent_patterns_for_site(site).unwrap();
+        assert!(
+            patterns.iter().any(|p| p == r"NetFront"),
+            "the site's overrides lifted the old-browser list: {patterns:?}"
+        );
+    }
+
+    /// Humans only blocks bots; these may be people, so it leaves the
+    /// old-browser switch where it was.
+    #[test]
+    fn humans_only_does_not_block_old_browsers() {
+        let db = db_with_a_mixed_bot_list();
+        db.set_humans_only(true).unwrap();
+        let patterns = db
+            .compute_blocked_patterns(Policy::Blocked, Policy::Blocked, Policy::Blocked, &[])
+            .unwrap();
+        assert!(
+            !patterns.iter().any(|p| p == r"NetFront"),
+            "humans only turned the old-browser list on: {patterns:?}"
+        );
     }
 
     /// The one exception, and the reason it exists: blocking ACME

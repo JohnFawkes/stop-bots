@@ -130,9 +130,10 @@ const STALE_AFTER_SECS: i64 = 7 * 24 * 60 * 60;
 const CATEGORIES: [Category; 3] = [Category::Scanner, Category::Search, Category::Ai];
 
 /// Rows in the Policy list: the humans-only switch, then the three
-/// categories it forces. The switch leads because it decides whether the
-/// three below it can be touched at all.
-const POLICY_ROWS: usize = CATEGORIES.len() + 1;
+/// categories it forces, then the old-browser switch. Humans only leads
+/// because it decides whether the three below it can be touched at all;
+/// old browsers comes last because it decides nothing about them.
+const POLICY_ROWS: usize = CATEGORIES.len() + 2;
 
 /// Which of the Dashboard's three lists arrow keys currently move through.
 /// Ordered as focus flows: `Down` past the last row of one moves into the
@@ -309,6 +310,8 @@ pub struct Dashboard {
     /// Whether this host serves humans only. Drives both the extra
     /// detector row and the greying of the three category rows.
     humans_only: bool,
+    /// Whether the old-browser list is blocked: the Policy list's last row.
+    old_browsers: bool,
     focus: Focus,
     /// The internal cron's per-job state (see `crate::cron`), read-only
     /// here — this panel only displays it, `App` is what actually runs due
@@ -343,6 +346,7 @@ impl Dashboard {
         self.sites = sites.into_iter().map(|s| s.server_name).collect();
         self.sources = db.list_sources()?;
         self.humans_only = db.get_humans_only()?;
+        self.old_browsers = db.get_block_old_browsers()?;
         self.scanner_default = db.get_category_default(Category::Scanner)?;
         self.search_default = db.get_category_default(Category::Search)?;
         self.ai_default = db.get_category_default(Category::Ai)?;
@@ -545,6 +549,7 @@ impl Dashboard {
                     .iter()
                     .map(|&category| ListItem::new(self.row_line(category))),
             )
+            .chain(std::iter::once(ListItem::new(self.old_browsers_line())))
             .collect();
         let focused = self.focus == Focus::Categories;
         let list = crate::tui::select_in(
@@ -815,6 +820,20 @@ impl Dashboard {
             Span::from("[ off ]").dim()
         });
         Line::from(line)
+    }
+
+    /// The old-browser switch, tagged as a category is: it allows or
+    /// blocks, and humans only leaves it alone.
+    fn old_browsers_line(&self) -> Line<'static> {
+        vec![
+            Span::from(format!("{:<14}", "Old browsers")),
+            policy_tag(if self.old_browsers {
+                Policy::Blocked
+            } else {
+                Policy::Allowed
+            }),
+        ]
+        .into()
     }
 
     fn row_line(&self, category: Category) -> Line<'static> {
@@ -1946,10 +1965,24 @@ impl Dashboard {
         }
     }
 
-    /// Enter on a Policy row: row 0 toggles humans-only, the rest open a
-    /// category popup — unless humans-only is on, in which case there is
-    /// nothing to open.
+    /// Enter on a Policy row: row 0 toggles humans-only, the last toggles
+    /// old browsers, and the rest open a category popup — unless
+    /// humans-only is on, in which case there is nothing to open.
     fn activate_policy_row(&mut self, db: &Db, message: &mut Option<String>) -> Result<KeyOutcome> {
+        if self.list_state.selected() == Some(POLICY_ROWS - 1) {
+            let on = !self.old_browsers;
+            db.set_block_old_browsers(on)?;
+            *message = Some(if on {
+                format!(
+                    "Old browsers are blocked on every site. Apply on the {} screen to \
+                     enforce it.",
+                    crate::webserver::WebServer::configured().label()
+                )
+            } else {
+                "Old browsers are allowed again.".to_string()
+            });
+            return Ok(KeyOutcome::Mutated);
+        }
         if self.list_state.selected() == Some(0) {
             let on = !self.humans_only;
             db.set_humans_only(on)?;
@@ -2709,6 +2742,32 @@ mod tests {
             .unwrap();
         assert_eq!(dashboard.focus, Focus::Countries);
         assert_eq!(dashboard.countries_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn enter_on_the_last_policy_row_toggles_old_browsers() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.list_state.select(Some(POLICY_ROWS - 1));
+
+        let mut message = None;
+        let outcome = dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert!(db.get_block_old_browsers().unwrap(), "message: {message:?}");
+
+        // Humans only locks the categories, not this.
+        db.set_humans_only(true).unwrap();
+        dashboard.refresh(&db).unwrap();
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        assert!(
+            !db.get_block_old_browsers().unwrap(),
+            "humans only kept the switch from turning off. message: {message:?}"
+        );
     }
 
     #[test]

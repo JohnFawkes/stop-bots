@@ -3,7 +3,7 @@ pkgname=stop-bots-bin
 _pkgname=stop-bots
 pkgver=0.1.1
 pkgrel=1
-pkgdesc="A TUI that helps you configure your server to stop bad bots and still allow good bots (prebuilt binary)"
+pkgdesc="A TUI, web console and CLI that help you configure NGINX or Apache and your firewall to stop bad bots and still allow good bots (prebuilt binary)"
 # Both architectures the release workflow builds a static musl binary for.
 # Arch's $CARCH spells them the way the Rust target triples do, which is what
 # lets one package() serve both.
@@ -17,6 +17,7 @@ depends=()
 provides=("$_pkgname=$pkgver")
 conflicts=("$_pkgname")
 optdepends=('nginx: to apply the generated site blocking rules'
+            'apache: to apply the generated site blocking rules, instead of nginx'
             'nftables: to apply the generated firewall script'
             'iptables: alternative firewall backend')
 _release="$url/releases/download/v$pkgver/$_pkgname-$pkgver"
@@ -32,4 +33,17 @@ package() {
   install -Dm0755 "$_pkgname" "$pkgdir/usr/bin/$_pkgname"
   install -Dm0644 README.md "$pkgdir/usr/share/doc/$_pkgname/README.md"
   install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$_pkgname/LICENSE"
+  # The tarball carries the man pages and completions from the release
+  # after 0.1.1 on; 0.1.1's has the binary, README and LICENSE only. Drop
+  # this test once the package is past 0.1.x.
+  if [[ ! -d man ]]; then
+    return 0
+  fi
+  # The man pages and completions the .deb ships, from the binary's own
+  # clap definition. Arch's zsh and bash-completion look in these paths;
+  # makepkg compresses the man pages itself.
+  install -Dm0644 -t "$pkgdir/usr/share/man/man1/" man/*.1
+  install -Dm0644 completions/stop-bots.bash "$pkgdir/usr/share/bash-completion/completions/stop-bots"
+  install -Dm0644 completions/_stop-bots "$pkgdir/usr/share/zsh/site-functions/_stop-bots"
+  install -Dm0644 completions/stop-bots.fish "$pkgdir/usr/share/fish/vendor_completions.d/stop-bots.fish"
 }

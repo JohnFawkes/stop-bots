@@ -86,11 +86,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - run: cargo check --all-targets
+      # `--locked`, so the tree checked against the MSRV is the one
+      # Cargo.lock pins and the release builds. Without it, cargo is free to
+      # resolve a newer dependency than the lock file says, and this job
+      # would be testing a build nobody ships.
+      - run: cargo check --all-targets --locked
 
-  # The only job where generated NGINX and nftables output meets the real
-  # parsers, and where a firewall rule is checked by sending actual
-  # packets at it. Separate from `test` because it needs Docker and
+  # The only job where generated NGINX, Apache, nftables and iptables
+  # output meets the real parsers, and where a block or a firewall rule is
+  # checked by sending actual requests and packets at it. Separate from `test` because it needs Docker and
   # NET_ADMIN, which the unit suite must never require.
   container:
     runs-on: ubuntu-latest
@@ -114,7 +118,7 @@ jobs:
       # (it races a real systemd, a real nginx and a real SQLite) cost a
       # reproduction attempt each to identify. `pipefail` because the
       # exit status that matters is cargo's, not tee's.
-      - name: End-to-end against real nginx and nftables
+      - name: End-to-end against real NGINX, Apache, nftables and iptables
         shell: bash
         run: |
           # GitHub runs this as `bash -e -o pipefail`. `-e` has to go: a
@@ -366,6 +370,18 @@ jobs:
         run: |
           STOP_BOTS_STRANGER_DEB="$(ls "$PWD"/dist/stop-bots_*.deb)" \
             cargo nextest run --test container -E 'test(/stranger/)' --no-fail-fast
+
+  # The AUR reads a package's metadata from .SRCINFO, never from the
+  # PKGBUILD, so a PKGBUILD edited without regenerating it builds fine and
+  # is described wrongly everywhere the AUR shows it. There is no makepkg
+  # on this runner; packaging/aur/srcinfo.py writes what it would, and
+  # `--check` fails if what is committed differs.
+  aur-srcinfo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Each .SRCINFO matches its PKGBUILD
+        run: python3 -B packaging/aur/srcinfo.py --check
 
   # Catches the class of mistake that only surfaces at publish time: a bad
   # category slug, a missing required field, or a crate that packages fine but

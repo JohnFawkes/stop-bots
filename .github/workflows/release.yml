@@ -15,9 +15,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Read-only by default; only the two jobs that publish get write. The
-# build job runs the third-party actions that compile the binaries the apt
-# job then signs, and none of them needs to push anything.
+# Read-only by default; only the two jobs that publish get write, and only
+# `attest` can mint an OIDC token. The build job runs the third-party actions
+# that compile the binaries the apt job then signs, and none of them needs to
+# push anything or to prove who it is.
 permissions:
   contents: read
 
@@ -39,6 +40,23 @@ jobs:
             exit 1
           fi
           echo "Version $manifest matches tag $GITHUB_REF_NAME."
+
+      # The changelog section is the release's notes, so a tag without one
+      # would publish a release that says nothing about itself — the same
+      # mistake RELEASING.md step 2 exists to prevent, caught here rather
+      # than on the release page. A release candidate needs its own
+      # `## [0.1.0-rc.1]` section: see scripts/changelog-section.py.
+      - name: CHANGELOG.md must have a section for this version
+        run: scripts/changelog-section.py "$GITHUB_REF_NAME" > release-notes.md
+
+      # Extracted once, here, and handed to `release` as is: the text that
+      # was checked is the text that is published, from the tagged tree,
+      # without a second checkout in the job that holds `contents: write`.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
 
   # The same tests CI runs, on both architectures this workflow ships. A tag
   # is normally pushed after CI went green on main (RELEASING.md step 4), but
@@ -163,9 +181,25 @@ jobs:
           name="stop-bots-${version}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
           cp "target/${{ matrix.target }}/release/stop-bots" README.md LICENSE "dist/${name}/"
+          # The man pages and completions the .deb ships, so the AUR `-bin`
+          # package can install them too rather than being the one route
+          # without `man stop-bots`. Same layout as target/assets: man/ and
+          # completions/.
+          cp -r target/assets/man target/assets/completions "dist/${name}/"
           tar -czf "dist/${name}.tar.gz" -C dist "${name}"
           rm -rf "dist/${name}"
-          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+
+      # One `.sha256` beside every asset, the .deb included: someone who
+      # downloads a single file should not need a second, all-assets file to
+      # check it. packaging/bump.py reads the tarballs' ones for the AUR
+      # `-bin` package. `release` adds a SHA256SUMS covering all of them.
+      - name: Checksums
+        working-directory: dist
+        run: |
+          for asset in *.tar.gz *.deb; do
+            sha256sum "$asset" > "$asset.sha256"
+          done
+          cat ./*.sha256
 
       - name: Inspect the package
         run: |
@@ -178,8 +212,45 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  release:
+  # SLSA build provenance for every binary artefact: a signed statement,
+  # logged in Sigstore's public transparency log, that this file was built
+  # by this workflow from this commit of this repository. Checked with
+  # `gh attestation verify` (RELEASING.md, "Verifying a download").
+  #
+  # Its own job, so the two permissions it needs are held by nothing but
+  # first-party actions: `id-token: write` lets a job mint a token that
+  # proves it is this workflow, and neither the build job's third-party
+  # toolchain actions nor the release action should be able to. Before
+  # `release` rather than after, so a published release always has its
+  # attestations; a failure here stops the release instead of shipping
+  # one that `gh attestation verify` rejects.
+  #
+  # The artefacts are attested as `release` will upload them — downloaded
+  # from this run, not rebuilt — so the digests are the published bytes.
+  # The `.sha256` files and SHA256SUMS are not subjects: they describe the
+  # artefacts, and what they say is checked against the attested ones.
+  attest:
     needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.deb
+
+  release:
+    needs: [verify-version, build, attest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -190,11 +261,39 @@ jobs:
           merge-multiple: true
           path: dist
 
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: notes
+
+      # Each build job wrote a `.sha256` per asset; checking them here
+      # proves the bytes survived the artifact round trip, and SHA256SUMS
+      # puts every asset of the release in one file for `sha256sum -c`.
+      #
+      # Not GPG-signed. The only key this workflow holds is the APT
+      # repository's, and it is imported in the `apt` job alone; bringing it
+      # into this job would hand it to the third-party release action for
+      # the sake of a second signature over what the provenance attestation
+      # already vouches for.
+      - name: Verify the checksums and write SHA256SUMS
+        working-directory: dist
+        run: |
+          for sum in *.sha256; do
+            sha256sum --check --strict "$sum"
+          done
+          sha256sum *.tar.gz *.deb > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: dist/*
-          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # The changelog's section for this tag, as `verify-version`
+          # extracted it, rather than GitHub's generated notes: those are a
+          # list of commit titles, and the changelog is what is written for
+          # the people upgrading.
+          body_path: notes/release-notes.md
           # Marked as a pre-release while the version is 0.0.x — cargo treats
           # every 0.0.z bump as breaking, and the release page should say the
           # same thing the version number does — and for a release candidate

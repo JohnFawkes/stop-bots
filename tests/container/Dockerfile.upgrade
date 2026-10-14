@@ -1,0 +1,29 @@
+# The systemd host of `Dockerfile.host`, with the last 0.1.x release beside
+# the binary under test, for the upgrade test.
+#
+# The released binary rather than a copy of what it wrote: an upgrade test
+# built from fixtures checks the fixtures, and the promise is about what
+# 0.1.1 actually left on a host — its NGINX blocks, its units, its
+# database, its host settings. Fetched from the GitHub release and pinned
+# by the checksum published beside it, so a changed asset fails the build
+# rather than testing something else. Like the `apt-get` in every image
+# here, the download happens when the image is built, never in a test.
+ARG BASE
+FROM ${BASE}
+
+ARG OLD=0.1.1
+RUN set -e; \
+    case "$(uname -m)" in \
+        x86_64) target=x86_64-unknown-linux-musl; \
+                sum=0e4b51651d62b9d544809f8c14d4df3186f8058faae4f4738914fb2933fe29c7 ;; \
+        aarch64) target=aarch64-unknown-linux-musl; \
+                 sum=755c2c59f5abae27661f96033c75eff9cf8e6c445fa65dfe6844d0a37cd6ebbd ;; \
+        *) echo "no ${OLD} release for $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    name="stop-bots-${OLD}-${target}"; \
+    curl -fsSL -o "/tmp/${name}.tar.gz" \
+        "https://github.com/ivankovic/stop-bots/releases/download/v${OLD}/${name}.tar.gz"; \
+    echo "${sum}  /tmp/${name}.tar.gz" | sha256sum -c -; \
+    tar -xzf "/tmp/${name}.tar.gz" -C /tmp; \
+    install -m 755 "/tmp/${name}/stop-bots" "/usr/local/bin/stop-bots-${OLD}"; \
+    rm -rf "/tmp/${name}" "/tmp/${name}.tar.gz"

@@ -296,6 +296,24 @@ make integration-test
 CI runs it as its own job. Run it before a release, and before trusting any change to
 generated config.
 
+Besides Debian's and Ubuntu's layouts, two images stand in for hosts nobody here runs.
+`Dockerfile.rhel` is AlmaLinux 10's `httpd`, for RHEL's `/etc/httpd` tree. And
+`Dockerfile.upgrade` adds the released 0.1.1 binary to the systemd host, for the tests
+that upgrade what 0.1.1 actually left on a host rather than a fixture of it. It
+downloads that binary when the image is built, pinned by its published checksum, the
+way every image fetches its packages; no test touches the network.
+
+Under rootless Podman, a test that starts a second container on a network of its own
+fails if Podman's network backend cannot load `ip_tables`, which some kernels refuse to
+an unprivileged user. Those containers only talk to each other on one bridge, which
+needs no host firewall rules, so for this suite they can be switched off without
+touching your own Podman configuration:
+
+```
+printf '[network]\nfirewall_driver = "none"\n' > /tmp/containers.conf
+CONTAINERS_CONF_OVERRIDE=/tmp/containers.conf STOP_BOTS_CONTAINER_RUNTIME=podman make integration-test
+```
+
 **Flakes are retried, and counted.** The suite races a real systemd, NGINX and SQLite,
 so `.config/nextest.toml` gives this binary, and only this one, two retries. CI runs it
 with `cargo nextest run --test container`: a test that passes on a retry is reported
@@ -307,9 +325,10 @@ cargo nextest run --test container` locally behaves as CI does.
 
 ### The stranger test
 
-Two tests in the same file follow the README's quick start on a fresh Debian 12 and a
+Three tests in the same file follow the README's quick start on a fresh Debian 12 and a
 fresh Ubuntu 24.04 (`tests/container/Dockerfile.stranger`: systemd, an SSH server,
-and NGINX and nftables as `apt install` leaves them). They install the `.deb`, run
+and NGINX and nftables as `apt install` leaves them), and on a fresh Ubuntu 24.04 with
+Apache in NGINX's place, where they also take the quick start's two Apache steps. They install the `.deb`, run
 every quick-start command as written, check blocking with packets from a second
 container, and end with `uninstall all` and a host identical to the one they started
 from. They install a package rather than the test binary because the package is part
@@ -323,7 +342,7 @@ make stranger-test
 builds the static package the way CI's `deb` job does (it needs `musl-gcc` and
 `cargo-deb`) and runs them. Two environment variables drive them:
 
-- `STOP_BOTS_STRANGER_DEB` names the `.deb` to install. Without it the two tests
+- `STOP_BOTS_STRANGER_DEB` names the `.deb` to install. Without it the three tests
   skip, and say so.
 - `STOP_BOTS_STRANGER_FETCH=1` runs `batch --apply` with real downloads, exactly as
   written. Without it, `batch` gets `--no-fetch` and blocks from the list compiled

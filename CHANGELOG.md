@@ -169,6 +169,11 @@ exemption reads as stale until it is applied again (see Fixed).
   rather than stopping the log read at that line. Neither is reachable with NGINX's
   stock formats.
 
+### Security
+
+- `rustls` is 0.23.46, for RUSTSEC-2026-0346, -0347, -0348 and -0349. stop-bots uses it
+  only as a client, to download the bot lists and address feeds.
+
 ## [0.1.1] — 2026-10-01
 
 ### Fixed

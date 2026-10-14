@@ -17,7 +17,8 @@ Nothing in this directory ships in the crate (`Cargo.toml` excludes it).
 The hand-maintained packages below point at artefacts that only exist after a
 release, so that work happens **after** `RELEASING.md` step 6, never before:
 
-1. tag pushed → GitHub release with the tarballs and their `.sha256`, **and** the
+1. tag pushed → GitHub release with the tarballs, the `.deb`s, a `.sha256` for
+   each and a `SHA256SUMS`, provenance attestations for all of them, **and** the
    `.deb`s published to the APT repository — all automatic
 2. `cargo publish` → the crates.io `.crate` tarball exists
 3. *then* `python3 packaging/bump.py <version>` for the AUR and Gentoo packages,
@@ -112,10 +113,24 @@ release published, not from a fresh download of the file being checked:
   that tarball.
 
 It reads everything before it writes anything, so a release that is only half
-published (no crate yet, a tarball missing) stops it with the tree untouched. A
-`.SRCINFO` next to a PKGBUILD is regenerated as well, with `makepkg --printsrcinfo`
-when makepkg is installed. The script pushes nothing: commit what it wrote here,
-then submit as below.
+published (no crate yet, a tarball missing) stops it with the tree untouched. The
+`.SRCINFO` next to each PKGBUILD is regenerated as well: with `makepkg
+--printsrcinfo` when makepkg is installed, and otherwise with `aur/srcinfo.py`,
+which runs the PKGBUILD through bash the way makepkg does and prints the same
+bytes. The script pushes nothing: commit what it wrote here, then submit as below.
+
+Editing a PKGBUILD by hand (a description, a dependency) needs the same:
+
+```
+python3 packaging/aur/srcinfo.py           # rewrite both .SRCINFO files
+python3 packaging/aur/srcinfo.py --check   # what CI runs
+```
+
+Both packages install what the `.deb` does: the binary, the README, the licence,
+a man page per verb and the bash, zsh and fish completions. `stop-bots` generates
+the last two in `build()` with the hidden `generate-docs` verb; `stop-bots-bin`
+takes them from the release tarball, which carries them from the release after
+0.1.1 on.
 
 ### Submitting
 
@@ -123,10 +138,10 @@ The AUR is a git remote per package. First time, for each of the two:
 
 ```
 git clone ssh://aur@aur.archlinux.org/stop-bots.git aur-stop-bots
-cp packaging/aur/stop-bots/PKGBUILD aur-stop-bots/
+cp packaging/aur/stop-bots/PKGBUILD packaging/aur/stop-bots/.SRCINFO aur-stop-bots/
 cd aur-stop-bots
-makepkg --printsrcinfo > .SRCINFO   # required; the AUR rejects a push without it
-makepkg -si                         # build it once before inflicting it on anyone
+makepkg --printsrcinfo | diff - .SRCINFO   # on Arch: should print nothing
+makepkg -si                                # build it once before inflicting it on anyone
 git add PKGBUILD .SRCINFO
 git commit -m "Initial import: stop-bots 0.0.15"
 git push
@@ -134,7 +149,8 @@ git push
 
 `.SRCINFO` is generated, must be committed, and must be regenerated on every version
 bump — a stale one is the single most common reason an AUR package looks wrong on the
-website while building fine locally.
+website while building fine locally. That is why it is kept here beside its
+PKGBUILD and checked by CI (`aur-srcinfo`), rather than generated only at push time.
 
 Pushing needs an AUR account with your SSH public key registered at
 <https://aur.archlinux.org/account/>.

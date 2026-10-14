@@ -371,6 +371,18 @@ jobs:
           STOP_BOTS_STRANGER_DEB="$(ls "$PWD"/dist/stop-bots_*.deb)" \
             cargo nextest run --test container -E 'test(/stranger/)' --no-fail-fast
 
+  # The AUR reads a package's metadata from .SRCINFO, never from the
+  # PKGBUILD, so a PKGBUILD edited without regenerating it builds fine and
+  # is described wrongly everywhere the AUR shows it. There is no makepkg
+  # on this runner; packaging/aur/srcinfo.py writes what it would, and
+  # `--check` fails if what is committed differs.
+  aur-srcinfo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Each .SRCINFO matches its PKGBUILD
+        run: python3 -B packaging/aur/srcinfo.py --check
+
   # Catches the class of mistake that only surfaces at publish time: a bad
   # category slug, a missing required field, or a crate that packages fine but
   # does not build from its own tarball.

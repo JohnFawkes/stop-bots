@@ -11,9 +11,9 @@ published, and both halves have to exist.
 - `aur/stop-bots-bin/PKGBUILD` gets the version and, for every
   `sha256sums_<arch>` it declares, the digest from the `.sha256` file the
   release workflow published next to that architecture's tarball.
-- A `.SRCINFO` next to either PKGBUILD is regenerated with
-  `makepkg --printsrcinfo` when makepkg is installed, and otherwise has its
-  version and checksums rewritten in place.
+- The `.SRCINFO` next to each PKGBUILD is regenerated, with
+  `makepkg --printsrcinfo` when makepkg is installed and with
+  aur/srcinfo.py, which writes the same thing without it, otherwise.
 - `gentoo/stop-bots-<version>.ebuild` is generated from the tag's Cargo.lock
   by gen-ebuild.py, and the previous ebuild is removed.
 
@@ -105,7 +105,6 @@ def bump_pkgbuild(path: pathlib.Path, version: str, sums: dict[str, str]) -> Non
     """Rewrite pkgver, pkgrel and the listed sha256sums variables in place."""
     text = path.read_text()
     old_version = read_var(text, "pkgver")
-    old_sums = {var: read_var(text, var) for var in sums}
 
     if old_version != version:
         text = set_var(text, "pkgver", version)
@@ -115,18 +114,17 @@ def bump_pkgbuild(path: pathlib.Path, version: str, sums: dict[str, str]) -> Non
     path.write_text(text)
     print(f"wrote {path.relative_to(ROOT)} ({old_version} -> {version})")
 
-    srcinfo = path.with_name(".SRCINFO")
-    if srcinfo.exists():
-        write_srcinfo(srcinfo, old_version, version, old_sums, sums)
+    write_srcinfo(path)
 
 
-def write_srcinfo(
-    path: pathlib.Path,
-    old_version: str,
-    version: str,
-    old_sums: dict[str, str],
-    sums: dict[str, str],
-) -> None:
+def write_srcinfo(pkgbuild: pathlib.Path) -> None:
+    """Regenerate the .SRCINFO from the PKGBUILD just written.
+
+    Always, and from the whole PKGBUILD: the AUR shows what .SRCINFO says,
+    so a description or a dependency changed by hand since the last bump
+    has to reach it too, not only the version and the checksums.
+    """
+    path = pkgbuild.with_name(".SRCINFO")
     if shutil.which("makepkg"):
         out = subprocess.run(
             ["makepkg", "--printsrcinfo"],
@@ -135,34 +133,12 @@ def write_srcinfo(
             text=True,
             check=True,
         ).stdout
-        path.write_text(out)
-        print(f"wrote {path.relative_to(ROOT)} (makepkg --printsrcinfo)")
-        return
-
-    # No makepkg here. .SRCINFO is `key = value` lines, and a bump changes
-    # only the version (in pkgver, source and provides), pkgrel and the
-    # checksums, so rewrite exactly those.
-    lines = []
-    for line in path.read_text().splitlines():
-        key, sep, value = line.strip().partition(" = ")
-        if sep and key == "pkgver":
-            value = version
-        elif sep and key == "pkgrel" and old_version != version:
-            value = "1"
-        elif sep and key in sums and value == old_sums[key]:
-            value = sums[key]
-        elif sep and (key.startswith("source") or key == "provides"):
-            # Bounded, so bumping 0.0.1 leaves a "0.0.15" elsewhere alone.
-            value = re.sub(
-                rf"(?<![\d.]){re.escape(old_version)}(?![\d])", version, value
-            )
-        else:
-            lines.append(line)
-            continue
-        indent = line[: len(line) - len(line.lstrip())]
-        lines.append(f"{indent}{key} = {value}")
-    path.write_text("\n".join(lines) + "\n")
-    print(f"wrote {path.relative_to(ROOT)} (rewritten; run makepkg --printsrcinfo to check)")
+        how = "makepkg --printsrcinfo"
+    else:
+        out = load("srcinfo", HERE / "aur" / "srcinfo.py").render(pkgbuild)
+        how = "aur/srcinfo.py; no makepkg here"
+    path.write_text(out)
+    print(f"wrote {path.relative_to(ROOT)} ({how})")
 
 
 def bin_arches(pkgbuild: pathlib.Path) -> list[str]:
@@ -173,15 +149,18 @@ def bin_arches(pkgbuild: pathlib.Path) -> list[str]:
     return found
 
 
-def gentoo(version: str) -> None:
-    # Imported by path (its name has a hyphen), and without leaving a
-    # __pycache__ in the tree.
+def load(name: str, path: pathlib.Path):
+    """A sibling script as a module: imported by path (gen-ebuild.py has a
+    hyphen in its name), and without leaving a __pycache__ in the tree."""
     sys.dont_write_bytecode = True
-    spec = importlib.util.spec_from_file_location(
-        "gen_ebuild", HERE / "gentoo" / "gen-ebuild.py"
-    )
-    gen = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(gen)
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def gentoo(version: str) -> None:
+    gen = load("gen_ebuild", HERE / "gentoo" / "gen-ebuild.py")
     written = gen.write_ebuild(version, gen.lock_at_tag(version))
     # One ebuild at a time: the overlay instructions copy the one that is here.
     for old in written.parent.glob(f"{CRATE}-*.ebuild"):

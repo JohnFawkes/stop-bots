@@ -467,6 +467,30 @@ const MAIN_CONFIGS: [&str; 3] = ["apache2.conf", "httpd.conf", "conf/httpd.conf"
 /// still that tree.
 const MAIN_CONFIG_LEVELS_UP: usize = 2;
 
+/// The directory Apache's main config is in, at or up to
+/// [`MAIN_CONFIG_LEVELS_UP`] above `root`, and the file: `/etc/httpd` and
+/// `/etc/httpd/conf/httpd.conf` for any root in RHEL's tree. `None` when
+/// there is none — a root that is not Apache's, as far as this can tell.
+fn main_config(root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let root = std::path::absolute(root).ok()?;
+    root.ancestors()
+        .take(MAIN_CONFIG_LEVELS_UP + 1)
+        .find_map(|dir| {
+            MAIN_CONFIGS
+                .iter()
+                .map(|name| dir.join(name))
+                .find(|main| main.is_file())
+                .map(|main| (dir.to_path_buf(), main))
+        })
+}
+
+/// The directory of Apache's main config for `root` ([`main_config`]):
+/// the tree `root` is part of, which is what the root helper's sandbox
+/// checks a root under `/etc` against.
+pub fn config_tree(root: &Path) -> Option<PathBuf> {
+    main_config(root).map(|(dir, _)| dir)
+}
+
 /// Apache's configuration as Apache reads it under one root: its main
 /// file, then everything that `Include`s, transitively.
 ///
@@ -503,17 +527,7 @@ impl Tree {
     /// The tree whose main file is at `root`, or a level or two above it,
     /// read; `None` when there is none.
     fn find(root: &Path) -> Option<Tree> {
-        let root = std::path::absolute(root).ok()?;
-        let (dir, main) = root
-            .ancestors()
-            .take(MAIN_CONFIG_LEVELS_UP + 1)
-            .find_map(|dir| {
-                MAIN_CONFIGS
-                    .iter()
-                    .map(|name| dir.join(name))
-                    .find(|main| main.is_file())
-                    .map(|main| (dir.to_path_buf(), main))
-            })?;
+        let (dir, main) = main_config(root)?;
         let text = fs::read_to_string(&main).ok()?;
         let declared = lines(&text).into_iter().find_map(|line| {
             let parts = words(line.text.trim());

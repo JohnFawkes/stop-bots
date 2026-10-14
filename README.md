@@ -104,7 +104,9 @@ sudo apt update && sudo apt install stop-bots
 ```
 
 Or `cargo install stop-bots` with Rust 1.88 or newer, or a static binary for `x86_64` or
-`aarch64` Linux from the GitHub [releases](https://github.com/ivankovic/stop-bots/releases).
+`aarch64` Linux from the GitHub [releases](https://github.com/ivankovic/stop-bots/releases),
+each with a checksum and a build provenance attestation
+([verifying a download](https://github.com/ivankovic/stop-bots/blob/main/RELEASING.md#verifying-a-download)).
 Installing starts nothing.
 
 It is tested on **Debian and Ubuntu with systemd, and NGINX or Apache**. It needs `nft`, or

@@ -17,7 +17,8 @@ principles run through everything and should survive every release:
 1. **Nothing happens without you.** Everything is generated; applying is a separate,
    visible act.
 2. **Don't lock out the operator.** The SSH guard, the "never block the address you're
-   connected from" rule, `nginx -t` with rollback.
+   connected from" rule, the web server's config test (`nginx -t`, `apache2ctl
+   configtest`) with rollback.
 3. **No component in the request path.** Offline log analysis plus generated config. That
    is what makes JS challenges and TLS fingerprinting out of scope, and it should stay a
    stated boundary rather than a backlog item.

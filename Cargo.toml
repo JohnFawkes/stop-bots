@@ -13,11 +13,11 @@ authors = ["Marko Ivankovic <marko@ivankovic.me>"]
 # "only" to match the header on every source file, which grants
 # "version 3 of the License" and no later version.
 license = "AGPL-3.0-only"
-description = "A TUI, web console and CLI that help you configure your server to stop bad bots and still allow good bots."
+description = "A TUI, web console and CLI that help you configure your server to stop bad bots without hiding behind a CDN. Works with NGINX or Apache, and nftables or iptables."
 repository = "https://github.com/ivankovic/stop-bots"
 homepage = "https://github.com/ivankovic/stop-bots"
 readme = "README.md"
-keywords = ["nginx", "firewall", "bots", "crawler", "tui"]
+keywords = ["nginx", "apache", "firewall", "bots", "tui"]
 categories = [
     "command-line-utilities",
     "network-programming",
@@ -64,10 +64,10 @@ priority = "optional"
 extended-description = """\
 A TUI, a web console and a CLI that help you configure your server to stop bad \
 bots without hiding behind a CDN. It classifies known bots by category and \
-blocks them in your NGINX config, and writes an nftables or iptables script \
-that blocks countries, datacenter ranges and addresses caught scanning your \
-logs, recording why each one is blocked. For Debian and Ubuntu with systemd \
-and NGINX. Nothing is applied without being asked."""
+blocks them in your NGINX or Apache config, and writes an nftables or iptables \
+script that blocks countries, datacenter ranges and addresses caught scanning \
+your logs, recording why each one is blocked. For Debian and Ubuntu with \
+systemd, and NGINX or Apache. Nothing is applied without being asked."""
 
 # Empty, not "$auto". The release build targets musl and links statically, so
 # there is no libc6 to depend on -- which is the whole reason for that target:
@@ -77,18 +77,20 @@ depends = ""
 
 # Neither belongs in `depends`, and the distinction is not pedantry.
 #
-# A firewall backend is `recommends`: the NGINX half of this tool is entirely
-# useful on a host that has neither `nft` nor `iptables`, and `recommends` is
+# A firewall backend is `recommends`: the web server half of this tool is
+# entirely useful on a host that has neither `nft` nor `iptables`, and `recommends` is
 # installed by default anyway, so the only people who notice are the ones who
 # passed --no-install-recommends and meant it.
 #
-# NGINX is `suggests`, weaker still, because the host running this very often
-# does not have the package at all -- it has NGINX in a container, with the
-# config on a bind mount. `set-nginx-commands` exists for exactly that
-# arrangement, and a hard dependency would install a second, idle NGINX on
-# every such host to satisfy a file the real one never reads.
+# The web server is `suggests`, weaker still, because the host running this
+# very often does not have the package at all -- it has NGINX or Apache in a
+# container, with the config on a bind mount. `set-web-server` (and
+# `set-nginx-commands`) exist for exactly that arrangement, and a hard
+# dependency would install a second, idle web server on every such host to
+# satisfy a file the real one never reads. Either one will do, hence the
+# alternative; Debian's Apache package is `apache2`.
 recommends = "nftables | iptables"
-suggests = "nginx"
+suggests = "nginx | apache2"
 
 # No maintainer scripts, and no unit file, on purpose. `stop-bots install web`
 # writes the systemd unit, creates /var/lib/stop-bots 0700 and generates the
@@ -118,7 +120,7 @@ assets = [
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 
-# For reading nginx config files
+# For walking the NGINX and Apache config trees
 walkdir = "2"
 
 # For error handling

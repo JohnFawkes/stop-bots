@@ -74,8 +74,8 @@ const ROOT_HELP: &str = "The web server's config root. Defaults to the one store
 `set-web-server --root` (or `set-nginx-commands --root`), else /etc/nginx, or /etc/apache2 for Apache";
 
 /// Help text shared by every detector subcommand's `--access-log`.
-const ACCESS_LOG_HELP: &str = "Read this NGINX access log instead of the stored one \
-(`set-log-paths`), else /var/log/nginx/access.log";
+const ACCESS_LOG_HELP: &str = "Read this access log instead of the stored one \
+(`set-log-paths`), else /var/log/nginx/access.log, or /var/log/apache2/access.log for Apache";
 
 /// Help text shared by every detector subcommand's `--dry-run`.
 const DRY_RUN_HELP: &str = "Show what would be blocked without storing anything";
@@ -84,6 +84,21 @@ const DRY_RUN_HELP: &str = "Show what would be blocked without storing anything"
 const TTL_HELP: &str = "How many days a block lasts. Defaults to this detector's stored TTL \
 (`set-detector`)";
 
+/// Printed under the list of commands by `-h` and `--help`. The list is
+/// long and flat — clap 4 has one heading for every subcommand — so this
+/// is the order to read it in, for someone who has just installed it.
+const GETTING_STARTED: &str = "\
+Getting started:
+  sudo stop-bots set-web-server apache    Only on an Apache host; NGINX is the default
+  sudo stop-bots batch --dry-run --diff   Show what a full pass would change, change nothing
+  sudo stop-bots batch --apply            Fetch the lists, scan the logs, apply both
+  sudo stop-bots install firewall         Load the applied firewall script at boot
+  sudo stop-bots install web              Run the web console as a service
+  sudo stop-bots uninstall all --dry-run  Show every step that puts the host back
+
+`sudo stop-bots` with no command starts the TUI. `stop-bots <command> --help` says
+more about one command.";
+
 #[derive(Parser)]
 // `version` is not decoration: this ships as a tagged GitHub release
 // binary, so "is the thing on the server the thing I built?" is a
@@ -91,7 +106,8 @@ const TTL_HELP: &str = "How many days a block lasts. Defaults to this detector's
 #[command(
     name = "stop-bots",
     version,
-    about = "Configure your server to stop bad bots"
+    about = "Configure your server to stop bad bots, in NGINX or Apache and the firewall",
+    after_help = GETTING_STARTED
 )]
 struct Cli {
     // Global, so it works before or after the subcommand, and read from
@@ -141,7 +157,7 @@ enum Command {
     ApplyBlocks {
         #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
-        /// Skip reloading NGINX after writing config changes (e.g. for
+        /// Skip reloading the web server after writing config changes (e.g. for
         /// tests, or to review the written config before it goes live).
         /// Applying is a no-op without a reload, so real usage wants this
         /// left on.
@@ -173,11 +189,11 @@ enum Command {
     /// A trusted address (an IP or a CIDR range) becomes an allow rule
     /// ahead of every other firewall rule — a detector's block, a
     /// reputation feed, a country, the allow-list catch-all — clears every
-    /// NGINX block and rate limit, and is skipped by the detectors.
+    /// web server block and rate limit, and is skipped by the detectors.
     ///
-    /// A trusted user agent clears every NGINX block and rate limit for
-    /// any client whose user agent contains it, ignoring case. Only NGINX:
-    /// a client chooses its own user agent, so letting one past the log
+    /// A trusted user agent clears every web server block and rate limit
+    /// for any client whose user agent contains it, ignoring case. Only the
+    /// web server's: a client chooses its own user agent, so letting one past the log
     /// detectors too would let any scanner past them by copying it. Trust
     /// the address for that.
     ///
@@ -200,11 +216,11 @@ enum Command {
     },
     /// List the user agents this host's blocking policy is turning away.
     ///
-    /// Reads the NGINX access log and counts, per user agent, how many
+    /// Reads the web server's access log and counts, per user agent, how many
     /// requests came back with the configured block response and how many
     /// were served. A client with refusals and nothing served is being
     /// stopped at the door; one with plenty served and a few refused is
-    /// being told no by the application behind NGINX.
+    /// being told no by the application behind the web server.
     ///
     /// Bots appearing here is the policy working. What this is for is the
     /// other kind: a first-party app matching a pattern in a public bad-bot
@@ -365,7 +381,7 @@ enum Command {
     },
     /// Block addresses that asked for many nonexistent URLs.
     ///
-    /// Scans the NGINX access log for addresses that requested many
+    /// Scans the web server's access log for addresses that requested many
     /// distinct URLs answered 404 — the signature of a vulnerability
     /// scanner, not a person clicking a dead link — and stores a temporary
     /// block for each. Unlike `block-ssh-scanners`, a successful response
@@ -392,7 +408,7 @@ enum Command {
     },
     /// Block addresses faking a Googlebot, Bingbot or GPTBot user agent.
     ///
-    /// Scans the NGINX access log for addresses that claim, in their user
+    /// Scans the web server's access log for addresses that claim, in their user
     /// agent, to be Googlebot, Bingbot or GPTBot while connecting from an
     /// address that crawler's operator does not publish — the cheapest and
     /// most common bot disguise there is — and stores a temporary block for
@@ -422,7 +438,7 @@ enum Command {
     },
     /// Block addresses that asked for /.env, /.git/config and friends.
     ///
-    /// Scans the NGINX access log for addresses that requested a path
+    /// Scans the web server's access log for addresses that requested a path
     /// nothing legitimate asks for — `/.env`, `/.git/config`,
     /// `/wp-config.php`, `/vendor/phpunit/...` and similar — and stores a
     /// temporary block for each.
@@ -461,7 +477,7 @@ enum Command {
     ListProbePaths,
     /// Block anything that fetched the honeypot trap path.
     ///
-    /// Scans the NGINX access log for anything that fetched the honeypot
+    /// Scans the web server's access log for anything that fetched the honeypot
     /// trap path and stores a temporary block for each.
     ///
     /// The trap path is published as `Disallow:` in the robots.txt this
@@ -552,7 +568,7 @@ enum Command {
     },
     /// Tally which user agents are getting through successfully.
     ///
-    /// Reads the NGINX access log and adds up, per user agent, the requests
+    /// Reads the web server's access log and adds up, per user agent, the requests
     /// that were answered successfully (anything but 4xx and 5xx) — a view
     /// of who is actually visiting, next to the detectors' view of who is
     /// misbehaving. Additive across runs: re-reading an overlapping or
@@ -687,7 +703,7 @@ enum Command {
     /// default` removes the override again.
     ///
     /// Only changes what would be written: run `apply-blocks` to put it
-    /// into the NGINX config. While "humans only" is on, every category is
+    /// into the web server's config. While "humans only" is on, every category is
     /// blocked whatever is stored here.
     SetCategory {
         /// scanner, search or ai
@@ -713,7 +729,7 @@ enum Command {
     /// overrides the bot for that one site only.
     ///
     /// Find a bot's slug with `list-bots`. Run `apply-blocks` afterwards to
-    /// write the change into the NGINX config.
+    /// write the change into the web server's config.
     SetBot {
         /// The bot's slug, as `list-bots` shows it
         #[arg(long)]
@@ -801,8 +817,9 @@ enum Command {
     /// Turn generation of a robots.txt on or off.
     ///
     /// When on, `apply-blocks` writes one to /etc/stop-bots/nginx/robots.txt
-    /// and adds a `location = /robots.txt` block to each site that serves
-    /// it: one `User-agent:` line per currently-blocked bot under a shared
+    /// (/etc/stop-bots/apache/robots.txt on Apache) and has each site serve
+    /// it, with a `location = /robots.txt` block on NGINX or an `Alias` on
+    /// Apache: one `User-agent:` line per currently-blocked bot under a shared
     /// `Disallow: /`, plus a `Disallow:` for the honeypot trap path.
     ///
     /// Off by default, because it *replaces* whatever the site already
@@ -816,11 +833,11 @@ enum Command {
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
-    /// Turn automatic applying of NGINX config on or off.
+    /// Turn automatic applying of the web server's config on or off.
     ///
     /// When on, the internal cron (the one inside `stop-bots web` or the
     /// TUI, not this command) re-writes every site's generated block and
-    /// reloads NGINX once an hour, whenever they have fallen behind the
+    /// reloads the web server once an hour, whenever they have fallen behind the
     /// database. That happens constantly on a busy host: every user agent
     /// a detector blocks changes the generated block, which puts every
     /// site back to STALE within the minute.
@@ -828,18 +845,19 @@ enum Command {
     /// Off by default. It reloads a live web server with nobody watching,
     /// which is not something an upgrade should start doing on its own.
     ///
-    /// NGINX only. The firewall script has its own switch,
-    /// `set-auto-apply-firewall`.
+    /// The web server's config only. The firewall script has its own
+    /// switch, `set-auto-apply-firewall`.
     SetAutoApply {
-        /// Whether the internal cron applies NGINX config
+        /// Whether the internal cron applies the web server's config
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
     /// Turn automatic applying of the firewall script on or off.
     ///
     /// Separate from `set-auto-apply`, and separately off by default,
-    /// because the risks are not comparable: a bad NGINX config is caught
-    /// by `nginx -t` and costs a failed reload, while a bad firewall
+    /// because the risks are not comparable: a bad web server config is
+    /// caught by its config test (`nginx -t`, `apache2ctl configtest`) and
+    /// costs a failed reload, while a bad firewall
     /// ruleset locks you out of the host and no care taken here can undo
     /// that remotely.
     ///
@@ -903,8 +921,8 @@ enum Command {
     ///
     /// Binds 127.0.0.1:8787 by default, which is reachable only from this
     /// machine. That default is the safe one and staying on it is the
-    /// recommendation: the console can rewrite your firewall and your
-    /// NGINX config, so it is worth reaching over an SSH tunnel
+    /// recommendation: the console can rewrite your firewall and your web
+    /// server's config, so it is worth reaching over an SSH tunnel
     /// (`ssh -L 8787:127.0.0.1:8787 you@host`) rather than exposing.
     ///
     /// The flags here apply to this run only. To change how every later
@@ -923,12 +941,14 @@ enum Command {
         #[arg(long)]
         ssh_log: Option<PathBuf>,
         /// Where the console's "Write script" button and its internal cron
-        /// write the firewall script.
+        /// write the firewall script. Not with --helper, which writes it to
+        /// the fixed path for the host's firewall backend.
         ///
-        /// Set here rather than in the console because the console runs as
-        /// root and the script is executable: a destination taken from a
-        /// form field would let anyone who reaches the login page create a
-        /// root-owned file anywhere on the host.
+        /// Only a console that runs as root itself, without --helper, reads
+        /// this. Set here rather than in the console because the script is
+        /// executable and that console writes it as root: a destination
+        /// taken from a form field would let anyone who reaches the login
+        /// page create a root-owned file anywhere on the host.
         #[arg(long)]
         firewall_out: Option<PathBuf>,
         /// Address to bind for this run, as `address:port`. Defaults to the
@@ -966,7 +986,7 @@ enum Command {
         #[arg(long)]
         set_password: bool,
         /// Never touch the system: applying writes the database and the
-        /// config files but does not reload NGINX or run the firewall
+        /// config files but does not reload the web server or run the firewall
         /// script. The same escape hatch the TUI's --no-reload is.
         #[arg(long)]
         no_apply: bool,
@@ -986,9 +1006,10 @@ enum Command {
     /// reads these. Give no flags to print what is stored.
     ///
     /// A non-loopback --bind is refused unless exposure is on, given here
-    /// or stored: the console can rewrite this host's firewall and NGINX
-    /// config. The intended deployment for exposing it is behind the same
-    /// NGINX this tool is protecting, with TLS and the Host allowlist set:
+    /// or stored: the console can rewrite this host's firewall and web
+    /// server config. The intended deployment for exposing it is behind the
+    /// same NGINX or Apache this tool is protecting, with TLS and the Host
+    /// allowlist set:
     ///
     ///   stop-bots set-web --bind 0.0.0.0:8787 --expose true \
     ///     --allowed-hosts admin.example.com --secure-cookie true
@@ -999,8 +1020,8 @@ enum Command {
         /// Whether binding an address that is not loopback is permitted
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         expose: Option<bool>,
-        /// Serve under a path prefix, for an NGINX location block like
-        /// `https://example.com/stop-bots/`. `/` removes it.
+        /// Serve under a path prefix, for a proxy that mounts the console at
+        /// a path like `https://example.com/stop-bots/`. `/` removes it.
         ///
         /// The proxy must NOT strip the prefix — this server matches the
         /// full path including it, and generates links that do too:
@@ -1012,7 +1033,15 @@ enum Command {
         ///
         /// A `proxy_pass` *with* a trailing slash strips the prefix, and
         /// then every link this server generates points outside the
-        /// location block. A subdomain needs none of this and is the
+        /// location block. On Apache, keep the prefix in the target:
+        ///
+        ///   <Location "/stop-bots/">
+        ///       ProxyPass "http://127.0.0.1:8787/stop-bots/"
+        ///       ProxyPreserveHost On
+        ///   </Location>
+        ///
+        /// The Web Access panel, in the TUI or the console, writes either
+        /// for you. A subdomain needs none of this and is the
         /// simpler deployment if you can take it.
         #[arg(long)]
         base_path: Option<String>,
@@ -1038,10 +1067,11 @@ enum Command {
     },
     /// Remember where this host's logs actually are.
     ///
-    /// The companion to `set-nginx-commands`, for the other half of a
-    /// containerised NGINX. A container that bind-mounts its log directory
-    /// writes the access log somewhere that is not
-    /// /var/log/nginx/access.log on the host, and `--access-log` on a
+    /// The companion to `set-web-server` and `set-nginx-commands`, for the
+    /// other half of a containerised web server. A container that
+    /// bind-mounts its log directory writes the access log somewhere that
+    /// is not /var/log/nginx/access.log (or /var/log/apache2/access.log) on
+    /// the host, and `--access-log` on a
     /// single command cannot reach the two things that actually run the
     /// detectors: the web console and the TUI take no arguments for it, so
     /// their internal cron reads the default and finds nothing.
@@ -1050,7 +1080,7 @@ enum Command {
     /// empty string to clear one. Give neither flag to print what is
     /// stored.
     SetLogPaths {
-        /// The NGINX access log every web-side detector reads.
+        /// The web server's access log every web-side detector reads.
         #[arg(long)]
         access_log: Option<String>,
         /// The SSH authentication log, feeding the SSH scanner detector
@@ -1059,6 +1089,9 @@ enum Command {
         ssh_log: Option<String>,
     },
     /// Set the commands used to test and reload NGINX, and its config root.
+    ///
+    /// NGINX only. `set-web-server` takes the same flags for either
+    /// server, Apache included.
     ///
     /// Defaults are `nginx -t` and `systemctl reload nginx`, which is what
     /// a normal host install needs. Change them when NGINX is not a
@@ -1152,8 +1185,8 @@ enum Command {
     },
     /// One unattended pass over everything, for a real cron entry.
     ///
-    /// Refreshes every list, scans the logs, writes the NGINX blocking
-    /// rules and the firewall script — and, with --apply, puts both into
+    /// Refreshes every list, scans the logs, writes the web server's
+    /// blocking rules and the firewall script — and, with --apply, puts both into
     /// effect.
     ///
     /// Without --apply nothing is enforced: the config and the script are
@@ -1182,7 +1215,7 @@ enum Command {
     Batch {
         #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
-        /// Reload NGINX and run the generated firewall script, rather than
+        /// Reload the web server and run the generated firewall script, rather than
         /// only writing both
         #[arg(long)]
         apply: bool,
@@ -1220,13 +1253,13 @@ enum Command {
         /// also print the diffs --diff prints
         #[arg(long, short)]
         verbose: bool,
-        /// Print what the NGINX and firewall steps would change — the
+        /// Print what the web server and firewall steps would change — the
         /// files, the rules added and removed against the applied script,
         /// the lockout check's verdict — and change nothing: nothing is
         /// downloaded, scanned, written, applied or recorded. The one
         /// exception is the bot list built into this binary, which is
-        /// stored first, as every other command that renders NGINX config
-        /// does
+        /// stored first, as every other command that renders web server
+        /// config does
         #[arg(long)]
         dry_run: bool,
         /// With --dry-run, also print a unified diff of every file that
@@ -1254,8 +1287,9 @@ enum Command {
     /// them the same way, because the service it starts reads them from
     /// the database.
     Install {
-        /// What to install. `web` writes a systemd unit for the web
-        /// console and enables it.
+        /// What to install. `web` writes the web console's units and
+        /// enables them; `firewall` writes the unit that loads the applied
+        /// firewall script at boot.
         #[arg(value_enum)]
         target: InstallTarget,
         /// Print every step and change nothing.
@@ -1275,8 +1309,10 @@ enum Command {
         /// next `cargo clean`.
         #[arg(long)]
         binary: Option<PathBuf>,
-        /// NGINX config root the service will scan. Defaults to the one
-        /// stored by `set-nginx-commands --root`, else /etc/nginx.
+        /// NGINX config root the service will scan, stored as
+        /// `set-nginx-commands --root` would. Defaults to the one already
+        /// stored, else /etc/nginx. It only ever sets NGINX's: on an Apache
+        /// host, set the root with `set-web-server apache --root`.
         #[arg(long)]
         root: Option<PathBuf>,
         /// Pin the service to this SSH log instead of letting it find one.
@@ -1298,8 +1334,8 @@ enum Command {
         /// would, not written into the unit — the server re-reads it.
         #[arg(long)]
         bind: Option<String>,
-        /// Serve under a path prefix, for an NGINX `location` block. See
-        /// `set-web --base-path`.
+        /// Serve under a path prefix, for a proxy that mounts the console
+        /// at a path. See `set-web --base-path`.
         #[arg(long)]
         base_path: Option<String>,
         /// Permit the service to bind an address that is not loopback, and
@@ -1320,9 +1356,10 @@ enum Command {
     /// Remove stop-bots from this host and put it back as it was.
     ///
     /// Stops and removes every unit it installed, deletes the live nft table or
-    /// iptables chain, takes the injected blocks out of every NGINX site
-    /// (tested with `nginx -t`, put back if that fails, then reloaded),
-    /// and deletes the generated NGINX files and firewall scripts. Every
+    /// iptables chain, takes the injected blocks out of every site of the
+    /// web server the host settings choose (tested with `nginx -t` or
+    /// `apache2ctl configtest`, put back if that fails, then reloaded), and
+    /// deletes the generated web server files and firewall scripts. Every
     /// step is reported, a failed one does not stop the rest, and any
     /// failure makes the exit status non-zero.
     ///
@@ -1331,8 +1368,10 @@ enum Command {
     /// says where it is. Needs root, except with
     /// --prefix. Run it with --dry-run first.
     Uninstall {
-        /// What to remove: `nginx`, `firewall`, `web`, or `all` (the
-        /// default), which is all three plus /etc/stop-bots itself.
+        /// What to remove: `nginx` (also spelled `web-server`, and on an
+        /// Apache host it is Apache's blocks it removes), `firewall`, `web`,
+        /// or `all` (the default), which is all three plus /etc/stop-bots
+        /// itself.
         #[arg(value_enum, default_value = "all")]
         target: UninstallTarget,
         /// Print every step and change nothing.
@@ -1344,7 +1383,7 @@ enum Command {
         purge: bool,
         /// Remove from this prefix instead of `/`, as `install --prefix`
         /// wrote it. Nothing outside it is touched, and no systemctl, nft,
-        /// iptables or NGINX test or reload is run.
+        /// iptables or web server test or reload is run.
         #[arg(long)]
         prefix: Option<PathBuf>,
         #[arg(long, help = ROOT_HELP)]
@@ -1377,9 +1416,9 @@ enum Command {
     Tui {
         #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
-        /// Skip reloading NGINX after the NGINX screen applies blocking
+        /// Skip reloading the web server after its screen applies blocking
         /// rules (e.g. for tests driving the TUI end to end against a
-        /// throwaway fixture root, where there's no real NGINX to reload)
+        /// throwaway fixture root, where there's no real server to reload)
         #[arg(long)]
         no_reload: bool,
         /// Read this SSH log file instead of auto-detecting one — the same

@@ -7,10 +7,10 @@ list — which meant the open items below were unfindable inside it.
 ## Worth doing next
 
 * **`ua_matches_blocked_bot_patterns`** (`dynamic.rs`) does case-insensitive
-  *substring* matching over `|`-split alternatives, while NGINX enforces a real
-  `~*` regex. The `BLOCKLIST` tag can therefore disagree with what actually gets
-  blocked — and since the web UI arrived it says so on two screens rather than
-  one, because both front-ends now read this from `crate::dynamic`.
+  *substring* matching over `|`-split alternatives, while the web server enforces a
+  real case-insensitive regex (NGINX's `~*`, Apache's `RewriteCond ... [NC]`). The
+  `BLOCKLIST` tag can therefore disagree with what actually gets blocked — and since
+  the web UI arrived it says so on two screens rather than one, because both front-ends now read this from `crate::dynamic`.
 * **A changed path prefix needs a restart.** `BasePath` is read once when the
   router is built, so after Web Access mounts the console under `/stop-bots/`
   — from either front-end — the running console keeps generating links without

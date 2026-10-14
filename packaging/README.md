@@ -166,18 +166,34 @@ previous one. To do only this half:
 python3 packaging/gentoo/gen-ebuild.py 0.0.15
 ```
 
-Given a version, it reads `Cargo.lock` from that version's tag, not from the working
-tree: the ebuild builds the tag's source archive, so it must fetch the crates that tag
-locked. With no argument it uses the working tree, for trying an unreleased build in
-a local overlay.
+Given a version, it exports that version's tag and works from it, not from the
+working tree: the ebuild builds the tag's source archive, so it must fetch the crates
+that tag locked. With no argument it uses the working tree, for trying an unreleased
+build in a local overlay.
 
-**This is a personal-overlay ebuild, not a ::gentoo submission.** Two things stand
-between it and the main tree, and both are more work than writing the ebuild was:
+Three things in it are generated, not written:
 
-- **The `LICENSE` line is not generated.** Gentoo requires the licences of the whole
-  dependency tree listed, and `Cargo.lock` does not record licences. The line in the
-  template is a plausible set, not a computed one. Before submitting anywhere public,
-  install `app-portage/pycargoebuild` and take its `LICENSE` line as authoritative.
+- **`CRATES`**, every crate in `Cargo.lock`. That includes the ~60 reachable only
+  through `[dev-dependencies]` (resvg, gif and the test harness): cargo resolves
+  dev-dependencies even for `cargo build`, and with them missing from the vendored
+  directory cargo.eclass builds from, not even `cargo check --offline` starts.
+- **`LICENSE`**, from each compiled-in crate's SPDX `license` in `cargo metadata`,
+  mapped to Gentoo's names as `metadata/license-mapping.conf` maps them. The
+  dev-only crates are left out, since nothing of theirs is installed. An SPDX
+  identifier the script has no Gentoo name for stops it; add it to
+  `SPDX_TO_GENTOO` from that file.
+- **`RUST_MIN_VER`**, from `rust-version` in `Cargo.toml`.
+
+`cargo metadata` needs the crates.io index, so this reads from the network unless
+cargo already has it cached.
+
+**This is a personal-overlay ebuild, not a ::gentoo submission.** What stands
+between it and the main tree is more work than writing the ebuild was:
+
+- **A second opinion on `LICENSE`.** It is computed now, but by this script, not by
+  the tool ::gentoo reviewers expect. Before submitting, run
+  `app-portage/pycargoebuild` over the same tag and compare; where they differ,
+  find out why before trusting either.
 - **A proxy maintainer.** Getting into `::gentoo` means the
   [proxy-maint](https://wiki.gentoo.org/wiki/Project:Proxy_Maintainers) process — a pull
   request against the gentoo repository with a developer sponsoring it, plus `pkgcheck

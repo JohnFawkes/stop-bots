@@ -14,8 +14,9 @@ published, and both halves have to exist.
 - The `.SRCINFO` next to each PKGBUILD is regenerated, with
   `makepkg --printsrcinfo` when makepkg is installed and with
   aur/srcinfo.py, which writes the same thing without it, otherwise.
-- `gentoo/stop-bots-<version>.ebuild` is generated from the tag's Cargo.lock
-  by gen-ebuild.py, and the previous ebuild is removed.
+- `gentoo/stop-bots-<version>.ebuild` is generated from the tag by
+  gen-ebuild.py (CRATES from its Cargo.lock, LICENSE and RUST_MIN_VER from
+  `cargo metadata`), and the previous ebuild is removed.
 
 The checksums are read from what was published rather than computed from a
 fresh download: a digest taken from the file you are checking says only that
@@ -161,7 +162,7 @@ def load(name: str, path: pathlib.Path):
 
 def gentoo(version: str) -> None:
     gen = load("gen_ebuild", HERE / "gentoo" / "gen-ebuild.py")
-    written = gen.write_ebuild(version, gen.lock_at_tag(version))
+    written = gen.write_ebuild_at_tag(version)
     # One ebuild at a time: the overlay instructions copy the one that is here.
     for old in written.parent.glob(f"{CRATE}-*.ebuild"):
         if old != written:

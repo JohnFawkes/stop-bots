@@ -1105,9 +1105,15 @@ enum Command {
     ///
     /// Takes the chosen server's own commands and config root as
     /// `set-nginx-commands` does NGINX's, for a server that is not where a
-    /// stock install puts it:
+    /// stock install puts it. On RHEL and its relatives, whose Apache
+    /// reads conf.d and logs to /var/log/httpd:
     ///
-    ///   set-web-server apache --root /etc/httpd --test "apachectl -t"
+    ///   set-web-server apache --root /etc/httpd --test "apachectl configtest" --reload "systemctl reload httpd"
+    ///
+    ///   set-log-paths --access-log /var/log/httpd/access_log
+    ///
+    /// Refused while the web server chosen now still has stop-bots in its
+    /// config: take that out first with `uninstall web-server`.
     ///
     /// Pass no server to print what is in effect.
     SetWebServer {

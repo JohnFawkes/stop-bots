@@ -48,6 +48,9 @@ the database unread, so an NGINX host can still go back to 0.1.1.
   scanner or an AI crawler, or an agent blocked by hand, even one served before a list
   named it. What it reports is what it was written for, a client caught by an
   uncategorised pattern, as the Nextcloud and Jellyfin apps were by `okhttp`.
+- Nor does it count refusals from an address that probed for a path like `/.env` or sent
+  an exploit payload, whatever user agent it wore. Scanners dress as browsers: one
+  Chrome string, worn by 33 addresses asking for `/.env`, read as a lost visitor.
 
 ### Removed
 

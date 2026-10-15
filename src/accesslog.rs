@@ -1188,7 +1188,17 @@ pub struct Survey {
     pub cdn: usize,
     /// The first line that did not parse, as it is safe to show.
     pub unparsed_sample: Option<String>,
-    turned_away: HashMap<String, (u64, u64)>,
+    /// Per agent, per address: `(refused, served)`. Kept by address until
+    /// the end, because an address is only known to be an attacker from
+    /// its first probe on, and its refusals before that do not count either.
+    turned_away: HashMap<String, HashMap<IpAddr, (u64, u64)>>,
+    /// Addresses that asked for a probe path or sent an exploit payload
+    /// (the same tests as [`probe_path_ips`] and [`injection_ips`], with
+    /// the built-in paths). Whatever agent they claim to be, what they
+    /// were refused was not a client being turned away: a scanner's
+    /// favourite disguise is a browser's user agent, and one Chrome string
+    /// worn by 33 addresses asking for `/.env` read as a lost visitor.
+    attackers: HashSet<IpAddr>,
     block_status: u16,
     /// The crawlers whose published ranges say who is really them: a
     /// request claiming one from elsewhere is an impersonator, and its
@@ -1239,7 +1249,15 @@ impl Survey {
         if impersonates(&line, &self.claims).is_some() {
             return;
         }
-        let entry = self.turned_away.entry(line.user_agent).or_insert((0, 0));
+        if !self.attackers.contains(&line.ip) && attacks(&line) {
+            self.attackers.insert(line.ip);
+        }
+        let entry = self
+            .turned_away
+            .entry(line.user_agent)
+            .or_default()
+            .entry(line.ip)
+            .or_insert((0, 0));
         if line.status == self.block_status {
             entry.0 += 1;
         } else if line.status < 400 {
@@ -1252,10 +1270,29 @@ impl Survey {
         sorted_turned_away(
             self.turned_away
                 .iter()
-                .map(|(ua, counts)| (ua.clone(), *counts))
+                .map(|(ua, by_address)| {
+                    let counts = by_address
+                        .iter()
+                        .filter(|(ip, _)| !self.attackers.contains(ip))
+                        .fold((0, 0), |(refused, served), (_, (r, s))| {
+                            (refused + r, served + s)
+                        });
+                    (ua.clone(), counts)
+                })
                 .collect(),
         )
     }
+}
+
+/// Whether `line` asks for one of [`DEFAULT_PROBE_PATHS`] or carries an
+/// exploit payload: one such request is conclusive about its address.
+fn attacks(line: &ParsedLine) -> bool {
+    let path = line.path.to_lowercase();
+    DEFAULT_PROBE_PATHS
+        .iter()
+        .any(|needle| path.contains(&needle.to_lowercase()))
+        || crate::injection::signature(&line.request, &line.user_agent, line.referer.as_deref())
+            .is_some()
 }
 
 /// The longest sample line a report quotes, in characters.
@@ -1366,6 +1403,33 @@ mod tests {
         let counted = tally(&real);
         assert_eq!(counted.len(), 1, "the real Googlebot went uncounted");
         assert_eq!(counted[0].refused, 1);
+    }
+
+    /// A browser's agent worn by an address that also asked for `/.env` is
+    /// a scanner's disguise: its refusals, before the probe as well as
+    /// after, are not a client turned away. The same agent from an address
+    /// that never probed still counts.
+    #[test]
+    fn refusals_from_an_address_that_probed_are_not_a_client_turned_away() {
+        let chrome = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+        let log = [
+            line_with("203.0.113.9", 418, chrome),
+            probe_from("203.0.113.9", "/.env", chrome),
+            line_with("198.51.100.7", 418, chrome),
+        ]
+        .concat();
+
+        let counted = turned_away_user_agents(&log, 418);
+
+        assert_eq!(
+            counted,
+            vec![TurnedAway {
+                user_agent: chrome.to_string(),
+                refused: 1,
+                served: 0,
+            }],
+            "only the address that never probed should count"
+        );
     }
 
     /// An agent that was never refused has nothing to report, however much
@@ -1696,6 +1760,13 @@ mod tests {
     fn line_with(ip: &str, status: u16, user_agent: &str) -> String {
         format!(
             "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET / HTTP/1.1\" {status} 512 \"-\" \"{user_agent}\"\n"
+        )
+    }
+
+    /// A refused request for `path`.
+    fn probe_from(ip: &str, path: &str, user_agent: &str) -> String {
+        format!(
+            "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/1.1\" 418 0 \"-\" \"{user_agent}\"\n"
         )
     }
 

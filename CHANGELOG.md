@@ -8,6 +8,14 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-10-15
+
+A fix worth taking if a host renews a Let's Encrypt certificate over HTTP and has the
+AWS feed on: its renewals have been failing, and its certificates will expire. After
+upgrading, re-render the firewall (`sudo stop-bots render-firewall --apply`, or wait
+for the cron) and run `sudo certbot renew`. `sudo stop-bots status` now says whether
+Let's Encrypt can reach port 80.
+
 ### Added
 
 - **Only trusted IPs, a geo mode in the TUI.** The Dashboard's geo mode popup (`m`) has
@@ -2277,7 +2285,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/ivankovic/stop-bots/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ivankovic/stop-bots/compare/v0.1.1...v0.2.0
 [0.2.0-rc.2]: https://github.com/ivankovic/stop-bots/compare/v0.2.0-rc.1...v0.2.0-rc.2
 [0.2.0-rc.1]: https://github.com/ivankovic/stop-bots/compare/v0.1.1...v0.2.0-rc.1

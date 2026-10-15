@@ -1797,9 +1797,9 @@ const LETS_ENCRYPT_VALIDATORS: [&str; 13] = [
 /// Whether Let's Encrypt can still reach port 80, on a host whose
 /// certificates renew there.
 ///
-/// Found the slow way: with the AWS feed on, a host's every renewal failed
-/// for a month, the first validator getting its challenge and the AWS ones
-/// timing out, and the only sign was certbot's own failed unit. The feeds
+/// Found by chance: with the AWS feed on, a host's every renewal failed,
+/// the first validator getting its challenge and the AWS ones timing out,
+/// and the only sign was certbot's own failed unit. The feeds
 /// now leave port 80 open, but Allowlist geo mode, an abuse list or a rule
 /// added by hand can still close it — and the price is every site on the
 /// host going down the day its certificate expires.

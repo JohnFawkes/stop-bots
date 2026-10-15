@@ -3399,9 +3399,16 @@ fn uninstall_takes_a_prefix_back_to_how_it_was() {
 fn install_cron_refuses_a_binary_in_a_build_directory() {
     let tmp = tempfile::tempdir().unwrap();
     fs::create_dir_all(tmp.path().join("etc/cron.d")).unwrap();
+    // Named outright: where the test's own binary was built depends on the
+    // runner (`cargo llvm-cov` builds under `target/llvm-cov-target/`).
+    let built = tmp.path().join("target/debug/stop-bots");
+    fs::create_dir_all(built.parent().unwrap()).unwrap();
+    fs::write(&built, "#!/bin/true\n").unwrap();
     stop_bots_bin()
         .args(["install", "cron", "--dry-run", "--prefix"])
         .arg(tmp.path())
+        .arg("--binary")
+        .arg(&built)
         .assert()
         .failure()
         .stderr(predicate::str::contains("build directory"));

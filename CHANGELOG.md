@@ -6,7 +6,37 @@ While the version is `0.0.x` any release may break those; from `0.1.0` a patch r
 breaks none of them. The Rust library in `src/lib.rs` is not a supported API and is not
 covered: it can change in any release. `RELEASING.md` says what counts as breaking.
 
-## [Unreleased]
+## [0.2.0] — 2026-10-15
+
+Apache, beside NGINX, and no web console. What changed since 0.1.1 is in this section
+and under the two release candidates below. In short:
+
+- **Apache, beside NGINX:** `sudo stop-bots set-web-server apache` makes this an Apache
+  host, with Debian's paths and commands by default and RHEL's when `--root /etc/httpd`
+  names RHEL's tree. NGINX is still the default, and an NGINX host has nothing to do.
+- **No web console:** stop-bots is a TUI and a CLI, and nothing of it listens on a
+  network. `sudo stop-bots install cron` runs the detectors on a schedule instead.
+- **More of what scanners send is refused:** 88 more bots in the stop-bots enhanced
+  list, and a list of old browsers' user agents, off by default, for the scanners that
+  wear them.
+- **Fewer false alarms from `status`:** its "Clients this host used to serve" check no
+  longer counts forged crawlers, bots refused on purpose, or scanners wearing a
+  browser's user agent.
+
+**Upgrading from 0.1.x.** Install the new binary or package. If you had the console
+installed, remove it as described below, before anything else. Then run
+`sudo stop-bots install cron`, and apply: every site reads as not applied until the next
+apply writes the new bot names in.
+
+**Going back to 0.1.x.** An NGINX host can. An Apache host cannot by installing the older
+package: 0.1.1 refuses a `/etc/stop-bots/host.conf` that names a web server, and where it
+falls back to its defaults it takes the host for NGINX and never finds, updates or
+removes the blocks this release wrote into Apache's sites. To go back, first run
+`sudo stop-bots uninstall web-server` with this release, then delete the `web_server` and
+`apache_*` lines from `host.conf`, then install 0.1.1. An NGINX host that was set to
+Apache at some point may still carry `apache_*` lines, which 0.1.1 refuses; delete them
+first. The same holds if 0.2.0 is ever withdrawn: removing it from the APT repository
+does not take an Apache host back.
 
 **The web console is gone.** stop-bots is a TUI and a CLI now, and nothing of it listens
 on a network. The console was a control panel for the host's firewall and web server
@@ -77,10 +107,10 @@ the database unread, so an NGINX host can still go back to 0.1.1.
   J2ME, Symbian, BlackBerry OS). Scanners rotate through these to pass for people; on
   one host a single scanner asked for `/.env`, `.git` and credentials files 1,150 times
   from 637 addresses, never twice with the same one, and no bot list can carry them
-  because none is a bot's name. It is a row of the Policy panel in the TUI and the
-  console, and `list-categories` shows it. **Off by default**, on new hosts as well as
-  upgraded ones, because a few of these strings are still a person somewhere (Opera Mini
-  sends `Opera/9.80`); and humans only does not turn it on. Old iOS, Windows XP and
+  because none is a bot's name. It is a row of the Policy panel in the TUI, and
+  `list-categories` shows it. **Off by default**, on new hosts as well as upgraded ones,
+  because a few of these strings are still a person somewhere (Opera Mini sends
+  `Opera/9.80`); and humans only does not turn it on. Old iOS, Windows XP and
   Android 4 are left out on purpose: Bing's and Yandex's mobile crawlers send old iOS,
   and Gmail's image proxy sends XP. It is a setting rather than a schema change, so a
   host can still go back to 0.1.1.
@@ -2193,7 +2223,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.2.0-rc.2...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ivankovic/stop-bots/compare/v0.1.1...v0.2.0
 [0.2.0-rc.2]: https://github.com/ivankovic/stop-bots/compare/v0.2.0-rc.1...v0.2.0-rc.2
 [0.2.0-rc.1]: https://github.com/ivankovic/stop-bots/compare/v0.1.1...v0.2.0-rc.1
 [0.1.1]: https://github.com/ivankovic/stop-bots/compare/v0.1.0...v0.1.1

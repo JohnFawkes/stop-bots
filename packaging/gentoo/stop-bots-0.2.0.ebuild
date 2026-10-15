@@ -21,7 +21,6 @@ CRATES="
 	anstyle@1.0.14
 	anyhow@1.0.104
 	approx@0.5.1
-	argon2@0.6.0
 	arrayref@0.3.9
 	arrayvec@0.7.8
 	assert_cmd@2.2.2
@@ -30,16 +29,12 @@ CRATES="
 	autocfg@1.5.1
 	aws-lc-rs@1.18.1
 	aws-lc-sys@0.45.0
-	axum-core@0.5.6
-	axum@0.8.9
 	base64@0.22.1
 	base64@0.23.1
-	base64ct@1.8.3
 	bit-set@0.5.3
 	bit-vec@0.6.3
 	bitflags@1.3.2
 	bitflags@2.13.2
-	blake2@0.11.0
 	block-buffer@0.10.4
 	block-buffer@0.12.1
 	bstr@1.13.1
@@ -61,7 +56,6 @@ CRATES="
 	clap_lex@1.1.1
 	clap_mangen@0.3.3
 	cmake@0.1.58
-	cmov@0.5.4
 	color_quant@1.1.0
 	colorchoice@1.0.5
 	combine@4.6.8
@@ -81,7 +75,6 @@ CRATES="
 	crypto-common@0.1.7
 	crypto-common@0.2.2
 	csscolorparser@0.6.2
-	ctutils@0.4.2
 	darling@0.24.1
 	darling_core@0.24.1
 	darling_macro@0.24.1
@@ -145,10 +138,9 @@ CRATES="
 	http-body@1.1.0
 	http@1.5.0
 	httparse@1.10.1
-	httpdate@1.0.3
 	hybrid-array@0.4.15
 	hyper-rustls@0.27.9
-	hyper-util@0.1.20
+	hyper-util@0.1.21
 	hyper@1.11.1
 	icu_collections@2.3.0
 	icu_locale_core@2.3.0
@@ -191,9 +183,6 @@ CRATES="
 	lru-slab@0.1.3
 	lru@0.18.4
 	mac_address@1.1.8
-	matchit@0.8.4
-	maud@0.27.0
-	maud_macros@0.27.0
 	memchr@2.8.3
 	memmap2@0.9.11
 	memmem@0.1.1
@@ -222,13 +211,11 @@ CRATES="
 	palette_math@0.7.7
 	parking_lot@0.12.5
 	parking_lot_core@0.9.12
-	password-hash@0.6.1
 	percent-encoding@2.3.2
 	pest@2.9.1
 	pest_derive@2.9.1
 	pest_generator@2.9.1
 	pest_meta@2.9.1
-	phc@0.6.1
 	phf@0.11.3
 	phf_codegen@0.11.3
 	phf_generator@0.11.3
@@ -245,7 +232,6 @@ CRATES="
 	predicates-core@1.0.10
 	predicates-tree@1.0.13
 	predicates@3.1.4
-	proc-macro2-diagnostics@0.10.1
 	proc-macro2@1.0.107
 	quick-error@2.0.1
 	quinn-proto@0.11.18
@@ -288,7 +274,7 @@ CRATES="
 	rustls-platform-verifier-android@0.1.1
 	rustls-platform-verifier@0.7.0
 	rustls-webpki@0.103.15
-	rustls@0.23.45
+	rustls@0.23.46
 	rustversion@1.0.23
 	ryu@1.0.23
 	same-file@1.0.6
@@ -301,8 +287,6 @@ CRATES="
 	serde_core@1.0.229
 	serde_derive@1.0.229
 	serde_json@1.0.151
-	serde_path_to_error@0.1.20
-	serde_urlencoded@0.7.1
 	sha2@0.10.9
 	sha2@0.11.0
 	shlex@2.0.1
@@ -442,7 +426,7 @@ RUST_MIN_VER="1.88.0"
 
 inherit cargo
 
-DESCRIPTION="TUI, web console and CLI to stop bad bots in NGINX or Apache and the firewall"
+DESCRIPTION="TUI and CLI to stop bad bots in NGINX or Apache and the firewall"
 HOMEPAGE="https://github.com/ivankovic/stop-bots"
 SRC_URI="
 	https://github.com/ivankovic/stop-bots/archive/v${PV}.tar.gz -> ${P}.tar.gz
@@ -454,7 +438,7 @@ SRC_URI="
 # does, with an any-of group dropped where one of its licences is already
 # required. The dev-only crates are not counted; nothing of theirs is
 # installed.
-LICENSE="AGPL-3+"
+LICENSE="AGPL-3"
 # Dependent crate licenses
 LICENSE+="
 	Apache-2.0 BSD CDLA-Permissive-2.0 ISC MIT Unicode-3.0 Unicode-DFS-2016

@@ -78,7 +78,8 @@
 //! row — no dedicated focus key, since these are just two vertically
 //! stacked lists, not a list-plus-search-box pair like Bot settings'
 //! `Focus`) shows every host-wide selected country (`Db::list_selected_countries`)
-//! plus a fixed "+ Add a country" action row at the top. What being
+//! plus a fixed action row at the top, "Enter to add a country, m to change
+//! mode", which is also where the mode key is announced. What being
 //! "selected" *means* depends on the geo mode, shown in the panel's title
 //! and toggled with `m` (a popup, unlike the direct actions below, since
 //! switching to Allowlist is meaningfully higher-stakes — see
@@ -550,14 +551,15 @@ impl Dashboard {
     }
 
     fn render_geo(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
-        let items: Vec<ListItem> =
-            std::iter::once(ListItem::new(Line::from("+ Add a country").italic()))
-                .chain(
-                    self.selected_countries
-                        .iter()
-                        .map(|cc| ListItem::new(self.country_row_line(cc))),
-                )
-                .collect();
+        let items: Vec<ListItem> = std::iter::once(ListItem::new(
+            Line::from("Enter to add a country, m to change mode").italic(),
+        ))
+        .chain(
+            self.selected_countries
+                .iter()
+                .map(|cc| ListItem::new(self.country_row_line(cc))),
+        )
+        .collect();
         // The *mode* is in the title and nothing else is: Allowlist turns
         // the host into default-deny, so it must never be what a narrow
         // panel truncates away.
@@ -1222,7 +1224,7 @@ impl Dashboard {
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     // The Countries list has one row per selected country
-                    // plus the fixed "+ Add a country" row at index 0, so
+                    // plus the fixed "add a country" row at index 0, so
                     // its last index is `len()`, not `len() - 1`.
                     if self.countries_state.selected() == Some(self.selected_countries.len()) {
                         self.focus = Focus::Crawlers;
@@ -2856,7 +2858,10 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("Geo"), "content was:\n{content}");
         assert!(content.contains("blocklist"), "content was:\n{content}");
-        assert!(content.contains("Add a country"), "content was:\n{content}");
+        assert!(
+            content.contains("Enter to add a country, m to change mode"),
+            "content was:\n{content}"
+        );
         assert!(content.contains("NL"), "content was:\n{content}");
         assert!(content.contains("1 range(s)"), "content was:\n{content}");
     }

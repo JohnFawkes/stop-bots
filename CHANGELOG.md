@@ -18,6 +18,8 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   again. The Geo panel's title says `only trusted IPs` with how many are trusted, and
   choosing it with nothing trusted says so first. On the command line it is still
   `set-geo-mode --mode allowlist` with no country selected.
+- The Geo panel's first row says how to change its mode: `Enter to add a country, m to
+  change mode`, in place of `+ Add a country`.
 
 ### Fixed
 

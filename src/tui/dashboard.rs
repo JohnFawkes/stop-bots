@@ -89,6 +89,11 @@
 //! - **Allowlist**: selected countries are the *only* ones allowed,
 //!   everything else is blocked host-wide once `render-firewall` runs (see
 //!   `Db::geo_firewall_rules` and its nftables-only guard in `main.rs`).
+//! - **Only trusted IPs**: Allowlist with no country selected, offered as a
+//!   mode of its own so that it can be seen and chosen. With no country to
+//!   allow, what gets through is what the firewall lets past every rule:
+//!   trusted addresses, recent SSH logins and private networks. Choosing it
+//!   deselects every country; adding one turns it back into Allowlist.
 //!
 //! Enter on the "Add" row opens a text-input popup for a two-letter code;
 //! Enter on an existing country row removes it directly (no confirmation
@@ -218,7 +223,7 @@ enum Popup {
         input: String,
         error: Option<String>,
     },
-    /// Cycles between Blocklist (0) and Allowlist (1) — a popup, not a
+    /// Blocklist (0), Allowlist (1) or Only trusted IPs (2) — a popup, not a
     /// direct toggle like removing a country, because flipping to
     /// Allowlist is a materially bigger decision: it turns host-wide geo
     /// enforcement into a default-deny gate for the whole box once
@@ -248,6 +253,12 @@ enum Popup {
     },
 }
 
+/// The geo mode popup's options, in order. The last is Allowlist with no
+/// country selected, which is how the database stores it.
+const GEO_BLOCKLIST: usize = 0;
+const GEO_ALLOWLIST: usize = 1;
+const GEO_TRUSTED_ONLY: usize = 2;
+
 #[derive(Debug, Default)]
 pub struct Dashboard {
     /// Which firewall backends this host has, as `App` found at start-up;
@@ -261,6 +272,9 @@ pub struct Dashboard {
     list_state: ListState,
     popup: Option<Popup>,
     geo_mode: GeoMode,
+    /// How many addresses are trusted by hand: in Only trusted IPs, what
+    /// the host still lets in from the internet besides recent SSH logins.
+    trusted_addresses: usize,
     selected_countries: Vec<String>,
     fetched_countries: Vec<(String, i64, i64)>,
     countries_state: ListState,
@@ -326,6 +340,7 @@ impl Dashboard {
         self.search_default = db.get_category_default(Category::Search)?;
         self.ai_default = db.get_category_default(Category::Ai)?;
         self.geo_mode = db.get_geo_mode()?;
+        self.trusted_addresses = db.list_trusted_addresses()?.len();
         self.selected_countries = db.list_selected_countries()?;
         self.fetched_countries = db.list_fetched_countries()?;
         self.detectors = Detector::ALL
@@ -546,9 +561,10 @@ impl Dashboard {
         // The *mode* is in the title and nothing else is: Allowlist turns
         // the host into default-deny, so it must never be what a narrow
         // panel truncates away.
-        let mode_label = match self.geo_mode {
-            GeoMode::Blocklist => "blocklist",
-            GeoMode::Allowlist => "allowlist",
+        let mode_label = match self.geo_choice() {
+            GEO_BLOCKLIST => "blocklist".to_string(),
+            GEO_ALLOWLIST => "allowlist".to_string(),
+            _ => format!("only trusted IPs ({})", self.trusted_addresses),
         };
         let focused = self.focus == Focus::Countries;
         let list = crate::tui::select_in(
@@ -997,6 +1013,7 @@ impl Dashboard {
                 &[
                     "Blocklist (block selected countries)".to_string(),
                     "Allowlist (block everything except selected)".to_string(),
+                    "Only trusted IPs (block everything else)".to_string(),
                 ],
                 selected,
                 theme,
@@ -1106,10 +1123,7 @@ impl Dashboard {
 
         if key.code == KeyCode::Char('m') {
             self.popup = Some(Popup::GeoMode {
-                selected: match self.geo_mode {
-                    GeoMode::Blocklist => 0,
-                    GeoMode::Allowlist => 1,
-                },
+                selected: self.geo_choice(),
             });
             return Ok(KeyOutcome::Consumed);
         }
@@ -1579,7 +1593,17 @@ impl Dashboard {
         }
     }
 
-    /// Blocklist (0) or Allowlist (1).
+    /// Which of the geo mode popup's options the host is in: Allowlist
+    /// with no country is Only trusted IPs.
+    fn geo_choice(&self) -> usize {
+        match self.geo_mode {
+            GeoMode::Blocklist => GEO_BLOCKLIST,
+            GeoMode::Allowlist if self.selected_countries.is_empty() => GEO_TRUSTED_ONLY,
+            GeoMode::Allowlist => GEO_ALLOWLIST,
+        }
+    }
+
+    /// Blocklist, Allowlist or Only trusted IPs; see [`Popup::GeoMode`].
     fn handle_geo_mode_popup_key(
         &mut self,
         key: KeyEvent,
@@ -1599,25 +1623,30 @@ impl Dashboard {
                 Ok(KeyOutcome::Consumed)
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                *selected = (*selected + 1).min(1);
+                *selected = (*selected + 1).min(GEO_TRUSTED_ONLY);
                 Ok(KeyOutcome::Consumed)
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 let Some(Popup::GeoMode { selected }) = self.popup.take() else {
                     unreachable!("checked above")
                 };
-                let mode = match selected {
-                    0 => GeoMode::Blocklist,
-                    _ => GeoMode::Allowlist,
-                };
-                db.set_geo_mode(mode)?;
-                *message = Some(match mode {
-                    GeoMode::Blocklist => {
-                        "Geo mode set to Blocklist: selected countries are blocked, everything else is allowed".to_string()
-                    }
-                    GeoMode::Allowlist => {
-                        "Geo mode set to Allowlist: selected countries are the ONLY ones allowed, everything else will be blocked host-wide once render-firewall runs".to_string()
-                    }
+                if selected == GEO_BLOCKLIST {
+                    db.set_geo_mode(GeoMode::Blocklist)?;
+                    *message = Some("Geo mode set to Blocklist: selected countries are blocked, everything else is allowed".to_string());
+                    return Ok(KeyOutcome::Mutated);
+                }
+                db.set_geo_mode(GeoMode::Allowlist)?;
+                if selected == GEO_ALLOWLIST {
+                    *message = Some("Geo mode set to Allowlist: selected countries are the ONLY ones allowed, everything else will be blocked host-wide once render-firewall runs".to_string());
+                    return Ok(KeyOutcome::Mutated);
+                }
+                for country in &self.selected_countries {
+                    db.set_country_selected(country, false)?;
+                }
+                // The warning first: the Log panel cuts a long line short.
+                *message = Some(match self.trusted_addresses {
+                    0 => "Only trusted IPs, and nothing is trusted yet: trust your addresses on the Firewall screen before render-firewall runs, or only SSH logins from the last week and private networks get in".to_string(),
+                    n => format!("Geo mode set to Only trusted IPs: once render-firewall runs, everything is blocked host-wide except {n} trusted address(es), SSH logins from the last week and private networks"),
                 });
                 Ok(KeyOutcome::Mutated)
             }
@@ -2965,6 +2994,64 @@ mod tests {
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
         assert!(message.unwrap().contains("Allowed NL"));
+    }
+
+    /// Only trusted IPs is Allowlist with no country: choosing it
+    /// deselects every country, and the panel and the popup both name it.
+    #[test]
+    fn only_trusted_ips_is_an_allowlist_with_no_country() {
+        let db = Db::open_in_memory().unwrap();
+        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        db.set_country_selected("nl", true).unwrap();
+        db.trust_address("198.51.100.7").unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.popup = Some(Popup::GeoMode {
+            selected: GEO_TRUSTED_ONLY,
+        });
+
+        let mut message = None;
+        let outcome = dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        dashboard.refresh(&db).unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert_eq!(db.get_geo_mode().unwrap(), GeoMode::Allowlist);
+        assert!(
+            db.list_selected_countries().unwrap().is_empty(),
+            "NL is still selected"
+        );
+        let message = message.unwrap_or_default();
+        assert!(
+            message.contains("Only trusted IPs") && message.contains("1 trusted address"),
+            "message was: {message}"
+        );
+        assert_eq!(dashboard.geo_choice(), GEO_TRUSTED_ONLY);
+    }
+
+    /// With nothing trusted, the message says so before the firewall is
+    /// rendered, rather than leaving the lockout guard to find out.
+    #[test]
+    fn only_trusted_ips_with_nothing_trusted_says_so() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.popup = Some(Popup::GeoMode {
+            selected: GEO_TRUSTED_ONLY,
+        });
+
+        let mut message = None;
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        let message = message.unwrap_or_default();
+        assert!(
+            message.contains("nothing is trusted yet"),
+            "message was: {message}"
+        );
     }
 
     #[test]

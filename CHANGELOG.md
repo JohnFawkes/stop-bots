@@ -6,6 +6,19 @@ While the version is `0.0.x` any release may break those; from `0.1.0` a patch r
 breaks none of them. The Rust library in `src/lib.rs` is not a supported API and is not
 covered: it can change in any release. `RELEASING.md` says what counts as breaking.
 
+## [Unreleased]
+
+### Added
+
+- **Only trusted IPs, a geo mode in the TUI.** The Dashboard's geo mode popup (`m`) has
+  a third option beside Blocklist and Allowlist: block everything host-wide except the
+  addresses trusted on the Firewall screen, SSH logins from the last week and private
+  networks. It is Allowlist with no country selected, which is what it was before it had
+  a name, so choosing it deselects every country, and adding one makes it Allowlist
+  again. The Geo panel's title says `only trusted IPs` with how many are trusted, and
+  choosing it with nothing trusted says so first. On the command line it is still
+  `set-geo-mode --mode allowlist` with no country selected.
+
 ## [0.2.0] — 2026-10-15
 
 Apache, beside NGINX, and no web console. What changed since 0.1.1 is in this section

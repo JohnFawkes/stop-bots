@@ -48,7 +48,7 @@ const LINES: [&str; MAX_LINES] = [
     "  Enter              open, change or download the selected item;  Space toggles an on/off row",
     "",
     "Dashboard",
-    "  m / F              switch geo mode (Blocklist / Allowlist) / write the firewall script",
+    "  m / F              geo mode: Blocklist, Allowlist, Only trusted IPs / write the firewall script",
     "  u / a              download every list / apply both planes (NGINX, then the firewall)",
     "  w                  put this console behind NGINX (a subdomain, or a path on a site)",
     "",

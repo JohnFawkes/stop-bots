@@ -50,7 +50,7 @@ const LINES: [&str; MAX_LINES] = [
     "Dashboard",
     "  m / F              geo mode: Blocklist, Allowlist, Only trusted IPs / write the firewall script",
     "  u / a              download every list / apply both planes (NGINX, then the firewall)",
-    "  w                  put this console behind NGINX (a subdomain, or a path on a site)",
+    "  Delete / Backspace remove the selected country from the Geo list",
     "",
     "Bot settings         /  searches the bots; type to filter, Enter opens, Esc leaves the box",
     "Blocks               every rule and why: f source, / address, Enter unblock, U all from source",
@@ -117,7 +117,7 @@ mod tests {
             );
             // Every mention is the server the host runs, as its tab is.
             assert!(
-                content.contains(&format!("put this console behind {}", server.label())),
+                content.contains(&format!("apply both planes ({}, then", server.label())),
                 "{server:?}'s help was:\n{content}"
             );
         }
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn the_key_column_parses_as_the_keys_it_lists() {
         let dashboard = keys_in("Dashboard", false);
-        for key in ["m", "F", "u", "a", "w", "q", "Esc", "?"] {
+        for key in ["m", "F", "u", "a", "Delete", "Backspace", "q", "Esc", "?"] {
             assert!(dashboard.contains(&key.to_string()), "{key}: {dashboard:?}");
         }
         assert!(!dashboard.contains(&"f".to_string()), "{dashboard:?}");

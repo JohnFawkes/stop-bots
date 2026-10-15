@@ -78,7 +78,8 @@
 //! row — no dedicated focus key, since these are just two vertically
 //! stacked lists, not a list-plus-search-box pair like Bot settings'
 //! `Focus`) shows every host-wide selected country (`Db::list_selected_countries`)
-//! plus a fixed "+ Add a country" action row at the top. What being
+//! plus a fixed action row at the top, "Enter to add a country, m to change
+//! mode", which is also where the mode key is announced. What being
 //! "selected" *means* depends on the geo mode, shown in the panel's title
 //! and toggled with `m` (a popup, unlike the direct actions below, since
 //! switching to Allowlist is meaningfully higher-stakes — see
@@ -96,7 +97,9 @@
 //!   deselects every country; adding one turns it back into Allowlist.
 //!
 //! Enter on the "Add" row opens a text-input popup for a two-letter code;
-//! Enter on an existing country row removes it directly (no confirmation
+//! Delete or Backspace on an existing country row removes it directly, and
+//! Enter there only says so: Enter adds on the row above, and a key that
+//! adds on one row should not delete on the next (no confirmation
 //! popup — unlike a category default, removing a country isn't "choose one
 //! of several options", it's a single reversible action, the same
 //! reasoning the NGINX screen's apply/apply-all actions already use).
@@ -458,7 +461,8 @@ impl Dashboard {
                 "Geo",
                 vec![
                     ("\u{2191}\u{2193}", "move"),
-                    ("Enter", "add/remove"),
+                    ("Enter", "add"),
+                    ("Del", "remove"),
                     ("m", "mode"),
                 ],
             ),
@@ -550,14 +554,15 @@ impl Dashboard {
     }
 
     fn render_geo(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
-        let items: Vec<ListItem> =
-            std::iter::once(ListItem::new(Line::from("+ Add a country").italic()))
-                .chain(
-                    self.selected_countries
-                        .iter()
-                        .map(|cc| ListItem::new(self.country_row_line(cc))),
-                )
-                .collect();
+        let items: Vec<ListItem> = std::iter::once(ListItem::new(
+            Line::from("Enter to add a country, m to change mode").italic(),
+        ))
+        .chain(
+            self.selected_countries
+                .iter()
+                .map(|cc| ListItem::new(self.country_row_line(cc))),
+        )
+        .collect();
         // The *mode* is in the title and nothing else is: Allowlist turns
         // the host into default-deny, so it must never be what a narrow
         // panel truncates away.
@@ -1222,7 +1227,7 @@ impl Dashboard {
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     // The Countries list has one row per selected country
-                    // plus the fixed "+ Add a country" row at index 0, so
+                    // plus the fixed "add a country" row at index 0, so
                     // its last index is `len()`, not `len() - 1`.
                     if self.countries_state.selected() == Some(self.selected_countries.len()) {
                         self.focus = Focus::Crawlers;
@@ -1232,7 +1237,10 @@ impl Dashboard {
                     }
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    return self.activate_country_row(message, db);
+                    return Ok(self.activate_country_row(message));
+                }
+                KeyCode::Delete | KeyCode::Backspace => {
+                    return self.remove_country_row(message, db);
                 }
                 _ => return Ok(KeyOutcome::Ignored),
             },
@@ -1875,22 +1883,37 @@ impl Dashboard {
     /// input popup on row 0, or directly unblocks the selected country
     /// (see this module's doc comment for why that's a direct action rather
     /// than a popup).
-    fn activate_country_row(
-        &mut self,
-        message: &mut Option<String>,
-        db: &Db,
-    ) -> Result<KeyOutcome> {
-        let Some(selected) = self.countries_state.selected() else {
-            return Ok(KeyOutcome::Consumed);
-        };
-        if selected == 0 {
-            self.popup = Some(Popup::AddCountry {
-                input: String::new(),
-                error: None,
-            });
-            return Ok(KeyOutcome::Consumed);
+    /// Enter on the Geo list: the add row opens the code popup, and a
+    /// country row says which key removes it.
+    fn activate_country_row(&mut self, message: &mut Option<String>) -> KeyOutcome {
+        match self.countries_state.selected() {
+            Some(0) => {
+                self.popup = Some(Popup::AddCountry {
+                    input: String::new(),
+                    error: None,
+                });
+            }
+            Some(selected) => {
+                if let Some(country_code) = self.selected_countries.get(selected - 1) {
+                    *message = Some(format!(
+                        "Press Delete or Backspace to remove {}",
+                        country_code.to_uppercase()
+                    ));
+                }
+            }
+            None => {}
         }
-        let Some(country_code) = self.selected_countries.get(selected - 1) else {
+        KeyOutcome::Consumed
+    }
+
+    /// Delete or Backspace on a country row: deselects it at once.
+    fn remove_country_row(&mut self, message: &mut Option<String>, db: &Db) -> Result<KeyOutcome> {
+        let Some(country_code) = self
+            .countries_state
+            .selected()
+            .and_then(|selected| selected.checked_sub(1))
+            .and_then(|index| self.selected_countries.get(index))
+        else {
             return Ok(KeyOutcome::Consumed);
         };
         db.set_country_selected(country_code, false)?;
@@ -2770,25 +2793,50 @@ mod tests {
         }
     }
 
-    #[test]
-    fn enter_on_a_selected_country_row_removes_it_directly() {
-        let db = Db::open_in_memory().unwrap();
+    /// A dashboard on the Geo list with NL selected, on NL's row.
+    fn on_a_country_row(db: &Db) -> Dashboard {
         db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
             .unwrap();
         db.set_country_selected("nl", true).unwrap();
         let mut dashboard = Dashboard::default();
-        dashboard.refresh(&db).unwrap();
+        dashboard.refresh(db).unwrap();
         dashboard.focus = Focus::Countries;
         dashboard.countries_state.select(Some(1)); // row 0 is "Add", row 1 is "nl"
+        dashboard
+    }
+
+    #[test]
+    fn delete_or_backspace_on_a_country_row_removes_it_directly() {
+        for key in [KeyCode::Delete, KeyCode::Backspace] {
+            let db = Db::open_in_memory().unwrap();
+            let mut dashboard = on_a_country_row(&db);
+
+            let mut message = None;
+            let outcome = dashboard
+                .handle_key(KeyEvent::from(key), &db, &mut message)
+                .unwrap();
+
+            assert_eq!(outcome, KeyOutcome::Mutated, "{key:?}");
+            assert!(db.list_selected_countries().unwrap().is_empty(), "{key:?}");
+            assert_eq!(message.as_deref(), Some("Removed NL"), "{key:?}");
+        }
+    }
+
+    /// Enter adds on the row above; on a country it removes nothing, and
+    /// says which key does.
+    #[test]
+    fn enter_on_a_country_row_names_the_key_that_removes_it() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = on_a_country_row(&db);
 
         let mut message = None;
-        let outcome = dashboard
+        dashboard
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
 
-        assert_eq!(outcome, KeyOutcome::Mutated);
-        assert!(db.list_selected_countries().unwrap().is_empty());
-        assert!(message.unwrap().contains("Removed NL"));
+        assert_eq!(db.list_selected_countries().unwrap(), vec!["nl"]);
+        let message = message.unwrap_or_default();
+        assert!(message.contains("Delete"), "message was: {message}");
     }
 
     /// Regression test: unblocking the *last* selected row must not leave
@@ -2814,7 +2862,7 @@ mod tests {
 
         let mut message = None;
         let outcome = dashboard
-            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .handle_key(KeyEvent::from(KeyCode::Delete), &db, &mut message)
             .unwrap();
         assert_eq!(outcome, KeyOutcome::Mutated);
         dashboard.refresh(&db).unwrap();
@@ -2856,7 +2904,10 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("Geo"), "content was:\n{content}");
         assert!(content.contains("blocklist"), "content was:\n{content}");
-        assert!(content.contains("Add a country"), "content was:\n{content}");
+        assert!(
+            content.contains("Enter to add a country, m to change mode"),
+            "content was:\n{content}"
+        );
         assert!(content.contains("NL"), "content was:\n{content}");
         assert!(content.contains("1 range(s)"), "content was:\n{content}");
     }

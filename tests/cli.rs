@@ -3351,6 +3351,8 @@ fn uninstall_takes_a_prefix_back_to_how_it_was() {
     ]);
     fs::create_dir_all(prefix.join("etc/stop-bots")).unwrap();
     fs::create_dir_all(prefix.join("etc/cron.d")).unwrap();
+    fs::create_dir_all(prefix.join("usr/sbin")).unwrap();
+    fs::write(prefix.join("usr/sbin/cron"), "").unwrap();
     let binary = prefix.join("stop-bots");
     fs::write(&binary, "#!/bin/true\n").unwrap();
     run(&[

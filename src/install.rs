@@ -84,6 +84,11 @@ pub struct Layout {
     pub unit_dir: PathBuf,
     /// `/etc/cron.d`.
     pub cron_dir: PathBuf,
+    /// Where a cron daemon's binary would be, any one of which will do:
+    /// Debian's `cron`, and cronie's `crond`. The directory alone proves
+    /// nothing — other packages ship files into it on hosts with no cron
+    /// at all, as Debian 13's cloud images are.
+    pub cron_daemons: Vec<PathBuf>,
     /// The database, read for the firewall backend and named in the cron
     /// file.
     pub db_path: PathBuf,
@@ -115,6 +120,10 @@ impl Layout {
         Self {
             unit_dir: prefix.join("etc/systemd/system"),
             cron_dir: prefix.join("etc/cron.d"),
+            cron_daemons: ["usr/sbin/cron", "usr/sbin/crond", "usr/bin/crond"]
+                .iter()
+                .map(|path| prefix.join(path))
+                .collect(),
             db_path: prefix.join("var/lib/stop-bots/db.sqlite3"),
             binary,
             systemd_marker: prefix.join("run/systemd/system"),
@@ -373,10 +382,17 @@ pub fn cron_file(layout: &Layout) -> String {
 
 /// Everything that must hold before the cron file is written.
 fn preflight_cron(layout: &Layout, options: &Options) -> Result<()> {
-    if !layout.cron_dir.is_dir() {
+    if !layout.cron_dir.is_dir() || !layout.cron_daemons.iter().any(|path| path.is_file()) {
         anyhow::bail!(
-            "{} does not exist, so this host has no cron to run the schedule.\n\n\
+            "this host has no cron to run the schedule: no cron daemon ({}), and {} \
+             proves nothing by itself.\n\n\
              On Debian and Ubuntu: `sudo apt install cron`, then run this again.",
+            layout
+                .cron_daemons
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
             layout.cron_dir.display()
         );
     }
@@ -669,6 +685,8 @@ mod tests {
     fn staged(dir: &Path) -> Layout {
         std::fs::create_dir_all(dir.join("run/systemd/system")).unwrap();
         std::fs::create_dir_all(dir.join("etc/cron.d")).unwrap();
+        std::fs::create_dir_all(dir.join("usr/sbin")).unwrap();
+        std::fs::write(dir.join("usr/sbin/cron"), "").unwrap();
         let binary = dir.join("stop-bots");
         std::fs::write(&binary, b"#!/bin/true\n").unwrap();
         Layout::under(dir, binary)
@@ -1020,6 +1038,24 @@ mod tests {
             format!("{err:#}").contains("apt install cron"),
             "was: {err:#}"
         );
+    }
+
+    /// `/etc/cron.d` exists on a host with no cron daemon — other packages
+    /// put files there — which is how a cron file came to be installed on
+    /// a server where nothing would ever run it.
+    #[test]
+    fn a_cron_directory_without_a_daemon_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        std::fs::remove_file(dir.path().join("usr/sbin/cron")).unwrap();
+
+        let err = install_cron(&layout, &Options::default()).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("no cron daemon"),
+            "was: {err:#}"
+        );
+        assert!(!layout.cron_path().exists(), "wrote it anyway");
     }
 
     #[test]

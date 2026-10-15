@@ -205,27 +205,6 @@ pub(super) fn migrate(conn: &Connection, path: Option<&Path>) -> Result<()> {
     }
 }
 
-/// Refuses the database on `conn` unless it is at [`CURRENT_VERSION`],
-/// and changes nothing either way. For the root helper, which opens a
-/// database the console's user can write and must never upgrade it: an
-/// upgrade copies the file into the console's directory and rewrites its
-/// schema, which root does only when an administrator asks.
-pub(super) fn require_current(conn: &Connection, path: &Path) -> Result<()> {
-    let found = user_version(conn)?;
-    refuse_if_newer(found, Some(path))?;
-    if found != CURRENT_VERSION {
-        bail!(
-            "the database {} is at schema version {found}, and this stop-bots ({}) works on \
-             version {CURRENT_VERSION}. The root helper never upgrades a database the console \
-             can write; run `sudo stop-bots install web` (or any `sudo stop-bots` command) to \
-             upgrade it, then try again",
-            path.display(),
-            env!("CARGO_PKG_VERSION"),
-        );
-    }
-    Ok(())
-}
-
 fn user_version(conn: &Connection) -> Result<u32> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -911,10 +890,6 @@ mod tests {
         }
     }
 
-    fn version_on_disk(path: &Path) -> u32 {
-        user_version(&Connection::open(path).unwrap()).unwrap()
-    }
-
     /// Root in the console's directory opens with triggers, views and the
     /// schema's trust off and defensive mode on — and every old release
     /// still upgrades under that, copy and all.
@@ -937,76 +912,6 @@ mod tests {
     #[test]
     fn a_0_0_15_database_upgrades_through_a_hardened_connection() {
         upgrades_through_a_hardened_connection(DB_0_0_15);
-    }
-
-    /// **The helper never migrates.** A database at any version but this
-    /// binary's is refused, with what `says` (the command that upgrades
-    /// it), and left exactly as it was: no copy beside it, the version
-    /// unchanged.
-    fn the_helper_refuses(make: impl FnOnce(&Path), says: &str) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db.sqlite3");
-        make(&path);
-        let before = version_on_disk(&path);
-
-        let err = Db::open_untrusted(&path).err().expect("opened it");
-
-        assert!(format!("{err:#}").contains(says), "{err:#}");
-        assert_eq!(version_on_disk(&path), before, "migrated");
-        let copies: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.contains(".bak-v"))
-            .collect();
-        assert!(copies.is_empty(), "copied to {copies:?}");
-    }
-
-    /// A current database with its version set to `version`.
-    /// Built in memory and written out once (`VACUUM INTO`), which costs
-    /// one write where an open on disk costs several syncs.
-    fn current_database_claiming(path: &Path, version: u32) {
-        let db = Db::open_in_memory().unwrap();
-        db.conn
-            .pragma_update(None, "user_version", version)
-            .unwrap();
-        db.conn
-            .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
-            .unwrap();
-    }
-
-    #[test]
-    fn the_helper_refuses_an_old_release_s_database_and_changes_nothing() {
-        the_helper_refuses(|path| pre_0_1_database(path, DB_0_0_15), "install web");
-    }
-
-    /// A console that lowers the version to have root copy and rewrite
-    /// its database on every request gets a refusal instead.
-    #[test]
-    fn the_helper_refuses_a_lowered_version_and_changes_nothing() {
-        the_helper_refuses(
-            |path| current_database_claiming(path, CURRENT_VERSION - 1),
-            "install web",
-        );
-    }
-
-    #[test]
-    fn the_helper_refuses_a_newer_version_and_changes_nothing() {
-        the_helper_refuses(
-            |path| current_database_claiming(path, CURRENT_VERSION + 1),
-            "only knows versions up to",
-        );
-    }
-
-    #[test]
-    fn the_helper_opens_a_current_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db.sqlite3");
-        drop(Db::open(&path).unwrap());
-
-        let db = Db::open_untrusted(&path).unwrap();
-
-        assert_eq!(version_of(&db), CURRENT_VERSION);
     }
 
     /// Under WAL, committed rows can still be in the `-wal` rather than
@@ -1749,9 +1654,9 @@ mod tests {
     }
 
     /// A version-4 database — what 0.1.0-rc.1 wrote — keeps its rules and
-    /// SSH logins, and gains the console's login record, empty.
+    /// SSH logins.
     #[test]
-    fn a_version_4_database_keeps_its_rules_and_gains_the_console_login_record() {
+    fn a_version_4_database_keeps_its_rules() {
         let conn = Connection::open_in_memory().unwrap();
         for step in &MIGRATIONS[..4] {
             (step.apply)(&conn).unwrap();
@@ -1771,17 +1676,13 @@ mod tests {
         assert_eq!(version_of(&db), CURRENT_VERSION);
         assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
         assert_eq!(db.recent_ssh_login_ips().unwrap(), ["198.51.100.9"]);
-        assert!(db.recent_console_logins(0).unwrap().is_empty());
-        db.record_console_login("203.0.113.20".parse().unwrap(), 100)
-            .unwrap();
-        assert_eq!(db.recent_console_logins(0).unwrap(), ["203.0.113.20"]);
     }
 
-    /// A version-5 database keeps its settings, including the password,
-    /// and gains an empty set of remembered browsers that can then be
-    /// written.
+    /// A version-5 database keeps its settings, including ones no release
+    /// reads any more (the web console's password hash, here), through the
+    /// upgrade to the current version.
     #[test]
-    fn a_version_5_database_keeps_its_password_and_gains_remembered_browsers() {
+    fn a_version_5_database_keeps_its_settings_through_the_upgrade() {
         let conn = Connection::open_in_memory().unwrap();
         for step in &MIGRATIONS[..5] {
             (step.apply)(&conn).unwrap();
@@ -1789,7 +1690,7 @@ mod tests {
         conn.pragma_update(None, "user_version", 5).unwrap();
         conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, '$argon2id$stored')",
-            params![keys::WEB_PASSWORD_HASH],
+            params!["web:password_hash"],
         )
         .unwrap();
 
@@ -1798,13 +1699,8 @@ mod tests {
         let db = Db { conn };
         assert_eq!(version_of(&db), CURRENT_VERSION);
         assert_eq!(
-            db.get_text_setting(keys::WEB_PASSWORD_HASH)
-                .unwrap()
-                .as_deref(),
+            db.get_text_setting("web:password_hash").unwrap().as_deref(),
             Some("$argon2id$stored")
         );
-        assert!(!db.is_remembered_browser("some-hash", 0).unwrap());
-        db.remember_browser("some-hash", 1_000, 32).unwrap();
-        assert!(db.is_remembered_browser("some-hash", 0).unwrap());
     }
 }

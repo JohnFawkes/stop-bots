@@ -19,7 +19,7 @@
     <title>stop-bots: stop bad bots without a CDN</title>
     <meta
       name="description"
-      content="A TUI, web console and CLI that block bad bots through your own NGINX or Apache config and firewall, with detection from your logs. No CDN, no account."
+      content="A TUI and CLI that block bad bots through your own NGINX or Apache config and firewall, with detection from your logs. No CDN, no account."
     />
     <style>
       :root {
@@ -142,7 +142,7 @@
     <main>
       <h1>stop-bots</h1>
       <p class="tagline">
-        A TUI, a web console and a CLI that help you configure your server to
+        A TUI and a CLI that help you configure your server to
         stop bad bots without hiding behind a CDN.
       </p>
       <p class="links">
@@ -160,7 +160,7 @@
           height="708"
           loading="lazy"
         />
-        <figcaption>The TUI. The web console serves the same screens.</figcaption>
+        <figcaption>The TUI.</figcaption>
       </figure>
 
       <h2>What it does</h2>
@@ -231,9 +231,10 @@ sudo apt install stop-bots</code></pre>
           still receiving updates. <code>amd64</code> and <code>arm64</code>.
         </li>
         <li>
-          No service. Run
-          <code>sudo stop-bots install web --dry-run</code> when you want the
-          console as one; it prints the whole plan before writing anything.
+          Nothing scheduled. Run
+          <code>sudo stop-bots install cron --dry-run</code> when you want the
+          detectors running unattended; it prints the plan before writing
+          anything.
         </li>
       </ul>
 

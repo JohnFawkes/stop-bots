@@ -19,26 +19,22 @@
 //! where the last piece stopped: the NGINX access log, and sshd's
 //! authentication lines.
 //!
-//! [`read`] is the one function that reads them, wherever it runs:
+//! [`read`] is the one function that reads them, in process, for the
+//! CLI, the TUI and `tick`. The caller holds a [`LogReader`] and asks it
+//! for [`Request`]s until a reply says there is no more.
 //!
-//! - in the root helper, for the web console, which since 0.1 reads no
-//!   host file but its database ([`crate::privileged::Op::ReadLog`]);
-//! - in process, for everything that is root already — the CLI, the TUI,
-//!   a console run by hand as root — and for a read-only console, with
-//!   whatever its own user may read.
-//!
-//! Either way the caller holds a [`LogReader`] and asks it for [`Request`]s
-//! until a reply says there is no more.
+//! The request-and-reply shape was made for the web console's root
+//! helper, which read the logs for a console that could not; the console
+//! is gone, and the shape stays because it is what bounds each read.
 //!
 //! ## What a request can choose, and what it cannot
 //!
 //! A request names one of the two logs, never a path: where each is comes
 //! from [`Sources`], which the reader is configured with — the host
-//! settings ([`crate::hostconf`]) and autodetection in the helper, as for
-//! the root CLI. What a request does choose is where in that log to start:
-//! a cursor, or a time for the journal. A cursor is a place, compared with
-//! the log the reader finds and otherwise ignored; it cannot point the
-//! read anywhere else.
+//! settings ([`crate::hostconf`]) and autodetection. What a request does
+//! choose is where in that log to start: a cursor, or a time for the
+//! journal. A cursor is a place, compared with the log the reader finds
+//! and otherwise ignored; it cannot point the read anywhere else.
 //!
 //! ## What comes back
 //!
@@ -49,20 +45,13 @@
 //! entries of sshd's own units. Nothing else in `auth.log` (sudo, cron,
 //! every user's sessions) and nothing else in the journal is returned.
 //!
-//! The lines come back unparsed, and are parsed where they are used, by
-//! the same code whichever side read them. The alternative, parsing in the
-//! helper and returning the detectors' evidence, would return less of the
-//! access log, but it would run the detectors' parsers — on text an
-//! attacker writes — as root, and it would need their whole configuration
-//! in each request (probe paths, honeypot, the crawler ranges), or read it
-//! from the database the helper treats as hostile. The console is meant to
-//! see the access log: that is what its detectors are for.
+//! The lines come back unparsed, and are parsed where they are used.
 //!
 //! ## How much one request costs
 //!
 //! At most [`MAX_CHUNK`] bytes of log, stopping at a line or an entry:
 //! a first read of a large log, or a journal with a month of brute-forcing
-//! in it, is many requests, each quick, and never holds the helper long.
+//! in it, is many requests, each quick.
 
 use std::path::{Path, PathBuf};
 
@@ -244,8 +233,8 @@ pub fn source_key(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Something that answers [`Request`]s: [`Sources`] in process, or
-/// [`crate::privileged::Privileged`], which may ask the helper. Blocking.
+/// Something that answers [`Request`]s: [`Sources`], in process.
+/// Blocking.
 pub trait LogReader {
     fn read_log(&self, request: &Request) -> anyhow::Result<Reply>;
 }

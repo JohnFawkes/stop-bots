@@ -155,15 +155,6 @@ pub enum AppEvent {
     /// storing it and assessing it are both `Db` work and so wait for the
     /// main thread, same as every other job here.
     HealthProbed { probe: Box<crate::health::Probe> },
-    /// The NGINX config change that puts this console behind a subdomain
-    /// or a path prefix has been written and validated (see
-    /// `App::start_web_access`). The plan comes back with it because
-    /// recording the new address is a `Db` write, and so waits for the
-    /// main thread.
-    WebAccessApplied {
-        plan: Box<crate::webaccess::Plan>,
-        result: Result<std::path::PathBuf, String>,
-    },
     /// A background pass over every site's config file, working out which
     /// of them still match what their settings render to (see
     /// `App::start_site_status_check`). In the site list's order.

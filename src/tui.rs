@@ -41,8 +41,7 @@ use ratatui::{
 /// Light/dark theme. Body text always uses the terminal's default
 /// foreground/background (see AGENTS.md) — the theme only picks the
 /// handful of role colours (accent, live, dim, selection) the chrome is
-/// drawn with. "Night Grid" is the dark one, "Greenhouse" the light one;
-/// the web console defines the same roles in `style.css`.
+/// drawn with. "Night Grid" is the dark one, "Greenhouse" the light one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Theme {
     #[default]
@@ -368,11 +367,6 @@ pub enum KeyOutcome {
     /// reasoning as [`Self::ReloadNginx`] and [`Self::RenderFirewall`] —
     /// `App` performs them.
     ApplyEverything,
-    /// The Dashboard's Web Access popup was confirmed. `App` validates it
-    /// against the database, rewrites the NGINX config and reloads — all
-    /// three are things the screen's key handler must not do, same as
-    /// [`Self::SiteAction`].
-    SetWebAccess(crate::webaccess::Request),
     /// Firewall's `R`: read the SSH log again now, rather than
     /// when the 30-second cache says so. `App` owns that read (see
     /// `App::start_ssh_log_read`), for the same reason it owns every
@@ -704,7 +698,6 @@ mod tests {
         for (job, expected) in [
             (Job::ReloadNginx, "reloading Apache"),
             (Job::ScanSites, "scanning the Apache config"),
-            (Job::ApplyWebAccess, "setting up Apache for this console"),
         ] {
             let jobs = std::collections::HashSet::from([job]);
             assert_eq!(busy_label(&jobs, Apache).as_deref(), Some(expected));

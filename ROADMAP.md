@@ -264,7 +264,7 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
   and the web) and health-check labels.
 - nextest retries for the container suite, with retries counted.
 - Man page and shell completions in the `.deb`.
-- Per-site bot overrides in the web console; crawler-range sources in either UI.
+- Crawler-range sources in the TUI.
 
 ## After 0.1, towards 1.0
 
@@ -280,14 +280,14 @@ Roughly in the order they would matter to a user:
    recommendation.
 7. **SSH detection on key-only hosts**: `Connection closed by authenticating user …
    [preauth]` and `maximum authentication attempts exceeded`.
-8. **One job layer for both front-ends.** The TUI's in-flight interlock, the cron dispatch
-   and each screen's data loading exist twice today (`app.rs` vs `web/cron.rs`,
-   `tui/dashboard.rs` vs `web/dashboard.rs`).
+8. **One job layer for the TUI and `tick`.** The TUI starts each scheduled job on a
+   background thread and `tick` runs them in line; both go through `cron.rs`, but the
+   dispatch exists twice (`App::check_cron` and `cron::tick`).
 9. **Structural debt**, when it earns its keep: `Commands` out of `main.rs`, `db.rs` by
    concern.
-10. **Apache at parity with NGINX.** Web Access and recognising the application behind
-    a site work on Apache too. What is left: the TUI and console still offer rate limiting
-    on an Apache host, where it writes nothing.
+10. **Apache at parity with NGINX.** Recognising the application behind a site works on
+    Apache too. What is left: the TUI still offers rate limiting on an Apache host, where
+    it writes nothing.
 11. **Release pace and the changelog.** After 0.1, patch releases for fixes only, with
     features batched into minors. Changelog bullets of one to three lines, with the
     reasoning in commits. It is 1,484 lines after two weeks and ships in the `.deb`.

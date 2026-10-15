@@ -1,5 +1,5 @@
 pkgbase = stop-bots-bin
-	pkgdesc = A TUI, web console and CLI that help you configure NGINX or Apache and your firewall to stop bad bots and still allow good bots (prebuilt binary)
+	pkgdesc = A TUI and CLI that help you configure NGINX or Apache and your firewall to stop bad bots and still allow good bots (prebuilt binary)
 	pkgver = 0.1.1
 	pkgrel = 1
 	url = https://github.com/ivankovic/stop-bots

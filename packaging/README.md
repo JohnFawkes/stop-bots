@@ -51,10 +51,9 @@ sudo apt update && sudo apt install stop-bots
 
 Four decisions are worth knowing before changing any of it:
 
-- **The package ships no systemd unit and no maintainer scripts.** `stop-bots
-  install web` writes the unit, creates `/var/lib/stop-bots` 0700 and generates the
-  console password, behind a `--dry-run` that prints the plan first. A package that
-  shipped an enabled unit would start a root-run web console on `apt install`, which
+- **The package ships no cron file, no systemd unit and no maintainer scripts.**
+  `stop-bots install cron` writes the schedule, behind a `--dry-run` that prints the
+  plan first. A package that shipped one would start blocking on `apt install`, which
   is the opposite of the rule the rest of the project keeps.
 - **It depends on nothing.** The binary is statically linked against musl, which is
   what lets one package install on every Debian and Ubuntu still receiving updates

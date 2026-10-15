@@ -17,7 +17,7 @@
 
 //! One apply at a time, across every stop-bots process on the host.
 //!
-//! The TUI, the web console and a cron `batch --apply` can each rewrite
+//! The TUI, `stop-bots tick` and a cron `batch --apply` can each rewrite
 //! the NGINX config and run the firewall script, and nothing stopped two
 //! of them doing it at once. Two NGINX applies interleaved can each take
 //! the other's half-written file as the "before" it restores on a failed
@@ -33,8 +33,8 @@
 //! calls something that takes it again gets a no-op guard rather than
 //! waiting for itself: `flock` locks belong to the open file, so a second
 //! `open` in the same process would conflict with the first. Other threads
-//! in the same process do wait, which is what keeps two requests to the
-//! console from applying at once.
+//! in the same process do wait, which is what keeps two of the TUI's
+//! background jobs from applying at once.
 
 use std::cell::Cell;
 use std::fs::File;
@@ -96,21 +96,9 @@ impl std::fmt::Display for Busy {
 
 impl std::error::Error for Busy {}
 
-/// Where every process running as root takes the lock: the console's
-/// unit, a root crontab, the TUI and `sudo stop-bots` all meet here.
-///
-/// **One path for all of them, and it has to stay writable inside the
-/// console's sandbox**, or [`hold_at`] quietly proceeds unlocked there.
-/// The unit makes the filesystem read-only and lists `/run` among the
-/// paths it gives back (see `install::writable_paths`, and the test there
-/// that checks this path against the unit). `/run` is a tmpfs, so a lock
-/// file never outlives a boot.
-///
-/// Not a `RuntimeDirectory=` of the unit's own, which would narrow what
-/// the console may write in `/run`: the console needs all of `/run` for
-/// `nginx -t` anyway, and systemd removes a runtime directory when the
-/// unit stops — under a CLI that may be holding a lock file inside it,
-/// after which the next process locks a new file and two applies run.
+/// Where every process running as root takes the lock: a root crontab,
+/// `tick`, the TUI and `sudo stop-bots` all meet here. `/run` is a tmpfs,
+/// so a lock file never outlives a boot.
 pub const ROOT_PATH: &str = "/run/stop-bots.lock";
 
 /// Where the lock lives.

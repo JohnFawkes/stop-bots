@@ -68,9 +68,6 @@ pub enum Job {
     ScanSites,
     /// Rewriting site config files. See [`App::start_site_action`].
     ApplySites,
-    /// Writing the NGINX config that serves this console, and running
-    /// `nginx -t` over it. See [`App::start_web_access`].
-    ApplyWebAccess,
     /// Reading each site's config file to work out whether its block is
     /// current. See [`App::start_site_status_check`].
     CheckSiteStatuses,
@@ -99,7 +96,6 @@ impl Job {
             Job::RenderFirewall => "writing the firewall script".to_string(),
             Job::ScanSites => format!("scanning the {server} config"),
             Job::ApplySites => "writing site config".to_string(),
-            Job::ApplyWebAccess => format!("setting up {server} for this console"),
             Job::CheckSiteStatuses => "checking site config".to_string(),
             Job::UpdateEverything => "downloading every list".to_string(),
             Job::RefreshCrawlerRanges(kind) => format!("downloading {}", kind.name()),
@@ -210,9 +206,8 @@ pub struct App {
     /// does: an nftables render lands in `.nft` and an iptables one in
     /// `.sh`.
     ///
-    /// A field rather than a call at the point of use for the same reason
-    /// the console has one: the default is a real path under `/etc`, and a
-    /// test that presses the key must be able to point it somewhere
+    /// A field rather than a call at the point of use because the default
+    /// is a real path under `/etc`, and a test that presses the key must be able to point it somewhere
     /// harmless. The render *popup* takes its path from the admin instead,
     /// which is why this only covers the one-key path.
     pub firewall_out: Option<std::path::PathBuf>,
@@ -554,9 +549,6 @@ impl App {
             Event::App(AppEvent::CrawlerRangesFetched { kind, result }) => {
                 self.finish_crawler_ranges_refresh(kind, result)?
             }
-            Event::App(AppEvent::WebAccessApplied { plan, result }) => {
-                self.finish_web_access(*plan, result)?
-            }
             Event::App(AppEvent::HealthProbed { probe }) => {
                 self.finish_cron_health_check(*probe)?
             }
@@ -855,15 +847,13 @@ impl App {
     /// same way rather than through `cron::apply_nginx`.
     ///
     /// That function takes a `&Db` and does the whole job inline, which is
-    /// right for the console (where `with_db` is already a blocking task)
-    /// and wrong here: `apply_all_sites` walks the config root and the
+    /// right for `tick` (which has nothing to redraw) and wrong here: `apply_all_sites` walks the config root and the
     /// reload shells out to `nginx -t` and `systemctl`, which is seconds
     /// with nothing redrawing. `start_site_action` already splits that the
     /// way every other background job here does — the `Db` reads happen on
     /// this thread and produce an `ApplyPlan`, the file writes happen on
     /// the blocking pool — and `finish_site_apply` already chains the
-    /// reload, gated by the same `reload_nginx_for_real` flag the console
-    /// spells `apply_for_real`. Reimplementing any of that would mean a
+    /// reload, gated by the `reload_nginx_for_real` flag. Reimplementing any of that would mean a
     /// second copy of the plan/run split.
     ///
     /// The toggle is still read here, before the plan, so a host with the
@@ -1359,8 +1349,8 @@ impl App {
     }
 
     /// Downloads every list this host uses, one source at a time — the
-    /// TUI's half of what `stop-bots batch` and the console's "Update
-    /// everything" button do, through the same [`crate::refresh::plan`].
+    /// TUI's half of what `stop-bots batch` and the schedule's weekly job
+    /// do, through the same [`crate::refresh::plan`].
     /// `scheduled` is the weekly job's run, which says nothing on the
     /// message line.
     ///
@@ -1621,8 +1611,8 @@ impl App {
     }
 
     /// Writes and enforces both planes: the NGINX config, then the
-    /// firewall — the TUI's half of the console's "Apply everything",
-    /// once its preview has been confirmed.
+    /// firewall — the TUI's "Apply everything", once its preview has been
+    /// confirmed.
     ///
     /// The two are independent, same as `batch --apply`: whichever fails,
     /// the other still gets its turn, because a half-applied host is
@@ -1671,67 +1661,6 @@ impl App {
         self.start_firewall_render(backend, out.display().to_string(), false, true);
     }
 
-    /// Puts this console behind NGINX, on a subdomain or a path prefix.
-    ///
-    /// Split across the thread boundary exactly the way
-    /// [`crate::webaccess`]'s three functions are: plan here, where `Db`
-    /// lives; write and `nginx -t` on the blocking pool; record the new
-    /// address back here once it validated.
-    fn start_web_access(&mut self, request: crate::webaccess::Request) {
-        if self.jobs_in_flight.contains(&Job::ApplyWebAccess) {
-            self.message = Some(format!(
-                "Already setting {} up for this console.",
-                self.nginx.server().label()
-            ));
-            return;
-        }
-
-        let plan = match self
-            .host()
-            .and_then(|host| crate::webaccess::plan(&self.db, &host, self.nginx.root(), &request))
-        {
-            Ok(plan) => plan,
-            Err(err) => {
-                self.message = Some(format!("{err:#}"));
-                return;
-            }
-        };
-
-        self.jobs_in_flight.insert(Job::ApplyWebAccess);
-        let root = self.nginx.root().to_path_buf();
-        let sender = self.events.sender();
-        tokio::task::spawn_blocking(move || {
-            let result = crate::webaccess::apply(&plan, &root).map_err(|err| format!("{err:#}"));
-            let _ = sender.send(Event::App(AppEvent::WebAccessApplied {
-                plan: Box::new(plan),
-                result,
-            }));
-        });
-    }
-
-    /// Records the address the console now answers to, and reloads NGINX.
-    fn finish_web_access(
-        &mut self,
-        plan: crate::webaccess::Plan,
-        result: Result<std::path::PathBuf, String>,
-    ) -> Result<()> {
-        self.jobs_in_flight.remove(&Job::ApplyWebAccess);
-        match result {
-            Ok(path) => {
-                crate::webaccess::record(&self.db, &plan)?;
-                self.message = Some(format!(
-                    "Wrote {} and recorded the host. {} Restart the console for a changed \
-                     path prefix to take effect.",
-                    path.display(),
-                    plan.recorded_note()
-                ));
-                self.start_nginx_reload();
-            }
-            Err(err) => self.message = Some(format!("Web access setup failed: {err}")),
-        }
-        self.refresh()
-    }
-
     /// Probes the host for the internal cron's health check.
     ///
     /// The probe shells out to `nft`, `systemctl` and `df` — `nft list` on
@@ -1764,9 +1693,16 @@ impl App {
             .get_block_response()
             .map(|r| r.status_code())
             .unwrap_or_else(|_| crate::db::BlockResponse::default().status_code());
+        let claims = crate::scanblock::crawler_claims(&self.db).unwrap_or_default();
         tokio::task::spawn_blocking(move || {
-            let probe =
-                crate::health::probe(backend, &db_path, ssh_log.as_deref(), &host, block_status);
+            let probe = crate::health::probe(
+                backend,
+                &db_path,
+                ssh_log.as_deref(),
+                &host,
+                block_status,
+                claims,
+            );
             let _ = sender.send(Event::App(AppEvent::HealthProbed {
                 probe: Box::new(probe),
             }));
@@ -1877,7 +1813,7 @@ impl App {
                 force,
                 apply,
             } => {
-                // Remembered, as the console's render form does, so that
+                // Remembered, as `set-firewall-backend` does, so that
                 // "Apply everything", the cron and `batch` render for the
                 // backend the operator last chose rather than the other.
                 crate::firewall::store_backend(&self.db, backend)?;
@@ -1910,10 +1846,6 @@ impl App {
             }
             KeyOutcome::ApplyEverything => {
                 self.start_apply_everything()?;
-                return Ok(());
-            }
-            KeyOutcome::SetWebAccess(request) => {
-                self.start_web_access(request);
                 return Ok(());
             }
             KeyOutcome::RereadLogs => {
@@ -1998,11 +1930,6 @@ impl App {
                 "Write the firewall script",
                 "F",
                 key(Screen::Dashboard, 'F'),
-            ),
-            (
-                "Web access: put this console behind NGINX",
-                "w",
-                key(Screen::Dashboard, 'w'),
             ),
             (
                 "Geo mode: blocklist or allowlist",
@@ -2150,7 +2077,6 @@ mod tests {
         for expected in [
             "Go to Apache",
             "Apply everything: Apache, then the firewall",
-            "Web access: put this console behind Apache",
             "Rescan for Apache sites",
         ] {
             assert!(
@@ -3034,111 +2960,6 @@ mod tests {
         ] {
             assert!(screen.contains(expected), "no {expected:?} on:\n{screen}");
         }
-    }
-
-    /// A host settings file in `dir` whose NGINX test command is `test`.
-    fn test_command_host_conf(dir: &std::path::Path, test: &str) -> std::path::PathBuf {
-        let path = dir.join("host.conf");
-        crate::hostconf::HostConf {
-            nginx_test_command: Some(test.to_string()),
-            ..Default::default()
-        }
-        .save_to(&path)
-        .unwrap();
-        path
-    }
-
-    /// The whole Web Access chain, in the order the split demands: plan
-    /// on the main thread, write and validate off it, record the new
-    /// address back on it. Recording only after the config validated is
-    /// the part that matters — a host allowlist naming somewhere NGINX
-    /// never got would lock the operator out of the page they were on.
-    #[tokio::test]
-    async fn w_mounts_the_console_on_a_site_and_then_records_the_address() {
-        let dir = tempfile::tempdir().unwrap();
-        let site = dir.path().join("example.conf");
-        std::fs::write(
-            &site,
-            "server {\n    server_name example.com;\n    listen 443 ssl;\n}\n",
-        )
-        .unwrap();
-
-        let db = Db::open_in_memory().unwrap();
-        db.upsert_site("example.com", site.to_str().unwrap())
-            .unwrap();
-        let mut app = App::new(
-            db,
-            dir.path().to_path_buf(),
-            false,
-            Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),
-        )
-        .unwrap();
-        // `nginx -t` would be the real one on whatever host runs the
-        // suite, so point the check at a command that always agrees.
-        app.host_conf = test_command_host_conf(dir.path(), "/bin/true");
-
-        app.start_web_access(crate::webaccess::Request::Path {
-            site: "example.com".to_string(),
-            prefix: "/stop-bots/".to_string(),
-        });
-        drain_background_work(&mut app).await;
-
-        let written = std::fs::read_to_string(&site).unwrap();
-        assert!(
-            written.contains(r#"location "/stop-bots/""#),
-            "the console location never landed:\n{written}"
-        );
-        assert_eq!(
-            app.db
-                .get_text_setting(crate::web::BASE_PATH_KEY)
-                .unwrap()
-                .as_deref(),
-            Some("/stop-bots")
-        );
-        assert!(crate::web::configured_hosts(&app.db)
-            .unwrap()
-            .contains(&"example.com".to_string()));
-    }
-
-    /// A refusal from `nginx -t` must leave the console's own settings
-    /// alone: the address it answers to is only true once NGINX agrees.
-    #[tokio::test]
-    async fn a_rejected_web_access_config_records_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let site = dir.path().join("example.conf");
-        std::fs::write(&site, "server {\n    server_name example.com;\n}\n").unwrap();
-
-        let db = Db::open_in_memory().unwrap();
-        db.upsert_site("example.com", site.to_str().unwrap())
-            .unwrap();
-        let mut app = App::new(
-            db,
-            dir.path().to_path_buf(),
-            false,
-            Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),
-        )
-        .unwrap();
-        app.host_conf = test_command_host_conf(dir.path(), "/bin/false");
-
-        app.start_web_access(crate::webaccess::Request::Path {
-            site: "example.com".to_string(),
-            prefix: "/stop-bots/".to_string(),
-        });
-        drain_background_work(&mut app).await;
-
-        let message = app.message.as_deref().unwrap_or_default();
-        assert!(message.contains("failed"), "message was: {message}");
-        assert_eq!(
-            app.db.get_text_setting(crate::web::BASE_PATH_KEY).unwrap(),
-            None
-        );
-        assert!(crate::web::configured_hosts(&app.db).unwrap().is_empty());
-        assert!(
-            !std::fs::read_to_string(&site)
-                .unwrap()
-                .contains("stop-bots"),
-            "a refused config must be rolled back"
-        );
     }
 
     /// A successful write must persist the rendered rule-set signature

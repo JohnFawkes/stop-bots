@@ -19,31 +19,27 @@
 //!
 //! Everything stop-bots puts on a host, and how each is taken back:
 //!
-//! - **The units**: the console's (`stop-bots-web.service`), its root
-//!   helper's (`stop-bots-helper.socket` and `.service`) and the firewall's
-//!   boot unit (`stop-bots-firewall.service`): stopped, disabled, deleted,
-//!   then `systemctl daemon-reload`.
+//! - **The schedule**: `/etc/cron.d/stop-bots`, which `install cron` wrote.
+//! - **The firewall's boot unit** (`stop-bots-firewall.service`): stopped,
+//!   disabled, deleted, then `systemctl daemon-reload`.
 //! - **The live firewall rules**: the nft table `inet stop_bots`, and the
 //!   iptables `STOP-BOTS` chain with every jump into it, for IPv4 and IPv6 —
 //!   whichever exist, all of them if several do.
 //! - **NGINX**: the injected blocks in every site file (both kinds of
-//!   marker), the generated `conf.d` files, the console's own site file,
-//!   and `/etc/stop-bots/nginx`. One change, tested and put back if NGINX
+//!   marker), the generated `conf.d` files, and `/etc/stop-bots/nginx`. One change, tested and put back if NGINX
 //!   refuses it, then reloaded — `webserver::remove_everything`.
 //! - **The firewall scripts** in `/etc/stop-bots`, and the directory once
 //!   it is empty.
-//! - **The database** and its `.bak-v*` copies only with `--purge`, and
-//!   with them the `stop-bots` user and group that own them.
+//! - **The database** and its `.bak-v*` copies only with `--purge`.
 //!
 //! ## The order, and why
 //!
-//! **The units go first**, the console before its helper, because the
-//! web console is the one thing that would put the rest back: its
-//! internal cron re-applies the NGINX blocks
-//! and re-renders the firewall script every few minutes, so anything
-//! removed while it runs can be back before this command ends. And the
-//! firewall unit reloads the rules at boot; disabled first, a reboot in
-//! the middle of an uninstall cannot bring them back.
+//! **The schedule goes first**, because it is the one thing that would put
+//! the rest back: `stop-bots tick` re-applies the NGINX blocks and
+//! re-renders the firewall script every few minutes, so anything removed
+//! while it runs can be back before this command ends. **Then the boot
+//! unit**, which reloads the rules at boot; disabled first, a reboot in the
+//! middle of an uninstall cannot bring them back.
 //!
 //! **Then the live firewall rules, before NGINX.** Removing them can only
 //! ever let traffic through, never stop it — every rule in that table or
@@ -65,7 +61,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::install::{FIREWALL_UNIT, HELPER_SOCKET_UNIT, HELPER_UNIT, WEB_UNIT};
+use crate::install::{CRON_FILE, FIREWALL_UNIT};
 use crate::nginx;
 use crate::webserver;
 use crate::webserver::ServerCommands;
@@ -74,13 +70,13 @@ use crate::webserver::ServerCommands;
 /// the database or `/etc/stop-bots` itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Target {
-    /// The site blocks, the generated `conf.d` files and the console's
-    /// site file, and `/etc/stop-bots/nginx`.
+    /// The site blocks, the generated `conf.d` files, and
+    /// `/etc/stop-bots/nginx`.
     Nginx,
     /// The live rules, the boot unit and the scripts.
     Firewall,
-    /// The web console's unit and its helper's.
-    Web,
+    /// The cron file `install cron` wrote.
+    Cron,
     All,
 }
 
@@ -91,8 +87,8 @@ impl Target {
     fn firewall(self) -> bool {
         matches!(self, Target::Firewall | Target::All)
     }
-    fn web(self) -> bool {
-        matches!(self, Target::Web | Target::All)
+    fn cron(self) -> bool {
+        matches!(self, Target::Cron | Target::All)
     }
 }
 
@@ -126,6 +122,8 @@ pub struct Plan {
     pub host: bool,
     /// `/etc/systemd/system`.
     pub unit_dir: PathBuf,
+    /// `/etc/cron.d`.
+    pub cron_dir: PathBuf,
     /// `/etc/stop-bots`: the firewall scripts, and the directory below.
     pub output_dir: PathBuf,
     /// `/etc/stop-bots/nginx`: the generated `robots.txt`.
@@ -147,11 +145,6 @@ pub struct Plan {
     /// `--purge`, like the database whose settings it took over.
     pub host_conf: PathBuf,
     pub systemctl: PathBuf,
-    /// `userdel` and `groupdel`, for `--purge`.
-    pub userdel: PathBuf,
-    pub groupdel: PathBuf,
-    /// The console's user and group, removed with `--purge`.
-    pub user: String,
     pub nft: PathBuf,
     /// `iptables` and `ip6tables`.
     pub iptables: Vec<PathBuf>,
@@ -223,6 +216,7 @@ impl Plan {
             prefix: prefix.map(Path::to_path_buf),
             host: prefix.is_none(),
             unit_dir: base.join("etc/systemd/system"),
+            cron_dir: base.join("etc/cron.d"),
             output_dir,
             managed_dir,
             server,
@@ -233,9 +227,6 @@ impl Plan {
             db_path,
             host_conf,
             systemctl: crate::host::program("systemctl"),
-            userdel: crate::host::program("userdel"),
-            groupdel: crate::host::program("groupdel"),
-            user: crate::account::USER.to_string(),
             nft: crate::host::program("nft"),
             iptables: vec![
                 crate::host::program("iptables"),
@@ -258,8 +249,9 @@ impl Plan {
 /// The NGINX root and commands are read only for a database that was
 /// never migrated to the host settings file ([`crate::hostconf`]), and
 /// only from one this user owns, in a directory this user owns: an
-/// uninstall runs the commands as root, and the console's database may
-/// hold rows written by whoever compromised it.
+/// uninstall runs the commands as root, and a database another user owns
+/// (the web console's, on a host a release with one set up) may hold rows
+/// written by whoever compromised that user.
 #[derive(Debug, Default)]
 struct Stored {
     root: Option<String>,
@@ -300,15 +292,15 @@ impl Stored {
         // so a dry run would leave two new files beside the database.
         // Nor `Db::open`, which would upgrade the schema.
         //
-        // Guarded, too: uninstall is root, and the directory is the
-        // console's (see `db::guard`).
+        // Guarded, too: uninstall is root, and the directory may be another
+        // user's (see `db::guard`).
         let conn = crate::db::guard::open_connection(
             db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .with_context(|| format!("failed to read {}", db_path.display()))?;
-        // The console may be mid-write when this runs: it is stopped only
-        // later, by the plan this is building.
+        // `tick` or the TUI may be mid-write when this runs: the schedule
+        // goes only later, by the plan this is building.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let setting = |key: &str| -> Result<Option<String>> {
             Ok(conn
@@ -334,8 +326,8 @@ impl Stored {
         };
         // The root and the two commands are read for `host_settings`, which
         // uses them only for a database never migrated and owned by this
-        // user: rows the console can write must not choose what this root
-        // process runs or which tree it rewrites.
+        // user: rows another user could write must not choose what this
+        // root process runs or which tree it rewrites.
         Ok(Stored {
             root: setting(ServerCommands::ROOT_KEY)?,
             test: setting(ServerCommands::TEST_KEY)?,
@@ -415,22 +407,27 @@ impl Report {
 pub fn run(plan: &Plan, target: Target, options: &Options) -> Report {
     let mut report = Report::default();
 
-    // 1. The units, so nothing puts back what the steps below remove.
-    let mut removed_a_unit = false;
-    if target.web() {
-        // The console first, so nothing asks the helper for anything; then
-        // the socket, so nothing starts the helper again; then the helper,
-        // which has no `[Install]` of its own to disable.
-        removed_a_unit |= remove_unit(plan, options, &mut report, WEB_UNIT);
-        removed_a_unit |= remove_unit(plan, options, &mut report, HELPER_SOCKET_UNIT);
-        removed_a_unit |= remove_unit(plan, options, &mut report, HELPER_UNIT);
-    } else if plan.unit_dir.join(WEB_UNIT).exists() {
+    // 1. The schedule and the boot unit, so nothing puts back what the
+    // steps below remove.
+    let cron_file = plan.cron_dir.join(CRON_FILE);
+    if target.cron() {
+        if cron_file.exists() {
+            remove_file_step(plan, options, &mut report, &cron_file);
+        } else {
+            report.skip(
+                format!("remove {}", cron_file.display()),
+                "it is not installed",
+            );
+        }
+    } else if cron_file.exists() {
         report.kept.push(format!(
-            "{WEB_UNIT} is still installed, and its internal cron re-applies the {} \
-             blocks and re-renders the firewall script. `stop-bots uninstall web` removes it.",
+            "{} is still installed, and `stop-bots tick` re-applies the {} blocks and \
+             re-renders the firewall script. `stop-bots uninstall cron` removes it.",
+            cron_file.display(),
             plan.server.label()
         ));
     }
+    let mut removed_a_unit = false;
     if target.firewall() {
         removed_a_unit |= remove_unit(plan, options, &mut report, FIREWALL_UNIT);
     }
@@ -470,47 +467,8 @@ pub fn run(plan: &Plan, target: Target, options: &Options) -> Report {
         host_settings(plan, options, &mut report);
         remove_dir_if_empty(plan, options, &mut report, &plan.output_dir);
         database(plan, options, &mut report);
-        account(plan, options, &mut report);
     }
     report
-}
-
-/// The console's user and group: removed with `--purge`, which removes
-/// what they own, and kept otherwise, with the database they own. Only on
-/// the host; a `--prefix` tree has no user database of its own.
-fn account(plan: &Plan, options: &Options, report: &mut Report) {
-    let user = plan.user.as_str();
-    if !plan.host {
-        return;
-    }
-    let has_user = crate::account::user(user).is_some();
-    let has_group = crate::account::group(user).is_some();
-    if !has_user && !has_group {
-        return;
-    }
-    if !options.purge {
-        report.kept.push(format!(
-            "the {user} user and group, which own the database. `--purge` removes them too."
-        ));
-        return;
-    }
-    if has_user {
-        report.step(options, format!("userdel {user}"), || {
-            run_program(&plan.userdel, &[user]).map(|_| ())
-        });
-    }
-    // `userdel` removes the user's own group with it, where it was made
-    // with the user; one that is still there afterwards is removed here.
-    let group_left = if options.dry_run {
-        has_group
-    } else {
-        crate::account::group(user).is_some()
-    };
-    if group_left {
-        report.step(options, format!("groupdel {user}"), || {
-            run_program(&plan.groupdel, &[user]).map(|_| ())
-        });
-    }
 }
 
 /// Stops, disables and deletes `unit`, if its file is there. Returns
@@ -523,17 +481,13 @@ fn remove_unit(plan: &Plan, options: &Options, report: &mut Report, unit: &str) 
     }
     if plan.host {
         // Stopped before it is disabled, and each on its own: an operator
-        // reading a failure needs to know which half happened. The helper
-        // is started by its socket and never enabled, so there is nothing
-        // to disable.
+        // reading a failure needs to know which half happened.
         report.step(options, format!("systemctl stop {unit}"), || {
             systemctl(plan, &["stop", unit])
         });
-        if unit != HELPER_UNIT {
-            report.step(options, format!("systemctl disable {unit}"), || {
-                systemctl(plan, &["disable", unit])
-            });
-        }
+        report.step(options, format!("systemctl disable {unit}"), || {
+            systemctl(plan, &["disable", unit])
+        });
     }
     remove_file_step(plan, options, report, &path);
     true
@@ -666,8 +620,8 @@ fn generated_nginx_files(plan: &Plan) -> Vec<webserver::DirFile> {
 /// A path the database's record names, if it is a file stop-bots
 /// generated, held through its directory.
 ///
-/// The record is a table the console writes, and the console is not
-/// root: a row naming `/etc/passwd`, or a link in `conf.d` pointing at it,
+/// The record is a table in a database root does not always own: a row
+/// naming `/etc/passwd`, or a link in `conf.d` pointing at it,
 /// must not have this root process delete it. So it has to be a plain
 /// file, not a link, opening with this project's own header, and either a
 /// `stop-bots*` file in a `conf.d` — any `conf.d`, because finding the
@@ -675,9 +629,9 @@ fn generated_nginx_files(plan: &Plan) -> Vec<webserver::DirFile> {
 /// file in `managed_dir`.
 ///
 /// And the path must already be resolved, with no link and no `..` in
-/// it ([`webserver::DirFile::exactly`]). A `conf.d` can be the console's own
-/// (`/var/lib/stop-bots/conf.d`), and one reached through a link the
-/// console made could lead elsewhere by the time it is used; what passes
+/// it ([`webserver::DirFile::exactly`]). A `conf.d` can be in a directory
+/// another user owns (`/var/lib/stop-bots/conf.d`), and one reached through
+/// a link they made could lead elsewhere by the time it is used; what passes
 /// is used only through the directory descriptor this checked.
 fn recorded_file_ours(path: &Path, managed_dir: &Path) -> Option<webserver::DirFile> {
     let file = webserver::DirFile::exactly(path).ok()?;
@@ -960,11 +914,6 @@ mod tests {
             std::fs::create_dir_all(&plan.unit_dir).unwrap();
             let mut staged = Staged { dir, plan };
             staged.plan.systemctl = staged.fake("systemctl", "exit 0");
-            // Never the host's own: a machine running these tests may well
-            // have a `stop-bots` user.
-            staged.plan.userdel = staged.fake("userdel", "exit 0");
-            staged.plan.groupdel = staged.fake("groupdel", "exit 0");
-            staged.plan.user = "stop-bots-test-no-such-user".to_string();
             // No table, and no chain, until a test says otherwise.
             staged.plan.nft = staged.fake("nft", "[ \"$1\" = list ] && exit 1\nexit 0");
             staged.plan.iptables = vec![staged.fake(
@@ -1044,9 +993,7 @@ mod tests {
     #[test]
     fn everything_goes_in_the_safe_order() {
         let staged = Staged::new();
-        staged.write("etc/systemd/system/stop-bots-web.service", "unit");
-        staged.write("etc/systemd/system/stop-bots-helper.socket", "unit");
-        staged.write("etc/systemd/system/stop-bots-helper.service", "unit");
+        staged.write("etc/cron.d/stop-bots", "* * * * * root stop-bots tick\n");
         staged.write("etc/systemd/system/stop-bots-firewall.service", "unit");
         let mut plan = staged.plan.clone();
         plan.nft = staged.fake("nft", "exit 0");
@@ -1055,6 +1002,15 @@ mod tests {
         let report = run(&plan, Target::All, &Options::default());
 
         assert!(failures(&report).is_empty(), "{report:#?}");
+        // The schedule first, since it is what would put the rest back.
+        let step = |needle: &str| {
+            report
+                .steps
+                .iter()
+                .position(|step| step.what.contains(needle))
+                .unwrap_or_else(|| panic!("no step naming {needle}: {report:#?}"))
+        };
+        assert!(step("cron.d/stop-bots") < step("systemctl stop stop-bots-firewall.service"));
         let calls = staged.calls();
         let position = |needle: &str| {
             calls
@@ -1063,97 +1019,22 @@ mod tests {
                 .unwrap_or_else(|| panic!("no `{needle}` in {calls:#?}"))
         };
         assert!(
-            position("systemctl stop stop-bots-web.service")
-                < position("systemctl stop stop-bots-helper.socket")
-        );
-        assert!(
-            position("systemctl stop stop-bots-helper.socket")
-                < position("systemctl stop stop-bots-helper.service")
-        );
-        assert!(
-            position("systemctl stop stop-bots-helper.service")
-                < position("nft delete table inet stop_bots")
-        );
-        assert!(
             position("systemctl disable stop-bots-firewall.service")
                 < position("nft delete table inet stop_bots")
         );
         assert!(position("nft delete table") < position("nginx -t"));
         assert!(position("nginx -t") < position("reload"));
         assert_eq!(std::fs::read_to_string(site).unwrap(), SITE);
-        assert!(!staged
-            .path("etc/systemd/system/stop-bots-web.service")
-            .exists());
-        for unit in [
-            "stop-bots-firewall.service",
-            "stop-bots-helper.socket",
-            "stop-bots-helper.service",
+        for left in [
+            "etc/cron.d/stop-bots",
+            "etc/systemd/system/stop-bots-firewall.service",
         ] {
-            assert!(
-                !staged.path(&format!("etc/systemd/system/{unit}")).exists(),
-                "{unit} was left"
-            );
+            assert!(!staged.path(left).exists(), "{left} was left");
         }
-        // The helper is started by its socket and never enabled.
-        assert!(
-            !calls
-                .iter()
-                .any(|call| call == "systemctl disable stop-bots-helper.service"),
-            "{calls:#?}"
-        );
     }
 
-    /// `--purge` removes what owns the database along with it: the
-    /// console's user and its group. Without it both stay, and say so.
-    #[test]
-    fn the_consoles_user_goes_only_with_purge() {
-        let staged = Staged::new();
-        let mut plan = staged.plan.clone();
-        // A user that exists, standing in for the console's; the fakes
-        // remove nothing.
-        // SAFETY: no preconditions; reads the process's own credentials.
-        plan.user = crate::account::user_name(unsafe { libc::geteuid() });
-        let has_group = crate::account::group(&plan.user).is_some();
-
-        let kept = run(&plan, Target::All, &Options::default());
-        assert!(
-            !staged
-                .calls()
-                .iter()
-                .any(|call| call.starts_with("userdel")),
-            "{:#?}",
-            staged.calls()
-        );
-        assert!(
-            kept.kept.iter().any(|k| k.contains(&plan.user)),
-            "{:#?}",
-            kept.kept
-        );
-
-        let purged = run(
-            &plan,
-            Target::All,
-            &Options {
-                purge: true,
-                ..Options::default()
-            },
-        );
-        assert_eq!(purged.failures(), 0, "{purged:#?}");
-        let calls = staged.calls();
-        assert!(
-            calls.contains(&format!("userdel {}", plan.user)),
-            "{calls:#?}"
-        );
-        // The fake removed nothing, so the group is still there to remove.
-        assert_eq!(
-            calls.contains(&format!("groupdel {}", plan.user)),
-            has_group,
-            "{calls:#?}"
-        );
-    }
-
-    /// The record is the console's to write, and the console is not
-    /// root: a row naming a file that is not one of ours, or a link that
+    /// The record may have been written by a user who is not root: a row
+    /// naming a file that is not one of ours, or a link that
     /// is named like one, must not have uninstall delete it.
     #[test]
     fn a_recorded_path_that_is_not_ours_is_not_deleted() {
@@ -1186,8 +1067,8 @@ mod tests {
         );
     }
 
-    /// A recorded path that reaches a `conf.d` through a link the console
-    /// made in its own directory is not followed: the file it leads to,
+    /// A recorded path that reaches a `conf.d` through a link another user
+    /// made in their own directory is not followed: the file it leads to,
     /// headed and named like ours, stays.
     #[test]
     fn a_recorded_path_through_a_link_is_not_followed() {
@@ -1205,11 +1086,11 @@ mod tests {
         let report = run(&plan, Target::Nginx, &Options::default());
 
         assert_eq!(report.failures(), 0, "{report:#?}");
-        assert!(theirs.exists(), "removed through the console's link");
+        assert!(theirs.exists(), "removed through the planted link");
     }
 
-    /// **Checked once, used through what was checked.** A `conf.d` of the
-    /// console's own, swapped for a link to another directory after the
+    /// **Checked once, used through what was checked.** A `conf.d` of
+    /// another user's, swapped for a link to another directory after the
     /// files were resolved: the removal and the restore after NGINX
     /// refuses the result happen in the directory that was checked, and
     /// nothing is written where the link now points.
@@ -1412,7 +1293,7 @@ mod tests {
         let staged = Staged::new();
         let db = staged.write("var/lib/stop-bots/db.sqlite3", "");
         let backup = staged.write("var/lib/stop-bots/db.sqlite3.bak-v0", "");
-        // What WAL leaves beside it while the console has it open.
+        // What WAL leaves beside it while another process has it open.
         let wal = staged.write("var/lib/stop-bots/db.sqlite3-wal", "");
         let shm = staged.write("var/lib/stop-bots/db.sqlite3-shm", "");
 

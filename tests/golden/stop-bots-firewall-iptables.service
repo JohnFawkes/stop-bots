@@ -22,7 +22,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/sh /etc/stop-bots/firewall.sh
 
-# The script runs as root at every boot and the console writes it, so
+# The script runs as root at every boot, so
 # this may load rules and do nothing else: every path read-only, only
 # the capabilities loading rules takes, and no AF_UNIX, which is how
 # root would ask systemd to run something outside this sandbox.

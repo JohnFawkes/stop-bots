@@ -21,12 +21,10 @@
 //! NGINX test and reload commands, the NGINX config root, and the two
 //! logs. They used to be rows in the database (`nginx:test_command`,
 //! `nginx:reload_command`, `nginx:root`, `logs:access_path`,
-//! `logs:ssh_path`), and the web console can write every row of the
-//! database. Once the console runs as its own unprivileged user, a row it
-//! wrote must not decide what a root process executes, so these live in a
-//! file only root can write. The console reads it to show the values and
-//! to know which cursors to offer for a log read (the helper reads the
-//! logs, from this file); nothing it does can change it.
+//! `logs:ssh_path`), and the database is a file other software can write
+//! — a release with the web console gave it to the console's own
+//! unprivileged user. A row written there must not decide what a root
+//! process executes, so these live in a file only root can write.
 //!
 //! The format is one `key = value` per line, `#` comments and blank lines
 //! ignored. An unknown key or a line that is not `key = value` is an
@@ -40,9 +38,9 @@
 //! It creates the file even when there is nothing to move, so that from
 //! then on the file's existence means "migrated": a row that appears in
 //! the database later is never read again. A non-root process never
-//! migrates. And a database that is not root's — the console's, once it
-//! runs as its own user — is not trusted to migrate from at all: its rows
-//! may have been written by whoever compromised the console.
+//! migrates. And a database that is not root's — the web console's, on a
+//! host a release with one set up — is not trusted to migrate from at all:
+//! its rows may have been written by whoever compromised the console.
 
 use std::path::{Path, PathBuf};
 
@@ -220,8 +218,7 @@ impl HostConf {
             "# stop-bots host settings. Written by `stop-bots set-web-server`,\n\
              # `stop-bots set-nginx-commands` and `stop-bots set-log-paths`; read\n\
              # by every stop-bots process.\n\
-             # Only root may change this file: the web console reads it and\n\
-             # cannot write it.\n",
+             # Only root may change this file.\n",
         );
         let lines = [
             (
@@ -416,23 +413,6 @@ impl Migrated {
     }
 }
 
-/// [`migrate`] into [`path`], then the settings as they now are: what
-/// `install web` calls before it hands the database to the console's user,
-/// after which nothing may migrate from it.
-pub fn migrate_from_db_if_absent(db: &Db) -> Result<HostConf> {
-    migrate_from_db_if_absent_at(db, &path())
-}
-
-/// [`migrate_from_db_if_absent`], for the file at `host_conf` (a tree
-/// under `install web --prefix`).
-pub fn migrate_from_db_if_absent_at(db: &Db, host_conf: &Path) -> Result<HostConf> {
-    let migrated = migrate(db, host_conf)?;
-    if let Some(note) = migrated.note(host_conf) {
-        crate::say_err!("{note}");
-    }
-    HostConf::load_from(host_conf)
-}
-
 /// Writes [`path`] with every default if there is no file there yet, so
 /// that from now on its existence means "migrated". Leaves one that exists
 /// alone.
@@ -470,9 +450,9 @@ pub fn migrate(db: &Db, path: &Path) -> Result<Migrated> {
 /// given rather than assumed to be root, so a test can run it.
 ///
 /// The database file and the directory it is in must both belong to
-/// `trusted_owner`. A database the console's user owns, or sits in a
-/// directory it owns and could have swapped the file in, may hold rows the
-/// console wrote: those are deleted, never copied.
+/// `trusted_owner`. A database another user owns, or sits in a directory
+/// they own and could have swapped the file in, may hold rows that user
+/// wrote: those are deleted, never copied.
 pub fn move_settings(db: &Db, path: &Path, trusted_owner: u32) -> Result<Migrated> {
     if std::fs::symlink_metadata(path).is_ok() {
         return Ok(Migrated::AlreadyDone);
@@ -555,8 +535,8 @@ fn owned_by(file: &Path, owner: u32) -> std::result::Result<(), String> {
     }
     if meta.uid() != owner {
         return Err(format!(
-            "{} belongs to uid {}, not {owner}, so its rows may have been written by the web \
-             console",
+            "{} belongs to uid {}, not {owner}, so its rows may have been written by \
+             another user",
             file.display(),
             meta.uid()
         ));
@@ -693,7 +673,7 @@ mod tests {
         );
     }
 
-    /// Root writes it and everyone, the console included, reads it.
+    /// Root writes it and everyone reads it.
     #[test]
     fn the_file_is_written_world_readable_and_owner_writable() {
         use std::os::unix::fs::PermissionsExt;
@@ -837,8 +817,9 @@ mod tests {
         assert_eq!(HostConf::load_from(&path).unwrap(), HostConf::default());
     }
 
-    /// The console's database, once it runs as its own user: whatever it
-    /// holds may have been written by an attacker, so nothing is copied.
+    /// A database another user owns — the web console's, on a host a release
+    /// with one set up: whatever it holds may have been written by an
+    /// attacker, so nothing is copied.
     #[test]
     fn a_database_someone_else_owns_is_not_migrated_from() {
         let dir = tempfile::tempdir().unwrap();

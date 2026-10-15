@@ -20,13 +20,13 @@
 //! [`Db::list_user_agent_stats`] reads every row, which is right for the
 //! CLI's `list-access-stats` and wrong for a screen: the table's rows are
 //! strings any client can choose, and twenty thousand distinct 4–8 KB user
-//! agents made the console's Firewall page load them all, classify each
-//! against every bot pattern inside the database lock, and render 418 MB of
-//! HTML. A screen shows the most-seen [`crate::dynamic::UA_PAGE_ROWS`] and
+//! agents made the web console's Firewall page (since removed) load them
+//! all, classify each against every bot pattern inside the database lock,
+//! and render 418 MB of HTML. A screen shows the most-seen [`crate::dynamic::UA_PAGE_ROWS`] and
 //! pages through the rest.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 
 use super::{Db, UserAgentStat};
 
@@ -67,42 +67,6 @@ impl Db {
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("failed to list a page of user agent stats")
     }
-
-    /// How many user agents are tallied, for "showing 200 of 20,413".
-    pub fn count_user_agent_stats(&self) -> Result<usize> {
-        let count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM user_agent_stats", [], |row| {
-                row.get(0)
-            })
-            .context("failed to count user agent stats")?;
-        Ok(count.max(0) as usize)
-    }
-
-    /// The row [`Self::user_agent_stats_page`] returned under `id`, if it
-    /// is still there.
-    ///
-    /// A `rowid` is not forever: `VACUUM` may renumber a table whose key is
-    /// not an `INTEGER PRIMARY KEY`, and pruning deletes rows. A caller that
-    /// took the id from a URL must check the string it gets back is the
-    /// one it meant; `web::firewall`'s reference carries a digest for that.
-    pub fn user_agent_stat_by_id(&self, id: i64) -> Result<Option<UserAgentStat>> {
-        self.conn
-            .query_row(
-                "SELECT user_agent, hit_count, last_seen_at FROM user_agent_stats
-                 WHERE rowid = ?1",
-                params![id],
-                |row| {
-                    Ok(UserAgentStat {
-                        user_agent: row.get(0)?,
-                        hit_count: row.get(1)?,
-                        last_seen_at: row.get(2)?,
-                    })
-                },
-            )
-            .optional()
-            .context("failed to read a user agent's statistics")
-    }
 }
 
 #[cfg(test)]
@@ -138,26 +102,5 @@ mod tests {
         seen.sort_unstable();
         assert_eq!(seen, ["a", "b", "c", "d", "e"], "each agent exactly once");
         assert_eq!(names(&db.user_agent_stats_page(2, 0).unwrap()), ["b", "e"]);
-    }
-
-    #[test]
-    fn a_page_holds_at_most_its_limit_whatever_the_table_holds() {
-        let many: Vec<(String, u64)> = (0..500).map(|i| (format!("ua-{i}"), i)).collect();
-        let refs: Vec<(&str, u64)> = many.iter().map(|(s, n)| (s.as_str(), *n)).collect();
-        let db = db_with(&refs);
-
-        assert_eq!(db.user_agent_stats_page(200, 0).unwrap().len(), 200);
-        assert_eq!(db.user_agent_stats_page(200, 400).unwrap().len(), 100);
-        assert_eq!(db.count_user_agent_stats().unwrap(), 500);
-    }
-
-    #[test]
-    fn a_row_is_found_again_by_the_id_its_page_gave_it() {
-        let db = db_with(&[("curl/8.0", 3), ("Googlebot/2.1", 12)]);
-
-        for (id, stat) in db.user_agent_stats_page(10, 0).unwrap() {
-            assert_eq!(db.user_agent_stat_by_id(id).unwrap(), Some(stat));
-        }
-        assert_eq!(db.user_agent_stat_by_id(9_999).unwrap(), None);
     }
 }

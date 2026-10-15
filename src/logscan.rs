@@ -23,8 +23,8 @@
 //! Every detector job read, decoded and parsed the whole access log for
 //! itself, about ten full reads a minute at roughly twice the file's size
 //! in memory each, and the TUI started them all at once. On a 200 MB log
-//! that was 440 MB for one pass of the web console and 2.9 GB for the
-//! TUI's first minute. And because each read counted over the whole file,
+//! that was 440 MB for one pass of the web console (since removed) and
+//! 2.9 GB for the TUI's first minute. And because each read counted over the whole file,
 //! a block that expired was re-added from the same old lines.
 //!
 //! ## The three halves of a pass
@@ -33,16 +33,16 @@
 //! front-end holds its database, or its event loop, across the slow part:
 //!
 //! - [`plan`] reads the database: which logs are wanted, where each read
-//!   resumes, what the detectors look for. Quick; under the web console's
-//!   lock, or on the TUI's main thread.
+//!   resumes, what the detectors look for. Quick; on the TUI's main
+//!   thread, or inline in `tick` and the CLI.
 //! - [`read`] reads and parses the logs, and touches no database: it
 //!   cannot, it is given none. Slow; on a blocking thread, outside the
 //!   lock. It streams a line at a time, so its memory is the evidence it
 //!   collects, not the file.
 //! - [`apply`] stores what the read found and where the next one resumes
 //!   (see `db::evidence::Ingest`), and prunes what has fallen out of every
-//!   window. Back under the lock; the web console takes it a chunk at a
-//!   time ([`store`]), so a large read does not hold it for all of it.
+//!   window. A chunk at a time ([`store`]), each its own transaction, so a
+//!   large read does not hold the database's write lock for all of it.
 //!
 //! Then each due job decides from the stored evidence: see
 //! `cron::run_log_jobs`.
@@ -246,7 +246,6 @@ fn watch(db: &Db, now: i64) -> Result<Watch> {
         probe_paths: crate::protection::probe_paths(db)?,
         honeypot: crate::protection::honeypot_path(db)?,
         claims: crate::scanblock::crawler_claims(db)?,
-        console: console(db)?,
         hosted: hosted(db)?,
     })
 }
@@ -269,23 +268,6 @@ pub fn hosted(db: &Db) -> Result<crate::services::Hosted> {
         }
     }
     Ok(crate::services::Hosted::new(sites))
-}
-
-/// Where this host's web console is served, whose lines no detector reads
-/// and the access stats do not count: see [`accesslog::Console`].
-pub fn console(db: &Db) -> Result<accesslog::Console> {
-    // A stored prefix the console itself would refuse to start with is
-    // still the prefix NGINX was given, so it is read as it stands.
-    let prefix = match crate::web::BasePath::from_db(db) {
-        Ok(base) => base.as_str().to_string(),
-        Err(_) => db
-            .get_text_setting(crate::web::BASE_PATH_KEY)?
-            .unwrap_or_default(),
-    };
-    Ok(accesslog::Console::new(
-        &prefix,
-        &crate::web::configured_hosts(db)?,
-    ))
 }
 
 /// The access-stats offset 0.0.x kept for `path`.
@@ -340,9 +322,8 @@ pub struct Read {
     pub ssh: Option<Outcome<SshFindings>>,
 }
 
-/// Reads what `plan` asks for, through `reader`: [`Plan::sources`] in
-/// process, or the console's [`crate::privileged::Privileged`]. Blocking,
-/// and deliberately without a `Db`: see the module docs.
+/// Reads what `plan` asks for, through `reader` — [`Plan::sources`].
+/// Blocking, and deliberately without a `Db`: see the module docs.
 pub fn read(plan: &Plan, reader: &dyn LogReader) -> Read {
     Read {
         now: plan.now,
@@ -535,9 +516,8 @@ enum Log {
 
 /// What a pass read, being stored one transaction at a time: each log's
 /// findings a chunk at a time (see [`Ingest`]), then the pruning. Holds no
-/// database, so the web console's cron can let the lock go between steps
-/// and a large pass does not keep every request, `/login` included,
-/// waiting for all of it.
+/// database, so the write lock goes between steps and a large pass does
+/// not keep the TUI or a `batch` waiting for all of it.
 pub struct Storing {
     applied: Applied,
     pending: Vec<(Log, Ingest)>,
@@ -862,32 +842,6 @@ mod tests {
         assert_eq!(applied.stats.total_hits, 0, "nothing new to tally");
     }
 
-    /// Behind NGINX the console's requests are in the site's log, from the
-    /// operator, and carry what the console shows them. None of it is
-    /// evidence, and none of it is a visitor to tally.
-    #[test]
-    fn the_console_s_own_lines_are_neither_evidence_nor_stats() {
-        let host = host();
-        host.db
-            .set_text_setting(crate::web::BASE_PATH_KEY, "/stop-bots")
-            .unwrap();
-        for (path, status) in [("/stop-bots/firewall", 200), ("/stop-bots/.env", 404)] {
-            append(
-                &host.access,
-                &format!(
-                    "198.51.100.10 - - [{}] \"GET {path} HTTP/1.1\" {status} 1 \"-\" \"Mozilla/5.0\"\n",
-                    stamp(now())
-                ),
-            );
-        }
-
-        let applied = pass(&host);
-
-        assert_eq!(applied.stats.total_hits, 0, "{:?}", applied.stats);
-        assert!(probers(&host.db).is_empty());
-        assert!(host.db.list_user_agent_stats().unwrap().is_empty());
-    }
-
     /// serde decodes a JSON log's `"\n"` to a real newline, and a newline
     /// is how the stored evidence marks the observation that clears an
     /// address. A client must not be able to spell it.
@@ -920,33 +874,6 @@ mod tests {
         );
         let outcome = crate::scanblock::run_detector(&host.db, detector, 1, now(), true).unwrap();
         assert_eq!(outcome.newly_blocked, ["203.0.113.5"], "{outcome:?}");
-    }
-
-    /// A console on its own host has no prefix to tell it by. A JSON log
-    /// that records the host still can; the rest of the site is read.
-    #[test]
-    fn a_subdomain_console_s_lines_are_known_by_their_host_in_a_json_log() {
-        let host = host();
-        host.db
-            .set_text_setting(crate::web::ALLOWED_HOSTS_KEY, "console.example.com")
-            .unwrap();
-        for (ip, name) in [
-            ("198.51.100.10", "console.example.com:443"),
-            ("203.0.113.5", "www.example.com"),
-        ] {
-            append(
-                &host.access,
-                &format!(
-                    "{{\"remote_addr\":\"{ip}\",\"status\":\"404\",\"request_uri\":\"/.env\",\
-                     \"host\":\"{name}\",\"time_iso8601\":\"{}\"}}\n",
-                    iso(now())
-                ),
-            );
-        }
-
-        pass(&host);
-
-        assert_eq!(probers(&host.db), ["203.0.113.5"]);
     }
 
     /// 0.0.x counted the access-stats tally up to a byte offset. An upgrade
@@ -1009,7 +936,7 @@ mod tests {
     }
 
     /// Two readers from the same cursor: the second stores nothing, so
-    /// running the console and `batch` together does not double a count.
+    /// running `tick` and `batch` together does not double a count.
     #[test]
     fn a_second_reader_of_the_same_lines_stores_nothing() {
         let host = host();

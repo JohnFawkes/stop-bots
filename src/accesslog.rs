@@ -251,7 +251,7 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
                 json_field(obj, "time_local").and_then(|t| crate::logtime::nginx_time_local(&t))
             }),
         // `$host` or `$http_host`, when the format logs either: what tells
-        // a subdomain console's lines apart (see [`Console`]).
+        // which site a request was for (see [`crate::services::Hosted`]).
         host: json_field(obj, "host").or_else(|| json_field(obj, "http_host")),
         trailing: Vec::new(),
     })
@@ -361,9 +361,7 @@ struct ParsedLine {
     /// and `"$http_x_forwarded_for"`, which the client writes, is as
     /// common as `"$host"`. So they are only ever compared against the
     /// names of this server's sites, to tell which site a request was for
-    /// (see [`crate::services::Hosted`]) — never taken for the host the
-    /// console is recognised by, where a client naming the console would
-    /// have its every line skipped.
+    /// (see [`crate::services::Hosted`]).
     trailing: Vec<String>,
 }
 
@@ -457,6 +455,30 @@ pub fn spoofed_crawler_ips(log_text: &str, claims: &[CrawlerClaim]) -> Vec<(Stri
         },
         Rule::Once,
     )
+}
+
+/// The crawler `line` claims to be and is not, if any: its user agent names
+/// one of `claims` and no crawler it names publishes its address.
+///
+/// Verification is per *request*, not per claim: if any crawler the user
+/// agent named vouches for the address, the request is legitimate and the
+/// other names it mentions prove nothing on their own. Checking per claim
+/// would flag the real Googlebot the moment its user agent contained
+/// another crawler's token. A crawler with no fetched ranges is skipped,
+/// for the reason [`spoofed_crawler_ips`] gives.
+fn impersonates(line: &ParsedLine, claims: &[CrawlerClaim]) -> Option<&'static str> {
+    let ua = line.user_agent.to_lowercase();
+    let matched: Vec<&CrawlerClaim> = claims
+        .iter()
+        .filter(|claim| !claim.ranges.is_empty() && ua.contains(claim.marker))
+        .collect();
+    let vouched = matched
+        .iter()
+        .any(|claim| claim.ranges.iter().any(|cidr| cidr_contains(cidr, line.ip)));
+    match matched.first() {
+        Some(first) if !vouched => Some(first.name),
+        _ => None,
+    }
 }
 
 /// Request paths that no human, browser or legitimate crawler ever asks
@@ -800,8 +822,8 @@ fn sorted_turned_away(counts: Vec<(String, (u64, u64))>) -> Vec<TurnedAway> {
 /// database before any log is read.
 ///
 /// A plain value with no database handle, because it goes with the read
-/// to wherever the read happens: a blocking thread in the TUI, outside the
-/// web console's lock. See [`crate::logscan`].
+/// to wherever the read happens: a blocking thread in the TUI, or inline
+/// in `tick` and the CLI. See [`crate::logscan`].
 #[derive(Debug, Clone, Default)]
 pub struct Watch {
     /// The access-log detectors that are on, each with the oldest time a
@@ -814,9 +836,6 @@ pub struct Watch {
     pub honeypot: String,
     /// [`crate::scanblock::crawler_claims`].
     pub claims: Vec<CrawlerClaim>,
-    /// Where this host's web console is served: its lines are the
-    /// operator's, and are not read at all (see [`Console`]).
-    pub console: Console,
     /// The applications behind this server's sites, whose own clients'
     /// requests the 404 and behavioural detectors do not count (see
     /// [`crate::services`]).
@@ -832,7 +851,6 @@ impl Watch {
             probe_paths: DEFAULT_PROBE_PATHS.iter().map(|p| p.to_string()).collect(),
             honeypot: crate::protection::HONEYPOT_PATH_DEFAULT.to_string(),
             claims: Vec::new(),
-            console: Console::default(),
             hosted: Hosted::default(),
         }
     }
@@ -842,83 +860,10 @@ impl Watch {
     }
 }
 
-/// Where this host's web console is served, so that its own traffic is
-/// never read as evidence, nor tallied into the access stats.
-///
-/// Behind NGINX the console's requests go into the site's access log, from
-/// the operator's address, and the console shows the operator what the
-/// attackers sent: the Firewall page links a user agent's details as
-/// `?inspect_ua=<the user agent>`, and a search is `?q=<what was typed>`.
-/// Read as traffic, one look at a `${jndi:...}` user agent was a log4shell
-/// payload from the operator, and the injection detector blocked them for
-/// a week on that one line.
-///
-/// Two ways to recognise a console line, one per way the Web Access panel
-/// puts it behind NGINX:
-///
-/// - **Under a path prefix** (`web:base_path`, e.g. `/stop-bots`): the
-///   request path, normalised as NGINX normalises it before choosing a
-///   `location` (`%XX` decoded once, `//` merged, `.` and `..` resolved), is
-///   the prefix or under it. Normalised so that `/stop-bots/../.env`, which
-///   NGINX serves from the site and not the console, is still read.
-/// - **On its own host**, when there is no prefix: the line's `Host` is one
-///   of the console's configured names. Only a JSON format can say, since
-///   the combined one does not log the host, which is why the panel's
-///   subdomain server block has `access_log off`.
-///
-/// The prefix wins when there is one: the configured names then include
-/// the site's own, and matching on them would skip the whole site.
-///
-/// The cost is that nothing a client sends under the console's prefix is
-/// judged. What answers there is the console, which does nothing without
-/// a session.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Console {
-    /// The prefix's segments: `["stop-bots"]`, or none for the root.
-    prefix: Vec<String>,
-    /// The console's own host names, compared without a port and ignoring
-    /// case. Consulted only when there is no prefix.
-    hosts: Vec<String>,
-}
-
-impl Console {
-    /// A console under `prefix` (`""`, `/stop-bots`, `/stop-bots/`),
-    /// answering to `hosts` besides the loopback names.
-    pub fn new(prefix: &str, hosts: &[String]) -> Console {
-        Console {
-            prefix: prefix
-                .split('/')
-                .filter(|segment| !segment.is_empty())
-                .map(str::to_string)
-                .collect(),
-            hosts: hosts.to_vec(),
-        }
-    }
-
-    /// Whether no line can be the console's: one at the root with no
-    /// configured name, which is a console on loopback.
-    pub fn is_empty(&self) -> bool {
-        self.prefix.is_empty() && self.hosts.is_empty()
-    }
-
-    /// Whether `line` was a request to the console.
-    fn serves(&self, line: &ParsedLine) -> bool {
-        if !self.prefix.is_empty() {
-            return path_segments(&line.path).starts_with(&self.prefix);
-        }
-        let Some(host) = line.host.as_deref() else {
-            return false;
-        };
-        let name = crate::services::host_name(host);
-        self.hosts.iter().any(|h| h.eq_ignore_ascii_case(name))
-    }
-}
-
 /// The segments of `path` as NGINX matches a `location` against it: `%XX`
 /// decoded once, empty and `.` segments dropped, and `..` taking away the
 /// one before it. Not the `%u` forms [`crate::injection`] also decodes:
-/// NGINX does not, and a path read as the console's must be one NGINX
-/// sent there.
+/// NGINX does not, and a path matched here must be one NGINX would match.
 pub(crate) fn path_segments(path: &str) -> Vec<String> {
     let bytes = path.as_bytes();
     let hex = |b: u8| (b as char).to_digit(16);
@@ -946,23 +891,6 @@ pub(crate) fn path_segments(path: &str) -> Vec<String> {
         }
     }
     segments
-}
-
-/// `log_text` without the console's lines (see [`Console`]), for a
-/// detector given a whole log to read, as the scheduled pass reads one.
-pub fn without_console<'a>(log_text: &'a str, console: &Console) -> std::borrow::Cow<'a, str> {
-    if console.is_empty() {
-        return std::borrow::Cow::Borrowed(log_text);
-    }
-    let mut kept = String::with_capacity(log_text.len());
-    for line in log_text.lines() {
-        if parse_line(line).is_some_and(|parsed| console.serves(&parsed)) {
-            continue;
-        }
-        kept.push_str(line);
-        kept.push('\n');
-    }
-    std::borrow::Cow::Owned(kept)
 }
 
 /// When a line happened, for the observer.
@@ -1044,9 +972,6 @@ impl Observer {
             return;
         };
         self.counts.parsed += 1;
-        if self.watch.console.serves(&line) {
-            return;
-        }
         if let Some(tally) = &mut self.user_agents {
             if counts_as_a_visit(&line) {
                 // Cut as it will be stored, so that two agents the table
@@ -1095,35 +1020,7 @@ impl Observer {
         match detector {
             // A distinct path that does not exist here.
             Detector::WebScanners => (line.status == 404).then(|| Item::seen(&line.path)),
-            Detector::SpoofedCrawlers => {
-                let active: Vec<&CrawlerClaim> = self
-                    .watch
-                    .claims
-                    .iter()
-                    .filter(|c| !c.ranges.is_empty())
-                    .collect();
-                if active.is_empty() {
-                    return None;
-                }
-                let ua = line.user_agent.to_lowercase();
-                let matched: Vec<&&CrawlerClaim> = active
-                    .iter()
-                    .filter(|claim| ua.contains(claim.marker))
-                    .collect();
-                // Verification is per *request*, not per claim: if any
-                // crawler the user agent named vouches for the address,
-                // the request is legitimate and the other names it
-                // mentions prove nothing on their own. Checking per claim
-                // would flag the real Googlebot the moment its user agent
-                // contained another crawler's token.
-                let vouched = matched
-                    .iter()
-                    .any(|claim| claim.ranges.iter().any(|cidr| cidr_contains(cidr, line.ip)));
-                match matched.first() {
-                    Some(first) if !vouched => Some(Item::seen(first.name)),
-                    _ => None,
-                }
-            }
+            Detector::SpoofedCrawlers => impersonates(line, &self.watch.claims).map(Item::seen),
             Detector::ProbePaths => {
                 let path = line.path.to_lowercase();
                 self.needles
@@ -1291,8 +1188,22 @@ pub struct Survey {
     pub cdn: usize,
     /// The first line that did not parse, as it is safe to show.
     pub unparsed_sample: Option<String>,
-    turned_away: HashMap<String, (u64, u64)>,
+    /// Per agent, per address: `(refused, served)`. Kept by address until
+    /// the end, because an address is only known to be an attacker from
+    /// its first probe on, and its refusals before that do not count either.
+    turned_away: HashMap<String, HashMap<IpAddr, (u64, u64)>>,
+    /// Addresses that asked for a probe path or sent an exploit payload
+    /// (the same tests as [`probe_path_ips`] and [`injection_ips`], with
+    /// the built-in paths). Whatever agent they claim to be, what they
+    /// were refused was not a client being turned away: a scanner's
+    /// favourite disguise is a browser's user agent, and one Chrome string
+    /// worn by 33 addresses asking for `/.env` read as a lost visitor.
+    attackers: HashSet<IpAddr>,
     block_status: u16,
+    /// The crawlers whose published ranges say who is really them: a
+    /// request claiming one from elsewhere is an impersonator, and its
+    /// refusal is not a client of this host being turned away.
+    claims: Vec<CrawlerClaim>,
 }
 
 impl Survey {
@@ -1301,6 +1212,12 @@ impl Survey {
             block_status,
             ..Survey::default()
         }
+    }
+
+    /// This survey, knowing who `claims`' crawlers really are.
+    pub fn with_claims(mut self, claims: Vec<CrawlerClaim>) -> Survey {
+        self.claims = claims;
+        self
     }
 
     pub fn line(&mut self, text: &str) {
@@ -1325,7 +1242,22 @@ impl Survey {
         if line.user_agent.is_empty() || line.user_agent == "-" {
             return;
         }
-        let entry = self.turned_away.entry(line.user_agent).or_insert((0, 0));
+        // Someone else's name, from someone else's address: neither a
+        // refusal nor a visit by the client that name belongs to. Left out,
+        // a forged Googlebot refused 16,000 times no longer reads as
+        // Googlebot turned away.
+        if impersonates(&line, &self.claims).is_some() {
+            return;
+        }
+        if !self.attackers.contains(&line.ip) && attacks(&line) {
+            self.attackers.insert(line.ip);
+        }
+        let entry = self
+            .turned_away
+            .entry(line.user_agent)
+            .or_default()
+            .entry(line.ip)
+            .or_insert((0, 0));
         if line.status == self.block_status {
             entry.0 += 1;
         } else if line.status < 400 {
@@ -1338,10 +1270,29 @@ impl Survey {
         sorted_turned_away(
             self.turned_away
                 .iter()
-                .map(|(ua, counts)| (ua.clone(), *counts))
+                .map(|(ua, by_address)| {
+                    let counts = by_address
+                        .iter()
+                        .filter(|(ip, _)| !self.attackers.contains(ip))
+                        .fold((0, 0), |(refused, served), (_, (r, s))| {
+                            (refused + r, served + s)
+                        });
+                    (ua.clone(), counts)
+                })
                 .collect(),
         )
     }
+}
+
+/// Whether `line` asks for one of [`DEFAULT_PROBE_PATHS`] or carries an
+/// exploit payload: one such request is conclusive about its address.
+fn attacks(line: &ParsedLine) -> bool {
+    let path = line.path.to_lowercase();
+    DEFAULT_PROBE_PATHS
+        .iter()
+        .any(|needle| path.contains(&needle.to_lowercase()))
+        || crate::injection::signature(&line.request, &line.user_agent, line.referer.as_deref())
+            .is_some()
 }
 
 /// The longest sample line a report quotes, in characters.
@@ -1425,6 +1376,59 @@ mod tests {
         assert_eq!(
             turned_away[0].served, 0,
             "a 404 and a 500 are neither refused by us nor served"
+        );
+    }
+
+    /// A forged Googlebot, refused, is not a client of this host turned
+    /// away: the survey leaves it out once it knows Google's ranges, and
+    /// still counts the real one.
+    #[test]
+    fn a_refused_impersonator_is_not_a_client_turned_away() {
+        let googlebot = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        let forged = line_with("203.0.113.9", 418, googlebot);
+        let real = line_with("66.249.66.1", 418, googlebot);
+        let tally = |log: &str| {
+            let mut survey = Survey::new(418).with_claims(vec![googlebot_claim()]);
+            for line in log.lines() {
+                survey.line(line);
+            }
+            survey.turned_away()
+        };
+
+        assert!(
+            tally(&forged).is_empty(),
+            "a forged Googlebot counted: {:?}",
+            tally(&forged)
+        );
+        let counted = tally(&real);
+        assert_eq!(counted.len(), 1, "the real Googlebot went uncounted");
+        assert_eq!(counted[0].refused, 1);
+    }
+
+    /// A browser's agent worn by an address that also asked for `/.env` is
+    /// a scanner's disguise: its refusals, before the probe as well as
+    /// after, are not a client turned away. The same agent from an address
+    /// that never probed still counts.
+    #[test]
+    fn refusals_from_an_address_that_probed_are_not_a_client_turned_away() {
+        let chrome = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+        let log = [
+            line_with("203.0.113.9", 418, chrome),
+            probe_from("203.0.113.9", "/.env", chrome),
+            line_with("198.51.100.7", 418, chrome),
+        ]
+        .concat();
+
+        let counted = turned_away_user_agents(&log, 418);
+
+        assert_eq!(
+            counted,
+            vec![TurnedAway {
+                user_agent: chrome.to_string(),
+                refused: 1,
+                served: 0,
+            }],
+            "only the address that never probed should count"
         );
     }
 
@@ -1756,6 +1760,13 @@ mod tests {
     fn line_with(ip: &str, status: u16, user_agent: &str) -> String {
         format!(
             "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET / HTTP/1.1\" {status} 512 \"-\" \"{user_agent}\"\n"
+        )
+    }
+
+    /// A refused request for `path`.
+    fn probe_from(ip: &str, path: &str, user_agent: &str) -> String {
+        format!(
+            "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/1.1\" 418 0 \"-\" \"{user_agent}\"\n"
         )
     }
 
@@ -2536,7 +2547,7 @@ mod tests {
         assert_eq!(parsed.trailing, ["cloud.example.com"]);
         assert_eq!(
             parsed.host, None,
-            "a trailing field is never the console's host"
+            "a trailing field is never taken for the host"
         );
     }
 

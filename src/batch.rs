@@ -68,8 +68,8 @@
 //! rather than claiming everything is overdue.
 //!
 //! Where each log was last read up to is shared the same way (see
-//! [`crate::logscan`]): keyed by the log's path, so a line the console
-//! already read is not read again here, and the other way round. A key of
+//! [`crate::logscan`]): keyed by the log's path, so a line `tick` or the
+//! TUI already read is not read again here, and the other way round. A key of
 //! batch's own would re-read the whole log on the first run and count
 //! every line twice thereafter.
 
@@ -223,11 +223,10 @@ fn scan_sites(server: webserver::WebServer, db: &Db, root: &Path) -> Result<Stri
 /// other two aren't.
 /// Every downloadable list, through the shared plan in `refresh`.
 ///
-/// This used to enumerate the four kinds of source itself, which is how
-/// the web console ended up unable to offer the same button: the loop held
-/// `&Db` across every `.await`, and `Db` is not `Sync`. `refresh::plan`
-/// now decides *what* to update and both front-ends drive the fetching in
-/// whatever order their runtime allows.
+/// This used to enumerate the four kinds of source itself, holding `&Db`
+/// across every `.await`, which only one front-end could drive. `refresh`
+/// now decides *what* to update and each front-end drives the fetching in
+/// whatever order its runtime allows.
 ///
 /// Holds the download lease (see [`refresh::Lease`]) while it runs. When a
 /// front-end's download holds it, this fetches nothing and says so as a

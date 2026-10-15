@@ -18,20 +18,17 @@
 //! "Update everything": every downloadable list this host uses, as a plan
 //! of fetch-then-store pairs.
 //!
-//! Lifted out of `batch::update_lists` when the web console needed the same
-//! button, for the reason `scanblock`, `accessstats` and `dynamic` were
-//! lifted out before: two front-ends running their own version of "update
-//! everything" is two front-ends that will eventually update different
-//! things, and the one that updates less is the one that quietly stops
-//! protecting anybody.
+//! Lifted out of `batch::update_lists` so that `batch`, the TUI's "Update
+//! everything" and the schedule's weekly job run one version of it: two
+//! front-ends running their own version of "update everything" is two
+//! front-ends that will eventually update different things, and the one
+//! that updates less is the one that quietly stops protecting anybody.
 //!
 //! The split is not a style choice. `Db` is not `Sync`, so it cannot be
-//! held across an `.await`; the web console reaches its database through
-//! `spawn_blocking`, which needs `Send + 'static`. `batch::update_lists`
-//! was an `async fn` holding `&Db` across every fetch, which works exactly
-//! once — in `batch`, on a current-thread runtime — and nowhere else.
-//! [`fetch`] touches no database and [`store`] touches no network, so
-//! either front-end can drive them in whatever order its runtime allows.
+//! held across an `.await` on a multi-threaded runtime, and the TUI keeps
+//! its database on the thread that draws. [`fetch`] touches no database
+//! and [`store`] touches no network, so each front-end can drive them in
+//! whatever order its runtime allows.
 
 use anyhow::{Context, Result};
 
@@ -146,8 +143,8 @@ pub fn store(db: &Db, source: &Source, raw: &str) -> Result<String> {
 
 /// "N range(s)", plus what storing `cidrs` dropped as too broad, if it
 /// dropped anything — this summary is what `batch` prints to a cron log and
-/// the console shows after "Update everything", so it is where a tampered
-/// feed has to show up.
+/// the TUI shows after "Update everything", so it is where a tampered feed
+/// has to show up.
 fn ranges_summary(count: usize, cidrs: &[String]) -> String {
     match ipranges::too_broad_note(cidrs) {
         Some(note) => format!("{count} range(s); {note}"),
@@ -214,11 +211,12 @@ pub fn record(db: &Db, outcomes: &[(Source, Result<String, String>)], by: &str) 
 pub const LEASE_SECONDS: i64 = 10 * 60;
 
 /// The right to download lists, recorded in the database so that the TUI,
-/// the console and a `batch` from cron all see it.
+/// `tick` and a `batch` from cron all see it.
 ///
 /// "Update everything" and the internal cron's jobs used to fetch the same
-/// feeds at once: the TUI kept its own interlock per job, and the console
-/// had none at all between its button and its cron. Nothing corrupted
+/// feeds at once: the TUI kept its own interlock per job, and the web
+/// console (since removed) had none at all between its button and its
+/// cron. Nothing corrupted
 /// (every store replaces), but it was duplicate traffic to the same third
 /// parties. A row rather than a lock file: every front-end already shares
 /// the database, a row outlives nothing it should not (it expires), and a
@@ -397,7 +395,7 @@ mod tests {
 
     /// The button says "everything", so the plan has to actually contain
     /// everything a `batch` run would fetch. A plan that quietly omits a
-    /// kind of source leaves the console telling you to go and run a CLI
+    /// kind of source leaves the TUI telling you to go and run a CLI
     /// command — which is the bug this replaced.
     #[test]
     fn the_plan_covers_every_kind_of_downloadable_list() {
@@ -452,7 +450,7 @@ mod tests {
     }
 
     /// A catch-all in a feed is dropped, and the one-line summary a cron
-    /// log or the console shows says so — a feed that suddenly carries
+    /// log or the TUI shows says so — a feed that suddenly carries
     /// `0.0.0.0/0` has been tampered with or broken, and that is news.
     #[test]
     fn a_dropped_catch_all_is_named_in_the_summary() {

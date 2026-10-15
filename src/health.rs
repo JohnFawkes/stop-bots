@@ -24,8 +24,8 @@
 //! ruleset, because writing the script and loading it are two steps and
 //! only the first had ever been checked.
 //!
-//! Split in two, the same way [`crate::refresh`] and [`crate::webaccess`]
-//! are, and for the same reason:
+//! Split in two, the same way [`crate::refresh`] is, and for the same
+//! reason:
 //!
 //! - [`probe`] shells out — `nft`, `iptables`, `systemctl`, the
 //!   filesystem. It touches no database, so it can run anywhere.
@@ -46,7 +46,7 @@
 //! everything is fine because it could not look is worse than no health
 //! check, because it is believed.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::Result;
@@ -162,10 +162,10 @@ pub struct Probe {
     /// decides whether enabling `nftables.service` is safe to suggest on
     /// this host. `None` when the file could not be read.
     pub nftables_conf_flushes: Option<bool>,
-    /// `systemctl is-active` for the console's unit, when there is one.
-    pub unit_active: Option<bool>,
-    /// The binary the unit's `ExecStart` names, if a unit exists.
-    pub unit_binary: Option<PathBuf>,
+    /// Whether `install cron`'s file is in `/etc/cron.d`. `None` in a probe
+    /// taken before this was carried.
+    #[serde(default)]
+    pub cron_installed: Option<bool>,
     /// Bytes free on the filesystem holding the database.
     pub db_free_bytes: Option<u64>,
     /// Whether each log source could actually be read.
@@ -239,23 +239,6 @@ pub struct Probe {
     /// from a CDN's edge addresses. `None` when the log could not be read.
     #[serde(default)]
     pub access_log_cdn: Option<usize>,
-    /// Who the running console is, as the kernel has it: the effective
-    /// uid and every group its process holds. `None` when no console unit
-    /// is running, or it could not be read.
-    #[serde(default)]
-    pub console_identity: Option<crate::account::Identity>,
-    /// Whether the running console was handed the root helper's socket
-    /// (`--helper` in its `ExecStart`) and that socket is listening.
-    /// `None` when no console unit is running.
-    #[serde(default)]
-    pub console_helper: Option<bool>,
-    /// The logs this host is configured to read that the running console
-    /// cannot get — the access log, and the SSH log or the journal. With
-    /// its helper, the ones the helper cannot read, since the helper reads
-    /// them for it; without one, the ones the console's own uid and groups
-    /// cannot read, asked from root, which itself can read everything.
-    #[serde(default)]
-    pub console_unreadable_logs: Vec<String>,
     /// The NGINX test and reload commands the host settings name, for
     /// [`nginx_deployment`] to check against where NGINX runs. `None` from
     /// a probe taken before they were carried here, or when the setting
@@ -337,8 +320,12 @@ const LARGE_DB_BYTES: u64 = 128 * 1024 * 1024;
 
 /// The last [`ACCESS_LOG_SAMPLE_BYTES`] of the access log at `path`, read
 /// through a [`crate::accesslog::Survey`], or `None` if it cannot be read.
-fn access_log_sample(path: &Path, block_status: u16) -> Option<crate::accesslog::Survey> {
-    let mut survey = crate::accesslog::Survey::new(block_status);
+fn access_log_sample(
+    path: &Path,
+    block_status: u16,
+    claims: Vec<crate::accesslog::CrawlerClaim>,
+) -> Option<crate::accesslog::Survey> {
+    let mut survey = crate::accesslog::Survey::new(block_status).with_claims(claims);
     crate::logread::read_tail(path, ACCESS_LOG_SAMPLE_BYTES, &mut |line| survey.line(line)).ok()?;
     Some(survey)
 }
@@ -352,13 +339,16 @@ fn access_log_sample(path: &Path, block_status: u16) -> Option<crate::accesslog:
 ///
 /// Where to look comes from `host` ([`crate::hostconf`]): the logs, the
 /// NGINX root whose `conf.d` is checked, and the NGINX commands, which are
-/// carried in the probe for [`assess`] to judge.
+/// carried in the probe for [`assess`] to judge. `claims` are the
+/// crawlers' published ranges ([`crate::scanblock::crawler_claims`]), so that
+/// an impersonator refused is not counted as one of this host's clients.
 pub fn probe(
     backend: FirewallBackend,
     db_path: &Path,
     ssh_log: Option<&Path>,
     host: &crate::hostconf::HostConf,
     block_status: u16,
+    claims: Vec<crate::accesslog::CrawlerClaim>,
 ) -> Probe {
     let paths = &host.log_paths();
     let conf_d = &crate::nginx::conf_d_dir(&host.root(None));
@@ -369,32 +359,13 @@ pub fn probe(
     };
     // Read once, and only the tail, and every access-log question answered
     // from that one pass: two reads would be two different moments.
-    let sample = access_log_sample(&paths.access_path(None), block_status);
+    let sample = access_log_sample(&paths.access_path(None), block_status, claims);
     let access_readable = sample.is_some();
     let survey = sample.unwrap_or_default();
     let nginx_home = nginx_home();
-    let unit_active = unit_is_active();
-    let console = unit_active
-        .filter(|active| *active)
-        .and_then(|_| console_identity());
-    let console_helper = console.as_ref().map(|_| console_has_helper());
     // Asked, not read: this used to read the whole log, which on a
     // journald host was the whole sshd journal, once an hour.
     let ssh_readable = paths.ssh(ssh_log).is_readable();
-    // Who reads the logs for the console: its root helper, which reads
-    // the host settings' logs as root does here; or, without one, the
-    // console itself, with its own account.
-    let console_unreadable_logs = match (&console, console_helper) {
-        (Some(_), Some(true)) => {
-            let ssh_readable = match ssh_log {
-                None => ssh_readable,
-                Some(_) => paths.ssh(None).is_readable(),
-            };
-            helper_unreadable_logs(paths, access_readable, ssh_readable)
-        }
-        (Some(who), _) => unreadable_logs(who, paths, ssh_log),
-        (None, _) => Vec::new(),
-    };
     let container = match &nginx_home {
         NginxHome::Container { name } => Some(name.clone()),
         _ => None,
@@ -418,11 +389,11 @@ pub fn probe(
         stray_generated_files: stray_generated_files(conf_d, Path::new(crate::nginx::CONF_D_DIR)),
         firewall_persists: firewall_persists(backend),
         nftables_conf_flushes: nftables_conf_flushes(),
-        unit_active,
-        unit_binary: unit_binary(),
-        console_helper,
-        console_unreadable_logs,
-        console_identity: console,
+        cron_installed: Some(
+            Path::new("/etc/cron.d")
+                .join(crate::install::CRON_FILE)
+                .is_file(),
+        ),
         db_free_bytes: free_bytes(db_path),
         ssh_log_readable: Some(ssh_readable),
         access_log_readable: Some(access_readable),
@@ -775,156 +746,6 @@ fn firewall_persists(backend: FirewallBackend) -> Option<bool> {
     }
 }
 
-fn unit_is_active() -> Option<bool> {
-    // `LoadState` first, because `is-active` says "inactive" both for a
-    // unit that is stopped and for one that does not exist — and calling
-    // a host with no console installed "CRITICAL: installed but not
-    // running" is exactly the false alarm that gets a health check muted.
-    let load = run(
-        "systemctl",
-        &[
-            "show",
-            crate::install::WEB_UNIT,
-            "-p",
-            "LoadState",
-            "--value",
-        ],
-    )?;
-    match load.trim() {
-        "" | "not-found" | "masked" => None,
-        _ => {
-            let state =
-                run_allowing_failure("systemctl", &["is-active", crate::install::WEB_UNIT])?;
-            Some(state.trim() == "active")
-        }
-    }
-}
-
-/// The running console's uid and groups, from its process's
-/// `/proc/<pid>/status` — what it actually holds, which is what decides
-/// what it can read, whatever its unit says.
-fn console_identity() -> Option<crate::account::Identity> {
-    let pid = run(
-        "systemctl",
-        &["show", crate::install::WEB_UNIT, "-p", "MainPID", "--value"],
-    )?;
-    let pid: u32 = pid.trim().parse().ok().filter(|pid| *pid != 0)?;
-    parse_proc_status(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?)
-}
-
-/// The effective uid and gid, and the supplementary groups, out of a
-/// `/proc/<pid>/status`.
-fn parse_proc_status(status: &str) -> Option<crate::account::Identity> {
-    let field = |name: &str| {
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix(name))
-            .map(|rest| {
-                rest.split_whitespace()
-                    .filter_map(|word| word.parse::<u32>().ok())
-                    .collect::<Vec<u32>>()
-            })
-    };
-    // Real, effective, saved and filesystem: the second is the one the
-    // kernel checks a read against (strictly the fourth, which follows it).
-    let uid = *field("Uid:")?.get(1)?;
-    let gid = *field("Gid:")?.get(1)?;
-    let mut gids = vec![gid];
-    for group in field("Groups:").unwrap_or_default() {
-        if !gids.contains(&group) {
-            gids.push(group);
-        }
-    }
-    Some(crate::account::Identity { uid, gids })
-}
-
-/// Whether the console's unit hands it the helper's socket, and the
-/// socket is listening. A console without one shows the host and applies
-/// nothing.
-fn console_has_helper() -> bool {
-    let named = run(
-        "systemctl",
-        &["show", crate::install::WEB_UNIT, "-p", "ExecStart"],
-    )
-    .is_some_and(|shown| shown.contains(" --helper "));
-    let listening = run_allowing_failure(
-        "systemctl",
-        &["is-active", crate::install::HELPER_SOCKET_UNIT],
-    )
-    .is_some_and(|state| state.trim() == "active");
-    named && listening
-}
-
-/// The logs the host is set up to read that root, here, could not: what
-/// the console's helper, which reads them for it as root, cannot read
-/// either.
-fn helper_unreadable_logs(
-    paths: &crate::logpaths::LogPaths,
-    access_readable: bool,
-    ssh_readable: bool,
-) -> Vec<String> {
-    let mut logs = Vec::new();
-    if !access_readable {
-        logs.push(paths.access_description(None));
-    }
-    if !ssh_readable {
-        logs.push(match paths.ssh(None) {
-            crate::sshlog::SshSource::File(path) => path.display().to_string(),
-            crate::sshlog::SshSource::Search => {
-                "the SSH log (auth.log, secure, or sshd in the journal)".to_string()
-            }
-        });
-    }
-    logs
-}
-
-/// The logs the host is set up to read that `who` cannot read.
-fn unreadable_logs(
-    who: &crate::account::Identity,
-    paths: &crate::logpaths::LogPaths,
-    ssh_log: Option<&Path>,
-) -> Vec<String> {
-    let mut logs = vec![paths.access_path(None)];
-    match paths.ssh(ssh_log).locate() {
-        crate::sshlog::Located::File(path) => logs.push(path),
-        crate::sshlog::Located::Journal => logs.extend(system_journal()),
-    }
-    logs.into_iter()
-        .filter(|log| crate::account::readable_by(log, who) == Some(false))
-        .map(|log| log.display().to_string())
-        .collect()
-}
-
-/// The system journal's active file, persistent or volatile, which is
-/// what `journalctl` has to open to read sshd's lines.
-fn system_journal() -> Option<PathBuf> {
-    ["/var/log/journal", "/run/log/journal"]
-        .iter()
-        .filter_map(|dir| std::fs::read_dir(dir).ok())
-        .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
-        .map(|entry| entry.path().join("system.journal"))
-        .find(|file| file.is_file())
-}
-
-fn unit_binary() -> Option<PathBuf> {
-    let shown = run(
-        "systemctl",
-        &["show", crate::install::WEB_UNIT, "-p", "ExecStart"],
-    )?;
-    parse_exec_start(&shown)
-}
-
-/// The binary out of `systemctl show -p ExecStart`, which prints
-/// `ExecStart={ path=/usr/local/bin/stop-bots ; argv[]=... }`.
-///
-/// Reads `path=` rather than the first word of `argv[]`: they are normally
-/// the same, but `path=` is what systemd will actually execute, and that
-/// is the one whose absence produces `203/EXEC`.
-fn parse_exec_start(shown: &str) -> Option<PathBuf> {
-    let path = shown.split("path=").nth(1)?.split_whitespace().next()?;
-    (!path.is_empty()).then(|| PathBuf::from(path))
-}
-
 /// Free bytes on the filesystem holding `path`, via `df`.
 ///
 /// `df` rather than `statvfs` to avoid a libc dependency for one number,
@@ -1002,10 +823,7 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     if let Some(check) = apache_rewrite(probe) {
         checks.push(check);
     }
-    checks.push(service_health(probe));
-    checks.extend(console_account(probe));
-    checks.extend(console_helper(probe));
-    checks.extend(console_log_access(probe));
+    checks.push(schedule(db, probe)?);
     checks.push(disk_room(probe));
     checks.push(database_size(db)?);
     checks.push(log_sources(probe));
@@ -1033,14 +851,32 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
             checks.push(check);
         }
     }
-    if let Some(check) = console_proxy(db)? {
-        checks.push(check);
-    }
 
     Ok(Report {
         checks,
         checked_at: now_secs(),
     })
+}
+
+/// Whether `user_agent` is refused by a choice somebody made about it: a
+/// bot the lists class as a scanner or an AI crawler, or an agent blocked
+/// by hand. Its refusal is the policy working, however much it was served
+/// before it was listed — a scanner gets through until a list names it.
+///
+/// What is left is the case [`turned_away_clients`] exists for: a client
+/// caught by an uncategorised pattern, as Nextcloud's and Jellyfin's apps
+/// were by `okhttp`, or by a rule about the shape of a request. Matched as
+/// the Firewall screen matches ([`crate::dynamic::matched_alternative`]),
+/// and a hand-blocked agent as NGINX matches it: a substring, in any case.
+fn refused_on_purpose(user_agent: &str, bots: &[crate::db::Bot], by_hand: &[String]) -> bool {
+    let lower = user_agent.to_lowercase();
+    by_hand
+        .iter()
+        .any(|blocked| lower.contains(&crate::db::stored_user_agent(blocked).to_lowercase()))
+        || bots.iter().any(|bot| {
+            (bot.is_scanner || bot.is_ai)
+                && crate::dynamic::matched_alternative(user_agent, bot).is_some()
+        })
 }
 
 /// How few refusals are worth a line. Low on purpose: a first-party app
@@ -1071,9 +907,14 @@ const TURNED_AWAY_MIN_REFUSALS: u64 = 5;
 /// Absent rather than "nothing to report" when there is nothing, like its
 /// neighbours: a line saying so on every healthy host is noise.
 fn turned_away_clients(db: &Db, probe: &Probe) -> Result<Option<Check>> {
+    let bots = db.list_bots()?;
+    let by_hand = db.list_blocked_user_agents()?;
     let mut regressions: Vec<&crate::accesslog::TurnedAway> = Vec::new();
     for entry in &probe.turned_away {
         if entry.refused < TURNED_AWAY_MIN_REFUSALS {
+            continue;
+        }
+        if refused_on_purpose(&entry.user_agent, &bots, &by_hand) {
             continue;
         }
         if db.user_agent_stat(&entry.user_agent)?.is_some() {
@@ -1086,9 +927,8 @@ fn turned_away_clients(db: &Db, probe: &Probe) -> Result<Option<Check>> {
     let named: Vec<String> = regressions
         .iter()
         .take(3)
-        // The agent is a client's text, and this line is drawn in the
-        // console's header on every page: capped, and with anything
-        // invisible written out.
+        // The agent is a client's text, and this line is drawn on the
+        // TUI's Dashboard: capped, and with anything invisible written out.
         .map(|entry| {
             let (shown, _) = crate::uadetail::for_display(&entry.user_agent);
             format!("{shown} ({} refused)", entry.refused)
@@ -1410,10 +1250,11 @@ fn script_freshness(db: &Db, expected: usize, backend: FirewallBackend) -> Resul
 ///
 /// The remaining false promise is a front-end stopped since its last run,
 /// where a future time is still projected. That is deliberate rather than
-/// missed: the console is only one of the things that drives this cron
-/// (the TUI does, and so does `stop-bots batch` from a real crontab), so
-/// there is no signal that distinguishes them, and the `service-health`
-/// check immediately below already reports a console that is not running.
+/// missed: `tick` from cron is only one of the things that drives this
+/// schedule (the TUI does, and so does `stop-bots batch` from a crontab of
+/// the operator's own), so there is no signal that distinguishes them, and
+/// the `schedule` check below already reports a schedule nothing has run
+/// lately.
 fn scheduled_render(db: &Db) -> Result<Option<i64>> {
     let at = crate::cron::next_run_at(db, crate::cron::CronJob::RenderFirewall)?;
     Ok(at.filter(|at| *at > now_secs()))
@@ -1545,169 +1386,61 @@ fn nginx_applied(db: &Db, probe: &Probe) -> Result<Check> {
     })
 }
 
-/// The console's own unit: running, and running the binary it names.
+/// How long the detectors can go unrun before the schedule reads as
+/// stopped: ten of their one-minute intervals.
+const SCHEDULE_STALE_SECS: i64 = 10 * 60;
+
+/// Whether anything runs the schedule: `stop-bots tick` from
+/// `/etc/cron.d`, or the TUI while it is open.
 ///
-/// The second half is the one with history. A unit whose `ExecStart`
-/// points somewhere the sandbox hides fails with `203/EXEC` and a message
-/// naming neither; a deploy that replaces a binary without restarting
-/// leaves the old code serving indefinitely.
-fn service_health(probe: &Probe) -> Check {
-    let (level, detail, fix) = match (probe.unit_active, &probe.unit_binary) {
-        // The console is optional: a host run from the CLI and cron has no
-        // unit, and that is a complete setup, not an unknown one. Reported
-        // as UNKNOWN, it was the one thing `status` flagged after following
-        // the README's quick start to the letter.
-        (None, _) => (
-            Level::Ok,
-            "not installed (optional: `stop-bots install web` runs it as a service)".to_string(),
-            None,
-        ),
-        (Some(false), _) => (
-            Level::Critical,
-            "the console unit is installed but not running".to_string(),
-            Some(format!("systemctl start {}", crate::install::WEB_UNIT)),
-        ),
-        (Some(true), Some(path)) if !path.exists() => (
-            Level::Critical,
-            format!("the unit runs {}, which does not exist", path.display()),
-            Some("re-run `stop-bots install web --force`".to_string()),
-        ),
-        (Some(true), Some(path)) => (Level::Ok, format!("running {}", path.display()), None),
-        (Some(true), None) => (Level::Ok, "running".to_string(), None),
-    };
-    Check {
-        id: "service-health",
-        title: "Console service",
-        level,
-        detail,
-        fix,
-    }
-}
-
-/// Whether the console runs as root, which since 0.1 it need not: a
-/// console running as root is a compromise of the host away from anyone
-/// who gets code running in it. Said only when a console is running.
-fn console_account(probe: &Probe) -> Option<Check> {
-    let who = probe.console_identity.as_ref()?;
-    let (level, detail, fix) = if who.uid == 0 {
-        (
-            Level::Warn,
-            "the console runs as root, so whoever compromises it has this host".to_string(),
-            Some(
-                "re-run `sudo stop-bots install web` to drop its privileges: it runs the \
-                 console as the stop-bots user, with a root helper for what needs root"
-                    .to_string(),
-            ),
-        )
-    } else {
-        (
-            Level::Ok,
-            format!("runs as {}, not root", crate::account::user_name(who.uid)),
-            None,
-        )
-    };
-    Some(Check {
-        id: "console-account",
-        title: "Console's account",
-        level,
-        detail,
-        fix,
-    })
-}
-
-/// Whether a console that is not root has the root helper to ask. Without
-/// it the console can show everything and apply nothing. Not asked of a
-/// console running as root, which does its own applying — and is
-/// [`console_account`]'s warning.
-fn console_helper(probe: &Probe) -> Option<Check> {
-    let who = probe.console_identity.as_ref()?;
-    if who.uid == 0 {
-        return None;
-    }
-    let (level, detail, fix) = match probe.console_helper? {
-        true => (
-            Level::Ok,
-            format!("asks {} for what needs root", crate::install::HELPER_UNIT),
-            None,
-        ),
-        false => (
-            Level::Warn,
-            "the console has no root helper, so it can show this host but apply nothing"
-                .to_string(),
-            Some(format!(
-                "sudo systemctl enable --now {}, or re-run `sudo stop-bots install web`",
-                crate::install::HELPER_SOCKET_UNIT
-            )),
-        ),
-    };
-    Some(Check {
-        id: "console-helper",
-        title: "Console's root helper",
-        level,
-        detail,
-        fix,
-    })
-}
-
-/// Whether the console, not being root, gets the logs this host is set up
-/// to read: from its root helper, which reads them for it (the console's
-/// own account reads none), or, with no helper, with its own account.
-/// This is the answer its detectors live by.
-fn console_log_access(probe: &Probe) -> Option<Check> {
-    let who = probe.console_identity.as_ref()?;
-    if who.uid == 0 {
-        return None;
-    }
-    let unreadable = probe.console_unreadable_logs.join(" or ");
-    let through_helper = probe.console_helper == Some(true);
-    let (level, detail, fix) = match (through_helper, unreadable.is_empty()) {
-        (true, true) => (
+/// Read from when the detectors last ran rather than from whether the file
+/// is there, because the file is a promise and the run is the fact: cron
+/// not installed, not running, or failing every minute all look like an
+/// installed file. Without the file, the TUI may still be running the
+/// schedule, which the same runs show; once it closes, nothing does.
+fn schedule(db: &Db, probe: &Probe) -> Result<Check> {
+    let last_run = crate::cron::status(db)?
+        .into_iter()
+        .filter(|job| matches!(job.job, crate::cron::CronJob::Detect(_)))
+        .filter_map(|job| job.last_run)
+        .max();
+    let recent = last_run.is_some_and(|at| now_secs() - at < SCHEDULE_STALE_SECS);
+    let since = last_run
+        .map(|at| format!("last ran {}", format_utc(at)))
+        .unwrap_or_else(|| "has never run".to_string());
+    let (level, detail, fix) = match (probe.cron_installed, recent) {
+        (Some(true), true) => (
             Level::Ok,
             format!(
-                "the console reads the logs through {}, which can read every one it is set up \
-                 to read",
-                crate::install::HELPER_UNIT
+                "/etc/cron.d/{} runs it every minute",
+                crate::install::CRON_FILE
             ),
             None,
         ),
-        (true, false) => (
+        (Some(true), false) => (
             Level::Warn,
             format!(
-                "the console reads the logs through {}, which cannot read {unreadable} — the \
-                 detectors that read it find nothing",
-                crate::install::HELPER_UNIT
+                "/etc/cron.d/{} is installed, but the schedule {since}: is cron running?",
+                crate::install::CRON_FILE
             ),
-            Some(
-                "check where the log is and store it with `sudo stop-bots set-log-paths`"
-                    .to_string(),
-            ),
+            Some("systemctl status cron".to_string()),
         ),
-        (false, true) => (
+        (_, true) => (
             Level::Ok,
-            format!(
-                "the console has no helper and reads the logs as {}, which can read every one \
-                 it is set up to read",
-                crate::account::user_name(who.uid)
-            ),
-            None,
+            "running while the TUI is open; nothing runs it once it closes".to_string(),
+            Some("stop-bots install cron".to_string()),
         ),
-        (false, false) => (
+        (_, false) => (
             Level::Warn,
             format!(
-                "the console has no helper, and its account ({}) cannot read {unreadable} — \
-                 the detectors that read it find nothing",
-                crate::account::user_name(who.uid)
+                "nothing runs the detectors and list updates unattended (the schedule {since})"
             ),
-            Some(
-                "re-run `sudo stop-bots install web`, which gives the console a root helper \
-                 that reads the logs for it"
-                    .to_string(),
-            ),
+            Some("stop-bots install cron".to_string()),
         ),
     };
-    Some(Check {
-        id: "console-log-access",
-        title: "Logs the console can read",
+    Ok(Check {
+        id: "schedule",
+        title: "Schedule",
         level,
         detail,
         fix,
@@ -2094,18 +1827,12 @@ fn skipped_entries(db: &Db, server: webserver::WebServer) -> Result<Option<Check
 /// guess. A host with no Docker and no active NGINX unit adds no check,
 /// no `Unknown`, and no line to the report.
 ///
-/// Three things have to line up for a containerised NGINX, and they fail
+/// Two things have to line up for a containerised NGINX, and they fail
 /// with very different loudness — so the levels differ:
 ///
 /// - **The reload command.** `systemctl reload nginx` reloads nothing when
 ///   NGINX is in a container. Silent, and total: every block this project
 ///   writes is staged and never served. Critical.
-/// - **The proxy target.** `webaccess` writes the console's own bind
-///   address into `proxy_pass`, and `127.0.0.1` inside a container is the
-///   container. Loud — a 502 the first time anyone opens the console — so
-///   Warn. Only on a console set up behind NGINX (`web::is_proxied`): one
-///   reached over an SSH tunnel has no `proxy_pass`, and a warning about it
-///   is advice to change a bind that works.
 /// - **The managed directory.** The generated config names it absolutely;
 ///   NGINX resolves it against its own filesystem. Caught at apply time by
 ///   `write_validated` running `nginx -t` inside the container, so Warn.
@@ -2162,7 +1889,7 @@ fn nginx_deployment(db: &Db, probe: &Probe) -> Result<Option<Check>> {
         NginxHome::Container { name } => name,
     };
 
-    // The reload command first: it is the only one of the three that is
+    // The reload command first: it is the only one of the two that is
     // both silent and total.
     let reload_reaches_container =
         targets_a_container(&commands.reload) || commands.reload.iter().any(|w| w.contains(name));
@@ -2183,18 +1910,6 @@ fn nginx_deployment(db: &Db, probe: &Probe) -> Result<Option<Check>> {
 
     let mut problems: Vec<String> = Vec::new();
     let mut fixes: Vec<String> = Vec::new();
-
-    let upstream = crate::web::resolve_bind(db, None)?;
-    let host_networked = probe.container_shares_host_network == Some(true);
-    if upstream.ip().is_loopback() && !host_networked && crate::web::is_proxied(db)? {
-        problems.push(format!(
-            "the console binds {upstream}, which inside the container means the container itself, so the generated proxy_pass cannot reach it"
-        ));
-        fixes.push(
-            "bind the console where the container can reach it (the bridge gateway, e.g. --bind 172.17.0.1:8787) and re-apply Web Access, or run the container with --network host"
-                .to_string(),
-        );
-    }
 
     if probe.managed_dir_in_container == Some(false) && db.get_serve_robots_txt()? {
         problems.push(format!(
@@ -2225,48 +1940,6 @@ fn nginx_deployment(db: &Db, probe: &Probe) -> Result<Option<Check>> {
                 problems.join("; and ")
             ),
             fix: Some(fixes.join(". ")),
-        }
-    }))
-}
-
-/// Whether a console set up behind a proxy believes the proxy's word
-/// about who is asking.
-///
-/// "Set up behind a proxy" is what the Web Access panel records: a path
-/// prefix, or a host name to answer to other than loopback. Behind one,
-/// every request arrives from the proxy's own address, and without
-/// `web:trust_forwarded_for` the console takes that for the client. Then
-/// the login throttle has one key for everyone, so an attacker's failures
-/// are the operator's too, and the guard against blocking your own address
-/// compares against 127.0.0.1.
-///
-/// A warning, not critical: nothing is unprotected, but the console's own
-/// defences are working against the wrong address. Absent on a console
-/// that is not proxied, which is the default.
-fn console_proxy(db: &Db) -> Result<Option<Check>> {
-    if !crate::web::is_proxied(db)? {
-        return Ok(None);
-    }
-    let trusted = db.get_bool_setting(crate::web::TRUST_FORWARDED_KEY, false)?;
-    Ok(Some(if trusted {
-        Check {
-            id: "web-proxy",
-            title: "Console behind a proxy",
-            level: Level::Ok,
-            detail: "client addresses come from the proxy's X-Forwarded-For".to_string(),
-            fix: None,
-        }
-    } else {
-        Check {
-            id: "web-proxy",
-            title: "Console behind a proxy",
-            level: Level::Warn,
-            detail: "the console is set up behind a proxy but does not believe its \
-                     X-Forwarded-For, so every client is the proxy's address: one login \
-                     throttle for the operator and every attacker, and no way to stop you \
-                     blocking your own address"
-                .to_string(),
-            fix: Some("stop-bots set-web --trust-forwarded-for true".to_string()),
         }
     }))
 }
@@ -2309,7 +1982,7 @@ fn log_sources(probe: &Probe) -> Check {
                 ),
             },
             // `set-log-paths` first, because it is the one that also fixes
-            // the console and the internal cron: they take no arguments, so
+            // `tick` and the TUI's schedule: they take no arguments, so
             // a flag cannot reach them and only a stored path can.
             Some(
                 "stop-bots set-log-paths --access-log <path> (or pass --ssh-log/--access-log \
@@ -2415,8 +2088,7 @@ mod tests {
             live_backend: Some(FirewallBackend::Nftables.stored().to_string()),
             firewall_persists: Some(true),
             nftables_conf_flushes: None,
-            unit_active: Some(true),
-            unit_binary: None,
+            cron_installed: Some(true),
             turned_away: Vec::new(),
             conf_d_path: Some(crate::nginx::CONF_D_DIR.to_string()),
             conf_d_exists: Some(true),
@@ -2436,10 +2108,6 @@ mod tests {
             managed_dir_in_container: None,
             container_shares_host_network: None,
             firewall_covers_forward: Some(true),
-            // The console as `install web` leaves it since 0.1.
-            console_identity: Some(console_user()),
-            console_helper: Some(true),
-            console_unreadable_logs: Vec::new(),
             nginx_commands: None,
             web_server: crate::webserver::WebServer::Nginx,
             config_root: None,
@@ -2447,192 +2115,64 @@ mod tests {
         }
     }
 
-    /// The `stop-bots` user, in its own group and no other.
-    fn console_user() -> crate::account::Identity {
-        crate::account::Identity {
-            uid: 998,
-            gids: vec![998],
-        }
-    }
-
-    /// The three things a console can be that the split was meant to
-    /// prevent, each its own warning with its own fix — and a console as
-    /// installed raises none of them.
+    /// A probe a release with the web console stored still parses: its
+    /// console fields are dropped, and nothing is known about the cron.
     #[test]
-    fn a_console_as_installed_raises_none_of_the_privilege_warnings() {
-        let report = assess(&db(), &healthy()).unwrap();
-        for id in ["console-account", "console-helper", "console-log-access"] {
-            assert_eq!(check(&report, id).level, Level::Ok, "{id}");
-        }
-    }
-
-    #[test]
-    fn a_console_running_as_root_is_a_warning_that_says_how_to_drop_it() {
-        let report = assess(
-            &db(),
-            &Probe {
-                console_identity: Some(crate::account::Identity {
-                    uid: 0,
-                    gids: vec![0],
-                }),
-                ..healthy()
-            },
+    fn a_probe_from_a_release_with_the_console_still_parses() {
+        let probe: Probe = serde_json::from_str(
+            r#"{"unit_active":true,"console_identity":{"uid":998,"gids":[998]},"live_rules":3}"#,
         )
         .unwrap();
+        assert_eq!(probe.live_rules, Some(3));
+        assert_eq!(probe.cron_installed, None);
+    }
 
-        let account = check(&report, "console-account");
-        assert_eq!(account.level, Level::Warn);
-        assert!(
-            account
-                .fix
-                .as_deref()
-                .is_some_and(|fix| fix.contains("sudo stop-bots install web")),
-            "{account:?}"
-        );
-        // A root console applies for itself; the other two are not its
-        // problems, and one warning is enough.
-        for id in ["console-helper", "console-log-access"] {
+    /// The schedule reads as running from what ran, not from whether the
+    /// cron file is there: a table of the four answers.
+    #[test]
+    fn the_schedule_check_reads_what_ran_against_what_is_installed() {
+        let now = now_secs();
+        for (installed, last_run, expected, says) in [
+            (
+                Some(true),
+                Some(now - 60),
+                Level::Ok,
+                "runs it every minute",
+            ),
+            (Some(true), Some(now - 3600), Level::Warn, "is cron running"),
+            (
+                Some(false),
+                Some(now - 60),
+                Level::Ok,
+                "while the TUI is open",
+            ),
+            (Some(false), None, Level::Warn, "has never run"),
+        ] {
+            let db = db();
+            if let Some(at) = last_run {
+                db.set_cron_last_run(
+                    crate::cron::CronJob::Detect(crate::protection::Detector::WebScanners).id(),
+                    at,
+                    "ok",
+                )
+                .unwrap();
+            }
+            let probe = Probe {
+                cron_installed: installed,
+                ..healthy()
+            };
+            let check = schedule(&db, &probe).unwrap();
+            assert_eq!(
+                check.level, expected,
+                "{installed:?}, {last_run:?}: {}",
+                check.detail
+            );
             assert!(
-                report.checks.iter().all(|check| check.id != id),
-                "{id} as well: {:#?}",
-                report.checks
+                check.detail.contains(says),
+                "{installed:?}, {last_run:?}: {}",
+                check.detail
             );
         }
-    }
-
-    #[test]
-    fn a_console_without_its_helper_is_a_warning() {
-        let report = assess(
-            &db(),
-            &Probe {
-                console_helper: Some(false),
-                ..healthy()
-            },
-        )
-        .unwrap();
-
-        let helper = check(&report, "console-helper");
-        assert_eq!(helper.level, Level::Warn);
-        assert!(
-            helper
-                .fix
-                .as_deref()
-                .is_some_and(|fix| fix.contains(crate::install::HELPER_SOCKET_UNIT)),
-            "{helper:?}"
-        );
-    }
-
-    /// As installed, the console reads its logs through the helper, and
-    /// the check says so.
-    #[test]
-    fn the_console_s_logs_are_said_to_come_through_its_helper() {
-        let report = assess(&db(), &healthy()).unwrap();
-
-        let logs = check(&report, "console-log-access");
-        assert_eq!(logs.level, Level::Ok);
-        assert!(
-            logs.detail.contains(crate::install::HELPER_UNIT),
-            "{logs:?}"
-        );
-    }
-
-    /// A log the helper cannot read is named, and so is the helper: the
-    /// console's own account reads no log, so its groups are not the fix.
-    #[test]
-    fn a_log_the_helper_cannot_read_is_named() {
-        let report = assess(
-            &db(),
-            &Probe {
-                console_unreadable_logs: vec!["/srv/logs/access.log".to_string()],
-                ..healthy()
-            },
-        )
-        .unwrap();
-
-        let logs = check(&report, "console-log-access");
-        assert_eq!(logs.level, Level::Warn);
-        assert!(logs.detail.contains("/srv/logs/access.log"), "{logs:?}");
-        assert!(
-            logs.detail.contains(crate::install::HELPER_UNIT),
-            "{logs:?}"
-        );
-        assert!(
-            logs.fix
-                .as_deref()
-                .is_some_and(|fix| fix.contains("set-log-paths")),
-            "{logs:?}"
-        );
-    }
-
-    /// Without its helper the console reads with its own account, and a
-    /// log that account cannot read is fixed by giving it the helper.
-    #[test]
-    fn without_a_helper_a_log_the_console_cannot_read_points_at_the_helper() {
-        let report = assess(
-            &db(),
-            &Probe {
-                console_helper: Some(false),
-                console_unreadable_logs: vec!["/var/log/auth.log".to_string()],
-                ..healthy()
-            },
-        )
-        .unwrap();
-
-        let logs = check(&report, "console-log-access");
-        assert_eq!(logs.level, Level::Warn);
-        assert!(logs.detail.contains("/var/log/auth.log"), "{logs:?}");
-        assert!(
-            logs.fix
-                .as_deref()
-                .is_some_and(|fix| fix.contains("install web") && fix.contains("helper")),
-            "{logs:?}"
-        );
-    }
-
-    /// No console running, nothing to say about it.
-    #[test]
-    fn no_running_console_means_no_privilege_checks() {
-        let report = assess(
-            &db(),
-            &Probe {
-                console_identity: None,
-                console_helper: None,
-                ..healthy()
-            },
-        )
-        .unwrap();
-
-        for id in ["console-account", "console-helper", "console-log-access"] {
-            assert!(report.checks.iter().all(|check| check.id != id), "{id}");
-        }
-    }
-
-    /// The effective ids, not the real ones, and every group the process
-    /// holds.
-    #[test]
-    fn a_process_status_gives_its_effective_ids_and_groups() {
-        let status = "Name:\tstop-bots\n\
-                      Uid:\t998\t997\t998\t997\n\
-                      Gid:\t996\t995\t996\t995\n\
-                      Groups:\t4 101 \n";
-
-        assert_eq!(
-            parse_proc_status(status),
-            Some(crate::account::Identity {
-                uid: 997,
-                gids: vec![995, 4, 101],
-            })
-        );
-        assert_eq!(parse_proc_status("Name:\tx\n"), None);
-    }
-
-    /// A probe stored before these fields existed still parses, and says
-    /// nothing about the console's account.
-    #[test]
-    fn a_probe_from_before_the_split_still_parses() {
-        let probe: Probe = serde_json::from_str(r#"{"unit_active":true}"#).unwrap();
-        assert_eq!(probe.console_identity, None);
-        assert!(probe.console_unreadable_logs.is_empty());
     }
 
     /// Alias for [`check`], for tests that bind a local named `check`.
@@ -2755,6 +2295,54 @@ mod tests {
             check.fix.as_deref().is_some_and(|f| f.contains("trust")),
             "and say how to allow it: {:?}",
             check.fix
+        );
+    }
+
+    /// A scanner the lists name, or an agent blocked by hand, is refused on
+    /// purpose, even one this host served before the list caught up with
+    /// it. A client caught by an uncategorised pattern still is reported.
+    #[test]
+    fn an_agent_refused_on_purpose_is_not_reported() {
+        let db = db();
+        crate::botlist::register_all_sources(&db).unwrap();
+        let source = db.list_sources().unwrap()[0].id.clone();
+        for (slug, pattern, scanner) in [
+            ("cyberconvoyscout", "CyberConvoyScout", true),
+            ("okhttp", "okhttp", false),
+        ] {
+            db.upsert_bot(&crate::db::NewBot {
+                slug: slug.into(),
+                name: slug.into(),
+                is_ai: false,
+                is_search_engine: false,
+                is_scanner: scanner,
+                user_agent_pattern: pattern.into(),
+                source_id: source.clone(),
+            })
+            .unwrap();
+        }
+        db.block_user_agent("curl/8.7.1").unwrap();
+        let scanner = "Mozilla/5.0 (compatible; CyberConvoyScout/1.0)";
+        let app = "Jellyfin Android TV/0.19.10 (OkHttp/4.12.0)";
+        for agent in [scanner, "curl/8.7.1", app] {
+            seen_working(&db, agent);
+        }
+        let probe = Probe {
+            turned_away: vec![
+                refused(scanner, 2_127, 0),
+                refused("curl/8.7.1", 1_479, 0),
+                refused(app, 262, 0),
+            ],
+            ..healthy()
+        };
+
+        let report = assess(&db, &probe).unwrap();
+        let check = check2(&report, "turned-away-clients");
+
+        assert!(
+            check.detail.starts_with("1 user agent(s)") && check.detail.contains("Jellyfin"),
+            "only the app caught by an uncategorised pattern belongs here: {}",
+            check.detail
         );
     }
 
@@ -3067,40 +2655,6 @@ mod tests {
         );
     }
 
-    /// A loopback bind is unreachable from inside the container, so the
-    /// `proxy_pass` `webaccess` generates points at the container itself.
-    #[test]
-    fn a_loopback_console_bind_is_flagged_for_a_bridged_container() {
-        let db = db();
-        db.set_text_setting(crate::web::BASE_PATH_KEY, "/stop-bots")
-            .unwrap();
-
-        let check = assess(&db, &configured_for_docker(in_container())).unwrap();
-        let check = check2(&check, "nginx-deployment");
-
-        assert_eq!(check.level, Level::Warn);
-        assert!(check.detail.contains("proxy_pass"), "was: {}", check.detail);
-    }
-
-    /// The same bind is correct when the container shares the host's
-    /// network namespace, where `127.0.0.1` means the same thing on both
-    /// sides. Reporting it then would be advice to break a working host.
-    #[test]
-    fn a_host_networked_container_is_happy_with_a_loopback_bind() {
-        let db = db();
-
-        let report = assess(
-            &db,
-            &configured_for_docker(Probe {
-                container_shares_host_network: Some(true),
-                ..in_container()
-            }),
-        )
-        .unwrap();
-
-        assert_eq!(check2(&report, "nginx-deployment").level, Level::Ok);
-    }
-
     /// The generated config names the managed directory absolutely, and
     /// NGINX resolves it inside the container.
     #[test]
@@ -3146,8 +2700,9 @@ mod tests {
         assert_eq!(check.level, Level::Ok, "was: {}", check.detail);
     }
 
-    /// Each warning follows its own feature: serving `robots.txt` brings
-    /// back the managed directory's, and not the console's.
+    /// Serving `robots.txt` brings back the managed directory's warning,
+    /// and nothing about a `proxy_pass`, which the web console's Web Access
+    /// used to write.
     #[test]
     fn serving_robots_txt_brings_back_only_the_managed_directory_warning() {
         let db = db();
@@ -3612,59 +3167,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_console_unit_that_is_installed_but_down_is_critical() {
-        let report = assess(
-            &db(),
-            &Probe {
-                unit_active: Some(false),
-                ..healthy()
-            },
-        )
-        .unwrap();
-
-        let check = check(&report, "service-health");
-        assert_eq!(check.level, Level::Critical);
-        assert!(check.fix.as_deref().unwrap().contains("systemctl start"));
-    }
-
-    /// The `203/EXEC` shape: the unit is up but names a binary that is not
-    /// there. Reported against the path, because that is the fact systemd
-    /// itself will not tell you.
-    #[test]
-    fn a_unit_pointing_at_a_missing_binary_is_critical() {
-        let probe = Probe {
-            unit_active: Some(true),
-            unit_binary: Some(PathBuf::from("/root/stop-bots")),
-            ..healthy()
-        };
-
-        let report = assess(&db(), &probe).unwrap();
-
-        let check = check(&report, "service-health");
-        assert_eq!(check.level, Level::Critical);
-        assert!(
-            check.detail.contains("/root/stop-bots"),
-            "was: {}",
-            check.detail
-        );
-    }
-
-    /// A host with no console unit — run from the CLI and cron, or with no
-    /// systemd at all — is a complete setup, not a broken or unknown one.
-    #[test]
-    fn no_console_unit_is_fine() {
-        let report = assess(
-            &db(),
-            &Probe {
-                unit_active: None,
-                ..healthy()
-            },
-        )
-        .unwrap();
-        assert_eq!(check(&report, "service-health").level, Level::Ok);
-    }
-
     /// The hour a real host spent reporting `SQLITE_FULL`, with the error
     /// naming neither the disk nor the tool.
     #[test]
@@ -3705,55 +3207,16 @@ mod tests {
     }
 
     #[test]
-    fn a_proxied_console_that_does_not_trust_the_proxy_is_warned_about() {
-        let db = db();
-        db.set_text_setting(crate::web::BASE_PATH_KEY, "/stop-bots")
-            .unwrap();
-
-        let report = assess(&db, &healthy()).unwrap();
-        let check = check(&report, "web-proxy");
-
-        assert_eq!(check.level, Level::Warn);
-        assert_eq!(
-            check.fix.as_deref(),
-            Some("stop-bots set-web --trust-forwarded-for true")
-        );
-    }
-
-    #[test]
-    fn a_console_named_by_a_public_host_counts_as_proxied_too() {
-        let db = db();
-        db.set_text_setting(crate::web::ALLOWED_HOSTS_KEY, "console.example.com")
-            .unwrap();
-
-        let report = assess(&db, &healthy()).unwrap();
-        assert_eq!(check(&report, "web-proxy").level, Level::Warn);
-
-        db.set_bool_setting(crate::web::TRUST_FORWARDED_KEY, true)
-            .unwrap();
-        let report = assess(&db, &healthy()).unwrap();
-        assert_eq!(check(&report, "web-proxy").level, Level::Ok);
-    }
-
-    /// The default install is loopback with no proxy, and has nothing to
-    /// say about one.
-    #[test]
-    fn a_console_that_is_not_proxied_gets_no_proxy_line() {
-        let db = db();
-        db.set_text_setting(crate::web::ALLOWED_HOSTS_KEY, "localhost")
-            .unwrap();
-
-        let report = assess(&db, &healthy()).unwrap();
-        assert!(
-            report.checks.iter().all(|c| c.id != "web-proxy"),
-            "{:?}",
-            report.checks
-        );
-    }
-
-    #[test]
     fn a_host_with_nothing_wrong_reports_nothing_wrong() {
-        let report = assess(&db(), &healthy()).unwrap();
+        let db = db();
+        // The schedule ran a minute ago, as `install cron` keeps it.
+        db.set_cron_last_run(
+            crate::cron::CronJob::Detect(crate::protection::Detector::WebScanners).id(),
+            now_secs() - 60,
+            "ok",
+        )
+        .unwrap();
+        let report = assess(&db, &healthy()).unwrap();
 
         // Scanning for sites is the one thing an untouched database has
         // genuinely not done, so that check is expected to complain.
@@ -3938,26 +3401,6 @@ mod tests {
         assert!(!check.detail.contains("auto-render"), "{}", check.detail);
     }
 
-    /// `systemctl is-active` says "inactive" both for a stopped unit and
-    /// for one that was never installed. Calling a host with no console
-    /// "CRITICAL: installed but not running" is the false alarm that gets
-    /// a health check muted, so the two are kept apart.
-    #[test]
-    fn a_host_with_no_console_installed_is_not_reported_as_broken() {
-        let report = assess(
-            &db(),
-            &Probe {
-                unit_active: None,
-                ..healthy()
-            },
-        )
-        .unwrap();
-
-        let check = check(&report, "service-health");
-        assert_eq!(check.level, Level::Ok);
-        assert_ne!(report.worst(), Level::Critical);
-    }
-
     /// A probe survives the round trip, so the dashboards read back what
     /// the cron recorded rather than a default.
     #[test]
@@ -4098,26 +3541,6 @@ mod tests {
                     -A STOP-BOTS -s 203.0.113.0/24 -j DROP\n";
 
         assert_eq!(count_iptables_rules(dump), 2);
-    }
-
-    /// The path systemd will execute, which is the one whose absence is
-    /// `203/EXEC`.
-    #[test]
-    fn the_unit_binary_is_read_from_the_path_systemd_will_execute() {
-        let shown = "ExecStart={ path=/usr/local/bin/stop-bots ; \
-                     argv[]=/usr/local/bin/stop-bots web --db /var/lib/stop-bots/db.sqlite3 ; \
-                     ignore_errors=no }";
-
-        assert_eq!(
-            parse_exec_start(shown),
-            Some(PathBuf::from("/usr/local/bin/stop-bots"))
-        );
-    }
-
-    #[test]
-    fn a_unit_with_no_exec_start_yields_no_binary() {
-        assert_eq!(parse_exec_start("ExecStart="), None);
-        assert_eq!(parse_exec_start(""), None);
     }
 
     /// A database directory whose name starts with `-` is still a path.
@@ -4308,7 +3731,7 @@ mod tests {
             .chain((0..direct).map(|i| line(format!("198.51.100.{}", i % 250 + 1))))
             .collect();
         std::fs::write(&log, text).unwrap();
-        let survey = access_log_sample(&log, 403).expect("readable");
+        let survey = access_log_sample(&log, 403, Vec::new()).expect("readable");
         Probe {
             access_log_clients: Some((survey.public, survey.counts.parsed)),
             access_log_cdn: Some(survey.cdn),
@@ -4359,7 +3782,7 @@ mod tests {
         )
         .unwrap();
 
-        let survey = access_log_sample(&log, 403).expect("readable");
+        let survey = access_log_sample(&log, 403, Vec::new()).expect("readable");
 
         assert_eq!(
             (survey.counts.lines, survey.counts.parsed, survey.public),
@@ -4369,6 +3792,6 @@ mod tests {
             survey.unparsed_sample.as_deref(),
             Some("custom \u{fffd}[2J format")
         );
-        assert!(access_log_sample(&dir.path().join("none.log"), 403).is_none());
+        assert!(access_log_sample(&dir.path().join("none.log"), 403, Vec::new()).is_none());
     }
 }

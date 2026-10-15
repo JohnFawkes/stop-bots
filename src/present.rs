@@ -20,9 +20,9 @@
 //!
 //! Each of these existed several times over — the relative time five times,
 //! with three different roundings — and the copies had drifted: the TUI said
-//! "Search Bots" where the console said "Search bots", and the two health
-//! strips had different words for the same check and labels for different
-//! sets of checks. One copy is the only way the CLI, the TUI and the console
+//! "Search Bots" where the web console said "Search bots", and the two
+//! health strips had different words for the same check and labels for
+//! different sets of checks. One copy is the only way the CLI and the TUI
 //! keep saying the same thing.
 //!
 //! And how anything reaches a terminal at all: [`terminal_safe`] for one
@@ -73,9 +73,8 @@ pub fn category_label(category: Category) -> &'static str {
     }
 }
 
-/// The one word a health check gets in the status strip under the tabs
-/// and in the console's header chips, which have room for a word and not
-/// for the check's title. Falls back to the title for a check this table
+/// The one word a health check gets in the status strip under the tabs,
+/// which has room for a word and not for the check's title. Falls back to the title for a check this table
 /// has not heard of; `every_health_check_has_a_short_label` is what stops
 /// that fallback from being reached.
 pub fn check_label(check: &Check) -> &'static str {
@@ -87,10 +86,7 @@ pub fn check_label(check: &Check) -> &'static str {
         "generated-files-reachable" => "files",
         "apache-rewrite" => "rewrite",
         "turned-away-clients" => "refused",
-        "service-health" => "console",
-        "console-account" => "account",
-        "console-helper" => "helper",
-        "console-log-access" => "log access",
+        "schedule" => "schedule",
         "disk-room" => "disk",
         "database-size" => "database",
         "log-sources" => "logs",
@@ -102,7 +98,6 @@ pub fn check_label(check: &Check) -> &'static str {
         "ssh-login-allowlist" => "ssh",
         "trusted" => "trusted",
         "skipped-entries" => "skipped",
-        "web-proxy" => "proxy",
         _ => check.title,
     }
 }
@@ -114,8 +109,8 @@ pub fn check_label(check: &Check) -> &'static str {
 ///
 /// Every control character goes: C0 (newline and tab included), DEL and
 /// C1. Much of what is printed is attacker-chosen: a user agent, a path,
-/// a username from a log, or a row that the console (which runs
-/// unprivileged) wrote into the database that root's CLI reads. An ESC
+/// a username from a log, or a row someone other than root wrote into the
+/// database that root's CLI reads. An ESC
 /// can carry an OSC 52 clipboard write or a title change into the
 /// operator's shell, some terminals act on a lone U+009B as a CSI, a CR
 /// makes `real\rfake` print as `fake`, and a newline forges a second row.
@@ -429,7 +424,7 @@ mod tests {
     }
 
     /// One casing, whichever front-end asks: the TUI used to say "Search
-    /// Bots" and the console "Search bots".
+    /// Bots" and the web console "Search bots".
     #[test]
     fn category_labels_are_in_sentence_case() {
         assert_eq!(

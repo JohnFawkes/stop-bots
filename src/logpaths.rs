@@ -26,12 +26,11 @@
 //! container that bind-mounts its log directory writes the access log
 //! somewhere that is not `/var/log/nginx/access.log` on the host, and the
 //! only way to say so was `--access-log` on each invocation. That works for
-//! the CLI and for a crontab. It does not work for the two things that
-//! actually run the detectors — the web console and the TUI — because their
-//! internal cron takes no arguments. Their unit has an `--ssh-log` flag and
-//! nothing for the access log at all.
+//! the CLI and for a crontab. It does not work for the things that run the
+//! detectors on a schedule — the TUI, and `tick` from the cron file
+//! `install cron` writes — because the schedule takes no arguments.
 //!
-//! The visible result on such a host was a console running every minute,
+//! The visible result on such a host was a schedule running every minute,
 //! finding nothing, and a health check that could only say "unreadable"
 //! without being able to say which path it had tried. The documented
 //! workaround was a symlink from `/var/log/nginx` into wherever the logs
@@ -42,12 +41,13 @@
 //! Flag, then setting, then the built-in search. An explicit `--access-log`
 //! still wins, because a one-off run against a copied or rotated file is a
 //! real thing to want and must not need the stored value changed and put
-//! back. The stored value is what the console and the internal cron get,
-//! since they have no way to be passed a flag.
+//! back. The stored value is what the TUI and `tick` get, since they have
+//! no way to be passed a flag.
 //!
 //! "Stored" means the host settings file ([`crate::hostconf`]), not the
 //! database: the lockout guard runs as root on the SSH log named here, and
-//! the web console can write every row of the database.
+//! the database is a file root does not always own (see
+//! [`crate::hostconf`]).
 
 use std::path::{Path, PathBuf};
 
@@ -163,7 +163,7 @@ mod tests {
         );
     }
 
-    /// The containerised-NGINX case this exists for: the console has no way
+    /// The containerised-NGINX case this exists for: the schedule has no way
     /// to be passed a flag, so the stored path has to be what it reads.
     #[test]
     fn a_stored_path_is_used_when_no_flag_is_given() {

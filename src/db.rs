@@ -29,7 +29,6 @@ pub mod evidence;
 pub mod guard;
 pub mod keys;
 mod managed;
-mod remembered;
 pub mod schema;
 mod uapage;
 
@@ -408,8 +407,7 @@ pub struct SiteBotOverride {
 /// What `bot` gets on one site: the site's own override for it if there
 /// is one, then its global override, then its categories — the per-bot
 /// view of [`Db::blocked_user_agent_patterns_for_site`]'s cascade, for the
-/// screens that show one bot at a time (the TUI's site detail and the
-/// console's). `ai`/`search`/`scanner` are already the *effective* values
+/// screens that show one bot at a time (the TUI's site detail). `ai`/`search`/`scanner` are already the *effective* values
 /// for the site: its category override if it has one, else the global
 /// default.
 pub fn effective_bot_policy(
@@ -641,8 +639,8 @@ pub fn normalize_trusted_address(address: &str) -> Result<String> {
 
 /// Whether `address` is a `/0` — every IPv4 or every IPv6 address.
 ///
-/// Refused as a manual block by both front-ends that take one (the
-/// console's block form and `add-firewall-rule`), for the reason
+/// Refused as a manual block by everything that takes one (the TUI and
+/// `add-firewall-rule`), for the reason
 /// [`normalize_trusted_address`] refuses it as a trust: it is not a rule,
 /// it is the host off the network, and it is far likelier to be a typo for
 /// a real prefix. The geo allow-list's catch-all is generated, not stored,
@@ -707,8 +705,7 @@ pub fn validate_exemption_user_agent(user_agent: &str) -> Result<String> {
 /// (`nginx::pattern_problem`) at the point an operator can still be told,
 /// instead of only at write time, where the block silently leaves it out.
 /// The one that mattered: an empty string, which is in every user agent —
-/// the console's block form posting `user_agent=` blocked every visitor of
-/// every site.
+/// a block form posting `user_agent=` blocked every visitor of every site.
 ///
 /// **No backslash and no control character**, although both would now be
 /// written exactly (see `nginx::nginx_quoted`). A blocked user agent is a
@@ -1087,10 +1084,6 @@ fn reject_an_overbroad_fetch(source: &str, addresses: &[String], max_v4_share: f
 /// used.
 pub const SSH_LOGIN_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 
-/// How long a login to the web console keeps its address safe from the
-/// detectors: the same week as an SSH login, for the same reason.
-pub const CONSOLE_LOGIN_WINDOW_SECONDS: i64 = SSH_LOGIN_WINDOW_SECONDS;
-
 /// The columns [`firewall_rule_from_row`] reads, in its order.
 const FIREWALL_RULE_COLUMNS: &str =
     "id, address, port, action, enabled, expires_at, source, created_at, evidence";
@@ -1130,11 +1123,10 @@ pub struct Db {
 ///
 /// SQLite's default is zero: a second writer does not wait, it fails
 /// immediately with `SQLITE_BUSY` ("database is locked"). More than one
-/// process wants this file in ordinary use — the console and the TUI, a
-/// `stop-bots batch` from crontab while the console is up, and the
-/// installer and the service it has just started — and every one of those
-/// collisions is short, because the long-running holder is the console,
-/// which only takes the lock for the length of one query.
+/// process wants this file in ordinary use — the TUI, `stop-bots tick`
+/// from cron every minute, and a `batch` or any other command run by hand
+/// while either is going — and every one of those collisions is short,
+/// because each holder takes the lock for the length of one transaction.
 ///
 /// Five seconds is chosen to be far longer than any transaction this
 /// project runs (the slowest is a feed's worth of ranges in one
@@ -1166,13 +1158,14 @@ pub fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
 /// Existing files are tightened because the installs this was written for
 /// already have a 0644 database. Only this user's own, though: root opening
 /// someone else's database with `--db` has no business changing who else
-/// may read it — nor the console's, which since 0.1 is its own user's.
+/// may read it — nor one that a release with the web console gave to that
+/// console's own user.
 ///
 /// Every change goes through a descriptor opened with `O_NOFOLLOW`, never
 /// by path: under a [`guard::Guard`] the names in this directory are
 /// another user's to choose, and `chmod` by path follows a link. One that
-/// root creates there is given to that user, the directory's owner, or the
-/// console could not open its own database.
+/// root creates there is given to that user, the directory's owner, or
+/// that user could not open its own database.
 fn make_private(path: &Path, guard: Option<guard::Guard>) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
@@ -1216,8 +1209,8 @@ const WAL_SIZE_LIMIT: i64 = 16 * 1024 * 1024;
 /// Switches the database to write-ahead logging.
 ///
 /// In the default rollback mode a writer locks out every reader for the
-/// length of its transaction, and the console, the TUI and a cron `batch`
-/// all read and write this file. With WAL, readers never wait for the
+/// length of its transaction, and the TUI, `stop-bots tick` and a
+/// `batch` all read and write this file. With WAL, readers never wait for the
 /// writer and the writer never waits for readers; only two writers still
 /// take turns, which `busy_timeout` covers.
 ///
@@ -1244,9 +1237,8 @@ fn use_write_ahead_log(conn: &Connection) {
 
 /// `err`, with the next step when the database is someone else's.
 ///
-/// The usual way to get here: `stop-bots install web` made the database
-/// root's, 0600 in a 0700 directory, and then someone ran `stop-bots`
-/// without sudo. "failed to secure database: Permission denied" is true
+/// The usual way to get here: a root run made the database root's, 0600
+/// in a 0700 directory, and then someone ran `stop-bots` without sudo. "failed to secure database: Permission denied" is true
 /// and does not say that. SQLite's own "unable to open database file"
 /// says even less, so a denied open is also recognised by trying the
 /// file directly.
@@ -1263,16 +1255,15 @@ fn not_yours(path: &Path, err: anyhow::Error, root: bool) -> anyhow::Error {
     crate::hint::with(
         err,
         &format!(
-            "{} belongs to another user — the console's own `stop-bots` user, if \
-             `stop-bots install web` set this host up. \
+            "{} belongs to another user — root, if stop-bots was set up with sudo. \
              Run it with sudo, or pass `--db <path>` to use a database of your own.",
             path.display()
         ),
     )
 }
 
-/// Where the host's database lives: what `stop-bots install web` points
-/// the unit at, and what every root run without `--db` opens.
+/// Where the host's database lives: what `stop-bots install cron` points
+/// `tick` at, and what every root run without `--db` opens.
 pub const SYSTEM_PATH: &str = "/var/lib/stop-bots/db.sqlite3";
 
 /// The one line both front-ends show when the database in use is not
@@ -1315,11 +1306,9 @@ impl Db {
     ///
     /// Sets [`BUSY_TIMEOUT`], which SQLite does not do for you.
     ///
-    /// **Private by default.** This file holds the console's Argon2 hash
-    /// and everything the host has learned about who attacks it, and it
-    /// used to be created by SQLite with the process's umask — 0644 in a
-    /// 0755 directory, for any root CLI run that happened before
-    /// `install web` tightened things. So a directory this call creates is
+    /// **Private by default.** This file holds everything the host has
+    /// learned about who attacks it, and it used to be created by SQLite
+    /// with the process's umask — 0644 in a 0755 directory. So a directory this call creates is
     /// 0700 ([`create_private_dir_all`]), and the file is created 0600
     /// before SQLite opens it ([`make_private`]). SQLite gives its `-wal`,
     /// `-shm` and `-journal` files the main file's mode, so those follow.
@@ -1357,8 +1346,9 @@ impl Db {
         let conn = Connection::open_with_flags(path, flags)
             .with_context(|| format!("failed to open database: {}", path.display()))
             .map_err(|err| not_yours(path, err, crate::hint::is_root()))?;
-        // Root in the console's directory: the file, its schema included,
-        // is the console's to write, so nothing in it may run here.
+        // Root in another user's directory (one a release with the web
+        // console gave to its user): the file, its schema included, is that
+        // user's to write, so nothing in it may run here.
         if guard.is_some() {
             guard::harden(&conn, path)?;
         }
@@ -1366,58 +1356,6 @@ impl Db {
             .context("failed to set the database busy timeout")?;
         use_write_ahead_log(&conn);
         schema::migrate(&conn, Some(path))?;
-        Ok(Db { conn })
-    }
-
-    /// Opens a database that another, less privileged user can write: the
-    /// web console's, from the root helper (see [`crate::helper`]).
-    ///
-    /// Everything in it is read as hostile, and so is the directory it is
-    /// in. Unlike [`Db::open`], this:
-    ///
-    /// - never creates the file or the directory, and changes no mode;
-    /// - refuses a database, `-wal`, `-shm` or `-journal` that is a link,
-    ///   not a regular file, or has a second name (a hard link), as
-    ///   [`guard::Guard::check`] does, and opens with
-    ///   `SQLITE_OPEN_NOFOLLOW`. SQLite itself opens the companions with
-    ///   `O_NOFOLLOW`, so a link planted at one after the check fails the
-    ///   open rather than having root write through it;
-    /// - hardens the connection ([`guard::harden`]): no trigger, view or
-    ///   untrusted schema function runs, and defensive mode is on;
-    /// - **never migrates.** A database at any schema version but this
-    ///   binary's is refused: an upgrade copies the file (`VACUUM INTO`)
-    ///   into the console's directory and rewrites its schema, and root
-    ///   does that only when an administrator runs it, through
-    ///   [`Db::open`] — `install web` or any root CLI command.
-    pub fn open_untrusted<P: AsRef<Path>>(path: P) -> Result<Self> {
-        use rusqlite::OpenFlags;
-        use std::os::unix::fs::MetadataExt;
-
-        let path = path.as_ref();
-        std::fs::symlink_metadata(path)
-            .with_context(|| format!("failed to open database: {}", path.display()))?;
-        let dir = match path.parent() {
-            Some(dir) if !dir.as_os_str().is_empty() => dir,
-            _ => Path::new("."),
-        };
-        let owner =
-            std::fs::metadata(dir).with_context(|| format!("failed to read {}", dir.display()))?;
-        guard::Guard {
-            uid: owner.uid(),
-            gid: owner.gid(),
-        }
-        .check(path)?;
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )
-        .with_context(|| format!("failed to open database: {}", path.display()))?;
-        guard::harden(&conn, path)?;
-        conn.busy_timeout(BUSY_TIMEOUT)
-            .context("failed to set the database busy timeout")?;
-        schema::require_current(&conn, path)?;
         Ok(Db { conn })
     }
 
@@ -3176,44 +3114,6 @@ impl Db {
         Ok(())
     }
 
-    // ---- web console login addresses ----
-
-    /// Records a successful login to the web console from `address`, at
-    /// `at`, refreshing it if the address is already stored. Rows older
-    /// than [`CONSOLE_LOGIN_WINDOW_SECONDS`] go at the same time, so the
-    /// table holds a week of logins and nothing more.
-    ///
-    /// Stored canonical (`::ffff:a.b.c.d` as `a.b.c.d`), the form the
-    /// detectors compare a block against.
-    pub fn record_console_login(&self, address: std::net::IpAddr, at: i64) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM console_logins WHERE last_login < ?1",
-            params![at - CONSOLE_LOGIN_WINDOW_SECONDS],
-        )?;
-        self.conn.execute(
-            "INSERT INTO console_logins (address, last_login) VALUES (?1, ?2)
-             ON CONFLICT(address) DO UPDATE SET
-                 last_login = max(last_login, excluded.last_login)",
-            params![address.to_canonical().to_string(), at],
-        )?;
-        Ok(())
-    }
-
-    /// Every address that logged in to the web console at or after
-    /// `since`, sorted.
-    ///
-    /// No detector blocks one of them, as none blocks an address with a
-    /// recent SSH login (see `scanblock`): the console shows its operator
-    /// what attackers sent, and a request for that page carries it.
-    pub fn recent_console_logins(&self, since: i64) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT address FROM console_logins WHERE last_login >= ?1 ORDER BY address",
-        )?;
-        let rows = stmt.query_map(params![since], |row| row.get::<_, String>(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("failed to list recent console login addresses")
-    }
-
     // ---- crawler IP-range sources ----
 
     /// Registers `source` if no source with that `id` exists yet, same
@@ -3896,10 +3796,8 @@ fn is_regex_special(c: char) -> bool {
 mod tests {
     use super::*;
 
-    /// Two processes want this database in ordinary use: the console and
-    /// the TUI, a `stop-bots batch` from crontab while the console is up,
-    /// and — the one that actually broke — `install web` and the service
-    /// it has just started.
+    /// Two processes want this database in ordinary use: the TUI and
+    /// `stop-bots tick` from cron, or either and a command run by hand.
     ///
     /// SQLite's default is to not wait at all: the second writer fails
     /// instantly with "database is locked". This asserts the connection
@@ -3940,8 +3838,8 @@ mod tests {
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
-    /// The database holds the console's Argon2 hash, and any root CLI run
-    /// before `install web` used to create it 0644 in a 0755 directory.
+    /// The database holds what the host knows about who attacks it, and a
+    /// root CLI run used to create it 0644 in a 0755 directory.
     #[test]
     fn a_new_database_and_the_directory_made_for_it_are_private() {
         let dir = tempfile::tempdir().unwrap();
@@ -3984,8 +3882,8 @@ mod tests {
         assert_eq!(mode_of(&parent), 0o755);
     }
 
-    /// With WAL a reader never waits for the writer, and the console, the
-    /// TUI and a cron `batch` all share this file.
+    /// With WAL a reader never waits for the writer, and the TUI,
+    /// `stop-bots tick` and a `batch` all share this file.
     #[test]
     fn a_database_on_disk_is_opened_in_write_ahead_log_mode() {
         let dir = tempfile::tempdir().unwrap();
@@ -4047,9 +3945,10 @@ mod tests {
         }
     }
 
-    /// The directory's owner, standing in for the console's user: the
-    /// guard is root's, but its refusals do not need root to be seen.
-    fn console_guard(dir: &Path) -> guard::Guard {
+    /// The directory's owner, standing in for another user who owns the
+    /// database's directory: the guard is root's, but its refusals do not
+    /// need root to be seen.
+    fn owner_guard(dir: &Path) -> guard::Guard {
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::metadata(dir).unwrap();
         guard::Guard {
@@ -4058,18 +3957,18 @@ mod tests {
         }
     }
 
-    /// The attack the guard exists for: a compromised console links its
-    /// database to a file that does not exist yet, and root — the CLI, or
-    /// the helper — would create a database there with the console's rows
-    /// in it. Refused, and nothing created.
+    /// The attack the guard exists for: the user who owns the directory
+    /// links its database to a file that does not exist yet, and root would
+    /// create a database there with that user's rows in it. Refused, and
+    /// nothing created.
     #[test]
-    fn root_does_not_follow_a_link_the_console_left_for_its_database() {
+    fn root_does_not_follow_a_link_left_for_its_database() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("cron.d-x");
         let path = dir.path().join("db.sqlite3");
         std::os::unix::fs::symlink(&target, &path).unwrap();
 
-        let opened = Db::open_guarded(&path, Some(console_guard(dir.path())));
+        let opened = Db::open_guarded(&path, Some(owner_guard(dir.path())));
 
         assert!(opened.is_err(), "opened a database through a link");
         assert!(!target.exists(), "created the file the link points at");
@@ -4078,7 +3977,7 @@ mod tests {
     /// The same for the write-ahead log: a write would land in the link's
     /// target.
     #[test]
-    fn root_does_not_write_through_a_link_the_console_left_for_its_wal() {
+    fn root_does_not_write_through_a_link_left_for_its_wal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.sqlite3");
         drop(Db::open(&path).unwrap());
@@ -4087,7 +3986,7 @@ mod tests {
         std::fs::write(&target, "root:x:0:0\n").unwrap();
         std::os::unix::fs::symlink(&target, dir.path().join("db.sqlite3-wal")).unwrap();
 
-        let opened = Db::open_guarded(&path, Some(console_guard(dir.path())));
+        let opened = Db::open_guarded(&path, Some(owner_guard(dir.path())));
         if let Ok(db) = opened {
             let _ = db.set_text_setting("probe", "x");
         }
@@ -4101,14 +4000,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.sqlite3");
 
-        let db = Db::open_guarded(&path, Some(console_guard(dir.path()))).unwrap();
+        let db = Db::open_guarded(&path, Some(owner_guard(dir.path()))).unwrap();
         db.set_text_setting("probe", "x").unwrap();
 
         assert_eq!(db.get_text_setting("probe").unwrap().as_deref(), Some("x"));
         assert_eq!(mode_of(&path), 0o600);
     }
 
-    /// A database with triggers a compromised console planted: one on
+    /// A database with triggers the directory's owner planted: one on
     /// every write to `settings`, each recording that it ran.
     ///
     /// Built in memory and written out once (`VACUUM INTO`, which copies
@@ -4137,7 +4036,7 @@ mod tests {
             .unwrap()
     }
 
-    /// **Nothing the console plants in its database runs as root.** A
+    /// **Nothing another user plants in its database runs as root.** A
     /// trigger on `settings` fired inside a root CLI connection when it
     /// stored a setting. Guarded, the same write fires nothing; unguarded
     /// — the control — the same trigger fires, so it is a working one.
@@ -4147,7 +4046,7 @@ mod tests {
         let path = dir.path().join("db.sqlite3");
         database_with_planted_triggers(&path);
 
-        let db = Db::open_guarded(&path, Some(console_guard(dir.path()))).unwrap();
+        let db = Db::open_guarded(&path, Some(owner_guard(dir.path()))).unwrap();
         db.set_text_setting("probe", "x").unwrap();
         drop(db);
         assert_eq!(times_fired(&path), 0, "a planted trigger ran as root");
@@ -4157,25 +4056,6 @@ mod tests {
             .set_text_setting("probe", "z")
             .unwrap();
         assert!(times_fired(&path) > 0, "the control did not fire either");
-    }
-
-    /// The helper's open: the same, and a database with a second name is
-    /// refused as the guard refuses one.
-    #[test]
-    fn the_helper_runs_no_planted_trigger_and_refuses_a_hard_link() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db.sqlite3");
-        database_with_planted_triggers(&path);
-
-        Db::open_untrusted(&path)
-            .unwrap()
-            .set_text_setting("probe", "x")
-            .unwrap();
-        assert_eq!(times_fired(&path), 0, "a planted trigger ran in the helper");
-
-        std::fs::hard_link(&path, dir.path().join("second-name")).unwrap();
-        let err = Db::open_untrusted(&path).err().expect("opened a hard link");
-        assert!(format!("{err:#}").contains("hard link"), "{err:#}");
     }
 
     /// Tightening a mode goes through a descriptor that does not follow a
@@ -4197,8 +4077,8 @@ mod tests {
         assert_eq!(mode_of(&target), 0o644);
     }
 
-    /// A database in a directory this user cannot enter is the state
-    /// `install web` leaves for everyone but root. The error names the
+    /// A database in a directory this user cannot enter is the state a root
+    /// install leaves for everyone but root. The error names the
     /// way out rather than only the errno.
     #[test]
     fn a_database_this_user_cannot_open_says_to_use_sudo_or_another_db() {
@@ -4570,9 +4450,9 @@ mod tests {
         );
     }
 
-    /// Matched as a substring, so an empty one is in every user agent: the
-    /// console's block form posting `user_agent=` turned every visitor of
-    /// every site away at the next apply.
+    /// Matched as a substring, so an empty one is in every user agent: a
+    /// block form posting `user_agent=` turned every visitor of every site
+    /// away at the next apply.
     #[test]
     fn a_user_agent_that_would_block_everyone_is_refused() {
         let db = test_db();

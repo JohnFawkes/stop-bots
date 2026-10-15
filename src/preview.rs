@@ -17,8 +17,7 @@
 
 //! What "Apply everything" would do, before it does it.
 //!
-//! "Apply everything" — `a` in the TUI, the button in the console, `batch
-//! --apply` — rewrites every site's NGINX config and runs the firewall
+//! "Apply everything" — `a` in the TUI, `batch --apply` — rewrites every site's NGINX config and runs the firewall
 //! script as root. Each front-end now shows this first: the files that
 //! would change, the rules added and removed against the applied script,
 //! and the lockout guard's verdict, with a unified diff of all of it on
@@ -71,48 +70,7 @@ impl ApplyPreview {
     }
 }
 
-/// Lines of diff a [`Summary`] carries before it stops and says where the
-/// rest is. A first apply on a host with reputation feeds is a 44,000-line
-/// script; a page that size helps nobody review anything, and the web
-/// console's helper should not have to send it.
-pub const DIFF_LINES_SHOWN: usize = 4_000;
-
-/// What the web console's confirm page shows: the summary lines, and the
-/// diff when asked for, cut at [`DIFF_LINES_SHOWN`]. All a front-end that
-/// does not hold the files gets — the root helper returns this and no
-/// file's contents beyond the diff.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Summary {
-    pub lines: Vec<String>,
-    pub diff: Option<String>,
-}
-
-impl ApplyPreview {
-    /// The [`Summary`] of this preview, with the diff if `diff`.
-    pub fn summary(&self, diff: bool) -> Summary {
-        Summary {
-            lines: self.lines(),
-            diff: diff.then(|| truncated(&self.diff(), DIFF_LINES_SHOWN)),
-        }
-    }
-}
-
-/// `full`'s first `max` lines, and a line saying how many more there were.
-pub fn truncated(full: &str, max: usize) -> String {
-    let total = full.lines().count();
-    let mut shown: String = full
-        .lines()
-        .take(max)
-        .flat_map(|line| [line, "\n"])
-        .collect();
-    if total > max {
-        shown.push_str(&format!(
-            "\u{2026} {} more line(s). `stop-bots batch --dry-run --diff` prints all of it.\n",
-            total - max
-        ));
-    }
-    shown
-}
+impl ApplyPreview {}
 
 /// The web server's half of a summary: how many files would change, and
 /// which. Headed with the server's name — an Apache host's summary that
@@ -142,8 +100,7 @@ pub fn nginx_diff(changes: &[FileChange]) -> String {
     changes.iter().map(FileChange::diff).collect()
 }
 
-/// A preview for a front-end that may hold the `Db` throughout: the CLI,
-/// and the console inside one `with_db`. `run` is the firewall run the
+/// A preview for a front-end that may hold the `Db` throughout: the CLI. `run` is the firewall run the
 /// apply would make; it is turned into a dry run here.
 pub fn apply_everything(
     server: crate::webserver::WebServer,

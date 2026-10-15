@@ -34,7 +34,7 @@ help:
 	@echo 'screenshots       regenerate docs/screenshots/ from seeded fiction'
 	@echo 'demo              a disposable NGINX container with stop-bots in it, to try it on'
 	@echo 'build             release binary, after unit-test'
-	@echo 'deploy            build, then install it on $$DEPLOY_HOST and restart the service'
+	@echo 'deploy            build, then install it on $$DEPLOY_HOST, where cron runs it next'
 	@echo
 	@echo 'test runner:       $(RUNNER)'
 	@echo 'container runtime: $(STOP_BOTS_CONTAINER_RUNTIME)'
@@ -130,24 +130,13 @@ demo:
 build: unit-test
 	cargo build --release
 
-# Where the deployed binary has to land, and why it is not the login
-# directory.
-#
-# `install web` writes a unit whose ExecStart names an absolute path, and
-# that unit sets ProtectHome=yes — so a binary under /root or /home is
-# invisible to the service even when it is plainly there. scp'ing to the
-# login directory therefore deploys a file nothing runs, silently: the
-# console keeps serving, from the previous binary, and the only symptom is
-# that the change you just shipped is not in it.
+# Where the deployed binary has to land: the path `install cron` wrote into
+# /etc/cron.d/stop-bots, which runs whatever is there the next minute.
 DEPLOY_HOST ?= www
 DEPLOY_PATH ?= /usr/local/bin/stop-bots
-DEPLOY_UNIT ?= stop-bots-web.service
 
-# The remote half lives in scripts/deploy-remote.sh, piped over ssh rather
-# than inlined here: it is branching shell that decides whether the host
-# keeps serving the old build, and `tests/container.rs` runs that exact
-# file against a real systemd. See the script for what it does and why.
+# The remote half lives in scripts/deploy-remote.sh, piped over ssh: it
+# swaps the binary in without writing over a running one.
 deploy: build
 	scp ./target/release/stop-bots '$(DEPLOY_HOST):$(DEPLOY_PATH).new'
-	ssh '$(DEPLOY_HOST)' 'sh -s' '$(DEPLOY_PATH)' '$(DEPLOY_UNIT)' \
-		< scripts/deploy-remote.sh
+	ssh '$(DEPLOY_HOST)' 'sh -s' '$(DEPLOY_PATH)' < scripts/deploy-remote.sh

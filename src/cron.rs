@@ -15,25 +15,24 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-//! The internal cron: replaces relying on an external `cron`/systemd-timer
-//! to keep scan detection and crawler-range data fresh, by having a
-//! long-running stop-bots process periodically check which background jobs
-//! are due and run them. The Dashboard's "Scheduled tasks" panel — in both
-//! front-ends — is where their state is shown.
+//! The schedule: which background jobs are due, and what each one does.
+//! Two things run it — the TUI, checking every minute while it is open,
+//! and [`tick`], which the cron file `stop-bots install cron` writes runs
+//! once a minute. The TUI Dashboard's "Scheduled tasks" panel is where
+//! their state is shown.
 //!
-//! **This only automates while a front-end is running.** Unlike a real
-//! cron entry, nothing here runs when no stop-bots process is: closing
-//! both the TUI and the web server pauses every job until one is reopened.
-//! A job that's overdue when one (re)starts just runs as soon as it's next
-//! checked, the same never-run-yet-so-do-it-now convention `ipranges`
+//! **Nothing here runs by itself.** With no cron file installed and the
+//! TUI closed, every job waits until one of them runs again. A job that's
+//! overdue then just runs as soon as it's next checked, the same never-run-yet-so-do-it-now convention `ipranges`
 //! sources already use for staleness, rather than trying to "catch up" on
 //! however many intervals were missed.
 //!
 //! ## One schedule, however many front-ends
 //!
-//! The TUI (`App::check_cron` in `crate::app`), the web server
-//! (`crate::web::cron`) and a real crontab entry running `stop-bots batch`
-//! all record through the same `Db::set_cron_last_run` keys. So running
+//! The TUI (`App::check_cron` in `crate::app`), `stop-bots tick` from the
+//! cron file `install cron` writes ([`tick`]), and a crontab entry of the
+//! operator's own running `stop-bots batch` all record through the same
+//! `Db::set_cron_last_run` keys. So running
 //! two of them at once doesn't double the work: whichever gets there first
 //! marks the job done, and the other finds it no longer due. That is also
 //! why the per-job work lives here rather than in either front-end — two
@@ -465,11 +464,6 @@ pub fn run_log_jobs(
                 let connected = if applied.ssh.is_readable() {
                     let mut all = db.recent_ssh_login_ips()?;
                     all.extend(applied.logins.iter().cloned());
-                    // And whoever logged in to the web console: a render
-                    // that walls them out is as much a lockout.
-                    all.extend(
-                        db.recent_console_logins(now() - crate::db::CONSOLE_LOGIN_WINDOW_SECONDS)?,
-                    );
                     all.sort();
                     all.dedup();
                     Some(all)
@@ -615,8 +609,8 @@ pub fn maintenance(db: &Db) -> String {
 /// that should not happen hourly. Same convention the detectors follow —
 /// see `protection`'s module docs.
 ///
-/// `reload` is the front-end's "do things for real" flag (`stop-bots web
-/// --no-apply`, the TUI's `reload_nginx`). False still writes the config,
+/// `reload` is the front-end's "do things for real" flag (the TUI's
+/// `reload_nginx`; `tick` always passes `true`). False still writes the config,
 /// because a written config is inert until something reloads it — the
 /// same split every other apply path here makes.
 ///
@@ -657,8 +651,7 @@ pub fn apply_nginx(
     }
 }
 
-/// The `ApplyNginx` job's summary of what an apply did: shared with the
-/// web console, whose apply may happen in its root helper.
+/// The `ApplyNginx` job's summary of what an apply did.
 pub fn apply_nginx_summary(applied: &crate::webserver::ApplyAllOutcome) -> String {
     // Writing the sentinel block does nothing until NGINX re-reads it, so
     // there is nothing to reload when nothing changed on disk — the same
@@ -707,7 +700,8 @@ pub fn health_check(
         .get_block_response()
         .map(|r| r.status_code())
         .unwrap_or_else(|_| crate::db::BlockResponse::default().status_code());
-    let probe = crate::health::probe(backend, &db_path, ssh_log, host, block_status);
+    let claims = crate::scanblock::crawler_claims(db).unwrap_or_default();
+    let probe = crate::health::probe(backend, &db_path, ssh_log, host, block_status, claims);
     if let Err(err) = crate::health::store_probe(db, &probe) {
         return format!("error: {err}");
     }
@@ -774,7 +768,7 @@ fn render_firewall(
 ) -> String {
     let result: Result<String> = (|| {
         // The *stored* backend, not a hardcoded one. This used to always
-        // render nftables while the console applied with whatever the
+        // render nftables while every apply by hand used whatever the
         // operator had chosen — so on a host set to iptables, each tick
         // quietly replaced their iptables script with an nftables one at
         // the same path, and the next apply ran `sh` over nftables syntax.
@@ -802,8 +796,7 @@ fn render_firewall(
 }
 
 /// The `RenderFirewall` job's summary of a run that wrote (or did not
-/// write) `summary`: shared with the web console, whose run may happen in
-/// its root helper.
+/// write) `summary`.
 ///
 /// The write's own failure names the file, because this is the one
 /// failure here an operator has to act on outside stop-bots.
@@ -876,6 +869,112 @@ pub fn store_ip_ranges(
     Ok(summary)
 }
 
+/// What [`tick`] needs from its caller: where the host is and what it may
+/// do there.
+pub struct TickSettings<'a> {
+    pub host: &'a crate::hostconf::HostConf,
+    /// The web server's config root, from the host settings.
+    pub root: &'a std::path::Path,
+    /// An SSH log to read in place of the stored one or the search.
+    pub ssh_log: Option<std::path::PathBuf>,
+    /// Where the applied firewall script is; `None` for the backend's own.
+    pub firewall_out: Option<&'a std::path::Path>,
+}
+
+/// Runs every job that is due, once, and returns each one's summary: one
+/// tick of the schedule, for `stop-bots tick` under `/etc/cron.d`, which
+/// is what keeps a host protected with no front-end open.
+///
+/// In process, as the TUI runs them, and as root: the log jobs in one pass
+/// that reads each log once, then the rest one at a time. A job only does
+/// what its switches allow, exactly as under the TUI — auto-apply for the
+/// web server and the firewall stays off until the operator turns it on.
+/// A job's failure becomes its recorded summary; only a schedule that
+/// cannot be read at all is an error.
+pub async fn tick(db: &Db, settings: &TickSettings<'_>) -> Result<Vec<(CronJob, String)>> {
+    // The list built into this binary, as the TUI stores it when it starts:
+    // after an upgrade, what the new binary added is what the next apply
+    // and every staleness check have to see.
+    crate::botlist::register_all_sources(db)?;
+    let due = due_jobs(db)?;
+    let (log_jobs, others): (Vec<CronJob>, Vec<CronJob>) =
+        due.into_iter().partition(|job| is_log_job(*job));
+    let mut ran = Vec::new();
+
+    if !log_jobs.is_empty() {
+        let flags = crate::logscan::Flags {
+            ssh_log: settings.ssh_log.clone(),
+            access_log: None,
+            stored: settings.host.log_paths(),
+        };
+        let plan = crate::logscan::plan(db, &log_jobs, &flags)?;
+        let read = crate::logscan::read(&plan, plan.sources());
+        let mut storing = crate::logscan::store(read);
+        let applied = loop {
+            if let Some(applied) = storing.step(db)? {
+                break applied;
+            }
+        };
+        let apply_firewall = db.get_auto_apply_firewall()?;
+        ran.extend(run_log_jobs(
+            db,
+            &log_jobs,
+            &applied,
+            settings.firewall_out,
+            apply_firewall,
+        )?);
+    }
+
+    for job in others {
+        let summary = match job {
+            CronJob::UpdateIpRanges => match crate::refresh::claim(db, now())? {
+                crate::refresh::Claim::Busy { .. } => continue,
+                crate::refresh::Claim::Granted(lease) => {
+                    let results = fetch_ip_ranges().await;
+                    let stored = store_ip_ranges(db, results);
+                    crate::refresh::release(db, &lease)?;
+                    stored?
+                }
+            },
+            CronJob::UpdateEverything => match crate::refresh::claim(db, now())? {
+                crate::refresh::Claim::Busy { .. } => continue,
+                crate::refresh::Claim::Granted(lease) => {
+                    let mut outcomes = Vec::new();
+                    match crate::refresh::plan(db) {
+                        Ok(plan) => {
+                            for source in plan {
+                                let stored = crate::refresh::fetch(&source)
+                                    .await
+                                    .and_then(|raw| crate::refresh::store(db, &source, &raw));
+                                crate::refresh::renew(db, &lease, now())?;
+                                outcomes.push((source, stored.map_err(|err| format!("{err:#}"))));
+                            }
+                        }
+                        Err(err) => {
+                            crate::refresh::release(db, &lease)?;
+                            return Err(err.context("could not work out what to update"));
+                        }
+                    }
+                    let summary = crate::refresh::record(db, &outcomes, "by the schedule");
+                    crate::refresh::release(db, &lease)?;
+                    // `record` keeps the job's books itself.
+                    ran.push((job, summary));
+                    continue;
+                }
+            },
+            CronJob::HealthCheck => health_check(db, settings.host, settings.ssh_log.as_deref()),
+            CronJob::Maintenance => maintenance(db),
+            CronJob::ApplyNginx => apply_nginx(db, settings.host, settings.root, true),
+            CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::RenderFirewall => {
+                unreachable!("run in the log pass above")
+            }
+        };
+        record_run(db, job, &summary);
+        ran.push((job, summary));
+    }
+    Ok(ran)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -887,6 +986,60 @@ mod tests {
     /// Weekly, pushed back by a jitter that stays inside its bound and
     /// moves with the last run — so hosts that ran at the same moment once
     /// do not keep asking the same feeds at the same moment every week.
+    /// One tick runs the due detectors against the logs and blocks what
+    /// they find; the next, a moment later, finds nothing due. The jobs that
+    /// fetch or probe the host are marked just run, so nothing leaves this
+    /// machine.
+    #[tokio::test]
+    async fn a_tick_runs_what_is_due_and_then_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let access = dir.path().join("access.log");
+        let now = crate::testing::nginx_time(super::now());
+        std::fs::write(
+            &access,
+            format!("203.0.113.50 - - [{now}] \"GET /.env HTTP/1.1\" 404 0 \"-\" \"curl/8\"\n"),
+        )
+        .unwrap();
+        let ssh = dir.path().join("auth.log");
+        std::fs::write(&ssh, "").unwrap();
+        let db = test_db();
+        for job in [
+            CronJob::UpdateIpRanges,
+            CronJob::UpdateEverything,
+            CronJob::HealthCheck,
+            CronJob::ApplyNginx,
+        ] {
+            db.set_cron_last_run(job.id(), super::now(), "skipped for test")
+                .unwrap();
+        }
+        let host = crate::hostconf::HostConf {
+            access_log: Some(access),
+            ..Default::default()
+        };
+        let firewall_out = dir.path().join("fw.nft");
+        let settings = TickSettings {
+            host: &host,
+            root: dir.path(),
+            ssh_log: Some(ssh),
+            firewall_out: Some(&firewall_out),
+        };
+
+        let ran = tick(&db, &settings).await.unwrap();
+
+        assert!(
+            ran.iter()
+                .any(|(job, _)| *job == CronJob::Detect(crate::protection::Detector::ProbePaths)),
+            "the probe-path detector did not run: {ran:?}"
+        );
+        let rules = db.list_firewall_rules().unwrap();
+        assert!(
+            rules.iter().any(|rule| rule.address == "203.0.113.50"),
+            "the prober was not blocked: {rules:?}"
+        );
+        let again = tick(&db, &settings).await.unwrap();
+        assert!(again.is_empty(), "ran again with nothing due: {again:?}");
+    }
+
     #[test]
     fn the_weekly_download_is_due_a_week_and_some_jitter_after_it_ran() {
         let week = 7 * 24 * 60 * 60;
@@ -1398,32 +1551,6 @@ mod tests {
         assert_eq!(db.recent_ssh_login_ips().unwrap(), ["203.0.113.5"]);
     }
 
-    /// Whoever logged in to the web console is on the guard's list too: a
-    /// scheduled apply that would wall them out is refused.
-    #[test]
-    fn a_scheduled_apply_refuses_to_cut_off_a_console_login() {
-        let db = test_db();
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("auth.log"), "").unwrap();
-        db.add_firewall_rule(&crate::db::NewFirewallRule {
-            address: "198.51.100.0/24".to_string(),
-            port: None,
-            action: crate::db::FirewallAction::Block,
-            source: crate::db::RuleSource::Cli,
-            evidence: None,
-        })
-        .unwrap();
-        db.set_auto_apply_firewall(true).unwrap();
-        db.record_console_login("198.51.100.10".parse().unwrap(), now())
-            .unwrap();
-
-        let summaries = pass(&db, dir.path(), &[CronJob::RenderFirewall]);
-
-        let summary = &summaries[0].1;
-        assert!(summary.starts_with("skipped"), "{summary}");
-        assert!(summary.contains("198.51.100.10"), "{summary}");
-    }
-
     /// The whole loop end to end, through real files: a probe is blocked,
     /// the block lapses, the next minute's pass reads the same log and
     /// blocks nothing, and a new probe is blocked again.
@@ -1471,7 +1598,7 @@ mod tests {
         assert!(crate::firewall::rendered_path(&out_path).exists());
     }
 
-    /// An unprivileged `stop-bots web` hits this once a day, forever, so
+    /// An unprivileged TUI hits this once a day, forever, so
     /// the summary the Dashboard shows has to name the file rather than
     /// leaving the operator with a bare "Permission denied".
     #[test]
@@ -1635,9 +1762,11 @@ mod tests {
     #[test]
     fn status_reports_every_job_with_its_persisted_state() {
         let db = Db::open_in_memory().unwrap();
+        // One reading of the clock: two could fall either side of a second.
+        let at = now();
         db.set_cron_last_run(
             CronJob::Detect(Detector::SshScanners).id(),
-            now(),
+            at,
             "blocked 2 IP(s)",
         )
         .unwrap();
@@ -1649,7 +1778,7 @@ mod tests {
             .iter()
             .find(|s| s.job == CronJob::Detect(Detector::SshScanners))
             .unwrap();
-        assert_eq!(ssh.last_run, Some(now()));
+        assert_eq!(ssh.last_run, Some(at));
         assert_eq!(ssh.last_summary, Some("blocked 2 IP(s)".to_string()));
         assert!(!ssh.due);
 

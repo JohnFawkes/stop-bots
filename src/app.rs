@@ -1693,9 +1693,16 @@ impl App {
             .get_block_response()
             .map(|r| r.status_code())
             .unwrap_or_else(|_| crate::db::BlockResponse::default().status_code());
+        let claims = crate::scanblock::crawler_claims(&self.db).unwrap_or_default();
         tokio::task::spawn_blocking(move || {
-            let probe =
-                crate::health::probe(backend, &db_path, ssh_log.as_deref(), &host, block_status);
+            let probe = crate::health::probe(
+                backend,
+                &db_path,
+                ssh_log.as_deref(),
+                &host,
+                block_status,
+                claims,
+            );
             let _ = sender.send(Event::App(AppEvent::HealthProbed {
                 probe: Box::new(probe),
             }));

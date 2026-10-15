@@ -320,8 +320,12 @@ const LARGE_DB_BYTES: u64 = 128 * 1024 * 1024;
 
 /// The last [`ACCESS_LOG_SAMPLE_BYTES`] of the access log at `path`, read
 /// through a [`crate::accesslog::Survey`], or `None` if it cannot be read.
-fn access_log_sample(path: &Path, block_status: u16) -> Option<crate::accesslog::Survey> {
-    let mut survey = crate::accesslog::Survey::new(block_status);
+fn access_log_sample(
+    path: &Path,
+    block_status: u16,
+    claims: Vec<crate::accesslog::CrawlerClaim>,
+) -> Option<crate::accesslog::Survey> {
+    let mut survey = crate::accesslog::Survey::new(block_status).with_claims(claims);
     crate::logread::read_tail(path, ACCESS_LOG_SAMPLE_BYTES, &mut |line| survey.line(line)).ok()?;
     Some(survey)
 }
@@ -335,13 +339,16 @@ fn access_log_sample(path: &Path, block_status: u16) -> Option<crate::accesslog:
 ///
 /// Where to look comes from `host` ([`crate::hostconf`]): the logs, the
 /// NGINX root whose `conf.d` is checked, and the NGINX commands, which are
-/// carried in the probe for [`assess`] to judge.
+/// carried in the probe for [`assess`] to judge. `claims` are the
+/// crawlers' published ranges ([`crate::scanblock::crawler_claims`]), so that
+/// an impersonator refused is not counted as one of this host's clients.
 pub fn probe(
     backend: FirewallBackend,
     db_path: &Path,
     ssh_log: Option<&Path>,
     host: &crate::hostconf::HostConf,
     block_status: u16,
+    claims: Vec<crate::accesslog::CrawlerClaim>,
 ) -> Probe {
     let paths = &host.log_paths();
     let conf_d = &crate::nginx::conf_d_dir(&host.root(None));
@@ -352,7 +359,7 @@ pub fn probe(
     };
     // Read once, and only the tail, and every access-log question answered
     // from that one pass: two reads would be two different moments.
-    let sample = access_log_sample(&paths.access_path(None), block_status);
+    let sample = access_log_sample(&paths.access_path(None), block_status, claims);
     let access_readable = sample.is_some();
     let survey = sample.unwrap_or_default();
     let nginx_home = nginx_home();
@@ -3650,7 +3657,7 @@ mod tests {
             .chain((0..direct).map(|i| line(format!("198.51.100.{}", i % 250 + 1))))
             .collect();
         std::fs::write(&log, text).unwrap();
-        let survey = access_log_sample(&log, 403).expect("readable");
+        let survey = access_log_sample(&log, 403, Vec::new()).expect("readable");
         Probe {
             access_log_clients: Some((survey.public, survey.counts.parsed)),
             access_log_cdn: Some(survey.cdn),
@@ -3701,7 +3708,7 @@ mod tests {
         )
         .unwrap();
 
-        let survey = access_log_sample(&log, 403).expect("readable");
+        let survey = access_log_sample(&log, 403, Vec::new()).expect("readable");
 
         assert_eq!(
             (survey.counts.lines, survey.counts.parsed, survey.public),
@@ -3711,6 +3718,6 @@ mod tests {
             survey.unparsed_sample.as_deref(),
             Some("custom \u{fffd}[2J format")
         );
-        assert!(access_log_sample(&dir.path().join("none.log"), 403).is_none());
+        assert!(access_log_sample(&dir.path().join("none.log"), 403, Vec::new()).is_none());
     }
 }

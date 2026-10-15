@@ -37,6 +37,14 @@ markers in that site, or its own site (`conf.d/stop-bots-console.conf` for NGINX
 recognises both and takes them out with everything else. The console's settings stay in
 the database unread, so an NGINX host can still go back to 0.1.1.
 
+### Fixed
+
+- `status` no longer reports a crawler's impersonators as one of this host's clients
+  being turned away. A request claiming to be Googlebot, Bingbot or GPTBot from outside
+  that crawler's published ranges is the forged-crawler detector's to judge, and is now
+  left out of the "Clients this host used to serve" check: on one host, 16,210 refusals
+  of forged Googlebots probing for `/.env` read as Googlebot being blocked.
+
 ### Removed
 
 - The web console (`stop-bots web`), its settings (`set-web`), its service and root

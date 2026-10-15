@@ -457,6 +457,30 @@ pub fn spoofed_crawler_ips(log_text: &str, claims: &[CrawlerClaim]) -> Vec<(Stri
     )
 }
 
+/// The crawler `line` claims to be and is not, if any: its user agent names
+/// one of `claims` and no crawler it names publishes its address.
+///
+/// Verification is per *request*, not per claim: if any crawler the user
+/// agent named vouches for the address, the request is legitimate and the
+/// other names it mentions prove nothing on their own. Checking per claim
+/// would flag the real Googlebot the moment its user agent contained
+/// another crawler's token. A crawler with no fetched ranges is skipped,
+/// for the reason [`spoofed_crawler_ips`] gives.
+fn impersonates(line: &ParsedLine, claims: &[CrawlerClaim]) -> Option<&'static str> {
+    let ua = line.user_agent.to_lowercase();
+    let matched: Vec<&CrawlerClaim> = claims
+        .iter()
+        .filter(|claim| !claim.ranges.is_empty() && ua.contains(claim.marker))
+        .collect();
+    let vouched = matched
+        .iter()
+        .any(|claim| claim.ranges.iter().any(|cidr| cidr_contains(cidr, line.ip)));
+    match matched.first() {
+        Some(first) if !vouched => Some(first.name),
+        _ => None,
+    }
+}
+
 /// Request paths that no human, browser or legitimate crawler ever asks
 /// for, matched case-insensitively as a prefix of the request path.
 ///
@@ -996,35 +1020,7 @@ impl Observer {
         match detector {
             // A distinct path that does not exist here.
             Detector::WebScanners => (line.status == 404).then(|| Item::seen(&line.path)),
-            Detector::SpoofedCrawlers => {
-                let active: Vec<&CrawlerClaim> = self
-                    .watch
-                    .claims
-                    .iter()
-                    .filter(|c| !c.ranges.is_empty())
-                    .collect();
-                if active.is_empty() {
-                    return None;
-                }
-                let ua = line.user_agent.to_lowercase();
-                let matched: Vec<&&CrawlerClaim> = active
-                    .iter()
-                    .filter(|claim| ua.contains(claim.marker))
-                    .collect();
-                // Verification is per *request*, not per claim: if any
-                // crawler the user agent named vouches for the address,
-                // the request is legitimate and the other names it
-                // mentions prove nothing on their own. Checking per claim
-                // would flag the real Googlebot the moment its user agent
-                // contained another crawler's token.
-                let vouched = matched
-                    .iter()
-                    .any(|claim| claim.ranges.iter().any(|cidr| cidr_contains(cidr, line.ip)));
-                match matched.first() {
-                    Some(first) if !vouched => Some(Item::seen(first.name)),
-                    _ => None,
-                }
-            }
+            Detector::SpoofedCrawlers => impersonates(line, &self.watch.claims).map(Item::seen),
             Detector::ProbePaths => {
                 let path = line.path.to_lowercase();
                 self.needles
@@ -1194,6 +1190,10 @@ pub struct Survey {
     pub unparsed_sample: Option<String>,
     turned_away: HashMap<String, (u64, u64)>,
     block_status: u16,
+    /// The crawlers whose published ranges say who is really them: a
+    /// request claiming one from elsewhere is an impersonator, and its
+    /// refusal is not a client of this host being turned away.
+    claims: Vec<CrawlerClaim>,
 }
 
 impl Survey {
@@ -1202,6 +1202,12 @@ impl Survey {
             block_status,
             ..Survey::default()
         }
+    }
+
+    /// This survey, knowing who `claims`' crawlers really are.
+    pub fn with_claims(mut self, claims: Vec<CrawlerClaim>) -> Survey {
+        self.claims = claims;
+        self
     }
 
     pub fn line(&mut self, text: &str) {
@@ -1224,6 +1230,13 @@ impl Survey {
             self.cdn += 1;
         }
         if line.user_agent.is_empty() || line.user_agent == "-" {
+            return;
+        }
+        // Someone else's name, from someone else's address: neither a
+        // refusal nor a visit by the client that name belongs to. Left out,
+        // a forged Googlebot refused 16,000 times no longer reads as
+        // Googlebot turned away.
+        if impersonates(&line, &self.claims).is_some() {
             return;
         }
         let entry = self.turned_away.entry(line.user_agent).or_insert((0, 0));
@@ -1327,6 +1340,32 @@ mod tests {
             turned_away[0].served, 0,
             "a 404 and a 500 are neither refused by us nor served"
         );
+    }
+
+    /// A forged Googlebot, refused, is not a client of this host turned
+    /// away: the survey leaves it out once it knows Google's ranges, and
+    /// still counts the real one.
+    #[test]
+    fn a_refused_impersonator_is_not_a_client_turned_away() {
+        let googlebot = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        let forged = line_with("203.0.113.9", 418, googlebot);
+        let real = line_with("66.249.66.1", 418, googlebot);
+        let tally = |log: &str| {
+            let mut survey = Survey::new(418).with_claims(vec![googlebot_claim()]);
+            for line in log.lines() {
+                survey.line(line);
+            }
+            survey.turned_away()
+        };
+
+        assert!(
+            tally(&forged).is_empty(),
+            "a forged Googlebot counted: {:?}",
+            tally(&forged)
+        );
+        let counted = tally(&real);
+        assert_eq!(counted.len(), 1, "the real Googlebot went uncounted");
+        assert_eq!(counted[0].refused, 1);
     }
 
     /// An agent that was never refused has nothing to report, however much

@@ -700,7 +700,8 @@ pub fn health_check(
         .get_block_response()
         .map(|r| r.status_code())
         .unwrap_or_else(|_| crate::db::BlockResponse::default().status_code());
-    let probe = crate::health::probe(backend, &db_path, ssh_log, host, block_status);
+    let claims = crate::scanblock::crawler_claims(db).unwrap_or_default();
+    let probe = crate::health::probe(backend, &db_path, ssh_log, host, block_status, claims);
     if let Err(err) = crate::health::store_probe(db, &probe) {
         return format!("error: {err}");
     }

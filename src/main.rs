@@ -1933,6 +1933,7 @@ fn run_status(
             ssh_log.as_deref(),
             &host_settings()?,
             block_status,
+            stop_bots::scanblock::crawler_claims(&db)?,
         );
         health::store_probe(&db, &probe)?;
         (health::assess(&db, &probe)?, None)

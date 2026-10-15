@@ -6,6 +6,16 @@ While the version is `0.0.x` any release may break those; from `0.1.0` a patch r
 breaks none of them. The Rust library in `src/lib.rs` is not a supported API and is not
 covered: it can change in any release. `RELEASING.md` says what counts as breaking.
 
+## [Unreleased]
+
+### Fixed
+
+- The SSH-scanner detector now sees failed logins on a host that takes keys only. There,
+  at sshd's default log level, a wrong key for an existing user such as `root` leaves no
+  `Failed` line, only `Connection closed by authenticating user root <ip> … [preauth]`
+  (or `Disconnected from authenticating user …`), and those lines now count as failed
+  attempts. A connection dropped before naming any user is a port scan and still does not.
+
 ## [0.2.0] — 2026-10-15
 
 Apache, beside NGINX, and no web console. What changed since 0.1.1 is in this section

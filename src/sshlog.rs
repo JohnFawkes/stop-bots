@@ -240,7 +240,7 @@ impl Observer {
     }
 }
 
-/// The three sshd messages this module reads, by the word they open with.
+/// The four sshd messages this module reads, by the words they open with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthKind {
     /// `Accepted <method> for <user> from <ip> port <n> ssh2[: <key>]`
@@ -250,7 +250,20 @@ enum AuthKind {
     /// `Invalid user <user> from <ip> port <n>`, logged before any auth
     /// method is tried.
     InvalidUser,
+    /// `Connection closed by authenticating user <user> <ip> port <n>
+    /// [preauth]`, or `Disconnected from` in place of `Connection closed
+    /// by`: a client that offered an existing user something sshd turned
+    /// down, and left. On a host that takes keys only, at sshd's default
+    /// log level, a wrong key leaves no `Failed` line, so for a scanner
+    /// trying `root` this is the only trace there is.
+    GaveUp,
 }
+
+/// The openings of [`AuthKind::GaveUp`]'s two forms.
+const GAVE_UP: [&str; 2] = [
+    "Connection closed by authenticating user ",
+    "Disconnected from authenticating user ",
+];
 
 /// One authentication line, read the way sshd wrote it.
 struct AuthLine<'a> {
@@ -287,6 +300,20 @@ struct AuthLine<'a> {
 /// the log.
 fn parse_auth_line(line: &str) -> Option<AuthLine<'_>> {
     let message = sshd_message(line)?;
+    if let Some(rest) = GAVE_UP
+        .iter()
+        .find_map(|opening| message.strip_prefix(opening))
+    {
+        // `<user> <ip> port <n>`, with no `from`: the address is the word
+        // before the last ` port `, and everything left of it the user's.
+        let (head, _) = split_port(rest, rest.rfind(" port ")?)?;
+        let (user, ip) = head.rsplit_once(' ').unwrap_or(("", head));
+        return Some(AuthLine {
+            kind: AuthKind::GaveUp,
+            user,
+            ip: ip.parse().ok()?,
+        });
+    }
     let (kind, rest) = if let Some(rest) = message.strip_prefix("Accepted ") {
         (AuthKind::Accepted, rest)
     } else if let Some(rest) = message.strip_prefix("Failed ") {
@@ -300,7 +327,7 @@ fn parse_auth_line(line: &str) -> Option<AuthLine<'_>> {
 
     let (head, ip) = split_address(rest)?;
     let user = match kind {
-        AuthKind::InvalidUser => head,
+        AuthKind::InvalidUser | AuthKind::GaveUp => head,
         AuthKind::Accepted | AuthKind::Failed => {
             // `<method> for <user>`. The method is sshd's own and has no
             // spaces (`password`, `keyboard-interactive/pam`), so the first
@@ -328,15 +355,23 @@ fn parse_auth_line(line: &str) -> Option<AuthLine<'_>> {
 fn split_address(rest: &str) -> Option<(&str, IpAddr)> {
     let at = rest.rfind(" from ")?;
     let after = rest.get(at + " from ".len()..)?;
-    let (address, after_address) = after.split_once(" port ")?;
-    let port_len = after_address
+    let (address, _) = split_port(after, after.find(" port ")?)?;
+    Some((rest.get(..at)?, address.parse().ok()?))
+}
+
+/// `text` split at the ` port ` found at `at`, which must be followed by a
+/// port number and then nothing or a space: what is before it, and the
+/// port.
+fn split_port(text: &str, at: usize) -> Option<(&str, &str)> {
+    let after = text.get(at + " port ".len()..)?;
+    let port_len = after
         .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(after_address.len());
-    let tail = after_address.get(port_len..)?;
+        .unwrap_or(after.len());
+    let tail = after.get(port_len..)?;
     if port_len == 0 || !(tail.is_empty() || tail.starts_with(' ')) {
         return None;
     }
-    Some((rest.get(..at)?, address.parse().ok()?))
+    Some((text.get(..at)?, after.get(..port_len)?))
 }
 
 /// Where sshd's own message begins in `line`, if `line` came from sshd.
@@ -363,7 +398,11 @@ fn split_address(rest: &str) -> Option<(&str, IpAddr)> {
 /// read lines from their start).
 fn sshd_message(line: &str) -> Option<&str> {
     const MARKERS: [&str; 3] = ["Accepted ", "Failed ", "Invalid user "];
-    if MARKERS.iter().any(|marker| line.starts_with(marker)) {
+    if MARKERS
+        .iter()
+        .chain(&GAVE_UP)
+        .any(|marker| line.starts_with(marker))
+    {
         return Some(line);
     }
 
@@ -412,11 +451,13 @@ pub fn parse_accepted_ips(log_text: &str) -> Vec<String> {
 
 /// Extracts the client IP (as a real [`IpAddr`], not yet stringified) from
 /// every failed-authentication line in `log_text`, one entry per line (not
-/// deduplicated — [`scanning_ips`] counts these). Covers sshd's two failure
+/// deduplicated — [`scanning_ips`] counts these). Covers sshd's three failure
 /// shapes: `Failed password/publickey/keyboard-interactive/none for
-/// [invalid user] <user> from <ip> port <port> ssh2` and the standalone
+/// [invalid user] <user> from <ip> port <port> ssh2`, the standalone
 /// `Invalid user <user> from <ip> port <port>` logged before any auth
-/// method is even tried. A single invalid-user attempt typically produces
+/// method is even tried, and a client giving up on an existing user
+/// ([`AuthKind::GaveUp`]), which a password failure is also followed by.
+/// A single invalid-user attempt typically produces
 /// *both* lines (sshd logs the `Invalid user` notice, then still runs —
 /// and fails — the auth exchange), so this deliberately counts each log
 /// line rather than each attempt: it's a cruder signal, but consistent with
@@ -544,6 +585,14 @@ fn failed_attempt_with_user<'a>(
         return None;
     }
     display_username(auth.user)
+}
+
+/// The address on one failed-authentication line, as [`failed_attempt_ips`]
+/// reads it, or `None` for any other line.
+pub fn failed_login_address(line: &str) -> Option<IpAddr> {
+    parse_auth_line(line)
+        .filter(|auth| auth.kind != AuthKind::Accepted)
+        .map(|auth| auth.ip)
 }
 
 /// The `String` form of [`failed_attempt_ips`], for callers outside this
@@ -705,6 +754,33 @@ Jun 12 01:00:01 host sshd[2]: Failed password for invalid user admin from 198.51
         assert_eq!(
             parse_failed_attempt_ips(log),
             vec!["198.51.100.3".to_string()]
+        );
+    }
+
+    /// A host that takes keys only logs no `Failed` line for a wrong key
+    /// at sshd's default level: a client giving up on an existing user is
+    /// the failure, in both of the ways sshd words it.
+    #[test]
+    fn a_client_giving_up_on_an_existing_user_is_a_failed_attempt() {
+        let log = "\
+Oct 09 09:32:48 www sshd-session[427215]: Connection closed by authenticating user root 194.230.144.221 port 6152 [preauth]
+Oct 09 09:32:49 www sshd-session[427216]: Disconnected from authenticating user root 2001:db8::7 port 6153 [preauth]
+";
+        assert_eq!(
+            parse_failed_attempt_ips(log),
+            vec!["194.230.144.221".to_string(), "2001:db8::7".to_string()]
+        );
+    }
+
+    /// A connection dropped before it named any user is a port scan, not a
+    /// login attempt, and is not counted.
+    #[test]
+    fn a_connection_closed_before_authenticating_is_not_a_failed_attempt() {
+        let log = "Oct 15 09:53:15 www sshd-session[501932]: Connection closed by 172.236.228.245 port 45732 [preauth]";
+        assert!(
+            parse_failed_attempt_ips(log).is_empty(),
+            "counted: {:?}",
+            parse_failed_attempt_ips(log)
         );
     }
 
@@ -890,6 +966,7 @@ Jun 12 01:00:01 h sshd[2]: Accepted publickey for marko from 198.51.100.1 port 2
     ];
 
     const HOSTILE_USERNAMES: &[&str] = &[
+        "x 198.51.100.50 port 22",
         "Accepted",
         "Failed",
         "Invalid user",
@@ -911,6 +988,12 @@ Jun 12 01:00:01 h sshd[2]: Accepted publickey for marko from 198.51.100.1 port 2
                         "{prefix}Failed password for invalid user {user} from {REAL} port 5555 ssh2"
                     ),
                     format!("{prefix}Failed password for {user} from {REAL} port 5555 ssh2"),
+                    format!(
+                        "{prefix}Connection closed by authenticating user {user} {REAL} port 5555 [preauth]"
+                    ),
+                    format!(
+                        "{prefix}Disconnected from authenticating user {user} {REAL} port 5555 [preauth]"
+                    ),
                 ] {
                     assert_eq!(
                         parse_failed_attempt_ips(&line),

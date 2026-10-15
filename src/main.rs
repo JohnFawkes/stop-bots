@@ -639,6 +639,10 @@ enum Command {
     /// including VPN endpoints, corporate egress and API clients — not
     /// just bots. Unlike the behavioural detectors there's no evidence
     /// involved, and a wrongly-blocked visitor has no way to tell you.
+    ///
+    /// In Blocklist geo mode a cloud-provider feed leaves TCP port 80 open,
+    /// because Let's Encrypt validates from AWS: with it closed, no
+    /// certificate on this host renews over HTTP.
     SetReputationSource {
         /// Which feed, as `list-reputation-sources` names it
         #[arg(long)]

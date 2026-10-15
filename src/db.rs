@@ -492,6 +492,10 @@ pub struct FirewallRule {
     pub evidence: Option<String>,
 }
 
+/// The port an ACME http-01 challenge is fetched on, which no feed of
+/// whole cloud providers closes — see [`Db::derived_firewall_entries`].
+pub const ACME_HTTP_PORT: u16 = 80;
+
 /// Fields needed to add a new firewall rule.
 ///
 /// `source` is not optional: every writer says who it is, so no rule
@@ -3492,33 +3496,72 @@ impl Db {
         Ok(rules)
     }
 
-    /// Every `(address, action)` pair [`Self::blocked_ip_ranges`] (always
-    /// Block) and [`Self::geo_firewall_rules`] (Block or Allow, depending on
-    /// mode) currently contribute, combined — what `render-firewall` layers
-    /// on top of the admin-managed `firewall_rules` table as synthetic,
+    /// Every `(address, port, action)` entry [`Self::blocked_ip_ranges`]
+    /// (always Block), the enabled reputation feeds and
+    /// [`Self::geo_firewall_rules`] (Block or Allow, depending on mode)
+    /// currently contribute, combined — what `render-firewall` layers on
+    /// top of the admin-managed `firewall_rules` table as synthetic,
     /// non-persisted rules (see `main.rs::render_firewall`). Not persisted
     /// into `firewall_rules` itself: recomputing this fresh on every render
     /// means there is never a stale derived row to reconcile, and an
     /// admin's own rules are never at risk of being deleted by a refresh.
-    pub fn derived_firewall_entries(&self) -> Result<Vec<(String, FirewallAction)>> {
-        let mut entries: Vec<(String, FirewallAction)> = self
+    ///
+    /// **A cloud provider's ranges leave port 80 open**, in Blocklist mode.
+    /// Let's Encrypt validates an http-01 challenge from several places at
+    /// once, and every place but the first is an AWS region: with the AWS
+    /// feed on, the first validator got its 200 and the others timed out,
+    /// so every renewal failed and nothing said so until certbot's own
+    /// timer did. Found on a real host a month before its certificates
+    /// expired. Port 80 is where the challenge is served and otherwise
+    /// only redirects to HTTPS, and the web server still turns bots away
+    /// there by user agent.
+    ///
+    /// The Allows go after every other Block, so they open the port only
+    /// to an address nothing but a cloud feed blocks. In Allowlist mode
+    /// there are none: an Allow ahead of the catch-all would let every
+    /// cloud address outside the allowed countries reach port 80, and that
+    /// mode turns away most of Let's Encrypt's validators regardless.
+    pub fn derived_firewall_entries(&self) -> Result<Vec<(String, Option<u16>, FirewallAction)>> {
+        let mut entries: Vec<(String, Option<u16>, FirewallAction)> = self
             .blocked_ip_ranges()?
             .into_iter()
-            .map(|address| (address, FirewallAction::Block))
+            .map(|address| (address, None, FirewallAction::Block))
             .collect();
-        // Reputation feeds go after crawler ranges and before geo rules.
-        // The only ordering constraint that actually matters is that geo's
-        // Allowlist catch-all stays strictly last (see
-        // `firewall::derived_firewall_rules`); within the Block-only
-        // entries ahead of it, order is irrelevant to the result, since
-        // first-match-wins between two Blocks reaches the same verdict
-        // either way.
+        let (cloud, abuse): (Vec<_>, Vec<_>) = self
+            .enabled_reputation_ranges_by_source_id()?
+            .into_iter()
+            .partition(|(source_id, _)| {
+                crate::ipranges::reputation::ReputationSourceKind::from_id(source_id)
+                    .is_some_and(|kind| kind.blocks_infrastructure())
+            });
         entries.extend(
-            self.enabled_reputation_ranges()?
+            abuse
                 .into_iter()
-                .map(|address| (address, FirewallAction::Block)),
+                .map(|(_, address)| (address, None, FirewallAction::Block)),
         );
-        entries.extend(self.geo_firewall_rules()?);
+        let geo = self.geo_firewall_rules()?;
+        let cloud_blocks = cloud
+            .into_iter()
+            .map(|(_, address)| (address, None, FirewallAction::Block));
+        if self.get_geo_mode()? == GeoMode::Blocklist {
+            entries.extend(
+                geo.into_iter()
+                    .map(|(address, action)| (address, None, action)),
+            );
+            let blocks: Vec<_> = cloud_blocks.collect();
+            entries.extend(blocks.iter().map(|(address, _, _)| {
+                (address.clone(), Some(ACME_HTTP_PORT), FirewallAction::Allow)
+            }));
+            entries.extend(blocks);
+        } else {
+            // Ahead of the geo Allows, or an allowed country would let its
+            // cloud addresses through.
+            entries.extend(cloud_blocks);
+            entries.extend(
+                geo.into_iter()
+                    .map(|(address, action)| (address, None, action)),
+            );
+        }
         Ok(entries)
     }
 
@@ -3613,6 +3656,20 @@ impl Db {
     /// been fetched but switched off contributes nothing, and its stored
     /// ranges are kept rather than deleted so re-enabling doesn't require
     /// another download.
+    /// [`Self::enabled_reputation_ranges`], each with the feed it came
+    /// from.
+    fn enabled_reputation_ranges_by_source_id(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.source_id, r.cidr FROM reputation_ranges r
+             JOIN reputation_sources s ON s.id = r.source_id
+             WHERE s.enabled != 0
+             ORDER BY r.source_id, r.cidr",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list enabled reputation ranges")
+    }
+
     pub fn enabled_reputation_ranges(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT r.cidr FROM reputation_ranges r
@@ -6053,10 +6110,118 @@ mod tests {
         assert_eq!(
             derived,
             vec![
-                ("4.5.6.0/24".to_string(), FirewallAction::Block),
-                ("7.8.9.0/24".to_string(), FirewallAction::Block),
+                ("4.5.6.0/24".to_string(), None, FirewallAction::Block),
+                ("7.8.9.0/24".to_string(), None, FirewallAction::Block),
             ]
         );
+    }
+
+    /// Where `entries` sends a connection from `ip` to `port`: the first
+    /// entry that matches it, the way both firewalls walk their rules, and
+    /// `None` when nothing does.
+    fn verdict(
+        entries: &[(String, Option<u16>, FirewallAction)],
+        ip: &str,
+        port: u16,
+    ) -> Option<FirewallAction> {
+        let ip = ip.parse().unwrap();
+        entries
+            .iter()
+            .find(|(cidr, scope, _)| {
+                scope.is_none_or(|p| p == port) && crate::ipranges::cidr_contains(cidr, ip)
+            })
+            .map(|(_, _, action)| *action)
+    }
+
+    /// A database with these reputation feeds switched on, each holding
+    /// the ranges given.
+    fn with_feeds(feeds: &[(&str, &[&str])]) -> Db {
+        let db = Db::open_in_memory().unwrap();
+        crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
+        for (id, cidrs) in feeds {
+            let cidrs: Vec<String> = cidrs.iter().map(|c| c.to_string()).collect();
+            db.replace_reputation_ranges(id, &cidrs).unwrap();
+            db.set_reputation_source_enabled(id, true).unwrap();
+        }
+        db
+    }
+
+    /// Let's Encrypt validates from AWS; a feed of every AWS address must
+    /// not take a host's certificates with it.
+    #[test]
+    fn a_cloud_feed_leaves_port_80_open_and_nothing_else() {
+        let db = with_feeds(&[
+            ("aws", &["18.216.0.0/16", "2600:1f16::/32"]),
+            ("firehol-level1", &["18.216.66.0/24"]),
+        ]);
+        db.replace_country_ranges("cn", &["18.216.77.0/24".to_string()])
+            .unwrap();
+        db.set_country_selected("cn", true).unwrap();
+        let entries = db.derived_firewall_entries().unwrap();
+
+        let cases = [
+            (
+                "an AWS address, port 80",
+                "18.216.118.75",
+                80,
+                Some(FirewallAction::Allow),
+            ),
+            (
+                "an AWS address over IPv6, port 80",
+                "2600:1f16::1",
+                80,
+                Some(FirewallAction::Allow),
+            ),
+            (
+                "an AWS address, port 443",
+                "18.216.118.75",
+                443,
+                Some(FirewallAction::Block),
+            ),
+            (
+                "an AWS address an abuse feed lists",
+                "18.216.66.1",
+                80,
+                Some(FirewallAction::Block),
+            ),
+            (
+                "an AWS address in a blocked country",
+                "18.216.77.1",
+                80,
+                Some(FirewallAction::Block),
+            ),
+        ];
+        for (what, ip, port, expected) in cases {
+            assert_eq!(verdict(&entries, ip, port), expected, "{what}: {entries:?}");
+        }
+    }
+
+    /// An Allow ahead of the catch-all would open port 80 to every cloud
+    /// address outside the allowed countries.
+    #[test]
+    fn in_allowlist_mode_a_cloud_feed_opens_nothing() {
+        let db = with_feeds(&[("aws", &["18.216.0.0/16"])]);
+        db.set_geo_mode(GeoMode::Allowlist).unwrap();
+        db.replace_country_ranges("de", &["18.216.0.0/17".to_string()])
+            .unwrap();
+        db.set_country_selected("de", true).unwrap();
+        let entries = db.derived_firewall_entries().unwrap();
+
+        let cases = [
+            (
+                "an AWS address outside the allowed country",
+                "18.216.200.1",
+                Some(FirewallAction::Block),
+            ),
+            (
+                "an AWS address inside the allowed country",
+                "18.216.1.1",
+                Some(FirewallAction::Block),
+            ),
+        ];
+        for (what, ip, expected) in cases {
+            assert_eq!(verdict(&entries, ip, 80), expected, "{what}: {entries:?}");
+        }
     }
 
     /// A real signature survives reopening — otherwise the dashboard would

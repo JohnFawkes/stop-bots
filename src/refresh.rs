@@ -569,7 +569,7 @@ mod tests {
             db.derived_firewall_entries()
                 .unwrap()
                 .iter()
-                .filter(|(addr, _)| addr.starts_with("5."))
+                .filter(|(addr, _, _)| addr.starts_with("5."))
                 .count(),
             2
         );

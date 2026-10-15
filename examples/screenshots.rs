@@ -147,6 +147,7 @@ async fn main() -> Result<()> {
             web_server: stop_bots::webserver::WebServer::Nginx,
             config_root: None,
             apache_rewrite_enabled: None,
+            http_renewals: Some(0),
         },
     )?;
 

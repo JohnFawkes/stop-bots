@@ -51,7 +51,7 @@ use std::process::Command;
 
 use anyhow::Result;
 
-use crate::db::Db;
+use crate::db::{Db, FirewallAction, FirewallRule, ACME_HTTP_PORT};
 use crate::firewall::{self, FirewallBackend};
 use crate::webserver;
 
@@ -258,6 +258,12 @@ pub struct Probe {
     /// is not there to ask.
     #[serde(default)]
     pub apache_rewrite_enabled: Option<bool>,
+    /// How many of certbot's certificates renew with an http-01 challenge,
+    /// which Let's Encrypt fetches over port 80. `None` when certbot's
+    /// renewal directory is there and could not be read; `Some(0)` on a
+    /// host without one.
+    #[serde(default)]
+    pub http_renewals: Option<usize>,
 }
 
 /// How much of the access log a probe reads: its last 32 MB. Every
@@ -420,6 +426,7 @@ pub fn probe(
                 ],
             )
         }),
+        http_renewals: http_renewals(Path::new(CERTBOT_RENEWAL_DIR)),
         firewall_covers_forward: live.as_ref().map(|state| state.covers_forward),
         container_shares_host_network: container.as_ref().map(|name| {
             run_allowing_failure(
@@ -429,6 +436,39 @@ pub fn probe(
             .is_some_and(|mode| mode.trim() == "host")
         }),
     }
+}
+
+/// Where certbot keeps one `.conf` per certificate it renews.
+const CERTBOT_RENEWAL_DIR: &str = "/etc/letsencrypt/renewal";
+
+/// The certbot authenticators that answer an http-01 challenge, all of
+/// them on port 80. The DNS plugins (`dns-cloudflare` and friends) do not
+/// touch this host's firewall, and `manual` could be either.
+const HTTP_AUTHENTICATORS: [&str; 4] = ["nginx", "apache", "webroot", "standalone"];
+
+/// See [`Probe::http_renewals`].
+fn http_renewals(dir: &Path) -> Option<usize> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(0),
+        Err(_) => return None,
+    };
+    let mut count = 0;
+    for entry in entries {
+        let path = entry.ok()?.path();
+        if path.extension().is_none_or(|ext| ext != "conf") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).ok()?;
+        let authenticator = text.lines().find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "authenticator").then(|| value.trim().to_string())
+        });
+        if authenticator.is_some_and(|a| HTTP_AUTHENTICATORS.contains(&a.as_str())) {
+            count += 1;
+        }
+    }
+    Some(count)
 }
 
 /// Generated files sitting in the stock `conf.d` while the active one is
@@ -833,6 +873,9 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
         checks.push(check);
     }
     checks.push(ssh_login_allowlist(db)?);
+    if let Some(check) = lets_encrypt_reachable(&rules, probe) {
+        checks.push(check);
+    }
     if let Some(check) = trusted_by_hand(db, probe.web_server)? {
         checks.push(check);
     }
@@ -1729,6 +1772,84 @@ fn ssh_login_allowlist(db: &Db) -> Result<Check> {
     })
 }
 
+/// Addresses Let's Encrypt fetched an http-01 challenge from, as a capture
+/// on a real host caught them in October 2026: the first two families are
+/// its own primary validators, the rest the secondary ones it runs in AWS
+/// regions. It publishes no list and moves them when it likes, so this is a
+/// sample, not the set; what it can show is a firewall that drops the
+/// kind of address a renewal needs.
+const LETS_ENCRYPT_VALIDATORS: [&str; 13] = [
+    "23.178.112.103",
+    "2600:3000:2710:200::83",
+    "13.250.204.32",
+    "13.51.169.225",
+    "16.147.27.145",
+    "18.216.118.75",
+    "34.214.124.47",
+    "51.20.251.217",
+    "2406:da18:611:5702:7d40:9ed0:9c66:50a5",
+    "2600:1f14:a8b:500:40f3:828d:f5cd:faa",
+    "2600:1f16:13c:c402:11cd:b415:5ace:6e8a",
+    "2a05:d016:dcc:9100:d24b:ecf0:d1ac:d0a1",
+    "2a05:d016:dcc:9101:5fe4:af21:e3e4:80c8",
+];
+
+/// Whether Let's Encrypt can still reach port 80, on a host whose
+/// certificates renew there.
+///
+/// Found the slow way: with the AWS feed on, a host's every renewal failed
+/// for a month, the first validator getting its challenge and the AWS ones
+/// timing out, and the only sign was certbot's own failed unit. The feeds
+/// now leave port 80 open, but Allowlist geo mode, an abuse list or a rule
+/// added by hand can still close it — and the price is every site on the
+/// host going down the day its certificate expires.
+///
+/// Absent on a host with no such certificate, which is most of the reason
+/// to ask the filesystem first.
+fn lets_encrypt_reachable(rules: &[FirewallRule], probe: &Probe) -> Option<Check> {
+    let renewals = probe.http_renewals.filter(|&n| n > 0)?;
+    let now = now_secs();
+    let dropped: Vec<String> = LETS_ENCRYPT_VALIDATORS
+        .iter()
+        .filter_map(|address| {
+            let rule = firewall::first_match(rules, address.parse().ok()?, ACME_HTTP_PORT, now)?;
+            (rule.action == FirewallAction::Block)
+                .then(|| format!("{address} (by {})", rule.address.trim()))
+        })
+        .collect();
+    let check = |level, detail, fix| Check {
+        id: "lets-encrypt-reachable",
+        title: "Let's Encrypt can renew",
+        level,
+        detail,
+        fix,
+    };
+    Some(if dropped.is_empty() {
+        check(
+            Level::Ok,
+            format!(
+                "{renewals} certificate(s) renew over port 80, and the firewall lets {} known validator address(es) reach it",
+                LETS_ENCRYPT_VALIDATORS.len()
+            ),
+            None,
+        )
+    } else {
+        check(
+            Level::Warn,
+            format!(
+                "{renewals} certificate(s) renew over port 80, and the firewall drops {} of {} known Let's Encrypt validator address(es) there: {}",
+                dropped.len(),
+                LETS_ENCRYPT_VALIDATORS.len(),
+                dropped.join(", ")
+            ),
+            Some(
+                "renewals will fail and the certificates expire: lift the rules named, or renew with a DNS challenge (a certbot dns-* plugin)"
+                    .to_string(),
+            ),
+        )
+    })
+}
+
 /// What an operator has trusted by hand, listed — for the reason
 /// [`ssh_login_allowlist`] lists its addresses, and more so: those expire
 /// on their own after a week, and these never do.
@@ -2112,7 +2233,81 @@ mod tests {
             web_server: crate::webserver::WebServer::Nginx,
             config_root: None,
             apache_rewrite_enabled: None,
+            http_renewals: Some(0),
         }
+    }
+
+    /// A host with an AWS feed switched on, holding the range one of Let's
+    /// Encrypt's validators was caught in.
+    fn with_aws_feed() -> Db {
+        let db = db();
+        crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
+        db.replace_reputation_ranges("aws", &["18.216.0.0/15".to_string()])
+            .unwrap();
+        db.set_reputation_source_enabled("aws", true).unwrap();
+        db
+    }
+
+    fn renewing_over_http() -> Probe {
+        Probe {
+            http_renewals: Some(2),
+            ..healthy()
+        }
+    }
+
+    #[test]
+    fn a_host_without_http_renewals_gets_no_lets_encrypt_line() {
+        let report = assess(&with_aws_feed(), &healthy()).unwrap();
+        assert!(
+            report
+                .checks
+                .iter()
+                .all(|c| c.id != "lets-encrypt-reachable"),
+            "{:?}",
+            report.checks
+        );
+    }
+
+    /// The case that was found: the AWS feed no longer costs a host its
+    /// certificates.
+    #[test]
+    fn a_cloud_feed_leaves_lets_encrypt_reaching_port_80() {
+        let report = assess(&with_aws_feed(), &renewing_over_http()).unwrap();
+        let check = check(&report, "lets-encrypt-reachable");
+        assert_eq!(check.level, Level::Ok, "{check:?}");
+    }
+
+    /// Allowlist mode still closes port 80 to the validators, and the line
+    /// names the rule that does it.
+    #[test]
+    fn an_allowlist_that_drops_the_validators_is_a_warning() {
+        let db = db();
+        db.set_geo_mode(crate::db::GeoMode::Allowlist).unwrap();
+        let report = assess(&db, &renewing_over_http()).unwrap();
+        let check = check(&report, "lets-encrypt-reachable");
+        assert_eq!(check.level, Level::Warn, "{check:?}");
+        assert!(
+            check.detail.contains("18.216.118.75 (by 0.0.0.0/0)"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn only_http_challenges_count_as_renewing_over_port_80() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, authenticator) in [
+            ("a.conf", "nginx"),
+            ("b.conf", "webroot"),
+            ("c.conf", "dns-cloudflare"),
+            ("d.conf.bak", "nginx"),
+        ] {
+            let text =
+                format!("version = 2.11.0\n\n[renewalparams]\nauthenticator = {authenticator}\n");
+            std::fs::write(dir.path().join(name), text).unwrap();
+        }
+        assert_eq!(http_renewals(dir.path()), Some(2));
+        assert_eq!(http_renewals(&dir.path().join("missing")), Some(0));
     }
 
     /// A probe a release with the web console stored still parses: its

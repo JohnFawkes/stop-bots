@@ -269,17 +269,18 @@ pub fn seed_backend(db: &Db, installed: Installed) -> Result<Option<FirewallBack
 /// geo mode's selected countries — see [`Db::derived_firewall_entries`].
 /// Uses `id: 0` since these don't correspond to a real `firewall_rules` row;
 /// they're never looked up or removed by id, only rendered. Order is
-/// preserved from `derived_firewall_entries` (crawler ranges, then geo rules
-/// with any Allowlist catch-all strictly last) — callers must append this
-/// after admin rules, never reorder it.
+/// preserved from `derived_firewall_entries` (crawler ranges and feeds,
+/// a cloud feed's port-80 Allows just ahead of its Blocks, and any
+/// Allowlist catch-all strictly last) — callers must append this after
+/// admin rules, never reorder it.
 pub fn derived_firewall_rules(db: &Db) -> Result<Vec<FirewallRule>> {
     Ok(db
         .derived_firewall_entries()?
         .into_iter()
-        .map(|(address, action)| FirewallRule {
+        .map(|(address, port, action)| FirewallRule {
             id: 0,
             address,
-            port: None,
+            port,
             action,
             enabled: true,
             expires_at: None,
@@ -337,6 +338,25 @@ pub fn lockout_risks(rules: &[FirewallRule], connected_ips: &[String]) -> Vec<(S
         }
     }
     risks
+}
+
+/// The rule that decides a new TCP connection from `ip` to `port` at
+/// `now`, or `None` when none does and the packet is accepted. The same
+/// first-match walk both scripts make, over the rules they are rendered
+/// from: a disabled or expired rule is not there, and a port-scoped one
+/// matches only its port.
+pub fn first_match(
+    rules: &[FirewallRule],
+    ip: std::net::IpAddr,
+    port: u16,
+    now: i64,
+) -> Option<&FirewallRule> {
+    rules.iter().find(|rule| {
+        rule.enabled
+            && rule.expires_at.is_none_or(|at| at > now)
+            && rule.port.is_none_or(|p| p == port)
+            && ipranges::cidr_contains(rule.address.trim(), ip)
+    })
 }
 
 /// What the lockout guard found.

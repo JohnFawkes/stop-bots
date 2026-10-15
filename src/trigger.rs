@@ -69,7 +69,7 @@ pub fn evidence_for(
     if detector.spec().uses_ssh_log {
         // The last failure: the most recent of what earned the block.
         for line in log_text.lines() {
-            if let Some(ip) = failed_login_address(line) {
+            if let Some(ip) = crate::sshlog::failed_login_address(line) {
                 if wanted.contains_key(&ip) {
                     found.insert(ip, line.trim().to_string());
                 }
@@ -142,18 +142,6 @@ fn describe(detector: Detector, request: &Request, hint: Option<&str>) -> Option
         Detector::AssetRatio | Detector::RefererlessCrawl => Some(plain()),
         Detector::SshScanners => None,
     }
-}
-
-/// The address on an sshd failure line — `Failed ... from <ip> port <n>`
-/// or `Invalid user ... from <ip> port <n>` — taken from the last
-/// ` from `, the one sshd itself wrote.
-fn failed_login_address(line: &str) -> Option<IpAddr> {
-    if !(line.contains("Failed ") || line.contains("Invalid user ")) {
-        return None;
-    }
-    let at = line.rfind(" from ")?;
-    let (address, _) = line.get(at + " from ".len()..)?.split_once(" port ")?;
-    address.parse().ok()
 }
 
 /// One access-log line in either format the detectors read.

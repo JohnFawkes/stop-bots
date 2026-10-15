@@ -19,6 +19,14 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   choosing it with nothing trusted says so first. On the command line it is still
   `set-geo-mode --mode allowlist` with no country selected.
 
+### Fixed
+
+- The SSH-scanner detector now sees failed logins on a host that takes keys only. There,
+  at sshd's default log level, a wrong key for an existing user such as `root` leaves no
+  `Failed` line, only `Connection closed by authenticating user root <ip> … [preauth]`
+  (or `Disconnected from authenticating user …`), and those lines now count as failed
+  attempts. A connection dropped before naming any user is a port scan and still does not.
+
 ## [0.2.0] — 2026-10-15
 
 Apache, beside NGINX, and no web console. What changed since 0.1.1 is in this section

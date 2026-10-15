@@ -285,9 +285,9 @@ jobs:
 
       # A package that builds but installs the binary somewhere nothing looks
       # would pass the step above. These two assertions are the contract the
-      # rest of the project assumes: `install web` writes a unit whose
-      # ExecStart names an absolute path, and RELEASING.md and the landing
-      # page both tell people the binary is at /usr/bin/stop-bots.
+      # rest of the project assumes: `install cron` writes a cron line that
+      # names an absolute path, and RELEASING.md and the landing page both
+      # tell people the binary is at /usr/bin/stop-bots.
       - name: Check the contents
         run: |
           dpkg-deb --info dist/*.deb

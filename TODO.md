@@ -9,14 +9,7 @@ list — which meant the open items below were unfindable inside it.
 * **`ua_matches_blocked_bot_patterns`** (`dynamic.rs`) does case-insensitive
   *substring* matching over `|`-split alternatives, while the web server enforces a
   real case-insensitive regex (NGINX's `~*`, Apache's `RewriteCond ... [NC]`). The
-  `BLOCKLIST` tag can therefore disagree with what actually gets blocked — and since
-  the web UI arrived it says so on two screens rather than one, because both front-ends now read this from `crate::dynamic`.
-* **A changed path prefix needs a restart.** `BasePath` is read once when the
-  router is built, so after Web Access mounts the console under `/stop-bots/`
-  — from either front-end — the running console keeps generating links without
-  it until it is restarted. The Web Access panel now says so explicitly, with
-  a "Restart needed" row naming what this process is serving; the underlying
-  fix is rebuilding the router in place, which nothing does yet.
+  `BLOCKLIST` tag can therefore disagree with what actually gets blocked.
 
 * **A few CLI tests read the host's SSH journal.** Those that pass no
   `--ssh-log` fall back to `journalctl` on whatever machine runs them —
@@ -24,12 +17,6 @@ list — which meant the open items below were unfindable inside it.
   fake `journalctl` first on PATH; tests that set their own PATH would then
   need to keep it. (The health probe's `systemctl`/`docker ps` calls from
   unit tests, the worse case, are fixed.)
-
-* **The web console holds ~125 MB after its first log pass.** Measured on www
-  under 0.1.0-rc.3: steady at 124,872 KB RSS hours later, not growing, where rc.2's
-  console sat near 6 MB. Probably what the allocator kept from the first pass's 4 MB
-  chunks through the helper; worth a heap profile, and a smaller chunk or a trim
-  after the first pass. Well under the unit's `MemoryHigh=`.
 
 ## Known gaps
 
@@ -42,8 +29,7 @@ eventually ask for, with the reason it isn't there.
 * **No `--firewall-out` for the TUI.** `App::firewall_out` exists so a test can
   point the `a` key's write somewhere harmless, but nothing on the command line
   sets it; the render popup takes a path from the operator instead, and `a`
-  uses whatever the stored backend implies. `stop-bots web` does have the flag,
-  because its console has no field to type one into.
+  uses whatever the stored backend implies.
 * **No way to refresh an already-fetched country from the TUI.** Re-adding a
   code that is already fetched reuses the cached ranges. The CLI's
   `update-country-ranges` does force a re-fetch.

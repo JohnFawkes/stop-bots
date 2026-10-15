@@ -3,7 +3,7 @@ pkgname=stop-bots-bin
 _pkgname=stop-bots
 pkgver=0.1.1
 pkgrel=1
-pkgdesc="A TUI, web console and CLI that help you configure NGINX or Apache and your firewall to stop bad bots and still allow good bots (prebuilt binary)"
+pkgdesc="A TUI and CLI that help you configure NGINX or Apache and your firewall to stop bad bots and still allow good bots (prebuilt binary)"
 # Both architectures the release workflow builds a static musl binary for.
 # Arch's $CARCH spells them the way the Rust target triples do, which is what
 # lets one package() serve both.

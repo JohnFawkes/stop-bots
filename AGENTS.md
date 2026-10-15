@@ -43,7 +43,7 @@ codebase** and have been considered and rejected — don't "fix" them:
 
 ## Background work in `App`
 
-Every long-running action is a `start_x` / `finish_x` pair, fourteen times
+Every long-running action is a `start_x` / `finish_x` pair, thirteen times
 over: `start_` does the `Db` reads on the main thread, spawns the slow half,
 and returns immediately; `finish_` applies the result back on the main thread,
 where `Db` can be touched again. Adding a fifteenth follows the same shape,

@@ -75,8 +75,8 @@ No Rust check errors are allowed. Rust check should be run frequently.
 
 Print with `say!`, `say_inline!` and `say_err!`, never `println!` and its siblings,
 which `clippy.toml` forbids. They pass the line through `present::terminal_safe_text`,
-because much of what this program prints was chosen by a client or by the unprivileged
-console, and it is read by root in a terminal.
+because much of what this program prints was chosen by a client — a user agent, a request
+path — and it is read by root in a terminal.
 
 ### The pre-commit hook
 
@@ -192,51 +192,6 @@ Ideally, the real implementation is used. Where it can't be, in order of prefere
 The pty harness that drives the TUI end to end lives in tests/tui.rs itself (on raw `libc`);
 see the comment there for why it isn't a crate.
 
-### The web UI
-
-`src/web/` is a third front-end over the same core as the CLI and the TUI. Nothing
-in it knows how to block a bot — `webserver`, `firewall`, `dynamic`, `protection` and
-`cron` already carry those decisions, because the other two front-ends needed them.
-A behaviour that belongs to the product goes in one of those, not in a handler.
-
-**All database work goes through `AppState::with_db`.** `Db` wraps a
-`rusqlite::Connection`, which is `Send` but not `Sync`, so it cannot be shared
-across concurrent handlers as it stands. `with_db` runs the closure inside
-`spawn_blocking` and takes and drops the guard entirely within it — the same rule
-`app.rs` follows for the TUI's event loop. It uses a `std::sync::Mutex` rather than
-a tokio one on purpose: the std guard is not `Send`, so holding one across an
-`.await` is a compile error rather than a stalled runtime.
-
-Read a whole screen's view in **one** `with_db` call. Each call is a
-`spawn_blocking` hop and a lock acquisition, and a page assembled from a dozen of
-them can show two halves of two different states. Anything slow that is not a
-database read — a bot-list download, say — happens *outside* the lock.
-
-**Anything an unauthenticated caller can reach has to be cheap, or throttled.**
-`/login` is the one such endpoint that does real work — an Argon2 verification —
-and `LoginThrottle` rejects before hashing rather than after. A new
-unauthenticated route that costs more than a map lookup needs the same treatment.
-
-**Every mutating form needs `layout::csrf_field`.** The server rejects a post
-without it either way; the helper is what makes the correct path the short one.
-Several screens have a test asserting that the number of POST forms on the page
-equals the number of tokens, which is the cheapest way to catch a new form that
-forgot.
-
-**No inline event handlers.** The Content-Security-Policy allows the one inline
-script by hash, and a hash does not cover an `onclick` — that needs
-`unsafe-hashes`, which is the hole hashing avoids. Attach handlers from the hashed
-script in `layout.rs`; `tests/web.rs` fails the build if a page carries one.
-
-Run it against a throwaway database while working on it:
-
-```
-cargo run -- web --db /tmp/stop-bots-dev.db --root ./tests/fixtures/nginx --no-apply
-```
-
-`--no-apply` is the important half: without it, applying a site reloads the web server
-on your development machine.
-
 ### Screenshots
 
 `docs/screenshots/` is generated, not captured:
@@ -248,11 +203,7 @@ make screenshots
 `examples/screenshots.rs` seeds a throwaway database with fiction — addresses from
 the documentation ranges reserved by RFC 5737, `example.com` hostnames — draws each
 TUI screen through `TestBackend`, the same in-memory backend the unit tests use, and
-writes SVG. It then renders the web console's pages from the same database through
-the real router in-process, the way `tests/web.rs` drives it, and rasterises them in
-the light theme with whichever of Firefox or Chromium it finds on `PATH`, headless,
-into PNG. With neither installed it says so and leaves the previous PNGs alone. The
-TUI is shown dark and the console light on purpose: one of each palette.
+writes SVG.
 
 Two reasons it works this way rather than someone pressing a key and cropping a
 terminal. The first is that this tool reads real SSH and web server logs: a hand-taken
@@ -358,15 +309,12 @@ tests at the bottom of `src/main.rs` walk the whole command tree and check the p
 machine can check.
 
 - **A stored setting is changed by a `set-*` verb.** Every setting a person is meant to
-  change has one: `set-detector`, `set-category`, `set-web`, `set-firewall-backend` and
+  change has one: `set-detector`, `set-category`, `set-old-browsers`, `set-firewall-backend` and
   so on. Give a `set-*` verb no flags and it prints what is stored.
-- **Flags on a verb that runs something apply to that run only.** `web --bind`,
-  `batch --backend`, `render-firewall --out` and a `block-*` detector's `--threshold`
-  change nothing stored; without them the run uses what is stored. `install web` is the
-  one exception: it sets up a service that reads its settings from the database, so it
-  stores the console flags exactly as `set-web` would.
-- **A stored on/off value takes an explicit value**: `--enabled true|false`,
-  `--secure-cookie true|false`. Both directions have to be sayable, and a bare flag can
+- **Flags on a verb that runs something apply to that run only.** `batch --backend`,
+  `render-firewall --out`, `tick --ssh-log` and a `block-*` detector's `--threshold`
+  change nothing stored; without them the run uses what is stored.
+- **A stored on/off value takes an explicit value**: `--enabled true|false`. Both directions have to be sayable, and a bare flag can
   only say one. Declare it with `action = clap::ArgAction::Set` and
   `value_name = "true|false"`, as `bool` when the verb exists to set it and
   `Option<bool>` when it is one of several optional settings.
@@ -414,11 +362,10 @@ Some directories don't exist yet but should be created if the need arises.
         |- nginx.rs       <- NGINX: finding server blocks, rendering and placing its blocks and generated files
         |- apache.rs      <- Apache: finding <VirtualHost>s, its mod_rewrite blocks, trust file and robots.txt
         |- hostconf.rs    <- /etc/stop-bots/host.conf: the web server, its commands and root, the logs
-        |- webaccess.rs   <- Putting the web console behind NGINX or Apache, for both front-ends
         |- logpaths.rs    <- Where this host's SSH and access logs are, remembered
         |- logscan.rs     <- One pass over the logs: plan, read (no Db), store
         |- logread.rs     <- Reading a log a line at a time, from where the last read stopped
-        |- hostlog.rs     <- The two logs the detectors read, a bounded piece per request (the helper's too)
+        |- hostlog.rs     <- The two logs the detectors read, a bounded piece per request
         |- logtime.rs     <- When a log line says it happened
         |- evidence.rs    <- What each detector counts, and the one decision over it
         |- sshlog.rs      <- SSH log parsing and scan detection
@@ -436,15 +383,13 @@ Some directories don't exist yet but should be created if the need arises.
         |- health.rs      <- Is this host actually protected? The checks behind `status`
         |- hint.rs        <- Errors that name the next step (run with sudo, set-nginx-commands)
         |- host.rs        <- The host name, and where the system programs this runs are
-        |- install.rs     <- `stop-bots install`: the systemd units and directories
-        |- install/       <- The units 0.0.x wrote, to tell an old unit from an edited one
+        |- install.rs     <- `stop-bots install`: the cron file and the firewall's boot unit
+        |- install/       <- The firewall units 0.0.x wrote, to tell an old unit from an edited one
         |- uninstall.rs   <- `stop-bots uninstall`: the host back as it was
         |- batch.rs       <- Batch mode: one unattended pass, for a real crontab
-        |- cron.rs        <- The internal cron: which background jobs run how often
+        |- cron.rs        <- The schedule: which background jobs run how often, and `tick`
         |- docs.rs        <- Man pages and shell completions for the `.deb` (hidden `generate-docs`)
-        |- dynamic.rs     <- What is hitting the server now, shared by the TUI and web screens
-        |- web.rs         <- Web UI: bind address, exposure policy, Host allowlist
-        |- web/           <- One file per web screen, plus auth, state, layout and the router
+        |- dynamic.rs     <- What is hitting the server now, for the Firewall screen
         |- firewall.rs    <- The one render -> lockout guard -> write -> apply path, and its policy
         |- iptables.rs    <- iptables script generation
         |- nftables.rs    <- nftables script generation

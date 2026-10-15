@@ -8,7 +8,52 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+**The web console is gone.** stop-bots is a TUI and a CLI now, and nothing of it listens
+on a network. The console was a control panel for the host's firewall and web server
+config, reachable over HTTP; however carefully it was split and sandboxed, it was the one
+piece of attack surface this tool added, on hosts it exists to protect. Everything it did,
+the TUI does over SSH, and its unattended schedule is now cron's (`install cron`, below).
+`web`, `set-web`, `install web`, `uninstall web` and Web Access are removed with it.
+
+**If you had the console installed** (`install web`), remove it after upgrading, as root,
+before anything else. This release no longer knows the console's units or user, so
+`uninstall` will not take them out:
+
+```
+systemctl disable --now stop-bots-web.service stop-bots-helper.socket
+systemctl stop stop-bots-helper.service
+rm -f /etc/systemd/system/stop-bots-web.service \
+  /etc/systemd/system/stop-bots-helper.socket \
+  /etc/systemd/system/stop-bots-helper.service
+systemctl daemon-reload
+chown -R root:root /var/lib/stop-bots
+userdel stop-bots
+```
+
+Then `sudo stop-bots install cron` to keep the detectors running. **If you set up Web
+Access**, also delete the console's `location` between the `# BEGIN stop-bots console`
+markers in that site, or its own site (`conf.d/stop-bots-console.conf` for NGINX,
+`zz-stop-bots-console.conf` for Apache), and reload the web server; `uninstall` still
+recognises both and takes them out with everything else. The console's settings stay in
+the database unread, so an NGINX host can still go back to 0.1.1.
+
+### Removed
+
+- The web console (`stop-bots web`), its settings (`set-web`), its service and root
+  helper (`install web`, `uninstall web`), and Web Access, which put it behind NGINX or
+  Apache. The detectors no longer skip the console's own requests or its operator's
+  address, since there are none.
+
 ### Added
+
+- **`sudo stop-bots install cron`** writes `/etc/cron.d/stop-bots`, which runs the new
+  **`stop-bots tick`** every minute: the jobs the TUI runs while it is open, each when
+  it is due, applying only as far as `set-auto-apply` and `set-auto-apply-firewall`
+  allow. `tick` prints nothing unless something could not be recorded, so cron mails
+  only trouble, and a run that finds the last one still going leaves. `uninstall cron`
+  and `uninstall all` remove the file, before anything else. `status` has a Schedule
+  check in place of the console's: whether the detectors have run lately, and what runs
+  them.
 
 - **Old browsers, a list with a switch of its own.** `sudo stop-bots set-old-browsers
   --enabled true` blocks, on every site, the user agents of browsers too old for anyone

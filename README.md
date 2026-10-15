@@ -4,8 +4,8 @@
 [![crates.io](https://img.shields.io/crates/v/stop-bots.svg)](https://crates.io/crates/stop-bots)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](https://github.com/ivankovic/stop-bots/blob/main/LICENSE)
 
-A TUI, a web console and a CLI that help you configure your server to stop bad bots without
-hiding behind a CDN. It is a fancy UI for your existing web server (nginx or Apache) and your
+A TUI and a CLI that help you configure your server to stop bad bots without hiding behind a
+CDN. It is a fancy UI for your existing web server (nginx or Apache) and your
 firewall (nftables or iptables). For those of us that don't want to hide behind Cloudflare and give
 one company the keys to all kingdoms.
 
@@ -143,16 +143,9 @@ rules it applies stay inside the container, and `exit` deletes it.
 `sudo stop-bots` starts the TUI. It needs root, because it rewrites your web server's config and
 loads firewall rules. `?` shows every key on every screen.
 
-`sudo stop-bots web` serves the same screens in a browser, on `127.0.0.1:8787` only. Reach it
-from your laptop over an SSH tunnel, `ssh -L 8787:127.0.0.1:8787 your-server`, then open
-<http://127.0.0.1:8787/>. The first run prints a password for it, once; only a hash is stored,
-and `sudo stop-bots web --set-password` issues a new one.
-
 Run every command with `sudo`. Without root, stop-bots cannot open
 `/var/lib/stop-bots/db.sqlite3` and falls back to a database of your own (it prints which),
 with none of your settings in it.
-
-![The web console's Dashboard: category policies, detectors, countries and scheduled tasks](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/web-dashboard.png)
 
 Or from the CLI, for scripts:
 
@@ -168,17 +161,18 @@ sudo stop-bots status
 
 ## Keep it running
 
-**Nothing re-runs on its own.** Detection, list updates and the rest run on an internal
-schedule that only ticks while the TUI or the web console is open. On a server you don't sit
-in front of, pick one of these.
-
-The console as a service, which runs the detectors every minute and refreshes the lists every
-week:
+**Nothing re-runs on its own.** Detection, list updates and the rest run on a schedule that
+only ticks while the TUI is open, or when cron runs it. On a server you don't sit in front of,
+let cron run it:
 
 ```
-sudo stop-bots install web --dry-run    # read the plan
-sudo stop-bots install web              # prints the console password at the end
+sudo stop-bots install cron --dry-run    # read the plan
+sudo stop-bots install cron
 ```
+
+That writes `/etc/cron.d/stop-bots`, which runs `stop-bots tick` every minute: the detectors
+each minute, the lists every week, the same jobs the TUI's Dashboard lists under Scheduled
+tasks. `sudo stop-bots status` says when they last ran.
 
 It still only *writes* what it finds until you let it apply, and there are two switches for
 that because the risks are different. NGINX config is re-applied at most once an hour, after
@@ -190,18 +184,11 @@ sudo stop-bots set-auto-apply --enabled true
 sudo stop-bots set-auto-apply-firewall --enabled true
 ```
 
-Or cron, without the console:
+`sudo stop-bots install firewall` adds a unit that loads the applied firewall script again at
+boot.
 
-```
-# One full pass a night. Refreshes the lists, scans the logs, applies both.
-0 4 * * * root /usr/bin/stop-bots batch --apply
-
-# And detection every ten minutes, without re-downloading lists that change weekly.
-*/10 * * * * root /usr/bin/stop-bots batch --apply --no-fetch
-```
-
-Either way, `sudo stop-bots install firewall` adds a unit that loads the applied firewall
-script again at boot.
+If you would rather write your own crontab, `stop-bots batch --apply` is one full pass that
+applies everything, and `--no-fetch` skips the downloads.
 
 ## Undo
 
@@ -284,28 +271,24 @@ All of these are off by default.
 
 ## Nothing happens without you
 
-Changing a setting only changes what *would* be written. In the TUI and the console, applying
-shows what would change first and asks; on the CLI, `--dry-run` shows the same. Unless you force
+Changing a setting only changes what *would* be written. In the TUI, applying shows what would
+change first and asks; on the CLI, `--dry-run` shows the same. Unless you force
 it, every apply refuses rules that would cut off an SSH session connected right now. Applying
 automatically is a setting, and it is off.
-
-# The web console's security model
-
-`sudo stop-bots install web` splits the console in two: the part you log into runs as an
-unprivileged `stop-bots` user in a systemd sandbox, and a small root helper, started on demand,
-does the few things that need root from a fixed list of requests. Taking over the console gets
-an attacker the operator's powers over blocking, not root.
-[docs/security-model.md](https://github.com/ivankovic/stop-bots/blob/main/docs/security-model.md)
-has the details and the limits.
 
 # FAQ
 
 ### Why does it need root?
 
 It rewrites your web server's config, reloads it, and loads firewall rules, and each of those
-needs root. The TUI and the CLI run as root because you started them with `sudo`. The console,
-once installed as a service, does not: it runs as its own user and asks a root helper for those
-few things, as described [above](#the-web-consoles-security-model).
+needs root. The TUI and the CLI run as root because you started them with `sudo`, and the cron
+file runs `stop-bots tick` as root. Nothing of stop-bots listens on a network.
+
+### Is there a web interface?
+
+There was, until 0.2.0. It was a root-equivalent control panel listening on a network port,
+which is exactly the kind of thing this tool exists to protect, so it is gone. The TUI over SSH
+does everything it did.
 
 ### My NGINX runs in Docker.
 
@@ -335,8 +318,7 @@ take the client address your web server logs. Set up NGINX's real-IP module
 (`set_real_ip_from` and `real_ip_header`) so that address is the visitor's. Until you do, the
 detectors never block Cloudflare's edge addresses (or private ones), so behind it they block no
 one; `sudo stop-bots status` warns when most of the log comes from Cloudflare and prints the
-NGINX lines to add. (`set-web --trust-forwarded-for` is a different thing: it is for a proxy in
-front of the web console itself.)
+NGINX lines to add.
 
 The user-agent blocks in the web server work either way. Firewall blocks of a visitor's
 address do not: behind a proxy, the connection reaching your server comes from the proxy.
@@ -366,8 +348,8 @@ possible if every line can be licensed both ways.
 
 Debian and Ubuntu are what is tested. The release binaries are static, so they run on any
 x86_64 or aarch64 Linux, and `cargo install stop-bots` builds anywhere Rust does. Beyond that
-you are on your own: `install web` assumes systemd, and the log paths it looks for first are
-Debian's. Packaging for Arch (PKGBUILDs) and Gentoo (an ebuild) is in
+you are on your own: `install firewall` assumes systemd, `install cron` a cron that reads
+`/etc/cron.d`, and the log paths it looks for first are Debian's. Packaging for Arch (PKGBUILDs) and Gentoo (an ebuild) is in
 [packaging/](https://github.com/ivankovic/stop-bots/tree/main/packaging), but neither is
 published or tested yet.
 

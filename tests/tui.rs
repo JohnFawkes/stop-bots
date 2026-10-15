@@ -1204,14 +1204,14 @@ fn dashboard_geo_blocking_add_and_remove_a_country() {
     session.exp_string("range(s)").unwrap();
     session.exp_string("Blocked NL").unwrap();
 
-    // One more Down selects the new "nl" row; Enter removes it directly
+    // One more Down selects the new "nl" row; Delete removes it directly
     // (no confirmation popup, unlike a category default). Checked as
     // "Remov", not the full "Removed NL": "Blocked NL" (the previous
     // message) and "Removed NL" coincidentally share identical trailing
     // characters ("ed NL") at the same screen position, so the diffed
     // terminal only retransmits the part that actually changed.
     send_key(&mut session, "\x1b[B");
-    send_key(&mut session, "\r");
+    send_key(&mut session, "\x1b[3~");
     session.exp_string("Remov").unwrap();
 
     send_key(&mut session, "q");

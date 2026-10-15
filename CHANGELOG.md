@@ -21,6 +21,18 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - The Geo panel's first row says how to change its mode: `Enter to add a country, m to
   change mode`, in place of `+ Add a country`.
 
+### Changed
+
+- **Delete or Backspace removes a country from the Geo panel; Enter no longer does.**
+  Enter adds a country on the row above, so the same key deleting on the next row down
+  made a removal one keypress away from an add. Enter on a country now says which key
+  removes it.
+
+### Removed
+
+- The help screen's `w` line, for putting the web console behind NGINX: the key did nothing
+  since the console was removed in 0.2.0.
+
 ### Fixed
 
 - The SSH-scanner detector now sees failed logins on a host that takes keys only. There,

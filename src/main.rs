@@ -876,6 +876,21 @@ enum Command {
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
+    /// Keep port 80 open in the cloud-provider feeds, for Let's Encrypt.
+    ///
+    /// Let's Encrypt fetches an http-01 challenge from several places, and
+    /// all but one are in AWS. With this on, which it is by default, the
+    /// AWS, Google Cloud and DigitalOcean feeds block every port but TCP 80,
+    /// so certbot's `nginx`, `apache`, `webroot` and `standalone` plugins
+    /// keep renewing. Turn it off on a host that renews over DNS, or has no
+    /// certificate, to block those ranges on port 80 as well. Allowlist geo
+    /// mode never opens the port.
+    #[command(name = "set-cloud-port-80")]
+    SetCloudPort80 {
+        /// Whether the cloud-provider feeds leave port 80 open
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
     /// Serve humans and nothing else.
     ///
     /// Blocks every catalogued bot whatever its category, and gives any
@@ -1716,6 +1731,7 @@ async fn run() -> Result<()> {
         Some(Command::SetRobotsTxt { enabled }) => set_robots_txt(db, enabled),
         Some(Command::SetAutoApply { enabled }) => set_auto_apply(db, enabled),
         Some(Command::SetAutoApplyFirewall { enabled }) => set_auto_apply_firewall(db, enabled),
+        Some(Command::SetCloudPort80 { enabled }) => set_cloud_port_80(db, enabled),
         Some(Command::SetHumansOnly { enabled }) => set_humans_only(db, enabled),
         Some(Command::SetOldBrowsers { enabled }) => set_old_browsers(db, enabled),
         Some(Command::ShowRobotsTxt) => show_robots_txt(db),
@@ -2453,6 +2469,9 @@ fn set_reputation_source(db_path: Option<PathBuf>, source_id: String, enabled: b
         if let Some(warning) = kind.warning() {
             say!("Warning: {warning}.");
         }
+        if kind == ReputationSourceKind::Aws {
+            say!("{}", cloud_port_80_line(db.get_cloud_port_80_open()?));
+        }
         let count = db
             .list_reputation_sources()?
             .into_iter()
@@ -2834,6 +2853,27 @@ fn set_auto_apply_firewall(db_path: Option<PathBuf>, enabled: bool) -> Result<()
         );
     }
     Ok(())
+}
+
+fn set_cloud_port_80(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    db.set_cloud_port_80_open(enabled)?;
+    say!("{}", cloud_port_80_line(enabled));
+    say!("Run render-firewall, then apply the script, to enforce it.");
+    Ok(())
+}
+
+/// What the cloud-provider feeds do on port 80, said the same way by
+/// `set-cloud-port-80` and by `set-reputation-source` turning AWS on.
+fn cloud_port_80_line(open: bool) -> &'static str {
+    if open {
+        "The cloud-provider feeds leave port 80 open, so Let's Encrypt can renew \
+         certificates over HTTP (`set-cloud-port-80 --enabled false` closes it)."
+    } else {
+        "The cloud-provider feeds block port 80 too. Let's Encrypt validates from AWS, so \
+         with the AWS feed on, certificates renewed over HTTP stop renewing \
+         (`set-cloud-port-80 --enabled true` opens it)."
+    }
 }
 
 fn set_robots_txt(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {

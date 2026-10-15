@@ -699,6 +699,35 @@ fn enabling_a_provider_feed_warns_and_flags_that_nothing_is_fetched_yet() {
         .stdout(predicate::str::contains("No ranges stored yet"));
 }
 
+/// Let's Encrypt validates from AWS, so turning that feed on says what it
+/// does to port 80, and the choice that closes it is the one that says
+/// certificates will stop renewing.
+#[test]
+fn enabling_aws_with_port_80_closed_says_renewals_will_stop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("db.sqlite3");
+    let db = db.to_str().unwrap();
+
+    stop_bots_bin()
+        .args(["set-cloud-port-80", "--db", db, "--enabled", "false"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("block port 80 too"));
+    stop_bots_bin()
+        .args([
+            "set-reputation-source",
+            "--db",
+            db,
+            "--source-id",
+            "aws",
+            "--enabled",
+            "true",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("stop renewing"));
+}
+
 #[test]
 fn an_unknown_reputation_source_is_rejected_with_the_known_ids() {
     let tmp = tempfile::tempdir().unwrap();

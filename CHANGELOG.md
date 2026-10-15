@@ -23,6 +23,12 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   runs the firewall's rules against addresses Let's Encrypt has validated from and warns
   when they would be dropped on port 80, naming the rule. Allowlist geo mode drops
   most of them.
+- **Switching the AWS feed on asks about port 80 first.** In the Dashboard, the AWS
+  ranges row opens a popup, "Let's Encrypt validates from AWS", with two choices: block
+  AWS but keep port 80 open for renewals, or block port 80 too and let renewals over
+  HTTP fail. Esc leaves the feed off. On the command line the choice is
+  `set-cloud-port-80 --enabled true|false`, on by default, and `set-reputation-source`
+  says which it is when it turns AWS on.
 - The Geo panel's first row says how to change its mode: `Enter to add a country, m to
   change mode`, in place of `+ Add a country`.
 
@@ -43,10 +49,11 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - **The AWS, Google Cloud and DigitalOcean feeds no longer stop Let's Encrypt
   renewing a certificate.** Let's Encrypt fetches an http-01 challenge from several
   places, and every one but the first is in AWS, so with the AWS feed on every renewal
-  timed out, on a real host for a month before anyone noticed. In Blocklist geo mode
-  the cloud-provider feeds now leave port 80 open: it serves the challenge and the
-  redirect to HTTPS, and the web server still turns bots away there by user agent. An
-  address an abuse list, a country or a detector blocks stays blocked on every port.
+  timed out, and nothing but certbot's own failed unit said so. In Blocklist geo mode
+  the cloud-provider feeds now leave port 80 open unless `set-cloud-port-80` says
+  otherwise: it serves the challenge and the redirect to HTTPS, and the web server still
+  turns bots away there by user agent. An address an abuse list, a country or a
+  detector blocks stays blocked on every port.
 - The SSH-scanner detector now sees failed logins on a host that takes keys only. There,
   at sshd's default log level, a wrong key for an existing user such as `root` leaves no
   `Failed` line, only `Connection closed by authenticating user root <ip> … [preauth]`

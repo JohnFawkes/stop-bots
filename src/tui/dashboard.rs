@@ -243,6 +243,13 @@ enum Popup {
         row: ProtectionRow,
         selected: usize,
     },
+    /// Switching the AWS feed on, which Let's Encrypt validates from:
+    /// block it but leave port 80 open (0), or block port 80 too (1). Esc
+    /// leaves the feed off. `feed` indexes `Dashboard::reputation`.
+    CloudPort80 {
+        feed: usize,
+        selected: usize,
+    },
     /// Firewall rendering: select backend (0 = nftables, 1 = iptables),
     /// enter the output path, and optionally toggle `apply_after_write`
     /// (Space) so confirming with Enter also actually enforces the script
@@ -1003,6 +1010,17 @@ impl Dashboard {
                 selected,
                 theme,
             ),
+            Popup::CloudPort80 { selected, .. } => render_option_list(
+                frame,
+                area,
+                "Let's Encrypt validates from AWS",
+                &[
+                    "Block AWS, keep port 80 open for renewals".to_string(),
+                    "Block AWS on port 80 too: renewals fail".to_string(),
+                ],
+                selected,
+                theme,
+            ),
             Popup::Category { category, selected } => render_option_list(
                 frame,
                 area,
@@ -1120,6 +1138,7 @@ impl Dashboard {
                 Popup::Category { .. } => self.handle_category_popup_key(key, db, message),
                 Popup::AddCountry { .. } => self.handle_add_country_popup_key(key, db, message),
                 Popup::Protection { .. } => self.handle_protection_popup_key(key, db, message),
+                Popup::CloudPort80 { .. } => self.handle_cloud_port_80_popup_key(key, db, message),
                 Popup::GeoMode { .. } => self.handle_geo_mode_popup_key(key, db, message),
                 Popup::RenderFirewall { .. } => self.handle_render_firewall_popup_key(key),
                 Popup::ConfirmApply { .. } => self.handle_confirm_apply_popup_key(key, message),
@@ -1442,6 +1461,31 @@ impl Dashboard {
         if source.enabled == enabled {
             return Ok(KeyOutcome::Consumed);
         }
+        // Asked first, because the AWS feed takes this host's certificates
+        // with it unless port 80 stays open, and whether it does is a
+        // setting nobody would think to look for.
+        if enabled && source.id == ipranges::reputation::ReputationSourceKind::Aws.id() {
+            let open = db.get_cloud_port_80_open()?;
+            self.popup = Some(Popup::CloudPort80 {
+                feed: index,
+                selected: if open { 0 } else { 1 },
+            });
+            return Ok(KeyOutcome::Consumed);
+        }
+        self.switch_feed(db, &source, enabled, "", message)
+    }
+
+    /// [`Self::commit_feed`] once nothing is left to ask. `note` follows
+    /// "on" in the message, ahead of the warning that can run off the
+    /// Log panel's edge.
+    fn switch_feed(
+        &mut self,
+        db: &Db,
+        source: &crate::db::ReputationSource,
+        enabled: bool,
+        note: &str,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
         db.set_reputation_source_enabled(&source.id, enabled)?;
         if !enabled {
             *message = Some(format!("{} off", source.name));
@@ -1451,17 +1495,17 @@ impl Dashboard {
         // Surfaced on enable, not buried in a doc comment: the provider
         // feeds block every visitor hosted there, and unlike a detector
         // there's no behavioural evidence behind it.
-        let warning = crate::ipranges::reputation::ReputationSourceKind::from_id(&source.id)
+        let warning = ipranges::reputation::ReputationSourceKind::from_id(&source.id)
             .and_then(|k| k.warning())
             .map(|w| format!(" — {w}"))
             .unwrap_or_default();
 
         if source.last_fetched_at.is_none() {
-            *message = Some(format!("{} on, fetching…{warning}", source.name));
-            return Ok(KeyOutcome::FetchReputationSource(source.id));
+            *message = Some(format!("{} on{note}, fetching…{warning}", source.name));
+            return Ok(KeyOutcome::FetchReputationSource(source.id.clone()));
         }
         *message = Some(format!(
-            "{} on ({} range(s)) — apply (a) to enforce them{warning}",
+            "{} on{note} ({} range(s)) — apply (a) to enforce them{warning}",
             source.name, source.range_count
         ));
         Ok(KeyOutcome::Mutated)
@@ -1596,6 +1640,49 @@ impl Dashboard {
                 let (row, selected) = (*row, *selected);
                 self.popup = None;
                 self.commit_protection(db, row, selected, message)
+            }
+            _ => Ok(KeyOutcome::Consumed),
+        }
+    }
+
+    /// See [`Popup::CloudPort80`]. The choice is stored before the feed is
+    /// switched on, so the message that follows says what was chosen.
+    fn handle_cloud_port_80_popup_key(
+        &mut self,
+        key: KeyEvent,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(Popup::CloudPort80 { feed, selected }) = &mut self.popup else {
+            unreachable!("dispatched on this variant")
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.popup = None;
+                *message = Some("AWS ranges left off".to_string());
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = 0;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                *selected = 1;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let (feed, open) = (*feed, *selected == 0);
+                self.popup = None;
+                db.set_cloud_port_80_open(open)?;
+                let Some(source) = self.reputation.get(feed).cloned() else {
+                    return Ok(KeyOutcome::Consumed);
+                };
+                let note = if open {
+                    ", port 80 open for Let's Encrypt"
+                } else {
+                    ", port 80 too: Let's Encrypt renewals over HTTP will fail"
+                };
+                self.switch_feed(db, &source, true, note, message)
             }
             _ => Ok(KeyOutcome::Consumed),
         }
@@ -3996,13 +4083,16 @@ mod tests {
     fn enabling_a_provider_feed_warns_about_blocking_real_visitors() {
         let db = Db::open_in_memory().unwrap();
         register_all_reputation_sources(&db).unwrap();
-        db.replace_reputation_ranges(ReputationSourceKind::Aws.id(), &["1.2.3.0/24".to_string()])
-            .unwrap();
+        db.replace_reputation_ranges(
+            ReputationSourceKind::GoogleCloud.id(),
+            &["1.2.3.0/24".to_string()],
+        )
+        .unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
         focus_protection(&mut dashboard, &db);
 
-        let target = feed_row_index(&dashboard, ReputationSourceKind::Aws.id());
+        let target = feed_row_index(&dashboard, ReputationSourceKind::GoogleCloud.id());
         dashboard.protection_state.select(Some(target));
         let mut message = None;
         dashboard
@@ -4017,6 +4107,86 @@ mod tests {
 
         let message = message.unwrap();
         assert!(message.contains("not just bots"), "message was: {message}");
+    }
+
+    /// A dashboard on the Automatic blocking panel, with the AWS feed
+    /// fetched, off, and selected.
+    fn on_the_aws_row(db: &Db) -> Dashboard {
+        register_all_reputation_sources(db).unwrap();
+        db.replace_reputation_ranges(ReputationSourceKind::Aws.id(), &["1.2.3.0/24".to_string()])
+            .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(db).unwrap();
+        focus_protection(&mut dashboard, db);
+        let target = feed_row_index(&dashboard, ReputationSourceKind::Aws.id());
+        dashboard.protection_state.select(Some(target));
+        dashboard
+    }
+
+    fn aws_enabled(db: &Db) -> bool {
+        db.list_reputation_sources()
+            .unwrap()
+            .iter()
+            .any(|s| s.id == ReputationSourceKind::Aws.id() && s.enabled)
+    }
+
+    /// Let's Encrypt validates from AWS, so switching the feed on asks
+    /// about port 80 first, and backing out of that leaves it off.
+    #[test]
+    fn switching_aws_on_asks_about_port_80_and_esc_leaves_it_off() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = on_the_aws_row(&db);
+
+        press(&mut dashboard, &db, KeyCode::Char(' '));
+        assert!(
+            matches!(
+                dashboard.popup,
+                Some(Popup::CloudPort80 { selected: 0, .. })
+            ),
+            "popup was {:?}",
+            dashboard.popup
+        );
+        assert!(!aws_enabled(&db), "AWS was switched on before the answer");
+
+        press(&mut dashboard, &db, KeyCode::Esc);
+        assert!(!aws_enabled(&db), "Esc switched AWS on");
+    }
+
+    #[test]
+    fn keeping_port_80_open_switches_aws_on_and_says_so() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = on_the_aws_row(&db);
+        let mut message = None;
+        for code in [KeyCode::Char(' '), KeyCode::Enter] {
+            dashboard
+                .handle_key(KeyEvent::from(code), &db, &mut message)
+                .unwrap();
+        }
+
+        assert!(aws_enabled(&db));
+        assert!(db.get_cloud_port_80_open().unwrap());
+        let message = message.unwrap();
+        assert!(message.contains("port 80 open"), "message was: {message}");
+    }
+
+    #[test]
+    fn blocking_port_80_too_is_stored_and_says_renewals_will_fail() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = on_the_aws_row(&db);
+        let mut message = None;
+        for code in [KeyCode::Char(' '), KeyCode::Down, KeyCode::Enter] {
+            dashboard
+                .handle_key(KeyEvent::from(code), &db, &mut message)
+                .unwrap();
+        }
+
+        assert!(aws_enabled(&db));
+        assert!(!db.get_cloud_port_80_open().unwrap());
+        let message = message.unwrap();
+        assert!(
+            message.contains("renewals over HTTP will fail"),
+            "message was: {message}"
+        );
     }
 
     /// Every automatic-blocking option is on screen at once. There are

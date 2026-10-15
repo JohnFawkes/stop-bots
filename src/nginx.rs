@@ -33,7 +33,7 @@
 
 pub use crate::dirfd::DirFile;
 use crate::webserver::*;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -1642,57 +1642,12 @@ fn block_text(config: &BlockConfig) -> Option<String> {
 /// Status checks go through here too, so a site whose rule is correctly
 /// omitted from its plain-HTTP block still reads as `UP TO DATE` rather
 /// than permanently `STALE`.
-///
-/// It also widens one thing: a block that serves the console (the `Web
-/// Access` panel's path mode puts its `location` there) exempts the
-/// console's prefix, see [`console_prefix_in`].
-fn for_block(config: &BlockConfig, content: &str, block: &ServerBlock) -> BlockConfig {
+fn for_block(config: &BlockConfig, block: &ServerBlock) -> BlockConfig {
     let mut config = config.clone();
     if !block.is_tls {
         config.request_rules.retain(|rule| !rule.needs_tls());
     }
-    if let Some(prefix) = console_prefix_in(content, block) {
-        if !config.exempt_paths.contains(&prefix) {
-            config.exempt_paths.push(prefix);
-        }
-    }
     config
-}
-
-/// The prefix of the console `location` this tool wrote into `block`, if
-/// it wrote one — read from the block itself, so the exemption is always
-/// for the location that is really there, on the block it is really in.
-///
-/// **Why the console is exempt.** Every check in a sentinel block runs in
-/// NGINX's server rewrite phase, before a `location` is chosen, so the
-/// console's own `location` inherits every one of them: a blocked user
-/// agent, a request-shape rule, the operator's own browser. An operator who
-/// turned on "No Accept-Language" and uses a client that sends none was
-/// locked out of the one place they could turn it off. The console has its
-/// own login and throttle; the bot rules are for the site.
-///
-/// What this cannot exempt it from is `limit_req`. It is inherited by
-/// every `location` that has none of its own and cannot be switched off in
-/// one, and a `limit_req` there would need a zone of its own in `conf.d`.
-/// It refuses with a 429 for as long as the client exceeds the rate, and
-/// no longer, so it slows the console down rather than locking anyone out.
-fn console_prefix_in(content: &str, block: &ServerBlock) -> Option<String> {
-    let (start, end) = locate_console_block(content, block)?;
-    let tokens = lex(&content[start..end]).tokens;
-    let at = tokens.iter().position(|(word, _)| word == "location")?;
-    let (word, offset) = tokens.get(at + 1)?;
-    // The quoted form this tool writes now, or the bare `location /prefix/`
-    // that versions before 0.0.13 wrote between the same markers — a host
-    // that set up Web Access then and never re-applied it still has that,
-    // and its operator needs the exemption as much. A modifier (`=`, `^~`,
-    // `~`) is somebody's edit and not a prefix to guess at: the validator
-    // refuses anything that does not start with `/`.
-    let prefix = if content[start + offset..].starts_with('"') {
-        nginx_unquoted(word)
-    } else {
-        word.clone()
-    };
-    is_stored_as_valid(&prefix, crate::db::validate_exempt_path).then_some(prefix)
 }
 
 /// Builds the path regexes that clear the block flag, none when there
@@ -1844,7 +1799,7 @@ fn locate_marked(
 /// any existing block. Idempotent: applying the same config twice yields
 /// identical output.
 fn apply_block(content: &str, block: &ServerBlock, config: &BlockConfig) -> String {
-    let new_block = block_text(&for_block(config, content, block));
+    let new_block = block_text(&for_block(config, block));
 
     match locate_existing_block(content, block) {
         Some((start, end)) => {
@@ -1870,68 +1825,16 @@ fn apply_block(content: &str, block: &ServerBlock, config: &BlockConfig) -> Stri
     }
 }
 
-// ---- reaching the console from outside ----
+// ---- what earlier releases wrote for the web console ----
 
-/// Sentinel markers for the console's own `location` block.
+/// The markers around the `location` the web console's Web Access panel
+/// wrote into a site, before the console was removed. Nothing writes them
+/// now; they are only ever taken out, by `uninstall`, with the blocks.
 ///
-/// Separate from [`BLOCK_BEGIN`]/[`BLOCK_END`] on purpose: the two live in
-/// the same `server` block and are rewritten by different actions, so one
-/// pair of markers would have "apply blocks" and "set up web access"
-/// deleting each other's work.
+/// **Frozen**, like [`BLOCK_BEGIN`]: they are the bytes on hosts that set
+/// Web Access up.
 const CONSOLE_BEGIN: &str = "# BEGIN stop-bots console (DO NOT EDIT)";
 const CONSOLE_END: &str = "# END stop-bots console";
-
-/// The `location` block that proxies to the console, shared by both modes.
-///
-/// `proxy_pass` deliberately has **no** trailing slash, and the location
-/// keeps its prefix: this server matches the full path including the
-/// prefix and generates links that do too, so a `proxy_pass` that stripped
-/// it would leave every link pointing outside the location block. See
-/// `--base-path` in `main.rs` for the same warning aimed at whoever writes
-/// this by hand.
-///
-/// The prefix is quoted, with any `"` or `\` inside it escaped. It has
-/// already passed `BasePath::parse`, which admits nothing NGINX treats as
-/// syntax; the quotes are what keep that true if a prefix ever reaches
-/// here some other way. This file is loaded by a root NGINX, and an
-/// unquoted `;` or `}` in it is a directive of the caller's choosing.
-fn console_location(prefix: &str, upstream: &std::net::SocketAddr) -> String {
-    let prefix = prefix.replace('\\', r"\\").replace('"', r#"\""#);
-    format!(
-        "    {CONSOLE_BEGIN}\n    \
-         location \"{prefix}\" {{\n        \
-         proxy_pass http://{upstream};\n        \
-         proxy_set_header Host $host;\n        \
-         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        \
-         proxy_set_header X-Forwarded-Proto $scheme;\n    \
-         }}\n    {CONSOLE_END}\n"
-    )
-}
-
-/// A whole `server` block serving the console on `host` at `/`.
-pub fn console_server_block(host: &str, upstream: &std::net::SocketAddr) -> String {
-    format!(
-        "# {} (`Web Access` panel). Safe to edit or delete.\n\
-         #\n\
-         # Plain HTTP: the console's password and session cookie are in the clear\n\
-         # until this host has a certificate for {host}. Get one with:\n\
-         #\n\
-         #     certbot --nginx -d {host}\n\
-         #\n\
-         # then run `stop-bots set-web --secure-cookie true` so the cookie is\n\
-         # HTTPS-only.\n\
-         server {{\n    \
-         listen 80;\n    \
-         listen [::]:80;\n    \
-         server_name {host};\n    \
-         # The console shows what attackers sent, and its requests carry it:\n    \
-         # logged where the detectors read, they would block its operator.\n    \
-         access_log off;\n\n\
-         {}}}\n",
-        crate::generated::generated_by(),
-        console_location("/", upstream)
-    )
-}
 
 /// Where a subdomain-mode config file goes: `conf.d/<name>.conf` under the
 /// config root.
@@ -1944,104 +1847,9 @@ pub fn console_site_path(root: &Path) -> PathBuf {
     root.join("conf.d").join("stop-bots-console.conf")
 }
 
-/// Inserts (or updates) the console's `location` block inside
-/// `server_name`'s block in `content`.
-///
-/// Returns `None` if that file has no matching `server` block — a
-/// mismatch between the database's idea of where a site lives and what is
-/// on disk, which is a refusal rather than something to guess at.
-fn with_console_location(
-    content: &str,
-    server_name: &str,
-    prefix: &str,
-    upstream: &std::net::SocketAddr,
-) -> Option<String> {
-    let blocks = parse_server_blocks(content);
-    // Prefer the TLS block. A site normally has two — a port-80 redirect
-    // and the real HTTPS one — and putting the console in the first would
-    // serve its login form over cleartext on a host that has a
-    // certificate sitting right there.
-    let block = blocks
-        .iter()
-        .filter(|b| b.names.iter().any(|n| n == server_name))
-        .max_by_key(|b| b.is_tls)?;
-
-    let new_block = console_location(prefix, upstream);
-    Some(match locate_console_block(content, block) {
-        Some((start, end)) => {
-            let mut out = String::with_capacity(content.len());
-            out.push_str(&content[..start]);
-            out.push_str(&new_block);
-            out.push_str(&content[end..]);
-            out
-        }
-        None => {
-            let mut out = String::with_capacity(content.len() + new_block.len() + 1);
-            out.push_str(&content[..block.open + 1]);
-            out.push('\n');
-            out.push_str(&new_block);
-            out.push_str(&content[block.open + 1..]);
-            out
-        }
-    })
-}
-
-/// [`locate_existing_block`] for the console markers.
+/// The console section an earlier release wrote into `block`, if any.
 fn locate_console_block(content: &str, block: &ServerBlock) -> Option<(usize, usize)> {
     locate_marked(content, block, CONSOLE_BEGIN, CONSOLE_END)
-}
-
-/// Sets the console up to be reachable, and returns what it did.
-///
-/// Validated before it can take effect (see [`write_validated`]) and
-/// reloaded only on success. The caller is responsible for the two
-/// database settings that have to agree with this config — `web:base_path`
-/// and `web:allowed_hosts` — because a console reachable at a path it does
-/// not serve, or under a `Host` it refuses, is broken in a way that looks
-/// like a 404 or a 403 rather than like a configuration mistake.
-pub fn apply_console_access(
-    root: &Path,
-    access: &ConsoleAccess,
-    upstream: &std::net::SocketAddr,
-    commands: &ServerCommands,
-) -> Result<PathBuf> {
-    validate_console_access(access)?;
-    match access {
-        ConsoleAccess::Subdomain { host } => {
-            let path = console_site_path(root);
-            write_validated(
-                WebServer::Nginx,
-                &path,
-                &console_server_block(host, upstream),
-                commands,
-                write_managed,
-            )?;
-            Ok(path)
-        }
-        ConsoleAccess::Path {
-            prefix,
-            config_path,
-            server_name,
-        } => {
-            let content = fs::read_to_string(config_path)
-                .with_context(|| format!("failed to read {}", config_path.display()))?;
-            let updated = with_console_location(&content, server_name, prefix, upstream)
-                .with_context(|| {
-                    format!(
-                        "{} has no `server` block for {server_name} — re-scan sites and try again",
-                        config_path.display()
-                    )
-                })?;
-            write_validated(
-                WebServer::Nginx,
-                config_path,
-                &updated,
-                commands,
-                |path, text| write_site_file(path, root, text),
-            )?;
-            Ok(config_path.clone())
-        }
-    }
 }
 
 /// What to do when the NGINX config root is not there: most often NGINX
@@ -2166,8 +1974,8 @@ fn current_block_text(content: &str, block: &ServerBlock) -> Option<String> {
 ///
 /// `scan-sites` stores a site under the *first* name on its block, because
 /// one row needs one name. NGINX answers for all of them, so anything that
-/// has to agree with NGINX about which hosts reach a site — the console's
-/// own allowlist, so far — needs the rest too.
+/// has to agree with NGINX about which hosts reach a site — telling which
+/// site a logged request was for ([`crate::logscan`]) — needs the rest too.
 ///
 /// Falls back to just `server_name` if the file cannot be read or no block
 /// declares it: a caller that gets one name behaves as it did before this
@@ -2184,18 +1992,6 @@ pub fn server_names_for(config_path: &Path, server_name: &str) -> Vec<String> {
         .unwrap_or_else(|| vec![server_name.to_string()])
 }
 
-/// Whether a `server` block declaring `server_name` in `config_path`
-/// terminates TLS — which is the block the console's `location` goes into
-/// when there is one (see `with_console_location`). `false` when the file
-/// cannot be read, which is the answer that turns nothing on.
-pub fn serves_tls(config_path: &Path, server_name: &str) -> bool {
-    fs::read_to_string(config_path).is_ok_and(|content| {
-        parse_server_blocks(&content)
-            .iter()
-            .any(|block| block.is_tls && block.names.iter().any(|name| name == server_name))
-    })
-}
-
 /// The application that answers for `server_name` in `config_path`, as
 /// [`crate::services::recognise`] reads it from the directives of every
 /// `server` block there that declares one of the site's names: the
@@ -2204,7 +2000,7 @@ pub fn serves_tls(config_path: &Path, server_name: &str) -> bool {
 ///
 /// This project's own blocks are taken out first. The bot block quotes
 /// upstream user-agent patterns, which could name anything, and the
-/// console's `location` passes to the console.
+/// console section an earlier release wrote passes to the console.
 ///
 /// `None` when the file cannot be read, which allows nothing.
 pub fn site_service(config_path: &Path, server_name: &str) -> Option<crate::services::Service> {
@@ -2276,9 +2072,10 @@ pub fn site_apply_status(
         .trust
         .as_ref()
         .and_then(|_| fs::read_to_string(trusted_conf_path(conf_d)).ok());
-    if matching.iter().all(|block| {
-        current_block_text(&content, block) == block_text(&for_block(config, &content, block))
-    }) && trust_file_is_current(config, trust_on_disk.as_deref())
+    if matching
+        .iter()
+        .all(|block| current_block_text(&content, block) == block_text(&for_block(config, block)))
+        && trust_file_is_current(config, trust_on_disk.as_deref())
     {
         SiteApplyStatus::UpToDate
     } else {
@@ -2359,7 +2156,7 @@ pub fn refusal<'a>(
     let blocks = parse_server_blocks(content);
     let wants_http1x = blocks.iter().find(|block| {
         config_for(block).is_some_and(|config| {
-            for_block(config, content, block)
+            for_block(config, block)
                 .request_rules
                 .contains(&RequestRule::Http1x)
         })
@@ -2404,8 +2201,9 @@ pub fn block_for_site(
 // ---- taking it all out again: `stop-bots uninstall` ----
 
 /// `content` with every block stop-bots injected taken out of every
-/// `server` block — the bot-blocking block and the console's `location`,
-/// found by their markers — and the line break each insertion added.
+/// `server` block — the bot-blocking block and the console `location` an
+/// earlier release wrote, found by their markers — and the line break each
+/// insertion added.
 ///
 /// The exact inverse of an insertion: a block is put right after the
 /// `server {` brace with a newline in front of it, so where that is still
@@ -2447,6 +2245,61 @@ pub fn without_injected_blocks(content: &str) -> String {
 mod tests {
     use crate::db::BlockResponse;
     use crate::webserver::{is_robots_token, remove_managed};
+    // ---- what releases with the web console wrote ----
+    //
+    // Frozen copies of the writers that put the console's section into a
+    // site, so the tests can make the bytes those hosts have and check that
+    // `uninstall` takes them back out.
+
+    fn console_location(prefix: &str, upstream: &std::net::SocketAddr) -> String {
+        let prefix = prefix.replace('\\', r"\\").replace('"', r#"\""#);
+        format!(
+            "    {CONSOLE_BEGIN}\n    \
+             location \"{prefix}\" {{\n        \
+             proxy_pass http://{upstream};\n        \
+             proxy_set_header Host $host;\n        \
+             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        \
+             proxy_set_header X-Forwarded-Proto $scheme;\n    \
+             }}\n    {CONSOLE_END}\n"
+        )
+    }
+
+    fn with_console_location(
+        content: &str,
+        server_name: &str,
+        prefix: &str,
+        upstream: &std::net::SocketAddr,
+    ) -> Option<String> {
+        let blocks = parse_server_blocks(content);
+        // Prefer the TLS block. A site normally has two — a port-80 redirect
+        // and the real HTTPS one — and putting the console in the first would
+        // serve its login form over cleartext on a host that has a
+        // certificate sitting right there.
+        let block = blocks
+            .iter()
+            .filter(|b| b.names.iter().any(|n| n == server_name))
+            .max_by_key(|b| b.is_tls)?;
+
+        let new_block = console_location(prefix, upstream);
+        Some(match locate_console_block(content, block) {
+            Some((start, end)) => {
+                let mut out = String::with_capacity(content.len());
+                out.push_str(&content[..start]);
+                out.push_str(&new_block);
+                out.push_str(&content[end..]);
+                out
+            }
+            None => {
+                let mut out = String::with_capacity(content.len() + new_block.len() + 1);
+                out.push_str(&content[..block.open + 1]);
+                out.push('\n');
+                out.push_str(&new_block);
+                out.push_str(&content[block.open + 1..]);
+                out
+            }
+        })
+    }
+
     /// The gap this closes. An NGINX in a container moves three things:
     /// the commands that drive it, the logs it writes, and the directory
     /// its config lives in. The first two were stored; this one had to be
@@ -5132,8 +4985,8 @@ mod tests {
         write_planned_managed_files(&[(path.to_path_buf(), body.to_string())]).unwrap();
     }
 
-    /// The record is a row the web console can write, and an apply runs as
-    /// root. So it is acted on only inside the directories this tree's
+    /// The record is a row in a database root does not always own, and an
+    /// apply runs as root. So it is acted on only inside the directories this tree's
     /// files go into: a set left in the `conf.d` of a root the host no
     /// longer uses is `uninstall`'s to collect, not an apply's, because
     /// a row naming *anywhere* is exactly what an attacker would write.
@@ -5215,8 +5068,8 @@ mod tests {
     }
 
     /// A row that reaches this root's `conf.d` through a link in a
-    /// directory the console owns is refused: the console could point the
-    /// link elsewhere between the check and the removal. The file itself is
+    /// directory another user owns is refused: they could point the link
+    /// elsewhere between the check and the removal. The file itself is
     /// still collected, by its own resolved path.
     #[test]
     fn a_recorded_path_through_a_link_is_refused() {
@@ -5224,8 +5077,8 @@ mod tests {
         let conf_d = fs::canonicalize(root.path().join("conf.d")).unwrap();
         let generated = rate_limit_conf_path(&conf_d);
         fs::write(&generated, rate_limit_conf_body(10, 10)).unwrap();
-        let console = tempfile::tempdir().unwrap();
-        let link = console.path().join("link");
+        let theirs = tempfile::tempdir().unwrap();
+        let link = theirs.path().join("link");
         std::os::unix::fs::symlink(&conf_d, &link).unwrap();
         let db = crate::db::Db::open_in_memory().unwrap();
         db.record_managed_file(&rate_limit_conf_path(&link), ManagedKind::Limits.id())
@@ -5234,8 +5087,8 @@ mod tests {
         let unused = paths_of(&unused_managed_files(WebServer::Nginx, &db, root.path()).unwrap());
 
         assert!(
-            unused.iter().all(|path| !path.starts_with(console.path())),
-            "a path through the console's link was collected: {unused:#?}"
+            unused.iter().all(|path| !path.starts_with(theirs.path())),
+            "a path through the planted link was collected: {unused:#?}"
         );
         assert!(unused.contains(&generated), "{unused:#?}");
     }
@@ -5614,7 +5467,7 @@ mod tests {
             open: 0,
             close: 0,
         };
-        let narrowed = for_block(&cfg_rules(&RequestRule::ALL), "", &plain);
+        let narrowed = for_block(&cfg_rules(&RequestRule::ALL), &plain);
 
         assert!(!narrowed.request_rules.contains(&RequestRule::Http1x));
         assert!(!narrowed.request_rules.contains(&RequestRule::OldTls));
@@ -5631,7 +5484,7 @@ mod tests {
             open: 0,
             close: 0,
         };
-        let narrowed = for_block(&cfg_rules(&RequestRule::ALL), "", &tls);
+        let narrowed = for_block(&cfg_rules(&RequestRule::ALL), &tls);
         assert_eq!(narrowed.request_rules.len(), RequestRule::ALL.len());
     }
 
@@ -5786,7 +5639,7 @@ mod tests {
             &block_text(&cfg_response(BlockResponse::Tarpit)).unwrap(),
         );
     }
-    // ---- reaching the console from outside ----
+    // ---- what uninstall takes out of a host that had Web Access ----
 
     /// `ServerCommands` whose test either passes or fails, without needing
     /// a real NGINX. `/bin/true` and `/bin/false` rather than a written
@@ -5817,169 +5670,9 @@ server {
         "127.0.0.1:8787".parse().unwrap()
     }
 
-    /// The console's login form must not end up on the port-80 redirect
-    /// block when the site has a certificate sitting right there.
-    #[test]
-    fn path_mode_picks_the_tls_block_not_the_redirect() {
-        let updated =
-            with_console_location(TWO_BLOCK_SITE, "example.com", "/stop-bots/", &upstream())
-                .expect("the site has a matching block");
-
-        // Against the parsed block's own span, not the order of
-        // directives: the block is inserted at the top of the `server`
-        // block, so it precedes `listen 443` while still being inside it.
-        let console_at = updated.find(CONSOLE_BEGIN).expect("the block was inserted");
-        let blocks = parse_server_blocks(&updated);
-        let tls = blocks
-            .iter()
-            .find(|b| b.is_tls)
-            .expect("the fixture has a TLS block");
-        assert!(
-            console_at > tls.open && console_at < tls.close,
-            "the console landed outside the TLS block:\n{updated}"
-        );
-    }
-
-    /// `proxy_pass` must not have a trailing slash and the location must
-    /// keep its prefix — otherwise NGINX strips the prefix and every link
-    /// this console generates points outside the location block.
-    #[test]
-    fn the_console_location_does_not_strip_its_prefix() {
-        let block = console_location("/stop-bots/", &upstream());
-
-        assert!(
-            block.contains(r#"location "/stop-bots/" {"#),
-            "block was:\n{block}"
-        );
-        assert!(
-            block.contains("proxy_pass http://127.0.0.1:8787;"),
-            "a trailing slash here strips the prefix:\n{block}"
-        );
-    }
-
-    /// The whole site file after path mode edits it — the exact bytes to
-    /// hand `nginx -t`, and the pin on the quoted `location` prefix.
-    #[test]
-    fn the_path_mode_console_block_matches_the_golden() {
-        let updated =
-            with_console_location(TWO_BLOCK_SITE, "example.com", "/stop-bots/", &upstream())
-                .unwrap();
-        crate::golden::assert_golden("nginx-console-path.conf", &updated);
-    }
-
-    #[test]
-    fn the_subdomain_console_block_matches_the_golden() {
-        let block = console_server_block("console.example.com", &upstream());
-        crate::golden::assert_golden("nginx-console-subdomain.conf", &block);
-    }
-
-    /// Quoting is the second line behind `BasePath::parse`, not a
-    /// substitute for it: `ConsoleAccess::Path` is a public type, and a
-    /// prefix that reaches it some other way must still be one token. A
-    /// quote or backslash inside it is escaped, so it cannot close the
-    /// string early.
-    #[test]
-    fn the_console_location_keeps_a_hostile_prefix_inside_its_quotes() {
-        let block = console_location(r#"/a\" { } ;"#, &upstream());
-
-        assert!(
-            block.contains(r#"location "/a\\\" { } ;" {"#),
-            "block was:\n{block}"
-        );
-    }
-
-    /// The console's own file is one this tool owns outright, so a link
-    /// planted at its name is replaced, never written through.
-    #[test]
-    fn subdomain_mode_replaces_a_planted_link_instead_of_following_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("nginx");
-        fs::create_dir_all(root.join("conf.d")).unwrap();
-        let victim = dir.path().join("victim");
-        fs::write(&victim, "precious\n").unwrap();
-        std::os::unix::fs::symlink(&victim, console_site_path(&root)).unwrap();
-
-        apply_console_access(
-            &root,
-            &ConsoleAccess::Subdomain {
-                host: "console.example.com".to_string(),
-            },
-            &upstream(),
-            &commands_that(true),
-        )
-        .unwrap();
-
-        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious\n");
-        let written = console_site_path(&root);
-        assert!(fs::symlink_metadata(&written).unwrap().is_file());
-        assert!(fs::read_to_string(&written)
-            .unwrap()
-            .contains("console.example.com"));
-    }
-
-    /// Path mode edits an operator's site file, which may be a link — but
-    /// not one that leads out of the NGINX root.
-    #[test]
-    fn path_mode_does_not_write_a_site_file_linking_outside_the_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("nginx");
-        fs::create_dir(&root).unwrap();
-        let victim = dir.path().join("elsewhere.conf");
-        fs::write(&victim, TWO_BLOCK_SITE).unwrap();
-        let link = root.join("example.com");
-        std::os::unix::fs::symlink(&victim, &link).unwrap();
-
-        let err = apply_console_access(
-            &root,
-            &ConsoleAccess::Path {
-                prefix: "/stop-bots/".to_string(),
-                config_path: link,
-                server_name: "example.com".to_string(),
-            },
-            &upstream(),
-            &commands_that(true),
-        )
-        .unwrap_err();
-
-        assert!(
-            format!("{err:#}").contains("outside the config root"),
-            "error was: {err:#}"
-        );
-        assert_eq!(fs::read_to_string(&victim).unwrap(), TWO_BLOCK_SITE);
-    }
-
-    #[test]
-    fn path_mode_is_idempotent() {
-        let once = with_console_location(TWO_BLOCK_SITE, "example.com", "/stop-bots/", &upstream())
-            .unwrap();
-        let twice =
-            with_console_location(&once, "example.com", "/stop-bots/", &upstream()).unwrap();
-
-        assert_eq!(once, twice);
-        assert_eq!(twice.matches(CONSOLE_BEGIN).count(), 1);
-    }
-
-    /// Rewritten in place, so changing the prefix does not leave the old
-    /// location block behind alongside the new one.
-    #[test]
-    fn changing_the_prefix_replaces_the_block_rather_than_adding_one() {
-        let first =
-            with_console_location(TWO_BLOCK_SITE, "example.com", "/stop-bots/", &upstream())
-                .unwrap();
-        let second =
-            with_console_location(&first, "example.com", "/console/", &upstream()).unwrap();
-
-        assert_eq!(second.matches(CONSOLE_BEGIN).count(), 1);
-        assert!(
-            second.contains(r#"location "/console/" {"#),
-            "was:\n{second}"
-        );
-        assert!(!second.contains("/stop-bots/"), "was:\n{second}");
-    }
-
-    /// The console markers must not collide with the bot-blocking ones:
-    /// both live in the same `server` block and are rewritten by different
-    /// actions.
+    /// A console section an earlier release left in a site and the
+    /// bot-blocking block live side by side: applying the block leaves the
+    /// section alone, and each is found by its own markers.
     #[test]
     fn the_console_block_and_the_blocking_block_coexist() {
         let with_console =
@@ -5994,106 +5687,6 @@ server {
         assert!(both.contains(CONSOLE_BEGIN), "console block lost:\n{both}");
         assert!(both.contains(BLOCK_BEGIN), "blocking block lost:\n{both}");
         assert!(both.contains(r#"location "/stop-bots/" {"#), "was:\n{both}");
-    }
-
-    #[test]
-    fn a_site_with_no_matching_block_is_a_refusal() {
-        assert!(
-            with_console_location(TWO_BLOCK_SITE, "other.example.org", "/x/", &upstream())
-                .is_none()
-        );
-    }
-
-    /// The failure this guards against: a new `server` block that does not
-    /// parse leaves the whole config unloadable, and nothing looks wrong
-    /// because the running NGINX keeps serving from memory.
-    #[test]
-    fn a_config_that_fails_validation_is_rolled_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("conf.d/stop-bots-console.conf");
-
-        let err = write_validated(
-            WebServer::Nginx,
-            &path,
-            "server { broken",
-            &commands_that(false),
-            write_managed,
-        )
-        .unwrap_err();
-
-        assert!(
-            format!("{err:#}").contains("restored"),
-            "the operator must be told the rollback happened: {err:#}"
-        );
-        assert!(
-            !path.exists(),
-            "a file that never validated must not be left behind"
-        );
-    }
-
-    /// Rolling back an *edit* puts the previous content back, rather than
-    /// deleting somebody's site config.
-    #[test]
-    fn a_failed_edit_restores_the_previous_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("example.com");
-        fs::write(&path, TWO_BLOCK_SITE).unwrap();
-
-        let _ = write_validated(
-            WebServer::Nginx,
-            &path,
-            "server { broken",
-            &commands_that(false),
-            write_managed,
-        );
-
-        assert_eq!(fs::read_to_string(&path).unwrap(), TWO_BLOCK_SITE);
-    }
-
-    #[test]
-    fn a_config_that_validates_is_kept() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("conf.d/stop-bots-console.conf");
-        let block = console_server_block("console.example.com", &upstream());
-
-        write_validated(
-            WebServer::Nginx,
-            &path,
-            &block,
-            &commands_that(true),
-            write_managed,
-        )
-        .unwrap();
-
-        assert_eq!(fs::read_to_string(&path).unwrap(), block);
-    }
-
-    /// Plain HTTP is a real downgrade for a page with a password form, so
-    /// the generated file has to say so where whoever opens it will look.
-    #[test]
-    fn the_subdomain_block_warns_that_it_is_cleartext() {
-        let block = console_server_block("console.example.com", &upstream());
-
-        assert!(
-            block.contains("certbot --nginx -d console.example.com"),
-            "was:\n{block}"
-        );
-        assert!(block.contains("in the clear"), "was:\n{block}");
-        assert!(
-            block.contains("server_name console.example.com;"),
-            "was:\n{block}"
-        );
-    }
-
-    /// The deprecated `web --secure-cookie` is not what the file tells an
-    /// operator to run.
-    #[test]
-    fn the_subdomain_block_points_at_set_web() {
-        let block = console_server_block("console.example.com", &upstream());
-        assert!(
-            block.contains("stop-bots set-web --secure-cookie true"),
-            "was:\n{block}"
-        );
     }
 
     // ---- uninstall ----
@@ -6229,8 +5822,9 @@ server {
         assert_eq!(fs::read_to_string(&site).unwrap(), before);
     }
 
-    /// The console's own file is recognised by the first line every
-    /// version wrote, and a file of the operator's at that path is not.
+    /// The console's own site file, as earlier releases wrote it, is
+    /// recognised by the first line every version wrote, and a file of the
+    /// operator's at that path is not.
     #[test]
     fn the_console_site_file_is_known_by_its_first_line() {
         let dir = tempfile::tempdir().unwrap();
@@ -6434,71 +6028,6 @@ server {
         let rest = text.split("if ($stop_bots_path ~* ").nth(1).unwrap();
         let end = closing_quote(rest).unwrap();
         assert_eq!(nginx_unquoted(&rest[1..end]), r"^(/a\.b\+\(c\))");
-    }
-
-    /// A console `location` from before 0.0.13, unquoted, is still read as
-    /// the console's; an edited one with a modifier is not.
-    #[test]
-    fn a_console_location_written_before_it_was_quoted_is_exempt_too() {
-        // What 0.0.x wrote, and what a real host still carries.
-        let site = "server {\n    listen 443 ssl;\n    server_name example.com;\n    \
-            # BEGIN stop-bots console (DO NOT EDIT)\n    location /stop-bots/ {\n        \
-            proxy_pass http://127.0.0.1:8787;\n    }\n    # END stop-bots console\n}\n";
-        let blocks = parse_server_blocks(site);
-        assert_eq!(
-            console_prefix_in(site, &blocks[0]).as_deref(),
-            Some("/stop-bots/"),
-            "site was:\n{site}"
-        );
-        for edited in [
-            "location = /stop-bots/ {",
-            "location ^~ /stop-bots/ {",
-            "location ~ ^/x {",
-        ] {
-            let site = site.replace("location /stop-bots/ {", edited);
-            let blocks = parse_server_blocks(&site);
-            assert_eq!(console_prefix_in(&site, &blocks[0]), None, "{edited}");
-        }
-    }
-
-    /// The Web Access panel's path mode, then an apply: the block in the
-    /// server that carries the console exempts the console's prefix, so a
-    /// rule that would refuse the operator's own client cannot lock them
-    /// out of the page that turns it off.
-    #[test]
-    fn the_server_that_serves_the_console_exempts_its_prefix() {
-        let with_console =
-            with_console_location(TWO_BLOCK_SITE, "example.com", "/stop-bots/", &upstream())
-                .unwrap();
-        let config = BlockConfig {
-            request_rules: vec![RequestRule::NoAcceptLanguage],
-            ..cfg(&["BadBot"])
-        };
-        let applied = blocks_for_file(&with_console, Path::new("site"), &[], &config).unwrap();
-        crate::golden::assert_golden("nginx-console-path-blocked.conf", &applied);
-
-        let blocks = parse_server_blocks(&applied);
-        let tls = blocks.iter().find(|b| b.is_tls).unwrap();
-        let plain = blocks.iter().find(|b| !b.is_tls).unwrap();
-        let tls_block = current_block_text(&applied, tls).unwrap();
-        assert!(
-            tls_block.contains(r#"if ($stop_bots_path ~* "^(/stop-bots/|/\.well-known/)") {"#),
-            "the console's server must exempt it:\n{tls_block}"
-        );
-        // Only there: the redirect block serves no console.
-        let plain_block = current_block_text(&applied, plain).unwrap();
-        assert!(
-            !plain_block.contains("/stop-bots/"),
-            "a block without the console exempts nothing of it:\n{plain_block}"
-        );
-        // And the site reads as applied, not stale, with it.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("site");
-        fs::write(&path, &applied).unwrap();
-        assert_eq!(
-            site_apply_status(&path, "example.com", &config, dir.path()),
-            SiteApplyStatus::UpToDate
-        );
     }
 
     /// What the render leaves out is named, so that it is not left out in

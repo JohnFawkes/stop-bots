@@ -26,7 +26,7 @@
 //! **Never rename a key here.** The spellings are what 0.0.x wrote to real
 //! hosts, and a database is only ever read back by the key it was written
 //! under. The three styles (`humans_only`, `detect_honeypot_path`,
-//! `web:bind`) stay as they are for that reason. A key that must change is
+//! `nginx:root`) stay as they are for that reason. A key that must change is
 //! a migration in [`super::schema`] that moves the row, not an edit here.
 //!
 //! **A new key** is a constant here, added to [`ALL`]; or, for a family
@@ -34,8 +34,8 @@
 //! builds the key. The tests below check that no two keys collide and that
 //! no other source file spells a key out.
 //!
-//! Some modules also name the keys they own (`web::BIND_KEY`,
-//! `ServerCommands::TEST_KEY`) so their call sites read in their own terms.
+//! Some modules also name the keys they own (`ServerCommands::TEST_KEY`)
+//! so their call sites read in their own terms.
 //! Those names are aliases of these constants, never a second spelling.
 
 // ---- the database itself ----
@@ -109,17 +109,6 @@ pub const DETECT_REFERERLESS_MIN_PATHS: &str = "detect_refererless_min_paths";
 pub const DETECT_SSH_SCANNERS_MIN_ATTEMPTS: &str = "detect_ssh_scanners_min_attempts";
 pub const DETECT_WEB_SCANNERS_MIN_PATHS: &str = "detect_web_scanners_min_paths";
 
-// ---- web console ----
-
-pub const WEB_BIND: &str = "web:bind";
-pub const WEB_BASE_PATH: &str = "web:base_path";
-pub const WEB_SECURE_COOKIE: &str = "web:secure_cookie";
-pub const WEB_TRUST_FORWARDED_FOR: &str = "web:trust_forwarded_for";
-pub const WEB_EXPOSE: &str = "web:expose";
-pub const WEB_ALLOWED_HOSTS: &str = "web:allowed_hosts";
-/// The console's Argon2 PHC string. Only ever the hash.
-pub const WEB_PASSWORD_HASH: &str = "web:password_hash";
-
 // ---- downloads ----
 
 /// Who is downloading the lists right now, and since when: see
@@ -168,13 +157,6 @@ pub const ALL: &[&str] = &[
     DETECT_REFERERLESS_MIN_PATHS,
     DETECT_SSH_SCANNERS_MIN_ATTEMPTS,
     DETECT_WEB_SCANNERS_MIN_PATHS,
-    WEB_BIND,
-    WEB_BASE_PATH,
-    WEB_SECURE_COOKIE,
-    WEB_TRUST_FORWARDED_FOR,
-    WEB_EXPOSE,
-    WEB_ALLOWED_HOSTS,
-    WEB_PASSWORD_HASH,
     HEALTH_PROBE,
     HEALTH_PROBE_AT,
     REFRESH_LEASE,

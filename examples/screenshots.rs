@@ -48,23 +48,11 @@
 //! it is a binary blob in review, and it needs fonts on the generating
 //! machine (Iosevka, see [`TOUR_FONT`]) — which is why it is one file
 //! rather than the format everything uses. See [`tour_gif`].
-//!
-//! The web console's pages come from the same seed, rendered through the
-//! real router in-process (the way `tests/web.rs` drives it) and written
-//! as HTML under `target/web-screenshots/`. A browser has to rasterise
-//! those: the generator runs whichever of Firefox or Chromium it finds
-//! headless, in the light theme, and writes PNG. With neither on the
-//! machine it says so and leaves the previous PNGs alone. The TUI is
-//! shown dark and the console light on purpose — one of each, so the
-//! README shows both palettes.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::body::Body;
-use axum::http::{header, Request};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -72,14 +60,12 @@ use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
 use resvg::tiny_skia;
 use resvg::usvg;
-use tower::ServiceExt;
 
 use stop_bots::app::App;
 use stop_bots::db::{
     BotStatus, Category, Db, FirewallAction, GeoMode, NewBot, NewFirewallRule, Policy, Source,
 };
 use stop_bots::tui::{self, Screen, Theme};
-use stop_bots::web::{auth, server, state::AppState};
 use stop_bots::webserver::SiteApplyStatus;
 
 /// Wide enough that no panel elides, short enough to stay readable when
@@ -136,8 +122,7 @@ async fn main() -> Result<()> {
             live_backend: Some("nftables".into()),
             firewall_persists: Some(false),
             nftables_conf_flushes: None,
-            unit_active: Some(true),
-            unit_binary: None,
+            cron_installed: Some(true),
             // The fiction is a host install, so the generated files are in
             // the stock place and nothing is stranded anywhere else.
             turned_away: Vec::new(),
@@ -158,11 +143,6 @@ async fn main() -> Result<()> {
             managed_dir_in_container: None,
             container_shares_host_network: None,
             firewall_covers_forward: Some(true),
-            // Left unasked, so the strip in the screenshots is the one it
-            // was: a console as installed adds three OK lines, nothing more.
-            console_identity: None,
-            console_helper: None,
-            console_unreadable_logs: Vec::new(),
             nginx_commands: None,
             web_server: stop_bots::webserver::WebServer::Nginx,
             config_root: None,
@@ -226,187 +206,11 @@ async fn main() -> Result<()> {
     // between them.
     tour_gif(&mut app, &out.join("tour.gif"))?;
 
-    // The console, from the same database. `App` keeps its own
-    // connection open; SQLite is happy to hand out a second one.
-    web_screenshots(&workspace, &root, &out).await?;
-
     // The database holds seeded fiction and nothing else, but leaving a
     // directory per run in /tmp is still litter.
     std::fs::remove_dir_all(&workspace)?;
 
     Ok(())
-}
-
-/// The console pages the README shows, and the viewport each is shown in.
-/// Wide enough for the Dashboard's two columns, tall enough for the top
-/// of each page — the README is not the place for a 3,000px scroll.
-const WEB_PAGES: [(&str, &str, u32, u32); 2] = [
-    ("/", "web-dashboard", 1280, 1000),
-    ("/firewall", "web-firewall", 1280, 640),
-];
-
-/// Renders each console page through the real router, stamps the light
-/// theme on it, and rasterises it with a headless browser if there is one.
-async fn web_screenshots(workspace: &Path, nginx_root: &Path, out: &Path) -> Result<()> {
-    let db = Db::open(workspace.join("stop-bots.db"))?;
-    let password = auth::generate_password()?;
-    auth::set_password(&db, &password)?;
-    let ssh_log = workspace.join("auth.log");
-    std::fs::write(&ssh_log, SSH_LOG_FIXTURE)?;
-    // `apply_for_real: false`: nothing here may touch NGINX or the
-    // firewall, same as the TUI half.
-    // `firewall_out` is left at its default, which the Firewall script
-    // panel *shows* as `/etc/stop-bots/firewall.nft` — the path a real
-    // install has, rather than this run's tempdir. Nothing here posts the
-    // form that would write there; every request below is a GET.
-    let state = AppState::new(db, nginx_root.to_path_buf(), Some(ssh_log), false);
-    let app = server::router(state);
-
-    let login = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/login")
-                .header(header::HOST, "localhost")
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from(format!("password={password}")))?,
-        )
-        .await?;
-    let cookie = login
-        .headers()
-        .get(header::SET_COOKIE)
-        .context("the login should set a session cookie")?
-        .to_str()?
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    // The pages reference the assets by absolute URL, which a file:// page
-    // cannot resolve; they are written beside it and the links rewritten.
-    let html_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/web-screenshots");
-    std::fs::create_dir_all(&html_dir)?;
-    std::fs::write(
-        html_dir.join("style.css"),
-        fetch(&app, &cookie, "/assets/style.css").await?,
-    )?;
-
-    let browser = find_browser();
-    for (path, name, width, height) in WEB_PAGES {
-        let html = fetch(&app, &cookie, path)
-            .await?
-            .replace(r#"href="/assets/style.css""#, r#"href="style.css""#)
-            // Light, explicitly: the browser's own theme must not decide.
-            .replace(
-                r#"<html lang="en">"#,
-                r#"<html lang="en" data-theme="light">"#,
-            );
-        let html_path = html_dir.join(format!("{name}.html"));
-        std::fs::write(&html_path, html)?;
-
-        let Some(browser) = &browser else {
-            stop_bots::say!("no headless browser found — {name}.png left as it was");
-            continue;
-        };
-        let png = out.join(format!("{name}.png"));
-        browser.screenshot(&html_path, &png, width, height, &html_dir)?;
-        stop_bots::say!("wrote {}", png.display());
-    }
-    Ok(())
-}
-
-/// One authenticated GET through the router, as the browser would make it.
-async fn fetch(app: &axum::Router, cookie: &str, path: &str) -> Result<String> {
-    let request = Request::builder()
-        .uri(path)
-        .header(header::HOST, "localhost")
-        .header(header::COOKIE, cookie)
-        .body(Body::empty())?;
-    let response = app.clone().oneshot(request).await?;
-    anyhow::ensure!(
-        response.status().is_success(),
-        "{path}: {}",
-        response.status()
-    );
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 22).await?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-/// A browser that can rasterise a page from the command line.
-enum Browser {
-    Firefox(PathBuf),
-    Chromium(PathBuf),
-}
-
-/// Firefox first, because it is what the maintainer has (as `firefox-bin`,
-/// Gentoo's name for Mozilla's own build); then the Chromium names Debian,
-/// Fedora and Google ship under.
-fn find_browser() -> Option<Browser> {
-    let on_path = |name: &str| {
-        std::env::var_os("PATH").and_then(|path| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join(name))
-                .find(|candidate| candidate.is_file())
-        })
-    };
-    if let Some(path) = ["firefox", "firefox-bin"]
-        .iter()
-        .find_map(|name| on_path(name))
-    {
-        return Some(Browser::Firefox(path));
-    }
-    [
-        "chromium",
-        "chromium-browser",
-        "google-chrome",
-        "google-chrome-stable",
-    ]
-    .iter()
-    .find_map(|name| on_path(name))
-    .map(Browser::Chromium)
-}
-
-impl Browser {
-    fn screenshot(
-        &self,
-        html: &Path,
-        png: &Path,
-        width: u32,
-        height: u32,
-        scratch: &Path,
-    ) -> Result<()> {
-        let url = format!("file://{}", html.display());
-        let size = format!("{width},{height}");
-        let output = match self {
-            Browser::Firefox(bin) => {
-                // A throwaway profile, so this never touches the user's
-                // own and never waits on a running Firefox.
-                let profile = scratch.join("firefox-profile");
-                std::fs::create_dir_all(&profile)?;
-                Command::new(bin)
-                    .args(["--headless", "--no-remote", "--profile"])
-                    .arg(&profile)
-                    .arg(format!("--window-size={size}"))
-                    .arg("--screenshot")
-                    .arg(png)
-                    .arg(&url)
-                    .output()?
-            }
-            Browser::Chromium(bin) => Command::new(bin)
-                .args(["--headless=new", "--hide-scrollbars"])
-                .arg(format!("--window-size={size}"))
-                .arg(format!("--screenshot={}", png.display()))
-                .arg(&url)
-                .output()?,
-        };
-        anyhow::ensure!(
-            png.is_file(),
-            "the browser wrote no screenshot for {}:\n{}",
-            html.display(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(())
-    }
 }
 
 /// `App::new` spawns a task that reads terminal events, and there is no

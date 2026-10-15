@@ -112,8 +112,7 @@ impl SshSource {
     /// part of the log and is all any of these readers look at.
     ///
     /// Read in process, with this process's access, through
-    /// [`crate::hostlog`]: the same reads the web console asks its helper
-    /// for.
+    /// [`crate::hostlog`].
     pub fn read(&self, since: i64) -> LogSource {
         let sources = crate::hostlog::Sources::ssh_only(self.clone());
         match crate::hostlog::ssh_since(&sources, since) {
@@ -284,7 +283,8 @@ struct AuthLine<'a> {
 /// callers that go on to store it as a firewall rule never hand a
 /// malformed value to [`crate::db::Db::add_firewall_rule`]. Nothing here
 /// indexes the line directly: it is attacker-shaped text, and a panic here
-/// under the web console's database lock poisons it.
+/// ends the pass that read it, every minute, for as long as the line is in
+/// the log.
 fn parse_auth_line(line: &str) -> Option<AuthLine<'_>> {
     let message = sshd_message(line)?;
     let (kind, rest) = if let Some(rest) = message.strip_prefix("Accepted ") {
@@ -994,7 +994,7 @@ Jun 12 01:00:01 h sshd[2]: Accepted publickey for marko from 198.51.100.1 port 2
     }
 
     /// Slicing between the marker and the first `" from "` used to panic
-    /// here, and a panic under the web console's database lock poisons it.
+    /// here, on a line any client can put in the log.
     #[test]
     fn a_username_that_is_itself_a_marker_does_not_panic() {
         let log = "Invalid user Failed from 203.0.113.9 port 5555\n\

@@ -17,12 +17,13 @@
 
 //! Root opening a database in a directory another user owns.
 //!
-//! Since the console runs as its own user, `/var/lib/stop-bots` and
-//! everything in it belong to that user — and so, after a compromise of
-//! the console, to whoever compromised it. Root still opens the database
-//! there: the CLI, the TUI, `install web` and the privileged helper all
-//! do. Every name in that directory is then the attacker's choice, and
-//! a root process that follows one writes where they chose:
+//! Releases with the web console gave `/var/lib/stop-bots` and everything
+//! in it to the console's own user — and so, after a compromise of the
+//! console, to whoever compromised it. A host upgraded from one may still
+//! have it that way, and `--db` can name any directory. Root still opens
+//! the database there: the CLI, the TUI and `tick` all do. Every name in
+//! that directory is then its owner's choice, and a root process that
+//! follows one writes where they chose:
 //!
 //! - `db.sqlite3` as a link to `/etc/cron.d/x` that does not exist yet:
 //!   SQLite resolves the link and creates a database there, as root, with
@@ -50,8 +51,8 @@
 //!   and modes and owners are changed through a descriptor opened with
 //!   `O_NOFOLLOW`, never by path.
 //!
-//! What it does not do is take anything back. Root opening the console's
-//! database leaves it the console's: SQLite itself gives a `-wal` or
+//! What it does not do is take anything back. Root opening another user's
+//! database leaves it that user's: SQLite itself gives a `-wal` or
 //! `-shm` it creates as root to the database file's owner, and the copy
 //! an upgrade makes goes to that owner too (see `schema::backup`).
 
@@ -161,9 +162,8 @@ pub fn with_companions(path: &Path) -> Vec<PathBuf> {
 /// A rusqlite connection to `path`, guarded as [`Guard::here`] says.
 ///
 /// For the readers that must not go through `Db::open` because it would
-/// migrate — `install web` reading a stored setting, `uninstall` reading
-/// its plan — and that run as root on the console's directory all the
-/// same.
+/// migrate — `uninstall` reading its plan — and that run as root on
+/// another user's directory all the same.
 pub fn open_connection(path: &Path, flags: OpenFlags) -> Result<Connection> {
     open_connection_guarded(path, flags, Guard::here(path))
 }
@@ -281,7 +281,7 @@ mod tests {
         }
     }
 
-    /// Every way a name in the console's directory could point root
+    /// Every way a name in another user's directory could point root
     /// somewhere else is refused, for the database and each companion.
     #[test]
     fn a_link_or_a_second_name_is_refused() {
@@ -347,7 +347,7 @@ mod tests {
         );
     }
 
-    /// The raw readers `install web` and `uninstall` use: guarded, a
+    /// The raw reader `uninstall` uses: guarded, a
     /// planted trigger does not fire; unguarded — the control — it does.
     #[test]
     fn a_guarded_raw_connection_runs_no_planted_trigger() {

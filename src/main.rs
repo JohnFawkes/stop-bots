@@ -50,8 +50,8 @@ fn min_threshold(raw: &str) -> Result<usize, String> {
 /// `MAX_TTL_DAYS` either way. Past the ceiling, the arithmetic that dates
 /// the block wraps.
 ///
-/// Only the magnitude is bounded, unlike the console and the TUI, which
-/// refuse anything under a day: a zero or negative TTL here writes a block
+/// Only the magnitude is bounded, unlike the TUI, which refuses anything
+/// under a day: a zero or negative TTL here writes a block
 /// that is born expired, which the CLI tests use to prove expiry end to
 /// end, and an operator typing one has asked for exactly that.
 fn ttl_days_arg(raw: &str) -> Result<i64, String> {
@@ -94,7 +94,7 @@ Getting started:
   sudo stop-bots batch --dry-run --diff   Show what a full pass would change, change nothing
   sudo stop-bots batch --apply            Fetch the lists, scan the logs, apply both
   sudo stop-bots install firewall         Load the applied firewall script at boot
-  sudo stop-bots install web              Run the web console as a service
+  sudo stop-bots install cron             Run the detectors and list updates every minute
   sudo stop-bots uninstall all --dry-run  Show every step that puts the host back
 
 `sudo stop-bots` with no command starts the TUI. `stop-bots <command> --help` says
@@ -293,8 +293,7 @@ enum Command {
     /// nothing loads. Review it, then run `render-firewall --apply`: that
     /// runs it and copies it to /etc/stop-bots/firewall.nft (or
     /// firewall.sh), the script `install firewall` loads at boot. `batch
-    /// --apply` and "Apply everything" in the TUI or the web console do the
-    /// same.
+    /// --apply` and "Apply everything" in the TUI do the same.
     ///
     /// Before writing anything, checks recent successful SSH logins (from
     /// /var/log/auth.log, /var/log/secure or journalctl) against every
@@ -339,7 +338,7 @@ enum Command {
     ///
     /// Read by `render-firewall`, `batch`, the internal cron, `status` and
     /// `install firewall` whenever they are not told otherwise. The TUI's
-    /// render popup and the web console set the same value.
+    /// render popup sets the same value.
     SetFirewallBackend {
         /// nftables (the default) or iptables
         #[arg(long)]
@@ -520,8 +519,8 @@ enum Command {
     ListDetectors,
     /// Switch a detector on or off, and set its TTL, threshold and window.
     ///
-    /// These are what the internal cron (inside `stop-bots web` or the
-    /// TUI) and `batch` use. Switching a detector off stops it adding
+    /// These are what the schedule (`stop-bots tick`, or the TUI while it
+    /// is open) and `batch` use. Switching a detector off stops it adding
     /// blocks; it never removes the ones it already added, which expire on
     /// their own. Give no flags to print the detector's current settings.
     ///
@@ -836,8 +835,8 @@ enum Command {
     },
     /// Turn automatic applying of the web server's config on or off.
     ///
-    /// When on, the internal cron (the one inside `stop-bots web` or the
-    /// TUI, not this command) re-writes every site's generated block and
+    /// When on, the schedule (`stop-bots tick` from `install cron`, or the
+    /// TUI while it is open — not this command) re-writes every site's generated block and
     /// reloads the web server once an hour, whenever they have fallen behind the
     /// database. That happens constantly on a busy host: every user agent
     /// a detector blocks changes the generated block, which puts every
@@ -932,154 +931,6 @@ enum Command {
         #[arg(long)]
         response: BlockResponseArg,
     },
-    /// Start the web UI.
-    ///
-    /// Binds 127.0.0.1:8787 by default, which is reachable only from this
-    /// machine. That default is the safe one and staying on it is the
-    /// recommendation: the console can rewrite your firewall and your web
-    /// server's config, so it is worth reaching over an SSH tunnel
-    /// (`ssh -L 8787:127.0.0.1:8787 you@host`) rather than exposing.
-    ///
-    /// The flags here apply to this run only. To change how every later
-    /// run starts — the address, the path prefix, exposure, the Host
-    /// allowlist and the proxy settings — use `set-web`. The service that
-    /// `install web` sets up reads the same settings.
-    ///
-    /// A password is generated and printed the first time this runs.
-    /// It is shown once and stored only as an Argon2 hash, so keep it;
-    /// --set-password issues a new one.
-    Web {
-        #[arg(long, help = ROOT_HELP)]
-        root: Option<PathBuf>,
-        /// SSH log to read for the Firewall screen and the detectors. Not
-        /// with --helper, which reads the one the host settings name.
-        #[arg(long)]
-        ssh_log: Option<PathBuf>,
-        /// Where the console's "Write script" button and its internal cron
-        /// write the firewall script. Not with --helper, which writes it to
-        /// the fixed path for the host's firewall backend.
-        ///
-        /// Only a console that runs as root itself, without --helper, reads
-        /// this. Set here rather than in the console because the script is
-        /// executable and that console writes it as root: a destination
-        /// taken from a form field would let anyone who reaches the login
-        /// page create a root-owned file anywhere on the host.
-        #[arg(long)]
-        firewall_out: Option<PathBuf>,
-        /// Address to bind for this run, as `address:port`. Defaults to the
-        /// stored one (`set-web --bind`), else 127.0.0.1:8787.
-        #[arg(long)]
-        bind: Option<String>,
-        /// Serve under a path prefix for this run. Defaults to the stored
-        /// one (`set-web --base-path`); see there for how the proxy in
-        /// front must be set up.
-        #[arg(long)]
-        base_path: Option<String>,
-        /// Permit this run to bind an address that is not loopback.
-        /// Without it, a non-loopback address is refused rather than
-        /// silently exposing the console to the network. `set-web --expose
-        /// true` makes that permanent.
-        #[arg(long)]
-        expose: bool,
-        /// Deprecated: use `set-web --allowed-hosts`. Still stored, for one
-        /// release.
-        #[arg(long, hide = true)]
-        allowed_hosts: Option<String>,
-        /// Deprecated: use `set-web --trust-forwarded-for`. Still stored,
-        /// for one release.
-        #[arg(long, value_name = "true|false", hide = true)]
-        trust_forwarded_for: Option<bool>,
-        /// Deprecated: use `set-web --secure-cookie`. Still stored, for one
-        /// release.
-        #[arg(long, value_name = "true|false", hide = true)]
-        secure_cookie: Option<bool>,
-        /// Deprecated: use `set-web`. Still persists --bind, --base-path
-        /// and --expose, for one release.
-        #[arg(long, hide = true)]
-        save: bool,
-        /// Generate a new password, print it, and exit without serving.
-        #[arg(long)]
-        set_password: bool,
-        /// Never touch the system: applying writes the database and the
-        /// config files but does not reload the web server or run the firewall
-        /// script. The same escape hatch the TUI's --no-reload is.
-        #[arg(long)]
-        no_apply: bool,
-        /// Do everything that needs root through the stop-bots helper
-        /// listening on this socket, rather than in this process.
-        ///
-        /// How the service runs: as its own unprivileged user, with
-        /// `--helper /run/stop-bots/helper.sock` (`install web` sets both
-        /// up). Without it, a console running as root does those things
-        /// itself, and one that is not root is read-only.
-        #[arg(long, value_name = "SOCKET")]
-        helper: Option<PathBuf>,
-    },
-    /// Set how the web console starts and whom it answers.
-    ///
-    /// Every later `stop-bots web`, and the service `install web` sets up,
-    /// reads these. Give no flags to print what is stored.
-    ///
-    /// A non-loopback --bind is refused unless exposure is on, given here
-    /// or stored: the console can rewrite this host's firewall and web
-    /// server config. The intended deployment for exposing it is behind the
-    /// same NGINX or Apache this tool is protecting, with TLS and the Host
-    /// allowlist set:
-    ///
-    ///   stop-bots set-web --bind 0.0.0.0:8787 --expose true \
-    ///     --allowed-hosts admin.example.com --secure-cookie true
-    SetWeb {
-        /// Address to bind, as `address:port`
-        #[arg(long)]
-        bind: Option<String>,
-        /// Whether binding an address that is not loopback is permitted
-        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
-        expose: Option<bool>,
-        /// Serve under a path prefix, for a proxy that mounts the console at
-        /// a path like `https://example.com/stop-bots/`. `/` removes it.
-        ///
-        /// The proxy must NOT strip the prefix — this server matches the
-        /// full path including it, and generates links that do too:
-        ///
-        ///   location /stop-bots/ {
-        ///       proxy_pass http://127.0.0.1:8787;   # no trailing slash
-        ///       proxy_set_header Host $host;
-        ///   }
-        ///
-        /// A `proxy_pass` *with* a trailing slash strips the prefix, and
-        /// then every link this server generates points outside the
-        /// location block. On Apache, keep the prefix in the target:
-        ///
-        ///   <Location "/stop-bots/">
-        ///       ProxyPass "http://127.0.0.1:8787/stop-bots/"
-        ///       ProxyPreserveHost On
-        ///   </Location>
-        ///
-        /// The Web Access panel, in the TUI or the console, writes either
-        /// for you. A subdomain needs none of this and is the
-        /// simpler deployment if you can take it.
-        #[arg(long)]
-        base_path: Option<String>,
-        /// Comma-separated host names the console answers to, beyond
-        /// localhost and 127.0.0.1. Required when reaching it by name: a
-        /// request carrying an unlisted Host is refused, which is what
-        /// makes DNS rebinding against the console fail. An empty string
-        /// clears it.
-        #[arg(long)]
-        allowed_hosts: Option<String>,
-        /// Believe the last address in `X-Forwarded-For`, for when the
-        /// console sits behind a proxy on the same host. Without it every
-        /// proxied request comes from 127.0.0.1, so the login throttle and
-        /// the guard against blocking your own address cannot tell clients
-        /// apart. Leave it off unless there really is such a proxy.
-        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
-        trust_forwarded_for: Option<bool>,
-        /// Mark the session cookie `Secure`. Turn it on behind TLS, or a
-        /// browser will also send the session to an `http://` URL for the
-        /// same host. Off, a plain-HTTP console cannot keep you logged in.
-        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
-        secure_cookie: Option<bool>,
-    },
     /// Remember where this host's logs actually are.
     ///
     /// The companion to `set-web-server` and `set-nginx-commands`, for the
@@ -1088,8 +939,8 @@ enum Command {
     /// is not /var/log/nginx/access.log (or /var/log/apache2/access.log) on
     /// the host, and `--access-log` on a
     /// single command cannot reach the two things that actually run the
-    /// detectors: the web console and the TUI take no arguments for it, so
-    /// their internal cron reads the default and finds nothing.
+    /// detectors: `stop-bots tick` and the TUI take no arguments for it, so
+    /// the schedule reads the default and finds nothing.
     ///
     /// A path given here is used whenever no flag overrides it. Pass an
     /// empty string to clear one. Give neither flag to print what is
@@ -1148,8 +999,8 @@ enum Command {
     /// choice. `apache` reads `<VirtualHost>` sections under /etc/apache2,
     /// blocks with mod_rewrite (`a2enmod rewrite` if it is off), and tests
     /// and reloads with `apache2ctl configtest` and `systemctl reload
-    /// apache2`. Stored in the host settings, so every command, the TUI and
-    /// the console follow it.
+    /// apache2`. Stored in the host settings, so every command and the TUI
+    /// follow it.
     ///
     /// Takes the chosen server's own commands and config root as
     /// `set-nginx-commands` does NGINX's, for a server that is not where a
@@ -1288,92 +1139,43 @@ enum Command {
         #[arg(long, requires = "dry_run")]
         diff: bool,
     },
-    /// Set stop-bots up as a system service.
+    /// Keep this host protected with nobody at a terminal.
     ///
-    /// Currently Debian with systemd, which is what has been tested. The
-    /// unit it writes is very likely correct on any systemd distribution;
-    /// the SSH log path it assumes is Debian's.
+    /// `install cron` writes /etc/cron.d/stop-bots, which runs `stop-bots
+    /// tick` once a minute: the detectors each minute and the lists weekly,
+    /// the same schedule the TUI runs while it is open. It writes what the
+    /// detectors find, and applies it only as far as `set-auto-apply` and
+    /// `set-auto-apply-firewall` allow; both are off until you turn them on.
     ///
-    /// Nothing is written until every check has passed, an existing unit
-    /// file that you have edited is left alone rather than replaced, and
-    /// --dry-run prints the whole plan without touching anything. Start
-    /// there.
+    /// `install firewall` writes a systemd unit that loads the applied
+    /// firewall script at boot.
     ///
-    /// `install web` creates the `stop-bots` system user, gives it the
-    /// database, and writes three units: the console, which runs as that
-    /// user, and the root helper's socket and service, which do what needs
-    /// root on the console's behalf.
-    ///
-    /// `install web` takes the console settings `set-web` does and stores
-    /// them the same way, because the service it starts reads them from
-    /// the database.
+    /// Nothing is written until every check has passed, a file you have
+    /// edited is left alone rather than replaced, and --dry-run prints the
+    /// whole plan without touching anything. Start there.
     Install {
-        /// What to install. `web` writes the web console's units and
-        /// enables them; `firewall` writes the unit that loads the applied
-        /// firewall script at boot.
+        /// What to install: `cron`, the schedule, or `firewall`, the unit
+        /// that loads the applied firewall script at boot.
         #[arg(value_enum)]
         target: InstallTarget,
         /// Print every step and change nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Replace a unit file even if it has been edited since stop-bots
-        /// wrote it. An unedited one, from any version, is replaced
-        /// without this.
+        /// Replace a file even if it has been edited since stop-bots wrote
+        /// it. An unedited one, from any version, is replaced without this.
         #[arg(long)]
         force: bool,
-        /// Enable the unit but do not start it now.
-        #[arg(long)]
-        no_start: bool,
-        /// The stop-bots binary to name in ExecStart. Defaults to the one
+        /// The stop-bots binary the cron file runs. Defaults to the one
         /// running this command, which is refused if it sits in a build
-        /// directory — a unit pointing into target/debug works until the
-        /// next `cargo clean`.
+        /// directory — a cron file pointing into target/debug works until
+        /// the next `cargo clean`.
         #[arg(long)]
         binary: Option<PathBuf>,
-        /// The web server's config root the service will scan, stored as
-        /// `set-web-server --root` would: NGINX's on an NGINX host, Apache's
-        /// on an Apache one (choose Apache with `set-web-server apache`
-        /// first). Defaults to the one already stored, else the stock path,
-        /// /etc/nginx or /etc/apache2.
-        #[arg(long)]
-        root: Option<PathBuf>,
-        /// Pin the service to this SSH log instead of letting it find one.
-        ///
-        /// Leave it off unless the log is somewhere this would not look.
-        /// Without it the service tries /var/log/auth.log, /var/log/secure
-        /// and then journalctl, every time it reads — which is what works
-        /// on a host that keeps sshd's output only in the journal. Naming
-        /// a path here disables that search. Stored as `set-log-paths
-        /// --ssh-log` would, for the helper that reads it.
-        #[arg(long)]
-        ssh_log: Option<PathBuf>,
         /// Install into this prefix instead of `/`. For inspecting the
-        /// result without root; a unit written under a prefix is not a
-        /// unit systemd will ever see, so this skips systemctl entirely.
+        /// result without root; a file written under a prefix is one that
+        /// cron and systemd never see, so this runs no `systemctl`.
         #[arg(long)]
         prefix: Option<PathBuf>,
-        /// Address the service will bind. Stored, as `set-web --bind`
-        /// would, not written into the unit — the server re-reads it.
-        #[arg(long)]
-        bind: Option<String>,
-        /// Serve under a path prefix, for a proxy that mounts the console
-        /// at a path. See `set-web --base-path`.
-        #[arg(long)]
-        base_path: Option<String>,
-        /// Permit the service to bind an address that is not loopback, and
-        /// store that permission as `set-web --expose true` would.
-        #[arg(long)]
-        expose: bool,
-        /// Comma-separated host names the console will answer to. See
-        /// `set-web --allowed-hosts`.
-        #[arg(long)]
-        allowed_hosts: Option<String>,
-        /// Believe the last address in `X-Forwarded-For`. See `set-web`.
-        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
-        trust_forwarded_for: Option<bool>,
-        /// Mark the session cookie `Secure`. See `set-web`.
-        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
-        secure_cookie: Option<bool>,
     },
     /// Remove stop-bots from this host and put it back as it was.
     ///
@@ -1391,7 +1193,7 @@ enum Command {
     /// --prefix. Run it with --dry-run first.
     Uninstall {
         /// What to remove: `nginx` (also spelled `web-server`, and on an
-        /// Apache host it is Apache's blocks it removes), `firewall`, `web`,
+        /// Apache host it is Apache's blocks it removes), `firewall`, `cron`,
         /// or `all` (the default), which is all three plus /etc/stop-bots
         /// itself.
         #[arg(value_enum, default_value = "all")]
@@ -1399,8 +1201,8 @@ enum Command {
         /// Print every step and change nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Also delete the database and the copies upgrades kept of it,
-        /// and the `stop-bots` user and group. Only with `all`.
+        /// Also delete the database and the copies upgrades kept of it.
+        /// Only with `all`.
         #[arg(long)]
         purge: bool,
         /// Remove from this prefix instead of `/`, as `install --prefix`
@@ -1411,19 +1213,6 @@ enum Command {
         #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
     },
-    /// Serve the web console's privileged operations, as root
-    ///
-    /// Hidden: `stop-bots-helper.service` runs it, socket-activated by
-    /// `stop-bots-helper.socket`, which `install web` writes. It answers
-    /// only root and the `stop-bots` user, and only the console's closed
-    /// set of operations.
-    #[command(hide = true)]
-    Helper {
-        /// Listen on this socket instead of the one systemd passes, which
-        /// is /run/stop-bots/helper.sock.
-        #[arg(long, value_name = "PATH")]
-        socket: Option<PathBuf>,
-    },
     /// Write the man pages and shell completions for packaging
     ///
     /// Hidden: the release pipeline runs it, and the `.deb` ships what it
@@ -1433,6 +1222,25 @@ enum Command {
         /// The directory to write `man/` and `completions/` into
         #[arg(long, value_name = "DIR")]
         out: PathBuf,
+    },
+    /// Run whatever is due on the schedule, once, and exit.
+    ///
+    /// What `install cron` runs every minute: the jobs the TUI's Dashboard
+    /// lists under Scheduled tasks, each only when it is due, so a minute
+    /// with nothing due costs one database read. It applies to the web
+    /// server and the firewall only what `set-auto-apply` and
+    /// `set-auto-apply-firewall` allow. Prints nothing unless a job could
+    /// not be recorded or --verbose is given, so cron mails only trouble.
+    /// A run while another is still going leaves at once.
+    Tick {
+        #[arg(long, help = ROOT_HELP)]
+        root: Option<PathBuf>,
+        /// Read this SSH log file instead of the stored one or the search
+        #[arg(long)]
+        ssh_log: Option<PathBuf>,
+        /// Print what each job that ran did
+        #[arg(long, short)]
+        verbose: bool,
     },
     /// Start the TUI (also the default when run with no subcommand)
     Tui {
@@ -1455,8 +1263,8 @@ enum Command {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum InstallTarget {
-    /// The web console, as a systemd service.
-    Web,
+    /// /etc/cron.d/stop-bots, which runs `stop-bots tick` every minute.
+    Cron,
     /// A systemd unit that re-applies the rendered firewall script at
     /// boot. Not `nftables.service`: that loads /etc/nftables.conf, which
     /// is a different file, and on a stock Debian or Ubuntu it flushes
@@ -1474,8 +1282,8 @@ enum UninstallTarget {
     /// The live nft table or iptables chain, the boot unit and the
     /// firewall scripts.
     Firewall,
-    /// The web console's unit and its root helper's socket and service.
-    Web,
+    /// /etc/cron.d/stop-bots.
+    Cron,
     /// All of the above, and /etc/stop-bots once it is empty.
     All,
 }
@@ -1485,7 +1293,7 @@ impl From<UninstallTarget> for stop_bots::uninstall::Target {
         match target {
             UninstallTarget::Nginx => Self::Nginx,
             UninstallTarget::Firewall => Self::Firewall,
-            UninstallTarget::Web => Self::Web,
+            UninstallTarget::Cron => Self::Cron,
             UninstallTarget::All => Self::All,
         }
     }
@@ -1658,16 +1466,11 @@ async fn run() -> Result<()> {
     // reading early (`| head`). Rust ignores SIGPIPE, so the next write is
     // an error, and `say!` (`println!` underneath) turns that into a panic.
     // Dying quietly, the default, is what every other command-line tool
-    // does. Not for the
-    // long-running front-ends and the helper: they write to sockets and a
-    // terminal, where a peer going away is an error to handle, not the end
-    // of the process.
+    // does. Not for the TUI: it writes to a terminal, where a peer going
+    // away is an error to handle, not the end of the process.
     // Nothing a one-shot command runs writes to a child's stdin, which is
     // the other place the signal could come from.
-    if !matches!(
-        cli.command,
-        None | Some(Command::Tui { .. }) | Some(Command::Web { .. }) | Some(Command::Helper { .. })
-    ) {
+    if !matches!(cli.command, None | Some(Command::Tui { .. })) {
         // SAFETY: called before any thread this program starts writes to a
         // pipe, and SIG_DFL is async-signal-safe to install.
         unsafe {
@@ -1690,36 +1493,17 @@ async fn run() -> Result<()> {
             target,
             dry_run,
             force,
-            no_start,
             binary,
-            root,
-            ssh_log,
             prefix,
-            bind,
-            base_path,
-            expose,
-            allowed_hosts,
-            trust_forwarded_for,
-            secure_cookie,
         }) => match target {
-            InstallTarget::Web => run_install_web(InstallWeb {
-                db,
-                dry_run,
-                force,
-                start: !no_start,
-                binary,
-                root,
-                ssh_log,
-                prefix,
-                bind,
-                base_path,
-                expose,
-                allowed_hosts,
-                trust_forwarded_for,
-                secure_cookie,
-            }),
+            InstallTarget::Cron => run_install_cron(db, binary, prefix, dry_run, force),
             InstallTarget::Firewall => run_install_firewall(binary, prefix, dry_run, force),
         },
+        Some(Command::Tick {
+            root,
+            ssh_log,
+            verbose,
+        }) => run_tick(db, root, ssh_log, verbose).await,
         Some(Command::Uninstall {
             target,
             dry_run,
@@ -1875,66 +1659,6 @@ async fn run() -> Result<()> {
         Some(Command::ListCategories { site }) => list_categories(db, site),
         Some(Command::SetBot { bot, policy, site }) => set_bot(db, bot, policy, site),
         Some(Command::ListBots { search }) => list_bots(db, search),
-        Some(Command::Web {
-            root,
-            ssh_log,
-            firewall_out,
-            bind,
-            base_path,
-            expose,
-            allowed_hosts,
-            trust_forwarded_for,
-            secure_cookie,
-            save,
-            set_password,
-            no_apply,
-            helper,
-        }) => {
-            run_web(
-                db,
-                WebRun {
-                    root,
-                    ssh_log,
-                    firewall_out,
-                    bind,
-                    base_path,
-                    expose,
-                    set_password,
-                    no_apply,
-                    helper,
-                },
-                DeprecatedWebFlags {
-                    allowed_hosts,
-                    trust_forwarded_for,
-                    secure_cookie,
-                    save,
-                },
-            )
-            .await
-        }
-        // Its own database open: no migration (it never reads the host
-        // settings' old rows) and nothing created, made private or trusted.
-        Some(Command::Helper { socket }) => {
-            stop_bots::helper::run(db.unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH)), socket)
-        }
-        Some(Command::SetWeb {
-            bind,
-            expose,
-            base_path,
-            allowed_hosts,
-            trust_forwarded_for,
-            secure_cookie,
-        }) => set_web(
-            db,
-            WebSettings {
-                bind,
-                expose,
-                base_path,
-                allowed_hosts,
-                trust_forwarded_for,
-                secure_cookie,
-            },
-        ),
         Some(Command::SetLogPaths {
             access_log,
             ssh_log,
@@ -2009,17 +1733,12 @@ async fn run() -> Result<()> {
 /// nginx/firewall changes needs anyway, but just exploring with `cargo run`
 /// or the TUI shouldn't require it.
 fn open_db(explicit: Option<PathBuf>) -> Result<Db> {
-    let db = open_db_as_is(explicit)?;
+    let db = match explicit {
+        Some(path) => Db::open(path)?,
+        None => open_default_db()?,
+    };
     migrate_host_settings(&db)?;
     Ok(db)
-}
-
-/// [`open_db`] without moving the host settings: for the web console.
-fn open_db_as_is(explicit: Option<PathBuf>) -> Result<Db> {
-    match explicit {
-        Some(path) => Db::open(path),
-        None => open_default_db(),
-    }
 }
 
 /// Moves the host settings out of the database into their own file, the
@@ -2194,10 +1913,15 @@ fn run_status(
             Some((report, at)) => (report, Some(at)),
             None => anyhow::bail!(
                 "no health probe has been recorded yet — run `stop-bots status` without \
-                 --cached, or leave the console running so its internal cron takes one"
+                 --cached, or `stop-bots install cron` so the schedule takes one"
             ),
         }
     } else {
+        // The list built into this binary, stored first, as every command
+        // that renders the web server's config stores it: whether a site
+        // is applied is judged against what an apply would write, and after
+        // an upgrade that includes what this binary added to the list.
+        botlist::register_all_sources(&db)?;
         let backend = stop_bots::firewall::stored_backend(&db)?;
         let path = db
             .path()
@@ -2519,8 +2243,8 @@ fn list_firewall_rules(db_path: Option<PathBuf>, source: Option<SourceFilter>) -
 /// part of unbounded length.
 ///
 /// The address and the evidence go through [`terminal_safe`] here as well
-/// as through `say!`: `say!` keeps newlines, and a row the console wrote
-/// straight into the database has not been through
+/// as through `say!`: `say!` keeps newlines, and a row written straight
+/// into the database has not been through
 /// [`stop_bots::blocks::evidence_line`], so a newline in it would forge a
 /// second rule underneath.
 fn rule_line(rule: &FirewallRule, now: i64) -> String {
@@ -3026,9 +2750,9 @@ fn set_auto_apply(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
         // turned on a switch nothing will ever read, and the only sign
         // would be that nothing happens.
         say!(
-            "The internal cron applies and reloads within the hour \u{2014} it runs inside \
-             `stop-bots web` or the TUI, so one of those has to be running. The firewall \
-             script is not covered: apply it yourself, or with `stop-bots batch --apply`."
+            "The schedule applies and reloads within the hour \u{2014} it runs from \
+             `stop-bots install cron`, or in the TUI while it is open. The firewall script is \
+             not covered: apply it yourself, or with `stop-bots batch --apply`."
         );
     }
     Ok(())
@@ -3094,8 +2818,8 @@ fn set_auto_apply_firewall(db_path: Option<PathBuf>, enabled: bool) -> Result<()
     );
     if enabled {
         say!(
-            "The internal cron will run the script it renders, daily \u{2014} it runs inside \
-             `stop-bots web` or the TUI, so one of those has to be running."
+            "The schedule will run the script it renders, daily \u{2014} it runs from \
+             `stop-bots install cron`, or in the TUI while it is open."
         );
         // The condition that most often stops this doing anything, said
         // up front rather than discovered in a summary line a day later.
@@ -3175,8 +2899,8 @@ fn list_detectors(db_path: Option<PathBuf>) -> Result<()> {
         stop_bots::protection::subnet_escalation_min(&db)?
     );
     say!(
-        "The internal cron (inside `stop-bots web` or the TUI) and `batch` run the ones that \
-         are on."
+        "The schedule (`stop-bots tick`, or the TUI while it is open) and `batch` run the \
+         ones that are on."
     );
     Ok(())
 }
@@ -3532,204 +3256,6 @@ fn show_robots_txt(db_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Everything `install web` was given. A struct because it is a dozen
-/// fields and `run_install_web(db, true, false, true, None, ...)` is not
-/// a call anyone can read.
-struct InstallWeb {
-    db: Option<PathBuf>,
-    dry_run: bool,
-    force: bool,
-    start: bool,
-    binary: Option<PathBuf>,
-    root: Option<PathBuf>,
-    ssh_log: Option<PathBuf>,
-    prefix: Option<PathBuf>,
-    bind: Option<String>,
-    base_path: Option<String>,
-    expose: bool,
-    allowed_hosts: Option<String>,
-    trust_forwarded_for: Option<bool>,
-    secure_cookie: Option<bool>,
-}
-
-/// Every console setting `set-web` can change, as given on the command
-/// line: `None` leaves what is stored alone.
-///
-/// Also what `install web` stores its proxy flags through, so the two
-/// cannot disagree about how a setting is written.
-#[derive(Default)]
-struct WebSettings {
-    bind: Option<String>,
-    expose: Option<bool>,
-    base_path: Option<String>,
-    allowed_hosts: Option<String>,
-    trust_forwarded_for: Option<bool>,
-    secure_cookie: Option<bool>,
-}
-
-impl WebSettings {
-    fn is_empty(&self) -> bool {
-        self.bind.is_none()
-            && self.expose.is_none()
-            && self.base_path.is_none()
-            && self.allowed_hosts.is_none()
-            && self.trust_forwarded_for.is_none()
-            && self.secure_cookie.is_none()
-    }
-
-    /// Checks everything, then writes it — so a refusal stores nothing.
-    ///
-    /// A non-loopback `bind` needs exposure on, given here or already
-    /// stored: the same check `stop-bots web` makes before it binds, made
-    /// before the address is stored rather than at the next start.
-    fn store(&self, db: &Db) -> Result<()> {
-        use stop_bots::web;
-
-        let bind = match &self.bind {
-            Some(raw) => {
-                let addr: std::net::SocketAddr = raw
-                    .parse()
-                    .with_context(|| format!("`{raw}` is not a valid `address:port`"))?;
-                let exposed = match self.expose {
-                    Some(on) => on,
-                    None => db.get_bool_setting(web::EXPOSE_KEY, false)?,
-                };
-                if !web::is_loopback(&addr) && !exposed {
-                    anyhow::bail!(
-                        "refusing to store {addr}, which is reachable from the network, while \
-                         exposure is off. The console can rewrite this host's firewall and {} \
-                         config. If that is what you want, add --expose true.",
-                        server_label()
-                    );
-                }
-                Some(addr)
-            }
-            None => None,
-        };
-        let base = self
-            .base_path
-            .as_deref()
-            .map(web::BasePath::parse)
-            .transpose()?;
-
-        if let Some(on) = self.expose {
-            db.set_bool_setting(web::EXPOSE_KEY, on)?;
-        }
-        if let Some(addr) = bind {
-            db.set_text_setting(web::BIND_KEY, &addr.to_string())?;
-        }
-        if let Some(base) = base {
-            db.set_text_setting(web::BASE_PATH_KEY, base.as_str())?;
-        }
-        if let Some(hosts) = &self.allowed_hosts {
-            db.set_text_setting(web::ALLOWED_HOSTS_KEY, hosts)?;
-        }
-        if let Some(on) = self.trust_forwarded_for {
-            db.set_bool_setting(web::TRUST_FORWARDED_KEY, on)?;
-        }
-        if let Some(on) = self.secure_cookie {
-            db.set_bool_setting(web::SECURE_COOKIE_KEY, on)?;
-        }
-        Ok(())
-    }
-}
-
-/// `web`'s flags that used to write settings, kept working for one
-/// release and hidden from `--help`. `set-web` replaces all four.
-struct DeprecatedWebFlags {
-    allowed_hosts: Option<String>,
-    trust_forwarded_for: Option<bool>,
-    secure_cookie: Option<bool>,
-    save: bool,
-}
-
-impl DeprecatedWebFlags {
-    /// Says which flags were used and what replaces them, on stderr so a
-    /// service's stdout is not disturbed. Silent when none were.
-    fn warn(&self) {
-        let mut used = Vec::new();
-        if self.allowed_hosts.is_some() {
-            used.push("--allowed-hosts");
-        }
-        if self.trust_forwarded_for.is_some() {
-            used.push("--trust-forwarded-for");
-        }
-        if self.secure_cookie.is_some() {
-            used.push("--secure-cookie");
-        }
-        if self.save {
-            used.push("--save");
-        }
-        if !used.is_empty() {
-            say_err!(
-                "Note: `stop-bots web {}` is deprecated and goes away in the next release. \
-                 Store settings with `stop-bots set-web` instead; flags on `web` apply to one \
-                 run.",
-                used.join(" ")
-            );
-        }
-    }
-}
-
-fn set_web(db_path: Option<PathBuf>, settings: WebSettings) -> Result<()> {
-    use stop_bots::web;
-
-    let db = open_db(db_path)?;
-    if settings.is_empty() {
-        say!("Nothing to change. Current settings:");
-    } else {
-        settings.store(&db)?;
-    }
-
-    let addr = web::resolve_bind(&db, None)?;
-    let exposed = db.get_bool_setting(web::EXPOSE_KEY, false)?;
-    let base = web::BasePath::from_db(&db)?;
-    let hosts = web::configured_hosts(&db)?;
-    let on_off = |on: bool| if on { "on" } else { "off" };
-    say!("  bind:                {addr}");
-    say!("  expose:              {}", on_off(exposed));
-    say!(
-        "  base path:           {}",
-        if base.is_root() { "/" } else { base.as_str() }
-    );
-    say!(
-        "  allowed hosts:       {}",
-        if hosts.is_empty() {
-            "(loopback names only)".to_string()
-        } else {
-            hosts.join(", ")
-        }
-    );
-    say!(
-        "  trust forwarded-for: {}",
-        on_off(db.get_bool_setting(web::TRUST_FORWARDED_KEY, false)?)
-    );
-    say!(
-        "  secure cookie:       {}",
-        on_off(db.get_bool_setting(web::SECURE_COOKIE_KEY, false)?)
-    );
-    if !web::is_loopback(&addr) && !exposed {
-        // Only reachable by switching exposure off under a stored
-        // non-loopback bind, which is the safe direction and so allowed.
-        say!(
-            "\n`stop-bots web` will refuse to start on {addr} until exposure is back on or the \
-             bind is loopback."
-        );
-    }
-    if !settings.is_empty() {
-        say!("\nA running console reads the host list and proxy settings on every request;");
-        say!("the bind address and path prefix take effect when it is next started.");
-    }
-    Ok(())
-}
-
-/// Writes and enables the unit that re-applies the rendered firewall
-/// script at boot.
-///
-/// Deliberately narrow next to `install web`: no database, no NGINX root,
-/// no SSH log. The unit runs one command against one file, which is what
-/// makes it safe to order after Docker and ufw rather than ahead of the
-/// world.
 /// Stores the log paths, then prints what every future run will read.
 ///
 /// Printing the resolved state rather than "saved" is the point: the
@@ -3794,25 +3320,15 @@ fn run_install_firewall(
         Some(path) => path,
         None => std::env::current_exe().context("could not determine the running binary")?,
     };
-    // No `hidden_from_unit` check, unlike `install web`. That guard exists
-    // because the web unit's ExecStart names the stop-bots binary and sets
-    // ProtectHome=yes, which makes a binary under /home invisible to the
-    // service. This unit runs `nft` or `sh` on the script; it never runs
-    // stop-bots at all, so where stop-bots lives cannot break it. The
-    // binary is carried only to name it in the --dry-run hint.
+    // No check of where the binary lives: this unit runs `nft` or `sh` on
+    // the script and never runs stop-bots at all, so a binary under /home
+    // or /tmp cannot break it. The binary is carried only to name it in
+    // the --dry-run hint.
     let layout = match &prefix {
         Some(prefix) => stop_bots::install::Layout::under(prefix, binary),
         None => stop_bots::install::Layout::system(binary),
     };
-    let options = stop_bots::install::Options {
-        dry_run,
-        force,
-        // Never started by the installer: the script it loads may not
-        // exist yet, and applying firewall rules is the one step an
-        // operator should take after reading what they say -- the same
-        // reason `render-firewall` does not apply what it writes.
-        start: false,
-    };
+    let options = stop_bots::install::Options { dry_run, force };
 
     let steps = stop_bots::install::install_firewall(&layout, &options)?;
     for step in steps.iter() {
@@ -3821,6 +3337,102 @@ fn run_install_firewall(
     if dry_run {
         say!("\nDry run — nothing was changed.");
     }
+    Ok(())
+}
+
+/// `stop-bots install cron`: the schedule, as /etc/cron.d/stop-bots.
+fn run_install_cron(
+    db: Option<PathBuf>,
+    binary: Option<PathBuf>,
+    prefix: Option<PathBuf>,
+    dry_run: bool,
+    force: bool,
+) -> Result<()> {
+    let binary = match binary {
+        Some(binary) => binary,
+        None => std::env::current_exe().context("could not determine the running binary")?,
+    };
+    if stop_bots::install::is_build_artifact(&binary) {
+        anyhow::bail!(
+            "{} is in a build directory, and the cron file would stop working at the next \
+             `cargo clean`. Install the binary first (`install -m 755 {} /usr/local/bin/`), \
+             then run `/usr/local/bin/stop-bots install cron`, or pass --binary.",
+            binary.display(),
+            binary.display()
+        );
+    }
+    let mut layout = match &prefix {
+        Some(prefix) => stop_bots::install::Layout::under(prefix, binary),
+        None => stop_bots::install::Layout::system(binary),
+    };
+    if let Some(db) = db {
+        layout.db_path = db;
+    }
+    let options = stop_bots::install::Options { dry_run, force };
+
+    let steps = stop_bots::install::install_cron(&layout, &options)?;
+    for step in steps.iter() {
+        say!("  {step}");
+    }
+    if dry_run {
+        say!("\nDry run — nothing was changed.");
+    }
+    Ok(())
+}
+
+/// The lock `tick` takes, so that a run cron starts while the last one is
+/// still going leaves rather than reading the logs beside it. A file of its
+/// own, not the apply lock: an apply waits its turn, a tick need not.
+const TICK_LOCK: &str = "/run/stop-bots-tick.lock";
+
+/// `stop-bots tick`: whatever is due on the schedule, once.
+async fn run_tick(
+    db_path: Option<PathBuf>,
+    root: Option<PathBuf>,
+    ssh_log: Option<PathBuf>,
+    verbose: bool,
+) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let lock_path = if unsafe { libc::geteuid() } == 0 {
+        PathBuf::from(TICK_LOCK)
+    } else {
+        std::env::temp_dir().join(format!("stop-bots-tick-{}.lock", unsafe {
+            libc::geteuid()
+        }))
+    };
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    // SAFETY: a valid descriptor, owned by `lock` until it drops at the end.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if verbose {
+            say!("Another tick is still running; leaving it to finish.");
+        }
+        return Ok(());
+    }
+
+    let db = open_db(db_path)?;
+    let host = stop_bots::hostconf::HostConf::load()?;
+    let root = host.root(root.as_deref());
+    let settings = stop_bots::cron::TickSettings {
+        host: &host,
+        root: &root,
+        ssh_log,
+        firewall_out: None,
+    };
+    let ran = stop_bots::cron::tick(&db, &settings).await?;
+    if verbose {
+        if ran.is_empty() {
+            say!("Nothing was due.");
+        }
+        for (job, summary) in ran {
+            say!("{}: {}", job.label(), terminal_safe(&summary));
+        }
+    }
+    drop(lock);
     Ok(())
 }
 
@@ -3894,497 +3506,6 @@ fn run_uninstall(
         say!("\nRe-run without --dry-run to do it.");
     }
     Ok(())
-}
-
-fn run_install_web(options: InstallWeb) -> Result<()> {
-    use stop_bots::install::{self, Layout, Options};
-    use stop_bots::web;
-
-    let binary = match options.binary {
-        Some(path) => path,
-        None => {
-            let current = std::env::current_exe()
-                .context("could not work out which stop-bots binary is running")?;
-            // A unit naming target/debug/stop-bots works right up until the
-            // next `cargo clean`, and nothing warns when it stops.
-            if install::is_build_artifact(&current) {
-                anyhow::bail!(
-                    "{} is a build artifact, so a unit naming it would break on the \
-                     next `cargo clean`. Install the binary first, then:\n\n    \
-                     stop-bots install web --binary /usr/local/bin/stop-bots\n\n\
-                     Or pass --binary explicitly if you really do mean this path.",
-                    current.display()
-                );
-            }
-            current
-        }
-    };
-
-    let prefix = options.prefix.clone().unwrap_or_else(|| PathBuf::from("/"));
-    let mut layout = Layout::under(&prefix, binary);
-
-    let opts = Options {
-        dry_run: options.dry_run,
-        force: options.force,
-        start: options.start,
-    };
-
-    // Read before `install_web` replaces it. 0.0.1 to 0.0.6 named the
-    // NGINX root in ExecStart; the unit that replaces theirs does not,
-    // because the service now reads it from the database — so a host that
-    // was given `--root` then would quietly go back to /etc/nginx.
-    let legacy_root = std::fs::read_to_string(layout.unit_path())
-        .ok()
-        .and_then(|text| install::legacy::web_unit(&text))
-        .and_then(|unit| unit.root)
-        .filter(|root| root != Path::new(nginx::DEFAULT_ROOT));
-
-    // Not named in ExecStart: the running service reads the stored root
-    // itself, so `--root` (or the old unit's) is stored below, as
-    // `set-web-server --root` would. The unit only has to let the
-    // service write there; `install_web` adds the root already stored.
-    layout.nginx_roots = options.root.iter().chain(&legacy_root).cloned().collect();
-
-    let db_path = options.db.clone().unwrap_or_else(|| layout.db_path.clone());
-    // Moves the host settings into host.conf first of all, before the
-    // database's directory is the console's; see `install_web`.
-    let mut steps = install::install_web_from(&layout, &opts, &db_path)?;
-
-    let prefixed = prefix != Path::new("/");
-
-    // Settings, not unit contents. The running server re-reads these on
-    // every request, so a flag in ExecStart would be a second source of
-    // truth that loses to the database on the next restart.
-    //
-    // **Before `activate`, not after.** `activate` is `systemctl enable
-    // --now`, so everything below would otherwise be racing a service that
-    // is already starting and opening this same database. Three things
-    // went wrong when it did: the service lost the race and crash-looped
-    // on `Restart=on-failure` with "database is locked"; or this lost it
-    // and the install failed having already enabled the unit; or the
-    // service won, generated the password first, and the operator was
-    // shown "a console password is already set" instead of the password.
-    // The bind-address refusal below is the same argument in one line — it
-    // declines to install a service that, in the old order, was already
-    // running.
-    let mut password = None;
-    if !options.dry_run {
-        // The host settings file of the tree being installed: the host's
-        // own, or the one under `--prefix`. `install_web` has written it.
-        let host_path = layout.host_conf.clone();
-        // Opened without `open_db`'s migration, which would move rows into
-        // the host's own file; `install_web` already moved them into this
-        // tree's, before the database's directory became the console's.
-        let db = Db::open(&db_path)?;
-
-        let addr = web::resolve_bind(&db, options.bind.as_deref())?;
-        let exposed = options.expose || db.get_bool_setting(web::EXPOSE_KEY, false)?;
-        if !web::is_loopback(&addr) && !exposed {
-            anyhow::bail!(
-                "refusing to install a service bound to {addr}, which is reachable \
-                 from the network, without --expose. The console can rewrite this \
-                 host's firewall and {} config.",
-                server_label()
-            );
-        }
-        db.set_text_setting(web::BIND_KEY, &addr.to_string())?;
-        if options.expose {
-            db.set_bool_setting(web::EXPOSE_KEY, true)?;
-        }
-        if let Some(raw) = &options.base_path {
-            db.set_text_setting(web::BASE_PATH_KEY, web::BasePath::parse(raw)?.as_str())?;
-        }
-        if let Some(hosts) = &options.allowed_hosts {
-            db.set_text_setting(web::ALLOWED_HOSTS_KEY, hosts)?;
-        }
-        WebSettings {
-            trust_forwarded_for: options.trust_forwarded_for,
-            secure_cookie: options.secure_cookie,
-            ..WebSettings::default()
-        }
-        .store(&db)?;
-        steps.push(format!(
-            "bind {addr} recorded in {}",
-            layout.db_path.display()
-        ));
-        // A host setting, like `set-nginx-commands --root`: in the file
-        // only root writes, not in the database the console writes.
-        let mut host = stop_bots::hostconf::HostConf::load_from(&host_path)?;
-        if let Some(root) = &options.root {
-            // The root of the server this host runs. It used to be NGINX's
-            // whatever the host ran, so on an Apache host `--root
-            // /etc/httpd` was stored where nothing reads it and the
-            // console went on scanning /etc/apache2.
-            *host.root_setting_mut() = Some(std::path::absolute(root)?);
-            host.save_to(&host_path)?;
-            steps.push(format!(
-                "{} root {} recorded in {}",
-                host.web_server().label(),
-                root.display(),
-                host_path.display()
-            ));
-        } else if let Some(root) = &legacy_root {
-            if host.nginx_root.is_none() {
-                host.nginx_root = Some(std::path::absolute(root)?);
-                host.save_to(&host_path)?;
-                steps.push(format!(
-                    "kept the old unit's --root {} as the NGINX root in {} \
-                     (`set-nginx-commands --root`)",
-                    root.display(),
-                    host_path.display()
-                ));
-            }
-        }
-        // The SSH log the helper reads, as `set-log-paths --ssh-log` stores
-        // it: the console is given no log, and reads none itself. Without
-        // the flag nothing is stored, and the helper finds the log on its
-        // own (auth.log, secure, then the journal).
-        if let Some(ssh_log) = &options.ssh_log {
-            host.ssh_log = Some(std::path::absolute(ssh_log)?);
-            host.save_to(&host_path)?;
-            steps.push(format!(
-                "SSH log {} recorded in {} (`set-log-paths --ssh-log`)",
-                ssh_log.display(),
-                host_path.display()
-            ));
-        }
-
-        if !web::auth::password_is_set(&db)? {
-            let generated = web::auth::generate_password()?;
-            web::auth::set_password(&db, &generated)?;
-            password = Some(generated);
-            steps.push("generated a console password".to_string());
-        } else {
-            steps.push("a console password is already set, keeping it".to_string());
-        }
-
-        // After the writes, and while the path is still to hand. The
-        // database, its companions and any pre-upgrade copies become the
-        // console's: on an upgrade from 0.1.0-rc.2 they are root's.
-        let account = install::service_account(&layout);
-        steps.extend(install::secure_database(&layout.db_path, account)?);
-        if account.is_some() {
-            steps.push(format!(
-                "gave {} and the copies beside it to {}, mode 0600",
-                layout.db_path.display(),
-                layout.user
-            ));
-        }
-    } else {
-        steps.push(format!(
-            "give {} and the copies beside it to {}, mode 0600",
-            layout.db_path.display(),
-            layout.user
-        ));
-    }
-
-    // Only now, with the database written and closed, is it safe to start
-    // the service. Under a prefix there is no systemd to tell: the unit is
-    // somewhere systemd will never look, and saying so beats running
-    // `daemon-reload` and implying the file took effect.
-    if prefixed {
-        steps.push(format!(
-            "skipping systemctl: {} is not a path systemd reads",
-            layout.unit_dir.display()
-        ));
-    } else {
-        steps.extend(install::activate(&layout, &opts)?);
-    }
-
-    if options.dry_run {
-        say!("Dry run — nothing was changed. Would:");
-    } else {
-        say!("Installed:");
-    }
-    for step in &steps {
-        say!("  {step}");
-    }
-    say!();
-
-    if let Some(password) = password {
-        say!("Console password:\n");
-        say!("    {password}\n");
-        say!("Shown once. Only an Argon2 hash of it is stored — write it down now.");
-        say!("`stop-bots web --set-password` issues a new one.\n");
-    }
-
-    if options.dry_run {
-        say!("Re-run without --dry-run to do it.");
-        return Ok(());
-    }
-
-    if prefixed {
-        say!(
-            "Written under {}. Review it, then install for real.",
-            prefix.display()
-        );
-        return Ok(());
-    }
-
-    let server = stop_bots::hostconf::HostConf::load_from(&layout.host_conf)
-        .unwrap_or_default()
-        .web_server()
-        .label();
-
-    if options.start {
-        say!("The console is on loopback. Reach it over an SSH tunnel:\n");
-        say!("    ssh -L 8787:127.0.0.1:8787 <this-host>\n");
-        say!("then open http://127.0.0.1:8787/.\n");
-        say!(
-            "To put it behind the {} it is protecting, use its Web Access panel, or `w` in the TUI.",
-            server
-        );
-    } else {
-        // Telling someone to open a URL for a service that is not running
-        // is how a working install gets reported as broken.
-        say!("Enabled for the next boot but not started, as asked. Start it with:\n");
-        say!("    systemctl start {}\n", stop_bots::install::WEB_UNIT);
-        say!("then reach it over an SSH tunnel:\n");
-        say!("    ssh -L 8787:127.0.0.1:8787 <this-host>");
-    }
-    say!();
-    say!(
-        "The console runs as the {} user. What needs root -- the {server} config, the",
-        layout.user
-    );
-    say!(
-        "firewall -- it asks of {}, which systemd starts when it",
-        stop_bots::install::HELPER_UNIT
-    );
-    say!("is first needed. The internal cron's daily firewall render writes");
-    say!(
-        "{}/firewall.next.*, for review.",
-        layout.output_dir.display()
-    );
-    say!("Nothing is enforced, or loaded at boot, until something applies it: \"Apply");
-    say!("everything\" in the console, `stop-bots render-firewall --apply`, `stop-bots");
-    say!("batch --apply` from a crontab, or `stop-bots set-auto-apply-firewall --enabled true`.");
-
-    Ok(())
-}
-
-/// `stop-bots web`'s flags for this run.
-struct WebRun {
-    root: Option<PathBuf>,
-    ssh_log: Option<PathBuf>,
-    firewall_out: Option<PathBuf>,
-    bind: Option<String>,
-    base_path: Option<String>,
-    expose: bool,
-    set_password: bool,
-    no_apply: bool,
-    helper: Option<PathBuf>,
-}
-
-/// How a console started with `helper` does what needs root: through it;
-/// else itself, if `root`; else not at all.
-fn privilege_for(helper: Option<PathBuf>, root: bool) -> stop_bots::web::state::Privilege {
-    use stop_bots::web::state::Privilege;
-    match helper {
-        Some(socket) => Privilege::Helper(socket),
-        None if root => Privilege::Local,
-        None => Privilege::ReadOnly,
-    }
-}
-
-/// Starts the web UI, after the checks that decide whether it may bind
-/// where it was asked to.
-async fn run_web(
-    db_path: Option<PathBuf>,
-    run: WebRun,
-    deprecated: DeprecatedWebFlags,
-) -> Result<()> {
-    use stop_bots::web::{self, auth, server, state::AppState};
-    let WebRun {
-        root,
-        ssh_log,
-        firewall_out,
-        bind,
-        base_path,
-        expose,
-        set_password,
-        no_apply,
-        helper,
-    } = run;
-
-    // The helper takes nothing from the console but the operation: where
-    // the web server is, where the script goes and which logs it reads are root's
-    // to say, in the host settings. A flag that would be ignored is
-    // refused instead.
-    if helper.is_some() {
-        for (given, flag) in [
-            (root.is_some(), "--root"),
-            (ssh_log.is_some(), "--ssh-log"),
-            (firewall_out.is_some(), "--firewall-out"),
-            (no_apply, "--no-apply"),
-        ] {
-            if given {
-                anyhow::bail!(
-                    "{flag} cannot be combined with --helper: the helper does what needs root, \
-                     and reads the logs, with the host's own settings (`stop-bots \
-                     set-web-server`, `stop-bots set-log-paths`), and takes none from \
-                     the console"
-                );
-            }
-        }
-    }
-
-    deprecated.warn();
-    let defaulted = db_path.is_none();
-    // Never migrated from here: the console is not one of the root
-    // processes an administrator runs by hand, and once it runs as its own
-    // user its database is not root's to trust. `install web`, the TUI and
-    // every other verb run as root move the host settings.
-    let db = open_db_as_is(db_path)?;
-    stop_bots::firewall::seed_backend(&db, stop_bots::firewall::Installed::detect())?;
-    let root = webserver::root(&host_settings()?, root.as_deref());
-    let db_notice = stop_bots::db::location_notice(db.path().as_deref(), defaulted);
-
-    // The same registration the TUI does on startup, and for the same
-    // reason: `SourceKind::StopBotsExtras` is a list compiled into this
-    // binary, so it is *stored* here rather than waiting for a download.
-    //
-    // It was missing, and the consequence was invisible. A host that only
-    // ever runs `stop-bots web` — which is what `install web` sets up, and
-    // so what a production host is — never registered the built-in list at
-    // all: no source row, no entries, and none of its 49 patterns in the
-    // rendered config. The list was written by reading that host's own
-    // access log and it had never once been applied there. Nothing failed,
-    // because nothing was asked to; the source simply was not in the
-    // database for anything to report on.
-    stop_bots::botlist::register_all_sources(&db)?;
-
-    // Resolve and *check* before anything is written. `--save` used to run
-    // first, which meant `--bind 0.0.0.0:8787 --expose --save
-    // --set-password` persisted an exposed bind and exited before the
-    // guard below ever ran — and the next plain `stop-bots web` came up on
-    // every interface having never passed it.
-    let addr = web::resolve_bind(&db, bind.as_deref())?;
-    let exposed = expose || db.get_bool_setting(web::EXPOSE_KEY, false)?;
-    let base = match &base_path {
-        Some(raw) => web::BasePath::parse(raw)?,
-        None => web::BasePath::from_db(&db)?,
-    };
-
-    if !web::is_loopback(&addr) && !exposed {
-        anyhow::bail!(
-            "refusing to bind {addr}, which is reachable from the network.\n\n\
-             The web UI can rewrite this host's firewall and {} config, so exposing it \n\
-             is a deliberate act rather than a default. If that is what you want:\n\n    \
-             stop-bots set-web --bind {addr} --expose true --allowed-hosts <your-hostname>\n    \
-             stop-bots web\n\n\
-             Otherwise reach it over an SSH tunnel and leave it on loopback:\n\n    \
-             ssh -L 8787:127.0.0.1:8787 <this-host>",
-            server_label()
-        );
-    }
-
-    // The deprecated flags, still honoured for one release: the three the
-    // server reads per request were always stored, and `--save` stored the
-    // rest. After the exposure check, so a refused bind stores nothing.
-    WebSettings {
-        allowed_hosts: deprecated.allowed_hosts,
-        trust_forwarded_for: deprecated.trust_forwarded_for,
-        secure_cookie: deprecated.secure_cookie,
-        ..WebSettings::default()
-    }
-    .store(&db)?;
-
-    if deprecated.save {
-        db.set_text_setting(web::BIND_KEY, &addr.to_string())?;
-        db.set_text_setting(web::BASE_PATH_KEY, base.as_str())?;
-        if expose {
-            db.set_bool_setting(web::EXPOSE_KEY, true)?;
-        }
-    }
-
-    if set_password {
-        let password = auth::generate_password()?;
-        auth::set_password(&db, &password)?;
-        say!("New password: {password}");
-        say!();
-        say!("Shown once. Only an Argon2 hash of it is stored.");
-        return Ok(());
-    }
-
-    // Only once the server is actually going to start. Printing a
-    // password and then refusing to bind reads as though the password is
-    // the problem, and burns one for nothing.
-    if !auth::password_is_set(&db)? {
-        let password = auth::generate_password()?;
-        auth::set_password(&db, &password)?;
-        say!("A password has been generated for the web UI:");
-        say!();
-        say!("    {password}");
-        say!();
-        say!("Shown once. Only an Argon2 hash of it is stored — write it down now.");
-        say!("`stop-bots web --set-password` issues a new one.");
-        say!();
-    }
-
-    let hosts = web::configured_hosts(&db)?;
-    if !web::is_loopback(&addr) && hosts.is_empty() {
-        // Not fatal: reaching it through an SSH tunnel as `localhost`
-        // still works. Loud, because the usual reason to get here is
-        // putting it behind NGINX on a hostname and then finding every
-        // request refused. It used to say a bare address would be
-        // accepted, which is only true of a loopback one.
-        say_err!(
-            "Warning: bound to {addr} with no allowed hosts set. Only requests for \n\
-             localhost or a loopback address will be answered; a host name, or this \n\
-             machine's own network address, is refused. This is the DNS-rebinding guard \n\
-             doing its job; list the name or address you will use with \n\
-             `stop-bots set-web --allowed-hosts`."
-        );
-    }
-
-    say!("stop-bots web UI on http://{addr}{}", base.url("/"));
-    if !base.is_root() {
-        say!(
-            "Served under {}. The proxy in front must not strip it:",
-            base.as_str()
-        );
-        say!("    proxy_pass http://{addr};   # no trailing slash");
-    }
-    if web::is_loopback(&addr) {
-        say!("Loopback only — reachable from this machine.");
-    } else {
-        say!("Exposed on {addr}. Put TLS and this tool's own protection in front of it.");
-        if !db.get_bool_setting(web::SECURE_COOKIE_KEY, false)? {
-            // Not fatal: this process cannot tell whether there is TLS in
-            // front of it, and refusing would break the plaintext-behind-a-
-            // proxy case that is otherwise fine.
-            say_err!(
-                "Note: the session cookie is not marked Secure, so a browser will also send \n\
-                 it to an http:// URL for this host. Behind TLS, run \n\
-                 `stop-bots set-web --secure-cookie true`."
-            );
-        }
-    }
-
-    let privilege = privilege_for(helper, stop_bots::hint::is_root());
-    match &privilege {
-        web::state::Privilege::Helper(socket) => {
-            say!(
-                "Changes to the host go through the helper at {}.",
-                socket.display()
-            )
-        }
-        web::state::Privilege::Local => {}
-        web::state::Privilege::ReadOnly => say_err!(
-            "Note: not running as root and given no --helper, so this console is read-only: \
-             it shows everything and changes nothing on the host. `sudo stop-bots install \
-             web` sets up the service and its helper."
-        ),
-    }
-
-    let mut state = AppState::with_base(db, root, ssh_log, !no_apply, base);
-    // `None` unless the operator named a path: without one the destination
-    // follows the backend, so an iptables render lands in `.sh`.
-    state.firewall_out = firewall_out;
-    state.db_notice = db_notice;
-    state.privilege = privilege;
-    server::serve(state, addr).await
 }
 
 fn set_nginx_commands(
@@ -4644,7 +3765,7 @@ impl From<FirewallBackend> for stop_bots::firewall::FirewallBackend {
 /// An explicit `--backend` wins; without one, the host's own setting does,
 /// and the default path follows whichever backend that turned out to be.
 /// Both used to be fixed instead: `batch`'s flag carried an `nftables`
-/// default, so a host switched to iptables in the console got an nftables
+/// default, so a host switched to iptables got an nftables
 /// script from every cron run — at the *other* path, so both files existed
 /// and one was always stale — and `render-firewall` required `--backend`
 /// and defaulted `--out` to `.nft` even for iptables, leaving a shell
@@ -4995,8 +4116,8 @@ fn detector_defaults(
 /// end into something actionable. Shared so a sixth detector can't quietly
 /// ship a seventh wording of it.
 fn read_access_log(db: &Db, access_log: Option<&Path>) -> Result<String> {
-    // Through `LogPaths`, so a CLI run reads the same file the console and
-    // the internal cron do. Before this, `set-log-paths` could be set and a
+    // Through `LogPaths`, so a CLI run reads the same file the TUI and the
+    // schedule do. Before this, `set-log-paths` could be set and a
     // detector invoked by hand would still go to the default -- two answers
     // to one question, which is the shape of bug this whole type removes.
     let _ = db;
@@ -5115,7 +4236,7 @@ fn record_access_stats(db_path: Option<PathBuf>, access_log: Option<PathBuf>) ->
     let db = open_db(db_path)?;
 
     // The same pass the internal cron makes, from the same cursor, keyed by
-    // the path actually read: what the console already tallied is not
+    // the path actually read: what the schedule already tallied is not
     // tallied again, and what this reads the detectors see too.
     let host = host_settings()?;
     let flags = stop_bots::logscan::Flags {
@@ -5426,41 +4547,6 @@ mod tests {
             !help.contains("block-scanners"),
             "the old name is advertised:\n{help}"
         );
-    }
-
-    #[test]
-    fn web_s_deprecated_flags_still_parse_but_are_not_advertised() {
-        let cli = Cli::try_parse_from([
-            "stop-bots",
-            "web",
-            "--save",
-            "--allowed-hosts",
-            "a.example",
-            "--trust-forwarded-for",
-            "true",
-            "--secure-cookie",
-            "false",
-        ])
-        .unwrap();
-        assert!(matches!(cli.command, Some(Command::Web { save: true, .. })));
-
-        let mut root = Cli::command();
-        let help = root
-            .find_subcommand_mut("web")
-            .unwrap()
-            .render_long_help()
-            .to_string();
-        for flag in [
-            "--save",
-            "--allowed-hosts",
-            "--trust-forwarded-for",
-            "--secure-cookie",
-        ] {
-            assert!(
-                !help.contains(flag),
-                "`web --help` still offers {flag}:\n{help}"
-            );
-        }
     }
 
     /// A detector is named the way it is typed, and the stored id — the

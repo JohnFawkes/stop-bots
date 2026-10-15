@@ -52,9 +52,9 @@ pub struct Ingested<'a> {
 }
 
 /// The most rows one step of an [`Ingest`] writes: evidence rows and user
-/// agents together. A step is one transaction under the web console's
-/// database lock, and a pass over 200,000 lines stored whole held that
-/// lock, `/login` included, for seven seconds.
+/// agents together. A step is one transaction, and a pass over 200,000
+/// lines stored whole held the database's write lock for seven seconds,
+/// with the TUI and every other process waiting on it.
 pub const INGEST_CHUNK: usize = 5_000;
 
 /// One read's findings, stored a chunk at a time, so that storing a large
@@ -64,7 +64,7 @@ pub const INGEST_CHUNK: usize = 5_000;
 /// transaction it checks that the stored cursor is still the one the read
 /// started from, moves it to where the read stopped, records the logins
 /// and writes the first chunk. Another process that read the same lines
-/// (the console and a `batch` from cron, say) finds the cursor moved and
+/// (`tick` and a `batch` run by hand, say) finds the cursor moved and
 /// stores nothing, so of two readers exactly one gets in and nothing is
 /// counted twice, however their steps interleave. Each later step writes
 /// the next chunk.
@@ -200,8 +200,8 @@ impl Db {
     ///
     /// Returns `false`, having stored nothing, when the stored cursor is no
     /// longer `read.from`: see [`Ingest`]. For a caller that has nothing
-    /// to gain from letting the database go between chunks; the web
-    /// console's cron steps an [`Ingest`] itself.
+    /// to gain from letting the database go between chunks; `logscan`
+    /// steps an [`Ingest`] itself.
     pub fn ingest(&self, read: &Ingested) -> Result<bool> {
         let mut ingest = Ingest::new(
             read.source,

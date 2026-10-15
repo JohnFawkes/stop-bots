@@ -307,15 +307,6 @@ impl WebServer {
         }
     }
 
-    /// Whether a block declaring `server_name` in `config_path` terminates
-    /// TLS.
-    pub fn serves_tls(self, config_path: &Path, server_name: &str) -> bool {
-        match self {
-            WebServer::Nginx => nginx::serves_tls(config_path, server_name),
-            WebServer::Apache => apache::serves_tls(config_path, server_name),
-        }
-    }
-
     /// The application behind `server_name` in `config_path`, as
     /// [`crate::services::recognise`] reads it.
     pub fn site_service(
@@ -329,7 +320,8 @@ impl WebServer {
         }
     }
 
-    /// Where Web Access's subdomain mode puts the console's own site.
+    /// Where the web console's Web Access put its own site, in subdomain
+    /// mode, in a release that had one: `uninstall` takes it out.
     pub fn console_site_path(self, root: &Path) -> PathBuf {
         match self {
             WebServer::Nginx => nginx::console_site_path(root),
@@ -947,12 +939,12 @@ pub fn unused_managed_files(
 /// project's header — and `path` already resolved, with no link and no
 /// `..` anywhere in it.
 ///
-/// **The record is not trusted.** The web console can write every row of
-/// the database, and this runs as root: a row naming `/etc/passwd`, a
-/// link to it, or `<conf.d>/../../passwd` must delete nothing. Nor may a
-/// row that reaches `conf.d` through a directory of the console's own
-/// (`/var/lib/stop-bots/link/...`): the console could point that link
-/// somewhere else between this check and the removal. So such a row is
+/// **The record is not trusted.** The database is not always root's (see
+/// [`crate::hostconf`]), and this runs as root: a row naming `/etc/passwd`,
+/// a link to it, or `<conf.d>/../../passwd` must delete nothing. Nor may a
+/// row that reaches `conf.d` through a directory another user owns
+/// (`/var/lib/stop-bots/link/...`): they could point that link somewhere
+/// else between this check and the removal. So such a row is
 /// refused, and the one that passes comes back with its directory held
 /// open, which is what every later use goes through.
 fn removable_record(path: &Path, within: &[PathBuf]) -> Option<DirFile> {
@@ -1228,98 +1220,10 @@ pub(crate) fn is_stored_as_valid(value: &str, validate: fn(&str) -> Result<Strin
     validate(value).is_ok_and(|valid| valid == value)
 }
 
-/// How the console is reached from outside this host.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConsoleAccess {
-    /// Its own `server` block on `host`, written as a new config file.
-    ///
-    /// Served over plain HTTP. Adding a certificate is a separate step
-    /// (certbot), and until it is taken, the console's password form and
-    /// its session cookie cross the network in the clear — which is why
-    /// [`ConsoleAccess::Path`] is the default the panel offers.
-    Subdomain { host: String },
-    /// A `location` block inserted into an existing site's `server` block,
-    /// which is how the console inherits that site's certificate.
-    Path {
-        /// Normalised with a leading and trailing slash, e.g. `/stop-bots/`.
-        prefix: String,
-        /// The site's config file, from `Db::list_sites`.
-        config_path: PathBuf,
-        /// The `server_name` whose block to edit.
-        server_name: String,
-    },
-}
-
-/// Refuses an `access` whose host name or prefix is not one, checked again
-/// where it is written into a file a root web server loads, whatever
-/// checked it before: a front-end, or a request that came over the
-/// helper's socket.
-pub(crate) fn validate_console_access(access: &ConsoleAccess) -> Result<()> {
-    match access {
-        ConsoleAccess::Subdomain { host } if !crate::webaccess::is_plausible_host(host) => {
-            anyhow::bail!("refusing to write a server block for {host:?}: it is not a host name")
-        }
-        ConsoleAccess::Path { prefix, .. }
-            if crate::web::BasePath::parse(prefix)
-                .ok()
-                .filter(|base| !base.is_root())
-                .map(|base| base.url("/"))
-                .as_deref()
-                != Some(prefix.as_str()) =>
-        {
-            anyhow::bail!("refusing to write a location for {prefix:?}: it is not a path prefix")
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Writes `content` to `path`, validates the whole web server config, and puts
-/// the previous state back if validation fails.
-///
-/// The reason this exists rather than a plain write: `apply_all_sites`
-/// writes then tests, which is survivable when it edited an existing file
-/// — but a *new* `server` block that fails `nginx -t` leaves the config
-/// unloadable, and nothing looks wrong because the running NGINX keeps
-/// serving from memory. The next reload is then somebody else's problem,
-/// most likely certbot's renewal hook at 3am.
-///
-/// `write` does the writing, both of `content` and of the restore, so the
-/// console's own file is replaced rather than written through
-/// ([`write_managed`]) and an operator's site file is written only where
-/// it really lives inside the root ([`write_site_file`]).
-pub(crate) fn write_validated(
-    server: WebServer,
-    path: &Path,
-    content: &str,
-    commands: &ServerCommands,
-    write: impl Fn(&Path, &str) -> Result<()>,
-) -> Result<()> {
-    let _lock = crate::applylock::hold()?;
-    let previous = fs::read_to_string(path).ok();
-    write(path, content).map_err(crate::hint::sudo_if_denied)?;
-
-    if let Err(err) = test_config(server, commands) {
-        // Put it back before reporting, so the operator is not left with a
-        // config that cannot be loaded.
-        let restored = match &previous {
-            Some(text) => write(path, text),
-            None => fs::remove_file(path).map_err(Into::into),
-        };
-        let note = if restored.is_ok() {
-            "the previous config was restored"
-        } else {
-            "AND RESTORING THE PREVIOUS CONFIG ALSO FAILED — fix this by hand"
-        };
-        anyhow::bail!("{err:#}\n\n{}: {}", note, path.display());
-    }
-    Ok(())
-}
-
 /// The file under `root` that declares `server_name`, found on disk.
 ///
-/// The database records where a site was when it was scanned, and the
-/// web console can write that record. Whatever writes a site's file as
+/// The database records where a site was when it was scanned, and root
+/// does not always own the database. Whatever writes a site's file as
 /// root therefore asks the disk, and uses `recorded` only to tell apart
 /// two files that both declare the name: the one at the recorded path if
 /// it is among them, the only one if there is one, and otherwise none.
@@ -1741,10 +1645,11 @@ pub fn apply_site_and_reload(
     Ok((changed, true))
 }
 
-/// Whether `path` is the console's own site file, as the `Web Access`
-/// panel writes it (see [`WebServer::console_site_path`]) — by its first line, which
-/// every version has written, so that a file an operator put at the same
-/// path is left alone.
+/// Whether `path` is the web console's own site file, as the `Web Access`
+/// panel of an earlier release wrote it (see
+/// [`WebServer::console_site_path`]) — by its first line, which every
+/// version wrote, so that a file an operator put at the same path is left
+/// alone.
 pub fn is_console_site_file(path: &Path) -> bool {
     use std::io::BufRead;
     let Ok(file) = fs::File::open(path) else {
@@ -1780,8 +1685,8 @@ fn generated_file_places(server: WebServer, root: &Path) -> Vec<PathBuf> {
 
 /// What stop-bots has left in `server`'s config under `root`: each site
 /// file with a block or a console section in it, each generated file where
-/// it would be, and the console's own site. Empty for a root that is not
-/// there.
+/// it would be, and the console's own site an earlier release wrote. Empty
+/// for a root that is not there.
 ///
 /// Asked before the host's web server is switched. Everything that finds
 /// these again — an apply, `uninstall web-server` — works on the server the
@@ -1935,7 +1840,7 @@ pub fn remove_everything(
 ///
 /// A file named by the database's record is held by its directory's
 /// descriptor ([`DirFile`]) and put back through it, never through its
-/// path: a path in a directory the web console owns can lead somewhere
+/// path: a path in a directory another user owns can lead somewhere
 /// else by the time a failed test puts it back, and root would write the
 /// held bytes there.
 pub struct Snapshot {
@@ -2115,7 +2020,7 @@ pub fn test_or_restore(
 /// become `docker exec <name> nginx ...` there.
 ///
 /// Read from the host's settings ([`crate::hostconf`]), never from the
-/// database: these run as root, and the web console can write every row.
+/// database: these run as root, and root does not always own the database.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ServerCommands {
     /// Argv for the config check. Must exit non-zero on a bad config.

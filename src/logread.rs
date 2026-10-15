@@ -49,8 +49,8 @@
 //! [`read_chunk`] stops after a budget of bytes, at a line boundary, and
 //! says whether there is more; the cursor it returns is where the next
 //! read picks up, in the rotated copy if that is where it stopped. That is
-//! what lets the root helper serve a large log a piece at a time, each
-//! piece bounded in time and in memory (see [`crate::hostlog`]). A line
+//! what lets a large log be read a piece at a time, each piece bounded in
+//! time and in memory (see [`crate::hostlog`]). A line
 //! longer than [`MAX_LINE`] is read past rather than held: no log this
 //! project reads writes one, and holding it would let one line take as
 //! much memory as it likes.
@@ -144,12 +144,12 @@ pub struct FileRead {
 
 /// Opens the log at `path` for reading.
 ///
-/// The root helper reads logs for the console with `CAP_DAC_OVERRIDE`,
-/// and a log's directory is not always root's alone: a site can log into
-/// a directory its own user owns. Whoever can write there could replace
-/// the log with a link to any file root can read, and the console would
-/// be handed its lines; or with a FIFO, and the read would hang the
-/// helper. So a link is followed only in a directory nobody but root (or
+/// The logs are read as root, from cron every minute, and a log's
+/// directory is not always root's alone: a site can log into a directory
+/// its own user owns. Whoever can write there could replace the log with a
+/// link to any file root can read, and its lines would be stored as
+/// evidence and shown; or with a FIFO, and the read would hang the
+/// schedule. So a link is followed only in a directory nobody but root (or
 /// this process) can change ([`crate::firewall::unsafe_directory`]), which
 /// keeps a log an administrator linked elsewhere working, and a FIFO or a
 /// socket, the special files anyone can make, is refused. (A device needs
@@ -720,7 +720,7 @@ mod tests {
     }
 
     /// A site user who owns the log's directory must not be able to point
-    /// the root helper at another file and have its lines handed over.
+    /// a root read at another file and have its lines stored.
     #[test]
     fn a_link_in_a_directory_others_can_write_is_not_followed() {
         use std::os::unix::fs::PermissionsExt;
@@ -755,8 +755,8 @@ mod tests {
         assert_eq!(lines, ["one"]);
     }
 
-    /// A FIFO in place of the log would hold the helper's one turn until
-    /// its deadline; it is refused at once.
+    /// A FIFO in place of the log would hold the read until its deadline;
+    /// it is refused at once.
     #[test]
     fn a_fifo_in_place_of_the_log_is_refused_without_waiting() {
         use std::os::unix::ffi::OsStrExt;

@@ -539,9 +539,9 @@ fn format_duration_left(seconds_left: i64) -> String {
 ///
 /// `user_agent_stats` holds whatever strings clients chose to send, and a
 /// flood of distinct ones is cheap to make. Twenty thousand 4–8 KB agents
-/// made the console's Firewall page read every row, classify each against
-/// every bot pattern with the database locked for nine seconds, and send
-/// 418 MB of HTML. A page of this many is what a person reads anyway.
+/// made the web console's Firewall page (since removed) read every row,
+/// classify each against every bot pattern with the database locked for
+/// nine seconds, and send 418 MB of HTML. A page of this many is what a person reads anyway.
 pub const UA_PAGE_ROWS: usize = 200;
 
 /// Both panels' worth of rows, loaded together.

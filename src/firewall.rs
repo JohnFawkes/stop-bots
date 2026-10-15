@@ -18,8 +18,8 @@
 //! The firewall: gathering rules, the allowlist/iptables guard, script
 //! rendering, the lockout guard, writing and applying.
 //!
-//! **One path, five front-ends.** `render-firewall`, `batch`, the internal
-//! cron, the TUI and the web console all go render → guard → write → apply
+//! **One path, four front-ends.** `render-firewall`, `batch`, the internal
+//! cron and the TUI all go render → guard → write → apply
 //! through [`prepare`], [`execute`] and [`record`] (or [`render_and_apply`],
 //! all three at once), with one policy — see [`FirewallRun`]. They differ
 //! only in how they put the [`FirewallOutcome`] into words. It is the one
@@ -416,7 +416,7 @@ pub fn check_lockout(rules: &[FirewallRule], log: SshLog<'_>) -> Guard {
 
 /// [`check_lockout`], with `protect` counted among the connected clients
 /// whenever the log could be read: addresses a front-end knows are in use
-/// (the browser driving the console, a recent login) that the rules must
+/// (a login this pass just read) that the rules must
 /// not block either. It can only make the guard stricter. It does not make
 /// a guard that could not read the log run.
 pub fn check_lockout_protecting(
@@ -922,8 +922,8 @@ pub(crate) fn unsafe_directory(
 /// entry `PATH` is `/usr/bin:/bin`, which has neither `nft` nor the
 /// `iptables` every line of the iptables script runs.
 ///
-/// Holds [`crate::applylock`] while the script runs, so the TUI, the
-/// console and a cron `batch` never run two scripts over the same table at
+/// Holds [`crate::applylock`] while the script runs, so the TUI, `tick`
+/// and a cron `batch` never run two scripts over the same table at
 /// once; a second one waits briefly, then says another is applying.
 pub fn apply_script(backend: FirewallBackend, out_path: &Path) -> Result<()> {
     Installed::detect().check(backend)?;
@@ -1013,9 +1013,10 @@ pub fn rendered_path(applied: &Path) -> std::path::PathBuf {
 /// - **The rendered signature is recorded on every write, the applied one
 ///   on every apply** (see [`record`]); a dry run records neither.
 ///
-/// Five front-ends used to implement this themselves and handled "no SSH
-/// log" four different ways: the TUI refused to write, the console wrote
-/// but would not apply, the cron wrote without applying, `batch` bailed,
+/// The front-ends used to implement this themselves and handled "no SSH
+/// log" four different ways: the TUI refused to write, the web console
+/// (since removed) wrote but would not apply, the cron wrote without
+/// applying, `batch` bailed,
 /// and `render-firewall` printed a note and recorded no signature.
 #[derive(Debug, Clone)]
 pub struct FirewallRun {
@@ -1091,7 +1092,7 @@ impl FirewallRun {
 }
 
 /// A run with every database read done, so the rest can happen where no
-/// `Db` may go — the TUI's worker thread, or outside the console's lock.
+/// `Db` may go — the TUI's worker thread.
 #[derive(Debug)]
 pub struct Prepared {
     pub run: FirewallRun,
@@ -1563,16 +1564,15 @@ fn failure_hint(backend: FirewallBackend, stderr: &str, root: bool) -> &'static 
 /// itself cannot name.
 ///
 /// `nft` and Debian's nft-backed `iptables` both reach the kernel over a
-/// netlink socket, and the systemd unit `stop-bots install web` writes
-/// restricts which address families the service may open. Get that wrong
-/// and the failure is `Unable to initialize Netlink socket: Address family
+/// netlink socket, and a systemd unit that runs this can restrict which
+/// address families it may open. Get that wrong and the failure is `Unable to initialize Netlink socket: Address family
 /// not supported by protocol` — which is accurate, mentions neither
 /// systemd nor this project, and sends whoever reads it looking for a
 /// kernel module or a missing package.
 ///
 /// Reported here rather than fixed here because the fix is in a file this
-/// process does not own: an operator running an older unit needs to be
-/// told which line to change, not have it changed under them.
+/// process does not own: the operator needs to be told which line to
+/// change, not have it changed under them.
 fn sandbox_hint(stderr: &str) -> &'static str {
     let netlink_denied = stderr.contains("Netlink")
         && (stderr.contains("Address family not supported")
@@ -1581,13 +1581,9 @@ fn sandbox_hint(stderr: &str) -> &'static str {
         return "";
     }
     "\n\nThat error means the kernel refused a netlink socket, which usually \
-     means this process is sandboxed. If it is running from the unit \
-     `stop-bots install web` writes, check that its RestrictAddressFamilies \
-     line includes AF_NETLINK:\n\n    \
-     systemctl show stop-bots-web.service -p RestrictAddressFamilies\n\n\
-     Units written before the console could apply the firewall do not have \
-     it. Re-run `stop-bots install web --force` to get the current unit, \
-     then `systemctl restart stop-bots-web.service`."
+     means this process is sandboxed. If it is running from a systemd unit, \
+     check that the unit's RestrictAddressFamilies line includes AF_NETLINK:\n\n    \
+     systemctl show <unit> -p RestrictAddressFamilies"
 }
 
 #[cfg(test)]
@@ -2492,8 +2488,8 @@ mod tests {
 
     // ---- the sandbox hint ----
 
-    /// The message an operator actually saw, from a console running under
-    /// the unit `install web` wrote before the console could apply.
+    /// The message an operator actually saw, from stop-bots running under a
+    /// unit that left out AF_NETLINK.
     #[test]
     fn a_netlink_refusal_explains_itself() {
         let hint = sandbox_hint(
@@ -2503,8 +2499,8 @@ mod tests {
 
         assert!(hint.contains("AF_NETLINK"), "was: {hint}");
         assert!(
-            hint.contains("stop-bots install web --force"),
-            "it has to say how to get a unit that works: {hint}"
+            hint.contains("RestrictAddressFamilies"),
+            "it has to say which line of the unit to change: {hint}"
         );
     }
 

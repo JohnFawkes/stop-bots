@@ -111,8 +111,10 @@ use walkdir::WalkDir;
 const BLOCK_BEGIN: &str = "# BEGIN stop-bots (DO NOT EDIT)";
 const BLOCK_END: &str = "# END stop-bots";
 
-/// The console's own section's markers, NGINX's too, and separate from the
-/// block's for the reason `nginx::CONSOLE_BEGIN` gives.
+/// The markers around the section the web console's Web Access wrote into
+/// a site, in a release that had one: NGINX's too. Nothing writes them now;
+/// `uninstall` takes the section out with the blocks. **Frozen**, like
+/// [`BLOCK_BEGIN`].
 const CONSOLE_BEGIN: &str = "# BEGIN stop-bots console (DO NOT EDIT)";
 const CONSOLE_END: &str = "# END stop-bots console";
 
@@ -482,13 +484,6 @@ fn main_config(root: &Path) -> Option<(PathBuf, PathBuf)> {
                 .find(|main| main.is_file())
                 .map(|main| (dir.to_path_buf(), main))
         })
-}
-
-/// The directory of Apache's main config for `root` ([`main_config`]):
-/// the tree `root` is part of, which is what the root helper's sandbox
-/// checks a root under `/etc` against.
-pub fn config_tree(root: &Path) -> Option<PathBuf> {
-    main_config(root).map(|(dir, _)| dir)
 }
 
 /// Apache's configuration as Apache reads it under one root: its main
@@ -1084,34 +1079,12 @@ fn agent_exemption_clears(exemptions: &[crate::db::AgentExemption]) -> String {
 /// Narrows a site's config to what is safe in *this* virtual host: the
 /// TLS-only request rules are dropped in one that does not terminate TLS,
 /// for the reason `nginx::for_block` gives.
-///
-/// It also exempts the console's prefix, where Web Access mounted it in
-/// this host: `mod_rewrite` runs before the proxy does, so every rule in
-/// the block would otherwise reach the console's own requests — the
-/// lock-out `nginx::console_prefix_in` describes.
-fn for_host(config: &BlockConfig, content: &str, host: &VirtualHost) -> BlockConfig {
+fn for_host(config: &BlockConfig, host: &VirtualHost) -> BlockConfig {
     let mut config = config.clone();
     if !host.is_tls {
         config.request_rules.retain(|rule| !rule.needs_tls());
     }
-    if let Some(prefix) = console_prefix_in(content, host) {
-        if !config.exempt_paths.contains(&prefix) {
-            config.exempt_paths.push(prefix);
-        }
-    }
     config
-}
-
-/// The prefix of the console `<Location>` this tool wrote into `host`, if
-/// it wrote one, read from the host itself and checked as an exempt path
-/// is.
-fn console_prefix_in(content: &str, host: &VirtualHost) -> Option<String> {
-    let (start, end) = locate_marked(content, host, CONSOLE_BEGIN, CONSOLE_END)?;
-    let prefix = lines(&content[start..end]).into_iter().find_map(|line| {
-        let (name, closing, args) = section(&line.text)?;
-        (name == "location" && !closing).then(|| args.into_iter().next())?
-    })?;
-    is_stored_as_valid(&prefix, crate::db::validate_exempt_path).then_some(prefix)
 }
 
 /// The byte range of the whole lines from the begin marker to the end
@@ -1148,7 +1121,7 @@ fn apply_block(
     tree: Option<&Tree>,
     config_path: &Path,
 ) -> Result<String> {
-    let config = for_host(config, content, host);
+    let config = for_host(config, host);
     if let Some(why) = refusal(&config, host, tree) {
         anyhow::bail!("refusing to write {}: {why}", config_path.display());
     }
@@ -1291,7 +1264,7 @@ pub fn site_apply_status(
     }
     let tree = Tree::find(root);
     let current = matching.iter().all(|host| {
-        let config = for_host(config, &content, host);
+        let config = for_host(config, host);
         refusal(&config, host, tree.as_ref()).is_none()
             && locate_existing_block(&content, host)
                 .map(|(start, end)| content[start..end].to_string())
@@ -1306,8 +1279,8 @@ pub fn site_apply_status(
 
 /// `content` with every block this project injected taken out: the exact
 /// inverse of an insertion, which puts the block's lines right after the
-/// `<VirtualHost>` line, or the console's right before `</VirtualHost>`,
-/// and adds nothing else.
+/// `<VirtualHost>` line, or the console section an earlier release wrote
+/// right before `</VirtualHost>`, and adds nothing else.
 pub fn without_injected_blocks(content: &str) -> String {
     let mut content = content.to_string();
     loop {
@@ -1427,15 +1400,6 @@ fn nginx_equivalent(name: &str) -> &str {
     }
 }
 
-/// Whether a host declaring `server_name` in `config_path` terminates TLS.
-pub fn serves_tls(config_path: &Path, server_name: &str) -> bool {
-    fs::read_to_string(config_path).is_ok_and(|content| {
-        virtual_hosts(&content)
-            .iter()
-            .any(|host| host.is_tls && host.names.iter().any(|name| name == server_name))
-    })
-}
-
 /// The stock layout an Apache root belongs to, which decides the defaults
 /// an operator would otherwise have to type: the config test, the reload
 /// and the access log.
@@ -1488,70 +1452,9 @@ impl Layout {
     }
 }
 
-/// Where Debian's `envvars` points `${APACHE_LOG_DIR}`.
-const DEBIAN_LOG_DIR: &str = "/var/log/apache2";
-
-/// Where RHEL's `httpd.conf` logs, through the `logs` link in its server
-/// root.
-const RHEL_LOG_DIR: &str = "/var/log/httpd";
-
-/// The directories `CustomLog` and `ErrorLog` write to under `root`, for
-/// the helper's sandbox. `${APACHE_LOG_DIR}` is Debian's `envvars`
-/// default, and a relative path is relative to the server root — which is
-/// the root's own, found from its main file ([`Tree`]), not Debian's: RHEL
-/// logs to `logs/access_log` in `/etc/httpd`. Each is given with its links
-/// resolved, as the sandbox will see it.
-pub fn log_dirs(root: &Path) -> Vec<PathBuf> {
-    let tree = Tree::find(root);
-    let debian = tree
-        .as_ref()
-        .is_none_or(|tree| tree.main.ends_with("apache2.conf"));
-    let stock = if debian { DEBIAN_LOG_DIR } else { RHEL_LOG_DIR };
-    let mut dirs = vec![PathBuf::from(stock)];
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let Ok(content) = fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        for line in lines(&content) {
-            let mut parts = words(line.text.trim());
-            if parts.len() < 2 || line.text.trim_start().starts_with('#') {
-                continue;
-            }
-            let name = parts.remove(0).to_ascii_lowercase();
-            if name != "customlog" && name != "errorlog" {
-                continue;
-            }
-            let target = parts[0].replace("${APACHE_LOG_DIR}", DEBIAN_LOG_DIR);
-            // A pipe or syslog is not a file.
-            if target.starts_with('|') || target.starts_with("syslog") {
-                continue;
-            }
-            let path = match &tree {
-                Some(tree) => match tree.resolve(&target) {
-                    Some(path) => path,
-                    None => continue,
-                },
-                None if Path::new(&target).is_absolute() => PathBuf::from(&target),
-                None => root.join(&target),
-            };
-            let Some(dir) = path.parent() else {
-                continue;
-            };
-            let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-            if !dirs.contains(&dir) {
-                dirs.push(dir);
-            }
-        }
-    }
-    dirs
-}
-
 /// What fixes a config test that failed because a module this project
-/// writes for is not loaded: `mod_rewrite` for the blocks, `mod_proxy`'s
-/// HTTP half for Web Access. Debian ships both switched off.
+/// writes for is not loaded: `mod_rewrite`, which the blocks are written
+/// in. Debian ships it switched off.
 pub fn missing_module_hint(err: &anyhow::Error) -> Option<&'static str> {
     let text = format!("{err:#}");
     let invalid = |command: &str| text.contains(&format!("Invalid command '{command}'"));
@@ -1561,26 +1464,19 @@ pub fn missing_module_hint(err: &anyhow::Error) -> Option<&'static str> {
              run `a2enmod rewrite`, then apply again.",
         );
     }
-    if invalid("ProxyPass") || invalid("ProxyPreserveHost") {
-        return Some(
-            "the console is reached through mod_proxy_http, which is not enabled: \
-             run `a2enmod proxy_http`, then try again.",
-        );
-    }
-    // Loaded `mod_proxy` without its HTTP half takes the config and then
-    // cannot proxy; Apache says so only in its error log.
     None
 }
 
-// ---- reaching the console from outside ----
+// ---- what earlier releases wrote for the web console ----
 
-/// Where a subdomain-mode site goes: a file of its own in `sites-enabled`,
-/// one thing to delete when an operator changes their mind.
+/// Where the web console's Web Access put its own site, in subdomain mode,
+/// in a release that had one. Nothing writes it now; `uninstall` takes it
+/// out.
 ///
 /// **Named to sort last.** For a name no site declares — every request
 /// that asks for a bare address — Apache answers with the first
 /// `<VirtualHost>` it read for that address and port, and Debian reads
-/// `sites-enabled` in name order. The console must never be that site.
+/// `sites-enabled` in name order. The console was never to be that site.
 ///
 /// In `conf.d` on a root that has that and no `sites-enabled` — RHEL's,
 /// whose `httpd.conf` reads its sites from there, also in name order — for
@@ -1594,133 +1490,6 @@ pub fn console_site_path(root: &Path) -> PathBuf {
         sites
     };
     dir.join("zz-stop-bots-console.conf")
-}
-
-/// The `<Location>` that proxies to the console, shared by both modes.
-///
-/// The prefix is kept on the way through, as NGINX's `proxy_pass` keeps
-/// it, because the console generates links with it. `ProxyPreserveHost`
-/// passes the `Host` the browser sent, which is what the console's own
-/// host check reads; Apache's proxy appends the client to
-/// `X-Forwarded-For` by itself. Both are quoted, though the prefix has
-/// passed `BasePath::parse`, for the reason `nginx::console_location`
-/// gives.
-fn console_location(prefix: &str, upstream: &std::net::SocketAddr) -> String {
-    format!(
-        "    {CONSOLE_BEGIN}\n    <Location {}>\n        ProxyPass {}\n        \
-         ProxyPreserveHost On\n    </Location>\n    {CONSOLE_END}\n",
-        conf_quoted(prefix),
-        conf_quoted(&format!("http://{upstream}{prefix}")),
-    )
-}
-
-/// A whole `<VirtualHost>` serving the console on `host` at `/`.
-pub fn console_server_block(host: &str, upstream: &std::net::SocketAddr) -> String {
-    format!(
-        "# {} (`Web Access` panel). Safe to edit or delete.\n\
-         #\n\
-         # Plain HTTP: the console's password and session cookie are in the clear\n\
-         # until this host has a certificate for {host}. Get one with:\n\
-         #\n\
-         #     certbot --apache -d {host}\n\
-         #\n\
-         # then run `stop-bots set-web --secure-cookie true` so the cookie is\n\
-         # HTTPS-only.\n\
-         <VirtualHost *:80>\n    \
-         ServerName {host}\n    \
-         # The console shows what attackers sent, and its requests carry it:\n    \
-         # logged where the detectors read, they would block its operator.\n    \
-         CustomLog /dev/null common\n\n\
-         {}</VirtualHost>\n",
-        crate::generated::generated_by(),
-        console_location("/", upstream)
-    )
-}
-
-/// Inserts (or updates) the console's `<Location>` inside `server_name`'s
-/// host in `content`, preferring the one that terminates TLS, as
-/// `nginx::with_console_location` does. `None` when no host there declares
-/// the name.
-///
-/// **Last in the host**, unlike the block. `<Location>` sections are merged
-/// in the order they are written, a later one overriding an earlier one,
-/// so a site that proxies everything from a `<Location "/">` of its own
-/// would take the console's prefix back from a section written above it.
-/// Written last, the console's wins; and a site that proxies with a bare
-/// `ProxyPass /` instead loses to any `<Location>` that proxies, wherever
-/// it is.
-fn with_console_location(
-    content: &str,
-    server_name: &str,
-    prefix: &str,
-    upstream: &std::net::SocketAddr,
-) -> Option<String> {
-    let pick = |content: &str| {
-        virtual_hosts(content)
-            .into_iter()
-            .filter(|h| h.names.iter().any(|n| n == server_name))
-            .max_by_key(|h| h.is_tls)
-    };
-    let host = pick(content)?;
-    let mut content = content.to_string();
-    if let Some((start, end)) = locate_marked(&content, &host, CONSOLE_BEGIN, CONSOLE_END) {
-        content.replace_range(start..end, "");
-    }
-    let host = pick(&content)?;
-    content.insert_str(host.close, &console_location(prefix, upstream));
-    Some(content)
-}
-
-/// Sets the console up to be reachable through Apache, validated before
-/// it can take effect and put back if the config test refuses it; see
-/// `nginx::apply_console_access`, which this is for Apache.
-pub fn apply_console_access(
-    root: &Path,
-    access: &ConsoleAccess,
-    upstream: &std::net::SocketAddr,
-    commands: &ServerCommands,
-) -> Result<PathBuf> {
-    validate_console_access(access)?;
-    match access {
-        ConsoleAccess::Subdomain { host } => {
-            let path = console_site_path(root);
-            if let Some(why) = unloaded_file(root, &path) {
-                anyhow::bail!("refusing to write the console's site: {why}");
-            }
-            write_validated(
-                WebServer::Apache,
-                &path,
-                &console_server_block(host, upstream),
-                commands,
-                write_managed,
-            )?;
-            Ok(path)
-        }
-        ConsoleAccess::Path {
-            prefix,
-            config_path,
-            server_name,
-        } => {
-            let content = fs::read_to_string(config_path).map_err(|err| {
-                anyhow::anyhow!("failed to read {}: {err}", config_path.display())
-            })?;
-            let updated = with_console_location(&content, server_name, prefix, upstream)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "{} has no <VirtualHost> for {server_name} — re-scan sites and try again",
-                        config_path.display()
-                    )
-                })?;
-            write_validated(
-                WebServer::Apache,
-                config_path,
-                &updated,
-                commands,
-                |path, text| write_site_file(path, root, text),
-            )?;
-            Ok(config_path.clone())
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1767,6 +1536,43 @@ mod tests {
             patterns.iter().map(|p| p.to_string()).collect(),
             BlockResponse::Forbidden,
         )
+    }
+
+    // ---- what releases with the web console wrote ----
+    //
+    // Frozen copies of the writers that put the console's section into a
+    // site, so the tests can make the bytes those hosts have and check that
+    // `uninstall` takes them back out.
+
+    fn console_location(prefix: &str, upstream: &std::net::SocketAddr) -> String {
+        format!(
+            "    {CONSOLE_BEGIN}\n    <Location {}>\n        ProxyPass {}\n        \
+             ProxyPreserveHost On\n    </Location>\n    {CONSOLE_END}\n",
+            conf_quoted(prefix),
+            conf_quoted(&format!("http://{upstream}{prefix}")),
+        )
+    }
+
+    fn with_console_location(
+        content: &str,
+        server_name: &str,
+        prefix: &str,
+        upstream: &std::net::SocketAddr,
+    ) -> Option<String> {
+        let pick = |content: &str| {
+            virtual_hosts(content)
+                .into_iter()
+                .filter(|h| h.names.iter().any(|n| n == server_name))
+                .max_by_key(|h| h.is_tls)
+        };
+        let host = pick(content)?;
+        let mut content = content.to_string();
+        if let Some((start, end)) = locate_marked(&content, &host, CONSOLE_BEGIN, CONSOLE_END) {
+            content.replace_range(start..end, "");
+        }
+        let host = pick(&content)?;
+        content.insert_str(host.close, &console_location(prefix, upstream));
+        Some(content)
     }
 
     #[test]
@@ -2101,80 +1907,10 @@ mod tests {
         assert_eq!(site_service(&path, "blog.example"), None);
     }
 
-    // ---- Web Access ----
+    // ---- what uninstall takes out of a host that had Web Access ----
 
     fn upstream() -> std::net::SocketAddr {
         "127.0.0.1:8787".parse().unwrap()
-    }
-
-    fn commands_that(pass: bool) -> ServerCommands {
-        let program = if pass { "true" } else { "false" };
-        ServerCommands {
-            test: vec![program.to_string()],
-            reload: vec!["true".to_string()],
-        }
-    }
-
-    #[test]
-    fn the_console_sections_match_the_goldens() {
-        let ours = format!("# {}", crate::generated::generated_by());
-        crate::golden::assert_golden(
-            "apache-console-subdomain.conf",
-            &console_server_block("console.example.com", &upstream()).replacen(
-                &ours,
-                "# Generated by stop-bots",
-                1,
-            ),
-        );
-        crate::golden::assert_golden(
-            "apache-console-location.conf",
-            &console_location("/stop-bots/", &upstream()),
-        );
-    }
-
-    #[test]
-    fn the_console_goes_into_the_tls_host_once() {
-        let once =
-            with_console_location(TWO_HOSTS, "example.com", "/stop-bots/", &upstream()).unwrap();
-        let twice =
-            with_console_location(&once, "example.com", "/stop-bots/", &upstream()).unwrap();
-        assert_eq!(once, twice);
-        let hosts = virtual_hosts(&once);
-        assert!(locate_marked(&once, &hosts[0], CONSOLE_BEGIN, CONSOLE_END).is_none());
-        assert!(locate_marked(&once, &hosts[1], CONSOLE_BEGIN, CONSOLE_END).is_some());
-        assert_eq!(
-            with_console_location(TWO_HOSTS, "nobody.example", "/x/", &upstream()),
-            None
-        );
-    }
-
-    /// Every rule in the block runs before the proxy, so the console's
-    /// prefix is exempt wherever the console is mounted — or an operator
-    /// whose browser trips a rule is locked out of the console.
-    #[test]
-    fn the_console_prefix_is_exempt_from_the_block() {
-        let mounted =
-            with_console_location(SITE, "example.com", "/stop-bots/", &upstream()).unwrap();
-        let applied = blocks_for_file(
-            &mounted,
-            Path::new("s"),
-            Path::new(NO_TREE),
-            &[],
-            &cfg(&["BadBot"]),
-        )
-        .unwrap();
-        assert!(
-            applied.contains(r#"%{REQUEST_URI} "(?:^(/stop-bots/))" [NC]"#),
-            "applied:\n{applied}"
-        );
-        // And the exemption reads as up to date once applied.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("site.conf");
-        fs::write(&path, &applied).unwrap();
-        assert_eq!(
-            site_apply_status(&path, "example.com", &cfg(&["BadBot"]), dir.path()),
-            SiteApplyStatus::UpToDate
-        );
     }
 
     #[test]
@@ -2193,69 +1929,11 @@ mod tests {
     }
 
     #[test]
-    fn a_console_the_config_test_refuses_is_put_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("site.conf");
-        fs::write(&path, SITE).unwrap();
-        let access = ConsoleAccess::Path {
-            prefix: "/stop-bots/".to_string(),
-            config_path: path.clone(),
-            server_name: "example.com".to_string(),
-        };
-        let err = apply_console_access(dir.path(), &access, &upstream(), &commands_that(false))
-            .unwrap_err();
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            SITE,
-            "error was: {err:#}"
-        );
-
-        apply_console_access(dir.path(), &access, &upstream(), &commands_that(true)).unwrap();
-        assert!(fs::read_to_string(&path).unwrap().contains("ProxyPass"));
-
-        let subdomain = ConsoleAccess::Subdomain {
-            host: "console.example.com".to_string(),
-        };
-        let written =
-            apply_console_access(dir.path(), &subdomain, &upstream(), &commands_that(true))
-                .unwrap();
-        assert_eq!(written, console_site_path(dir.path()));
-        assert!(crate::webserver::is_console_site_file(&written));
-    }
-
-    #[test]
     fn a_missing_module_names_the_command_that_enables_it() {
-        for (said, fix) in [
-            (
-                "Invalid command 'RewriteEngine', perhaps misspelled",
-                "a2enmod rewrite",
-            ),
-            (
-                "Invalid command 'ProxyPass', perhaps misspelled",
-                "a2enmod proxy_http",
-            ),
-        ] {
-            let hint = missing_module_hint(&anyhow::anyhow!("{said}")).unwrap();
-            assert!(hint.contains(fix), "{said} gave: {hint}");
-        }
+        let said = "Invalid command 'RewriteEngine', perhaps misspelled";
+        let hint = missing_module_hint(&anyhow::anyhow!("{said}")).unwrap();
+        assert!(hint.contains("a2enmod rewrite"), "{said} gave: {hint}");
         assert_eq!(missing_module_hint(&anyhow::anyhow!("Syntax error")), None);
-    }
-
-    #[test]
-    fn log_directories_come_from_the_config() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("site.conf"),
-            "<VirtualHost *:80>\n    CustomLog /srv/logs/example/access.log combined\n    ErrorLog ${APACHE_LOG_DIR}/error.log\n    CustomLog \"|/usr/bin/rotatelogs x\" common\n</VirtualHost>\n",
-        )
-        .unwrap();
-        assert_eq!(
-            log_dirs(dir.path()),
-            vec![
-                PathBuf::from("/var/log/apache2"),
-                PathBuf::from("/srv/logs/example")
-            ]
-        );
     }
 
     // ---- what the rest of the config says ----
@@ -2494,20 +2172,6 @@ mod tests {
     }
 
     #[test]
-    fn a_rhel_root_logs_where_its_logs_link_leads() {
-        let root = tree(&[RHEL_MAIN]);
-        let logs = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink(logs.path(), root.path().join("logs")).unwrap();
-        assert_eq!(
-            log_dirs(root.path()),
-            vec![
-                PathBuf::from(RHEL_LOG_DIR),
-                fs::canonicalize(logs.path()).unwrap()
-            ]
-        );
-    }
-
-    #[test]
     fn the_block_acts_only_on_the_request_the_client_sent() {
         let text = block_text(&cfg(&["BadBot"])).unwrap();
         let lines: Vec<&str> = text.lines().collect();
@@ -2639,30 +2303,5 @@ mod tests {
                 assert!(format!("{err:#}").contains("HTTP/1.x"), "{what}: {err:#}");
             }
         }
-    }
-
-    #[test]
-    fn the_console_goes_last_in_its_host_after_the_sites_own_locations() {
-        let site = "<VirtualHost *:80>\n    ServerName example.com\n    <Location />\n        ProxyPass http://127.0.0.1:3000/\n    </Location>\n</VirtualHost>\n";
-        let mounted =
-            with_console_location(site, "example.com", "/stop-bots/", &upstream()).unwrap();
-        assert!(
-            mounted.ends_with(&format!("    {CONSOLE_END}\n</VirtualHost>\n")),
-            "mounted:\n{mounted}"
-        );
-        assert_eq!(without_injected_blocks(&mounted), site);
-    }
-
-    #[test]
-    fn a_console_site_apache_would_not_read_is_refused_unwritten() {
-        // RHEL, with a `sites-enabled` someone made by hand.
-        let root = tree(&[RHEL_MAIN, ("sites-enabled/.keep", "")]);
-        let access = ConsoleAccess::Subdomain {
-            host: "console.example.com".to_string(),
-        };
-        let err = apply_console_access(root.path(), &access, &upstream(), &commands_that(true))
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("never read"), "said: {err:#}");
-        assert!(!console_site_path(root.path()).exists());
     }
 }

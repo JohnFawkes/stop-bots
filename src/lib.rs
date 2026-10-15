@@ -33,8 +33,6 @@ pub mod accesslog;
 #[doc(hidden)]
 pub mod accessstats;
 #[doc(hidden)]
-pub mod account;
-#[doc(hidden)]
 pub mod apache;
 #[doc(hidden)]
 pub mod app;
@@ -75,8 +73,6 @@ mod golden;
 #[doc(hidden)]
 pub mod health;
 #[doc(hidden)]
-pub mod helper;
-#[doc(hidden)]
 pub mod hint;
 #[doc(hidden)]
 pub mod host;
@@ -111,8 +107,6 @@ pub mod present;
 #[doc(hidden)]
 pub mod preview;
 #[doc(hidden)]
-pub mod privileged;
-#[doc(hidden)]
 pub mod protection;
 #[doc(hidden)]
 pub mod refresh;
@@ -132,9 +126,5 @@ pub mod tui;
 pub mod uadetail;
 #[doc(hidden)]
 pub mod uninstall;
-#[doc(hidden)]
-pub mod web;
-#[doc(hidden)]
-pub mod webaccess;
 #[doc(hidden)]
 pub mod webserver;

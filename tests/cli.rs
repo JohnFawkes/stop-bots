@@ -2137,8 +2137,7 @@ fn repeat_failed_attempt(ip: &str, times: usize) -> String {
     format!("Failed password for root from {ip} port 4444 ssh2\n").repeat(times)
 }
 
-/// Every detector subcommand's `--ttl-days` has the ceiling the console
-/// and the TUI have; past it the arithmetic that dates the block wraps.
+/// Every detector subcommand's `--ttl-days` has the ceiling the TUI has; past it the arithmetic that dates the block wraps.
 /// `=` so clap does not read the negative one as a flag.
 #[test]
 fn a_ttl_past_ten_years_is_refused_on_the_command_line() {
@@ -3292,167 +3291,10 @@ fn a_missing_source_file_names_the_file() {
         .stderr(predicate::str::contains("/nonexistent/ranges.json"));
 }
 
-// ---- `stop-bots web` startup checks ----
+// ---- a staged host ----
 
-/// Exposing the console is opt-in, and the refusal has to be a refusal:
-/// nothing may be persisted, or a later plain `stop-bots web` comes up on
-/// every interface having never passed this check.
-#[test]
-fn web_refuses_a_non_loopback_bind_without_expose_and_saves_nothing() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("db.sqlite3");
-
-    stop_bots_bin()
-        .args([
-            "web",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--bind",
-            "0.0.0.0:8787",
-            "--save",
-            "--set-password",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("refusing to bind"))
-        .stderr(predicate::str::contains("ssh -L"));
-
-    let db = stop_bots::db::Db::open(&db_path).unwrap();
-    assert_eq!(
-        db.get_text_setting(stop_bots::web::BIND_KEY).unwrap(),
-        None,
-        "a refused bind must not be persisted"
-    );
-    assert!(
-        !db.get_bool_setting(stop_bots::web::EXPOSE_KEY, false)
-            .unwrap(),
-        "nor may the exposure flag be"
-    );
-}
-
-/// The deliberate path does persist, so a later plain run starts the same
-/// way.
-#[test]
-fn web_with_expose_and_save_persists_the_bind() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("db.sqlite3");
-
-    stop_bots_cmd(&[
-        "web",
-        "--db",
-        db_path.to_str().unwrap(),
-        "--bind",
-        "0.0.0.0:8788",
-        "--expose",
-        "--allowed-hosts",
-        "admin.example.com",
-        "--save",
-        "--set-password",
-    ])
-    .assert()
-    .success()
-    .stdout(predicate::str::contains("New password:"));
-
-    let db = stop_bots::db::Db::open(&db_path).unwrap();
-    assert_eq!(
-        db.get_text_setting(stop_bots::web::BIND_KEY)
-            .unwrap()
-            .as_deref(),
-        Some("0.0.0.0:8788")
-    );
-    assert!(db
-        .get_bool_setting(stop_bots::web::EXPOSE_KEY, false)
-        .unwrap());
-    assert_eq!(
-        db.get_text_setting(stop_bots::web::ALLOWED_HOSTS_KEY)
-            .unwrap()
-            .as_deref(),
-        Some("admin.example.com")
-    );
-}
-
-/// The two proxy settings are read from the database on every request, so
-/// like `--allowed-hosts` they are stored with or without `--save` — and
-/// `false` has to switch them back off, not just leave them alone.
-#[test]
-fn web_stores_the_proxy_settings_and_can_turn_them_off() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("db.sqlite3");
-    let run = |value: &str| {
-        stop_bots_cmd(&[
-            "web",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--trust-forwarded-for",
-            value,
-            "--secure-cookie",
-            value,
-            "--set-password",
-        ])
-        .assert()
-        .success();
-        let db = stop_bots::db::Db::open(&db_path).unwrap();
-        (
-            db.get_bool_setting(stop_bots::web::TRUST_FORWARDED_KEY, false)
-                .unwrap(),
-            db.get_bool_setting(stop_bots::web::SECURE_COOKIE_KEY, false)
-                .unwrap(),
-        )
-    };
-
-    assert_eq!(run("true"), (true, true));
-    assert_eq!(run("false"), (false, false));
-}
-
-/// `--set-password` stores a hash and prints the password once. The
-/// password itself must not survive anywhere this program can read it
-/// back.
-#[test]
-fn web_set_password_stores_only_a_hash() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("db.sqlite3");
-
-    let output = stop_bots_cmd(&["web", "--db", db_path.to_str().unwrap(), "--set-password"])
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let password = stdout
-        .lines()
-        .next()
-        .unwrap()
-        .trim_start_matches("New password: ")
-        .to_string();
-    assert!(!password.is_empty(), "stdout was:\n{stdout}");
-
-    let db = stop_bots::db::Db::open(&db_path).unwrap();
-    let stored = db
-        .get_text_setting(stop_bots::web::auth::PASSWORD_HASH_KEY)
-        .unwrap()
-        .unwrap();
-    assert!(stored.starts_with("$argon2id$"), "was: {stored}");
-    assert!(!stored.contains(&password));
-    assert!(stop_bots::web::auth::verify_password(&db, &password).unwrap());
-}
-
-/// An unparsable bind address is rejected by name rather than defaulted.
-#[test]
-fn web_rejects_a_bind_that_is_not_an_address_and_port() {
-    let tmp = tempfile::tempdir().unwrap();
-    stop_bots_bin()
-        .args([
-            "web",
-            "--db",
-            tmp.path().join("db.sqlite3").to_str().unwrap(),
-            "--bind",
-            "8787",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("8787"));
-}
-
-/// Stages a fake Debian-with-systemd root that `install web` will accept,
-/// and a binary for its ExecStart to point at.
+/// Stages a fake Debian-with-systemd root to install into under
+/// `--prefix`, and a binary for what is installed to point at.
 fn fake_debian_root() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     fs::create_dir_all(tmp.path().join("run/systemd/system")).unwrap();
@@ -3463,349 +3305,12 @@ fn fake_debian_root() -> (tempfile::TempDir, std::path::PathBuf) {
     (tmp, binary)
 }
 
-/// The whole installer, end to end, into a prefix: the three units, the
-/// two directories, a generated password, and no `systemctl` and no
-/// `useradd` — a unit under a prefix is not a path systemd reads, nor the
-/// tree a user database, and saying so beats implying either took effect.
-#[test]
-fn install_web_writes_a_unit_and_a_password_under_a_prefix() {
-    let (tmp, binary) = fake_debian_root();
-
-    let output = stop_bots_bin()
-        .args([
-            "install",
-            "web",
-            "--prefix",
-            tmp.path().to_str().unwrap(),
-            "--binary",
-            binary.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-
-    assert!(stdout.contains("Console password"), "was: {stdout}");
-    assert!(stdout.contains("skipping systemctl"), "was: {stdout}");
-
-    assert!(
-        stdout.contains("not this host's user database"),
-        "was: {stdout}"
-    );
-
-    let unit_file = |name: &str| {
-        fs::read_to_string(tmp.path().join("etc/systemd/system").join(name))
-            .unwrap_or_else(|_| panic!("no {name} written"))
-    };
-    // Directive lines only: the units' own comments name directives to
-    // explain them, so a plain substring search finds them in the prose.
-    let directives = |unit: &str| -> Vec<String> {
-        unit.lines()
-            .map(str::trim)
-            .filter(|line| !line.starts_with('#') && !line.is_empty())
-            .map(String::from)
-            .collect()
-    };
-    let console = directives(&unit_file("stop-bots-web.service"));
-    let socket = tmp.path().join("run/stop-bots/helper.sock");
-    let exec = format!(
-        "ExecStart={} web --db {} --helper {}",
-        binary.display(),
-        tmp.path().join("var/lib/stop-bots/db.sqlite3").display(),
-        socket.display()
-    );
-    for line in [exec.as_str(), "User=stop-bots", "ProtectSystem=strict"] {
-        assert!(
-            console.contains(&line.to_string()),
-            "no {line}: {console:?}"
-        );
-    }
-    assert!(
-        directives(&unit_file("stop-bots-helper.socket"))
-            .contains(&format!("ListenStream={}", socket.display())),
-        "the socket listens somewhere else"
-    );
-    // The helper's: strict, with the NGINX config given back. Without that
-    // line the first NGINX apply fails on a read-only /etc. Under the
-    // prefix, like every other path in the unit.
-    let helper = directives(&unit_file("stop-bots-helper.service"));
-    let nginx = format!("ReadWritePaths=-{}", tmp.path().join("etc/nginx").display());
-    for line in ["ProtectSystem=strict", nginx.as_str()] {
-        assert!(helper.contains(&line.to_string()), "no {line}: {helper:?}");
-    }
-    assert!(tmp.path().join("var/lib/stop-bots/db.sqlite3").exists());
-    assert!(tmp.path().join("etc/stop-bots").is_dir());
-}
-
-/// Re-running must not issue a second password: the first one was printed
-/// once and written down, and silently replacing it locks the operator out
-/// of their own console.
-#[test]
-fn install_web_run_twice_keeps_the_first_password() {
-    let (tmp, binary) = fake_debian_root();
-    let args = [
-        "install",
-        "web",
-        "--prefix",
-        tmp.path().to_str().unwrap(),
-        "--binary",
-        binary.to_str().unwrap(),
-    ];
-
-    let first = stop_bots_bin().args(args).assert().success();
-    let first = String::from_utf8(first.get_output().stdout.clone()).unwrap();
-    let second = stop_bots_bin().args(args).assert().success();
-    let second = String::from_utf8(second.get_output().stdout.clone()).unwrap();
-
-    assert!(first.contains("Console password"));
-    assert!(
-        !second.contains("Console password"),
-        "a second password was issued: {second}"
-    );
-    assert!(second.contains("already set"), "was: {second}");
-    assert!(second.contains("already up to date"), "was: {second}");
-}
-
-/// A service is where the proxy settings are needed, and a second
-/// `stop-bots web` to set them would collide with the one systemd runs.
-#[test]
-fn install_web_stores_the_proxy_settings() {
-    let (tmp, binary) = fake_debian_root();
-    stop_bots_bin()
-        .args([
-            "install",
-            "web",
-            "--prefix",
-            tmp.path().to_str().unwrap(),
-            "--binary",
-            binary.to_str().unwrap(),
-            "--trust-forwarded-for",
-            "true",
-            "--secure-cookie",
-            "true",
-        ])
-        .assert()
-        .success();
-
-    let db = stop_bots::db::Db::open(tmp.path().join("var/lib/stop-bots/db.sqlite3")).unwrap();
-    assert!(db
-        .get_bool_setting(stop_bots::web::TRUST_FORWARDED_KEY, false)
-        .unwrap());
-    assert!(db
-        .get_bool_setting(stop_bots::web::SECURE_COOKIE_KEY, false)
-        .unwrap());
-}
-
-/// `install web --root` is stored, as `set-nginx-commands --root` would
-/// store it, in the host settings file the helper reads the root from —
-/// and the helper's unit lets the helper, which writes NGINX config for the
-/// console, write there. It used to be accepted and then ignored.
-#[test]
-fn install_web_stores_the_nginx_root_and_lets_the_helper_write_it() {
-    let (tmp, binary) = fake_debian_root();
-    stop_bots_bin()
-        .args([
-            "install",
-            "web",
-            "--prefix",
-            tmp.path().to_str().unwrap(),
-            "--binary",
-            binary.to_str().unwrap(),
-            "--root",
-            "/srv/nginx",
-        ])
-        .assert()
-        .success();
-
-    let host =
-        stop_bots::hostconf::HostConf::load_from(&tmp.path().join("etc/stop-bots/host.conf"))
-            .unwrap();
-    assert_eq!(host.root(None), std::path::PathBuf::from("/srv/nginx"));
-    let unit = fs::read_to_string(
-        tmp.path()
-            .join("etc/systemd/system/stop-bots-helper.service"),
-    )
-    .unwrap();
-    assert!(
-        unit.lines()
-            .any(|line| line == "ReadWritePaths=-/srv/nginx"),
-        "unit was:\n{unit}"
-    );
-}
-
-/// On an Apache host `--root` is Apache's root. It used to be stored as
-/// `nginx_root` whatever the host ran, where nothing on an Apache host
-/// reads it, and the console went on scanning /etc/apache2.
-#[test]
-fn install_web_stores_the_root_of_the_server_the_host_runs() {
-    let (tmp, binary) = fake_debian_root();
-    let host_conf = tmp.path().join("etc/stop-bots/host.conf");
-    fs::create_dir_all(host_conf.parent().unwrap()).unwrap();
-    fs::write(&host_conf, "web_server = apache\n").unwrap();
-
-    let output = stop_bots_bin()
-        .args([
-            "install",
-            "web",
-            "--prefix",
-            tmp.path().to_str().unwrap(),
-            "--binary",
-            binary.to_str().unwrap(),
-            "--root",
-            "/srv/httpd",
-        ])
-        .assert()
-        .success();
-    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
-    assert!(
-        stdout.contains("Apache root /srv/httpd recorded"),
-        "was: {stdout}"
-    );
-
-    let host = stop_bots::hostconf::HostConf::load_from(&host_conf).unwrap();
-    assert_eq!(
-        (host.apache_root.as_deref(), host.nginx_root.as_deref()),
-        (Some(Path::new("/srv/httpd")), None),
-        "host.conf was:\n{}",
-        host.render()
-    );
-    let unit = fs::read_to_string(
-        tmp.path()
-            .join("etc/systemd/system/stop-bots-helper.service"),
-    )
-    .unwrap();
-    assert!(
-        unit.lines()
-            .any(|line| line == "ReadWritePaths=-/srv/httpd"),
-        "unit was:\n{unit}"
-    );
-}
-
-/// `install web --ssh-log` is stored where the helper reads the SSH log
-/// from, as `set-log-paths --ssh-log` would store it, and not handed to
-/// the console, which reads no log itself.
-#[test]
-fn install_web_stores_the_ssh_log_for_the_helper_not_the_console() {
-    let (tmp, binary) = fake_debian_root();
-    stop_bots_bin()
-        .args([
-            "install",
-            "web",
-            "--prefix",
-            tmp.path().to_str().unwrap(),
-            "--binary",
-            binary.to_str().unwrap(),
-            "--ssh-log",
-            "/srv/logs/auth.log",
-        ])
-        .assert()
-        .success();
-
-    let host =
-        stop_bots::hostconf::HostConf::load_from(&tmp.path().join("etc/stop-bots/host.conf"))
-            .unwrap();
-    assert_eq!(
-        host.ssh_log.as_deref(),
-        Some(std::path::Path::new("/srv/logs/auth.log"))
-    );
-    let unit =
-        fs::read_to_string(tmp.path().join("etc/systemd/system/stop-bots-web.service")).unwrap();
-    assert!(!unit.contains("--ssh-log"), "unit was:\n{unit}");
-}
-
-/// A console given the helper reads its logs through it, from the host
-/// settings; a log named on its command line would be ignored, so it is
-/// refused.
-#[test]
-fn a_console_with_a_helper_refuses_an_ssh_log_of_its_own() {
-    let tmp = tempfile::tempdir().unwrap();
-    stop_bots_bin()
-        .args(["web", "--db"])
-        .arg(tmp.path().join("db.sqlite3"))
-        .args(["--helper"])
-        .arg(tmp.path().join("helper.sock"))
-        .args(["--ssh-log", "/var/log/auth.log"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "--ssh-log cannot be combined with --helper",
-        ));
-}
-
-/// The refusal names the command that sets where the web server is on
-/// either server, not NGINX's alone: an Apache host's root is set with
-/// `set-web-server apache --root`.
-#[test]
-fn a_console_with_a_helper_points_a_root_at_set_web_server() {
-    let tmp = tempfile::tempdir().unwrap();
-    stop_bots_bin()
-        .args(["web", "--db"])
-        .arg(tmp.path().join("db.sqlite3"))
-        .args(["--helper"])
-        .arg(tmp.path().join("helper.sock"))
-        .args(["--root", "/etc/httpd"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "--root cannot be combined with --helper",
-        ))
-        .stderr(predicate::str::contains("`stop-bots set-web-server`"));
-}
-
-/// `--dry-run` has to be trustworthy or nobody will use it on the one
-/// command in this project that starts a daemon.
-#[test]
-fn install_web_dry_run_changes_nothing() {
-    let (tmp, binary) = fake_debian_root();
-
-    stop_bots_bin()
-        .args([
-            "install",
-            "web",
-            "--prefix",
-            tmp.path().to_str().unwrap(),
-            "--binary",
-            binary.to_str().unwrap(),
-            "--dry-run",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("nothing was changed"));
-
-    assert!(!tmp
-        .path()
-        .join("etc/systemd/system/stop-bots-web.service")
-        .exists());
-    assert!(!tmp.path().join("var/lib/stop-bots").exists());
-    assert!(!tmp.path().join("etc/stop-bots").exists());
-}
-
-/// A host that is not Debian is told so rather than given a unit nobody
-/// has checked.
-#[test]
-fn install_web_refuses_a_host_that_is_not_debian() {
-    let (tmp, binary) = fake_debian_root();
-    fs::remove_file(tmp.path().join("etc/debian_version")).unwrap();
-
-    stop_bots_bin()
-        .args([
-            "install",
-            "web",
-            "--prefix",
-            tmp.path().to_str().unwrap(),
-            "--binary",
-            binary.to_str().unwrap(),
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("not look like Debian"));
-}
-
 // ---- uninstall ----
 
 /// The host back as it was, end to end through the binary: an applied
-/// site, a generated `conf.d` file, both units and a firewall script go;
-/// the site file is byte for byte what it was before; the database stays,
-/// and the output says where.
+/// site, a generated `conf.d` file, the cron file, the boot unit and a
+/// firewall script go; the site file is byte for byte what it was before;
+/// the database stays, and the output says where.
 ///
 /// Under `--prefix`, which runs no system program; the unit tests in
 /// `uninstall` cover the host's path with fakes, and the container suite
@@ -3845,12 +3350,18 @@ fn uninstall_takes_a_prefix_back_to_how_it_was() {
         "--no-reload",
     ]);
     fs::create_dir_all(prefix.join("etc/stop-bots")).unwrap();
+    fs::create_dir_all(prefix.join("etc/cron.d")).unwrap();
+    let binary = prefix.join("stop-bots");
+    fs::write(&binary, "#!/bin/true\n").unwrap();
+    run(&[
+        "install",
+        "cron",
+        "--prefix",
+        prefix.to_str().unwrap(),
+        "--binary",
+        binary.to_str().unwrap(),
+    ]);
     let units = prefix.join("etc/systemd/system");
-    fs::write(
-        units.join("stop-bots-web.service"),
-        include_str!("fixtures/units/stop-bots-web-0.0.15.service"),
-    )
-    .unwrap();
     fs::write(prefix.join("etc/stop-bots/firewall.nft"), "table\n").unwrap();
     assert_ne!(
         fs::read_to_string(&site).unwrap(),
@@ -3864,7 +3375,7 @@ fn uninstall_takes_a_prefix_back_to_how_it_was() {
     assert_eq!(fs::read_to_string(&site).unwrap(), before, "{stdout}");
     for gone in [
         root.join("conf.d/stop-bots-limits.conf"),
-        units.join("stop-bots-web.service"),
+        prefix.join("etc/cron.d/stop-bots"),
         units.join("stop-bots-firewall.service"),
         prefix.join("etc/stop-bots"),
     ] {
@@ -3880,6 +3391,70 @@ fn uninstall_takes_a_prefix_back_to_how_it_was() {
         stdout.contains(&db.display().to_string()),
         "the output must say where the database is:\n{stdout}"
     );
+}
+
+/// A cron file naming a binary in `target/` works until the next `cargo
+/// clean`, so `install cron` refuses one and says what to run instead.
+#[test]
+fn install_cron_refuses_a_binary_in_a_build_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("etc/cron.d")).unwrap();
+    stop_bots_bin()
+        .args(["install", "cron", "--dry-run", "--prefix"])
+        .arg(tmp.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("build directory"));
+}
+
+/// One `tick` runs the due detectors against the stored access log and
+/// blocks what they find; the next one, straight after, has nothing due.
+/// The jobs that download or probe the host are marked just run, so
+/// nothing leaves this machine.
+#[test]
+fn tick_runs_what_is_due_and_then_nothing() {
+    let fx = Fixture::new();
+    let access = fx._tmp.path().join("access.log");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let stamp = std::process::Command::new("date")
+        .args(["-u", "-d", &format!("@{now}"), "+%d/%b/%Y:%H:%M:%S +0000"])
+        .output()
+        .unwrap();
+    let stamp = String::from_utf8(stamp.stdout).unwrap();
+    fs::write(
+        &access,
+        format!(
+            "203.0.113.50 - - [{}] \"GET /.env HTTP/1.1\" 404 0 \"-\" \"curl/8\"\n",
+            stamp.trim()
+        ),
+    )
+    .unwrap();
+    let ssh = fx._tmp.path().join("auth.log");
+    fs::write(&ssh, "").unwrap();
+    fx.run(&["set-log-paths", "--access-log", access.to_str().unwrap()]);
+    {
+        let db = stop_bots::db::Db::open(&fx.db).unwrap();
+        for job in [
+            "update_ip_ranges",
+            "update_everything",
+            "health_check",
+            "apply_nginx",
+        ] {
+            db.set_cron_last_run(job, now, "skipped for test").unwrap();
+        }
+    }
+
+    let first = fx.run(&["tick", "--verbose", "--ssh-log", ssh.to_str().unwrap()]);
+    let said = String::from_utf8(first.get_output().stdout.clone()).unwrap();
+    assert!(said.contains("Block probe paths"), "tick said:\n{said}");
+    fx.run(&["list-firewall-rules"])
+        .stdout(predicate::str::contains("203.0.113.50"));
+
+    fx.run(&["tick", "--verbose", "--ssh-log", ssh.to_str().unwrap()])
+        .stdout(predicate::str::contains("Nothing was due."));
 }
 
 /// `--purge` deletes the database, which every part still installed reads.
@@ -4371,17 +3946,16 @@ fn auto_apply_is_off_until_it_is_turned_on() {
         .run(&["set-auto-apply", "--enabled", "true"])
         .stdout(predicate::str::contains("enabled"))
         // Says where the work happens, because it is not in this command:
-        // setting this on a host with no console running turns on a switch
-        // nothing will ever read.
-        .stdout(predicate::str::contains("internal cron"));
+        // setting this on a host where nothing runs the schedule turns on a
+        // switch nothing will ever read.
+        .stdout(predicate::str::contains("install cron"));
 
     let db = stop_bots::db::Db::open(&fixture.db).unwrap();
     assert!(db.get_auto_apply().unwrap());
 }
 
 /// Turning the switch on must not, by itself, apply anything: the CLI sets
-/// a flag, and the internal cron inside the console or the TUI is what acts
-/// on it. A `set-` command that quietly reloaded NGINX would be the worst
+/// a flag, and the schedule (`tick`, or the TUI) is what acts on it. A `set-` command that quietly reloaded NGINX would be the worst
 /// possible surprise from a subcommand whose name says "set".
 #[test]
 fn setting_auto_apply_does_not_itself_touch_any_config() {
@@ -4582,31 +4156,6 @@ fn block_scanners_still_works_under_its_old_name() {
         fx.run(&[command, "--ssh-log", log.to_str().unwrap(), "--dry-run"])
             .stdout(predicate::str::contains("Would block 198.51.100.9"));
     }
-}
-
-/// `web`'s old setting flags still store what they used to, and say what
-/// replaces them.
-#[test]
-fn web_s_deprecated_setting_flags_still_store_and_say_so() {
-    let fx = Fixture::new();
-    fx.cmd(&[
-        "web",
-        "--allowed-hosts",
-        "admin.example.com",
-        "--set-password",
-    ])
-    .assert()
-    .success()
-    .stderr(predicate::str::contains("deprecated"))
-    .stderr(predicate::str::contains("set-web"));
-
-    let db = stop_bots::db::Db::open(&fx.db).unwrap();
-    assert_eq!(
-        db.get_text_setting(stop_bots::web::ALLOWED_HOSTS_KEY)
-            .unwrap()
-            .as_deref(),
-        Some("admin.example.com")
-    );
 }
 
 // ---- detectors ----
@@ -5014,92 +4563,6 @@ fn render_firewall_out_points_at_apply_not_a_hand_run() {
     );
 }
 
-// ---- the web console's settings ----
-
-#[test]
-fn set_web_stores_every_console_setting() {
-    let fx = Fixture::new();
-    fx.run(&[
-        "set-web",
-        "--bind",
-        "0.0.0.0:8788",
-        "--expose",
-        "true",
-        "--base-path",
-        "/stop-bots/",
-        "--allowed-hosts",
-        "admin.example.com",
-        "--trust-forwarded-for",
-        "true",
-        "--secure-cookie",
-        "true",
-    ]);
-
-    let db = stop_bots::db::Db::open(&fx.db).unwrap();
-    let text = |key| db.get_text_setting(key).unwrap();
-    let flag = |key| db.get_bool_setting(key, false).unwrap();
-    use stop_bots::web::*;
-    assert_eq!(text(BIND_KEY).as_deref(), Some("0.0.0.0:8788"));
-    assert_eq!(text(BASE_PATH_KEY).as_deref(), Some("/stop-bots"));
-    assert_eq!(
-        text(ALLOWED_HOSTS_KEY).as_deref(),
-        Some("admin.example.com")
-    );
-    assert!(flag(EXPOSE_KEY));
-    assert!(flag(TRUST_FORWARDED_KEY));
-    assert!(flag(SECURE_COOKIE_KEY));
-
-    // `false` switches them back off rather than being ignored.
-    fx.run(&[
-        "set-web",
-        "--trust-forwarded-for",
-        "false",
-        "--secure-cookie",
-        "false",
-    ]);
-    let db = stop_bots::db::Db::open(&fx.db).unwrap();
-    assert!(!db.get_bool_setting(TRUST_FORWARDED_KEY, true).unwrap());
-    assert!(!db.get_bool_setting(SECURE_COOKIE_KEY, true).unwrap());
-
-    fx.run(&["set-web"])
-        .stdout(predicate::str::contains("0.0.0.0:8788"))
-        .stdout(predicate::str::contains("admin.example.com"));
-}
-
-/// The same check `web` makes before it binds, made before anything is
-/// stored — and a refusal stores none of the other flags either.
-#[test]
-fn set_web_refuses_a_network_bind_without_exposure_and_stores_nothing() {
-    let fx = Fixture::new();
-    fx.cmd(&[
-        "set-web",
-        "--bind",
-        "0.0.0.0:8788",
-        "--allowed-hosts",
-        "admin.example.com",
-    ])
-    .assert()
-    .failure()
-    .stderr(predicate::str::contains("--expose true"));
-
-    let db = stop_bots::db::Db::open(&fx.db).unwrap();
-    assert_eq!(db.get_text_setting(stop_bots::web::BIND_KEY).unwrap(), None);
-    assert_eq!(
-        db.get_text_setting(stop_bots::web::ALLOWED_HOSTS_KEY)
-            .unwrap(),
-        None
-    );
-}
-
-/// A `Command` carrying `args`, for the tests above that need one without
-/// the `Fixture`'s own NGINX directories. Still not the host's: see
-/// [`common::stop_bots_bin`].
-fn stop_bots_cmd(args: &[&str]) -> Command {
-    let mut cmd = stop_bots_bin();
-    cmd.args(args);
-    cmd
-}
-
 // ---- upgrading from 0.0.x ----
 
 /// A database as 0.0.15 left it, restored from its SQL dump into `db`.
@@ -5394,7 +4857,8 @@ fn assert_output_terminal_safe(command: &str, output: &std::process::Output) {
 impl Fixture {
     /// This fixture with every [`HOSTILE`] value planted where a `list-*`
     /// or `status` command prints it: in the rows themselves, written with
-    /// plain SQL past every check, as the console could; in a site's
+    /// plain SQL past every check, as anyone who can write the database
+    /// could; in a site's
     /// server name; and in an access log that `host.conf` points at.
     fn hostile() -> Fixture {
         let fx = Fixture::new();
@@ -5480,7 +4944,8 @@ impl Fixture {
 }
 
 /// The confirmed attack: a title-set OSC and a C1 CSI in a firewall rule
-/// the console wrote reached root's terminal through `list-firewall-rules`.
+/// the web console wrote reached root's terminal through
+/// `list-firewall-rules`.
 /// The rule is still listed, one line each, with the characters replaced.
 #[test]
 fn list_firewall_rules_prints_a_hostile_rule_defanged_on_one_line() {
@@ -5541,7 +5006,7 @@ fn every_list_and_show_command_prints_hostile_rows_terminal_safe() {
     }
 }
 
-/// `status --cached` prints the strings of a probe the console stored,
+/// `status --cached` prints the strings of a probe as it was stored,
 /// as stored, and the checks it derives from the database: what is
 /// trusted by hand, and what the NGINX config leaves out.
 #[test]
@@ -5553,7 +5018,6 @@ fn status_cached_prints_a_hostile_probe_and_database_terminal_safe() {
         access_log_path: Some(value.clone()),
         access_log_unparsed_sample: Some(value.clone()),
         stray_generated_files: vec![value.clone()],
-        console_unreadable_logs: vec![value.clone()],
         conf_d_path: Some(value),
         ..Default::default()
     };

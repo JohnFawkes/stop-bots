@@ -57,7 +57,8 @@ pub enum RuleSource {
     Cli,
     /// A block key in the TUI.
     Tui,
-    /// A block button in the web console.
+    /// A block button in the web console, which earlier releases had. Kept
+    /// so the rules it made still read as what they are.
     Web,
     /// Never stored: the Allow every recent successful SSH login gets
     /// (`firewall::ssh_allow_rules`).

@@ -18,10 +18,8 @@
 //! This machine's host name, for the headers of both surfaces — and where
 //! on it the system programs this project runs are (see [`program`]).
 //!
-//! Read once and cached: a host does not rename itself while a console is
-//! open, the TUI's header redraws thirty times a second, and the web
-//! console builds its chrome on every request. Both used to read
-//! `/proc` themselves, the console twice per page.
+//! Read once and cached: a host does not rename itself while the TUI is
+//! open, and its header redraws thirty times a second.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};

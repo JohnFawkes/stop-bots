@@ -19,11 +19,12 @@
 //! path.
 //!
 //! Root removes, reads and puts back generated NGINX files whose paths
-//! come from `managed_files`, a table the web console can write. A path
-//! checked and then used by name can mean two different files: when one
-//! of its directories belongs to the console, the console can make it a
-//! link to somewhere else between the check and the use, and root then
-//! deletes, or writes back, a file there.
+//! come from `managed_files`, a table in a database root does not always
+//! own (see [`crate::hostconf`]). A path checked and then used by name can
+//! mean two different files: when one of its directories belongs to
+//! another user, that user can make it a link to somewhere else between
+//! the check and the use, and root then deletes, or writes back, a file
+//! there.
 //!
 //! So a [`DirFile`] holds its directory open from the moment it is
 //! checked. The directory is opened one component at a time with

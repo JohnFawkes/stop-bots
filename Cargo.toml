@@ -13,7 +13,7 @@ authors = ["Marko Ivankovic <marko@ivankovic.me>"]
 # "only" to match the header on every source file, which grants
 # "version 3 of the License" and no later version.
 license = "AGPL-3.0-only"
-description = "A TUI, web console and CLI that help you configure your server to stop bad bots without hiding behind a CDN. Works with NGINX or Apache, and nftables or iptables."
+description = "A TUI and CLI that help you configure your server to stop bad bots without hiding behind a CDN. Works with NGINX or Apache, and nftables or iptables."
 repository = "https://github.com/ivankovic/stop-bots"
 homepage = "https://github.com/ivankovic/stop-bots"
 readme = "README.md"
@@ -62,8 +62,8 @@ license-file = ["LICENSE", "0"]
 section = "net"
 priority = "optional"
 extended-description = """\
-A TUI, a web console and a CLI that help you configure your server to stop bad \
-bots without hiding behind a CDN. It classifies known bots by category and \
+A TUI and a CLI that help you configure your server to stop bad bots \
+without hiding behind a CDN. It classifies known bots by category and \
 blocks them in your NGINX or Apache config, and writes an nftables or iptables \
 script that blocks countries, datacenter ranges and addresses caught scanning \
 your logs, recording why each one is blocked. For Debian and Ubuntu with \
@@ -92,11 +92,10 @@ depends = ""
 recommends = "nftables | iptables"
 suggests = "nginx | apache2"
 
-# No maintainer scripts, and no unit file, on purpose. `stop-bots install web`
-# writes the systemd unit, creates /var/lib/stop-bots 0700 and generates the
-# console password -- with a --dry-run that prints the whole plan first,
-# because it is the one command in the project that starts a daemon. A package
-# that shipped an enabled unit would start a root-run web console on `apt
+# No maintainer scripts, no cron file and no unit, on purpose. `stop-bots
+# install cron` writes the schedule and `stop-bots install firewall` the boot
+# unit, each with a --dry-run that prints the plan first. A package that
+# shipped either would start blocking or loading firewall rules on `apt
 # install`, which contradicts the rule the rest of the project is built on:
 # nothing happens without you.
 #
@@ -144,42 +143,12 @@ futures = "0.3"
 
 # For CLI argument parsing
 clap = { version = "4.4", features = ["derive", "env"] }
-# For the web UI. `axum` is close to free here: `reqwest` already brings
-# `hyper`, `http` and `tower`, so this adds the router and little else.
-# Default features off — `axum`'s defaults pull in multipart, ws and
-# tracing, none of which this serves.
-axum = { version = "0.8", default-features = false, features = [
-    "http1",
-    "tokio",
-    "query",
-    "form",
-] }
-
-# The console's own accept loop, for what `axum::serve` does not offer: a
-# header read timeout (which needs hyper's timer) and a cap on open
-# connections. Both are already in the tree under axum and reqwest, with
-# these features; naming them adds no crate. `tower` is here for
-# `ServiceExt::oneshot`, which the loop calls the router with.
-hyper = { version = "1", default-features = false, features = ["server", "http1"] }
-hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
-tower = { version = "0.5.3", default-features = false, features = ["util"] }
-
-# HTML as a compile-time macro rather than runtime templates: a typo in a
-# tag name is a build error, escaping is on by default, and there are no
-# template files to ship alongside the binary.
-maud = { version = "0.27", features = ["axum"] }
-
-# For hashing the web UI's password. Argon2id is the current default
-# recommendation for a password that guards root-equivalent access.
-argon2 = "0.6"
-
-# Session ids and CSRF tokens. `rand` was already in the tree; this makes
-# the dependency direct because the security of those tokens depends on it.
+# The random name the firewall script is staged under, so nothing planted
+# beside it can be opened in its place.
 rand = "0.10"
 
-# Constant-time comparison for session and CSRF tokens, so neither can be
-# recovered a byte at a time from response timing.
-subtle = { version = "2", default-features = false }
+# The hash a generated unit or cron file records of its own text, and
+# the firewall rule-set signature.
 sha2 = "0.11.0"
 
 # `geteuid`/`getegid`, which std does not expose: deciding whether a
@@ -205,11 +174,6 @@ tempfile = "3"
 # The pty harness that drives the TUI in e2e tests (tests/tui.rs) is on
 # raw libc, which is now a normal dependency — see the comment there for
 # why it isn't a crate.
-# `ServiceExt::oneshot`, to drive the web router in tests without binding
-# a port. The whole middleware stack runs, which is the part worth
-# testing; a real listener would only add a port to collide on.
-tower = { version = "0.5.3", features = ["util"] }
-
 # Rasterising the TUI's own SVG frames into the animated tour in
 # `docs/screenshots/`. Dev-only on purpose: the shipped binary draws to a
 # terminal and has no use for an SVG renderer, so `cargo install
@@ -217,21 +181,6 @@ tower = { version = "0.5.3", features = ["util"] }
 # and `tiny-skia` it needs, so this is two entries rather than four.
 resvg = "0.48"
 gif = "0.14"
-
-# Argon2 is deliberately expensive, and an unoptimised build multiplies
-# that by roughly twenty: the same hash that costs ~50ms in the shipped
-# binary cost nearly two seconds under `cargo test`, which made every
-# web-UI test blow its budget and starved the rest of the suite of CPU.
-#
-# Optimising these two packages *only* fixes it without touching the cost
-# parameters, which are the OWASP-recommended defaults and are what the
-# tests should be exercising. Everything else stays unoptimised and
-# debuggable.
-[profile.dev.package.argon2]
-opt-level = 3
-
-[profile.dev.package.blake2]
-opt-level = 3
 
 [profile.release]
 opt-level = 2

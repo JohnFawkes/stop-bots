@@ -2074,6 +2074,17 @@ impl Db {
         self.set_bool_setting(keys::AUTO_APPLY_FIREWALL, auto)
     }
 
+    /// Whether a cloud-provider feed leaves port 80 open for Let's Encrypt.
+    /// On unless someone chose otherwise: closed, every certificate this
+    /// host renews over HTTP stops renewing.
+    pub fn get_cloud_port_80_open(&self) -> Result<bool> {
+        self.get_bool_setting(keys::CLOUD_PORT_80_OPEN, true)
+    }
+
+    pub fn set_cloud_port_80_open(&self, open: bool) -> Result<()> {
+        self.set_bool_setting(keys::CLOUD_PORT_80_OPEN, open)
+    }
+
     pub fn get_serve_robots_txt(&self) -> Result<bool> {
         self.get_bool_setting(keys::SERVE_ROBOTS_TXT, false)
     }
@@ -3520,7 +3531,9 @@ impl Db {
     /// to an address nothing but a cloud feed blocks. In Allowlist mode
     /// there are none: an Allow ahead of the catch-all would let every
     /// cloud address outside the allowed countries reach port 80, and that
-    /// mode turns away most of Let's Encrypt's validators regardless.
+    /// mode turns away most of Let's Encrypt's validators regardless. Nor
+    /// when [`Self::get_cloud_port_80_open`] is off: a host that renews
+    /// over DNS, or has no certificate, may want the port closed too.
     pub fn derived_firewall_entries(&self) -> Result<Vec<(String, Option<u16>, FirewallAction)>> {
         let mut entries: Vec<(String, Option<u16>, FirewallAction)> = self
             .blocked_ip_ranges()?
@@ -3543,7 +3556,7 @@ impl Db {
         let cloud_blocks = cloud
             .into_iter()
             .map(|(_, address)| (address, None, FirewallAction::Block));
-        if self.get_geo_mode()? == GeoMode::Blocklist {
+        if self.get_geo_mode()? == GeoMode::Blocklist && self.get_cloud_port_80_open()? {
             entries.extend(
                 geo.into_iter()
                     .map(|(address, action)| (address, None, action)),
@@ -6194,6 +6207,20 @@ mod tests {
         for (what, ip, port, expected) in cases {
             assert_eq!(verdict(&entries, ip, port), expected, "{what}: {entries:?}");
         }
+    }
+
+    /// The operator's choice, for a host that renews over DNS or has no
+    /// certificate.
+    #[test]
+    fn with_port_80_closed_a_cloud_feed_blocks_it_too() {
+        let db = with_feeds(&[("aws", &["18.216.0.0/16"])]);
+        db.set_cloud_port_80_open(false).unwrap();
+        let entries = db.derived_firewall_entries().unwrap();
+        assert_eq!(
+            verdict(&entries, "18.216.118.75", 80),
+            Some(FirewallAction::Block),
+            "{entries:?}"
+        );
     }
 
     /// An Allow ahead of the catch-all would open port 80 to every cloud

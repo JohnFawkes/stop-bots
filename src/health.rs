@@ -1843,7 +1843,7 @@ fn lets_encrypt_reachable(rules: &[FirewallRule], probe: &Probe) -> Option<Check
                 dropped.join(", ")
             ),
             Some(
-                "renewals will fail and the certificates expire: lift the rules named, or renew with a DNS challenge (a certbot dns-* plugin)"
+                "renewals will fail and the certificates expire: lift the rules named (for a cloud-provider feed, `stop-bots set-cloud-port-80 --enabled true`), or renew with a DNS challenge (a certbot dns-* plugin)"
                     .to_string(),
             ),
         )

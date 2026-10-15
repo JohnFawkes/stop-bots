@@ -93,6 +93,9 @@ pub const FIREWALL_RENDERED_SIGNATURE: &str = "firewall_rendered_signature";
 pub const FIREWALL_APPLIED_SIGNATURE: &str = "firewall:applied_signature";
 /// Whether the internal cron applies the rendered firewall script.
 pub const AUTO_APPLY_FIREWALL: &str = "auto_apply_firewall";
+/// Whether a cloud-provider feed leaves port 80 open, so Let's Encrypt
+/// can reach it (see `Db::derived_firewall_entries`).
+pub const CLOUD_PORT_80_OPEN: &str = "firewall:cloud_port_80_open";
 
 // ---- detectors ----
 //
@@ -148,6 +151,7 @@ pub const ALL: &[&str] = &[
     FIREWALL_RENDERED_SIGNATURE,
     FIREWALL_APPLIED_SIGNATURE,
     AUTO_APPLY_FIREWALL,
+    CLOUD_PORT_80_OPEN,
     DETECT_PROBE_PATHS_EXTRA,
     DETECT_HONEYPOT_PATH,
     DETECT_SUBNET_ESCALATION,

@@ -858,6 +858,27 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     })
 }
 
+/// Whether `user_agent` is refused by a choice somebody made about it: a
+/// bot the lists class as a scanner or an AI crawler, or an agent blocked
+/// by hand. Its refusal is the policy working, however much it was served
+/// before it was listed — a scanner gets through until a list names it.
+///
+/// What is left is the case [`turned_away_clients`] exists for: a client
+/// caught by an uncategorised pattern, as Nextcloud's and Jellyfin's apps
+/// were by `okhttp`, or by a rule about the shape of a request. Matched as
+/// the Firewall screen matches ([`crate::dynamic::matched_alternative`]),
+/// and a hand-blocked agent as NGINX matches it: a substring, in any case.
+fn refused_on_purpose(user_agent: &str, bots: &[crate::db::Bot], by_hand: &[String]) -> bool {
+    let lower = user_agent.to_lowercase();
+    by_hand
+        .iter()
+        .any(|blocked| lower.contains(&crate::db::stored_user_agent(blocked).to_lowercase()))
+        || bots.iter().any(|bot| {
+            (bot.is_scanner || bot.is_ai)
+                && crate::dynamic::matched_alternative(user_agent, bot).is_some()
+        })
+}
+
 /// How few refusals are worth a line. Low on purpose: a first-party app
 /// that cannot reach its server retries, so a real one clears this in
 /// minutes, and the cost of a false positive is one line naming a client
@@ -886,9 +907,14 @@ const TURNED_AWAY_MIN_REFUSALS: u64 = 5;
 /// Absent rather than "nothing to report" when there is nothing, like its
 /// neighbours: a line saying so on every healthy host is noise.
 fn turned_away_clients(db: &Db, probe: &Probe) -> Result<Option<Check>> {
+    let bots = db.list_bots()?;
+    let by_hand = db.list_blocked_user_agents()?;
     let mut regressions: Vec<&crate::accesslog::TurnedAway> = Vec::new();
     for entry in &probe.turned_away {
         if entry.refused < TURNED_AWAY_MIN_REFUSALS {
+            continue;
+        }
+        if refused_on_purpose(&entry.user_agent, &bots, &by_hand) {
             continue;
         }
         if db.user_agent_stat(&entry.user_agent)?.is_some() {
@@ -2269,6 +2295,54 @@ mod tests {
             check.fix.as_deref().is_some_and(|f| f.contains("trust")),
             "and say how to allow it: {:?}",
             check.fix
+        );
+    }
+
+    /// A scanner the lists name, or an agent blocked by hand, is refused on
+    /// purpose, even one this host served before the list caught up with
+    /// it. A client caught by an uncategorised pattern still is reported.
+    #[test]
+    fn an_agent_refused_on_purpose_is_not_reported() {
+        let db = db();
+        crate::botlist::register_all_sources(&db).unwrap();
+        let source = db.list_sources().unwrap()[0].id.clone();
+        for (slug, pattern, scanner) in [
+            ("cyberconvoyscout", "CyberConvoyScout", true),
+            ("okhttp", "okhttp", false),
+        ] {
+            db.upsert_bot(&crate::db::NewBot {
+                slug: slug.into(),
+                name: slug.into(),
+                is_ai: false,
+                is_search_engine: false,
+                is_scanner: scanner,
+                user_agent_pattern: pattern.into(),
+                source_id: source.clone(),
+            })
+            .unwrap();
+        }
+        db.block_user_agent("curl/8.7.1").unwrap();
+        let scanner = "Mozilla/5.0 (compatible; CyberConvoyScout/1.0)";
+        let app = "Jellyfin Android TV/0.19.10 (OkHttp/4.12.0)";
+        for agent in [scanner, "curl/8.7.1", app] {
+            seen_working(&db, agent);
+        }
+        let probe = Probe {
+            turned_away: vec![
+                refused(scanner, 2_127, 0),
+                refused("curl/8.7.1", 1_479, 0),
+                refused(app, 262, 0),
+            ],
+            ..healthy()
+        };
+
+        let report = assess(&db, &probe).unwrap();
+        let check = check2(&report, "turned-away-clients");
+
+        assert!(
+            check.detail.starts_with("1 user agent(s)") && check.detail.contains("Jellyfin"),
+            "only the app caught by an uncategorised pattern belongs here: {}",
+            check.detail
         );
     }
 

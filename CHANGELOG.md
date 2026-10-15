@@ -44,6 +44,10 @@ the database unread, so an NGINX host can still go back to 0.1.1.
   that crawler's published ranges is the forged-crawler detector's to judge, and is now
   left out of the "Clients this host used to serve" check: on one host, 16,210 refusals
   of forged Googlebots probing for `/.env` read as Googlebot being blocked.
+- The same check no longer lists agents refused on purpose: a bot the lists class as a
+  scanner or an AI crawler, or an agent blocked by hand, even one served before a list
+  named it. What it reports is what it was written for, a client caught by an
+  uncategorised pattern, as the Nextcloud and Jellyfin apps were by `okhttp`.
 
 ### Removed
 

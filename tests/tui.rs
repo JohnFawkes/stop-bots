@@ -1302,6 +1302,30 @@ fn dashboard_geo_mode_toggle_switches_to_allowlist() {
         .expect("process should exit after q on the Dashboard");
 }
 
+/// "Only trusted IPs" is the geo mode popup's third option: choosing it
+/// names the mode in the Geo panel's title, and says that nothing is
+/// trusted yet on a host where nothing is.
+#[test]
+fn dashboard_geo_mode_only_trusted_ips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = spawn_tui(&tmp.path().join("db.sqlite3"));
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "m");
+    session.exp_string("Geo mode").unwrap();
+    session.exp_string("trusted").unwrap();
+    send_key(&mut session, "\x1b[B");
+    send_key(&mut session, "\x1b[B");
+    send_key(&mut session, "\r");
+    session.exp_string("(0)").unwrap();
+    session.exp_string("nothing").unwrap();
+
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+}
+
 /// The one code path in the whole project that *executes* a generated
 /// firewall script — the render popup's "apply after writing" toggle —
 /// driven end to end against a fake `nft` on PATH. Everything real runs:

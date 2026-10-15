@@ -8,6 +8,17 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Added
+
+- **Only trusted IPs, a geo mode in the TUI.** The Dashboard's geo mode popup (`m`) has
+  a third option beside Blocklist and Allowlist: block everything host-wide except the
+  addresses trusted on the Firewall screen, SSH logins from the last week and private
+  networks. It is Allowlist with no country selected, which is what it was before it had
+  a name, so choosing it deselects every country, and adding one makes it Allowlist
+  again. The Geo panel's title says `only trusted IPs` with how many are trusted, and
+  choosing it with nothing trusted says so first. On the command line it is still
+  `set-geo-mode --mode allowlist` with no country selected.
+
 ### Fixed
 
 - The SSH-scanner detector now sees failed logins on a host that takes keys only. There,

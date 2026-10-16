@@ -127,6 +127,32 @@ impl Service {
         }
     }
 
+    /// The pages the application's own sign-in form or apps post a
+    /// password to, beyond the ones every site is checked for
+    /// ([`crate::accesslog::LOGIN_PATHS`]): what the login brute-force
+    /// detector counts on a site running it. Whole paths, compared
+    /// ignoring case, never prefixes: Nextcloud's desktop client polls
+    /// `/login/v2/poll` every few seconds while it waits for its owner,
+    /// and that is not a login attempt.
+    ///
+    /// Immich (`/api/auth/login`) and Navidrome (`/auth/login`) sign in at
+    /// paths already on the built-in list.
+    pub fn login_routes(self) -> &'static [&'static str] {
+        match self {
+            Service::Nextcloud => &["/index.php/login"],
+            Service::Jellyfin => &["/Users/AuthenticateByName"],
+            Service::Immich | Service::Navidrome => &[],
+        }
+    }
+
+    /// Whether `path`, already normalised as NGINX normalises it, is one
+    /// of [`Self::login_routes`].
+    fn signs_in_at(self, path: &str) -> bool {
+        self.login_routes()
+            .iter()
+            .any(|route| path.eq_ignore_ascii_case(route))
+    }
+
     /// Whether `path`, already normalised as NGINX normalises it, is on
     /// one of [`Self::app_routes`].
     fn routes(self, path: &str) -> bool {
@@ -210,6 +236,28 @@ impl Hosted {
             return false;
         }
         let path = format!("/{}", crate::accesslog::path_segments(path).join("/"));
+        self.for_site(hosts, |service| service.routes(&path))
+    }
+
+    /// Whether a request for `path` is a sign-in to the application behind
+    /// its site ([`Service::login_routes`]), given every host name the
+    /// line carries. As [`Self::app_request`] does, a request naming no
+    /// site is judged against every application here.
+    pub fn app_login<'a>(&self, hosts: impl IntoIterator<Item = &'a str>, path: &str) -> bool {
+        if self.sites.iter().all(|(_, service)| service.is_none()) {
+            return false;
+        }
+        let path = format!("/{}", crate::accesslog::path_segments(path).join("/"));
+        self.for_site(hosts, |service| service.signs_in_at(&path))
+    }
+
+    /// `test` of the application behind the site `hosts` names, or of any
+    /// application here when they name none.
+    fn for_site<'a>(
+        &self,
+        hosts: impl IntoIterator<Item = &'a str>,
+        test: impl Fn(Service) -> bool,
+    ) -> bool {
         let site = hosts.into_iter().find_map(|host| {
             let name = host_name(host);
             self.sites
@@ -217,12 +265,12 @@ impl Hosted {
                 .find(|(site, _)| site.eq_ignore_ascii_case(name))
         });
         match site {
-            Some((_, service)) => service.is_some_and(|service| service.routes(&path)),
+            Some((_, service)) => service.is_some_and(&test),
             None => self
                 .sites
                 .iter()
                 .filter_map(|(_, service)| *service)
-                .any(|service| service.routes(&path)),
+                .any(test),
         }
     }
 }
@@ -357,6 +405,26 @@ mod tests {
     fn a_server_with_no_recognised_application_allows_nothing() {
         let hosted = Hosted::new(vec![("blog.example.com".to_string(), None)]);
         assert!(!hosted.app_request([], "/remote.php/dav/x"));
+    }
+
+    #[test]
+    fn an_application_s_sign_in_page_counts_only_where_it_runs() {
+        let cases = [
+            ("cloud.example.com", "/index.php/login", true),
+            ("cloud.example.com", "/index.php/login/", true),
+            ("media.example.com", "/users/authenticatebyname", true),
+            ("blog.example.com", "/Users/AuthenticateByName", false),
+            ("media.example.com", "/index.php/login", false),
+            // The desktop client polling while its owner approves it.
+            ("cloud.example.com", "/index.php/login/v2/poll", false),
+        ];
+        for (host, path, expected) in cases {
+            assert_eq!(hosted().app_login([host], path), expected, "{host} {path}");
+        }
+        assert!(
+            hosted().app_login([], "/Users/AuthenticateByName"),
+            "a request naming no site could have reached Jellyfin"
+        );
     }
 
     /// NGINX routes `/remote.php/../.env` as `/.env`.

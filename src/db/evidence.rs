@@ -231,8 +231,10 @@ impl Db {
     pub fn evidence_rows(&self, detector: Detector, since: i64, rule: Rule) -> Result<Vec<Row>> {
         let (least, measure) = match rule {
             Rule::Once => (1, "COUNT(*)"),
+            Rule::AfterWarning => (2, "COUNT(*)"),
             Rule::Distinct(n) => (n as i64, "COUNT(*)"),
             Rule::AtLeast(n) => (n as i64, "SUM(count)"),
+            Rule::Rate { lines, refused } => (lines.min(refused) as i64, "SUM(count)"),
         };
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT address, item, count, first_seen, last_seen FROM log_evidence

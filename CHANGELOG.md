@@ -65,6 +65,33 @@ back, put back the copy the upgrade kept, `/var/lib/stop-bots/db.sqlite3.bak-v7`
   marked new, on one an earlier release created:
   `stop-bots set-detector probe-paths --app-aware true` turns it on.
 
+- **Login brute force** (`login-attempts`): blocks an address that sends 20 or more
+  login attempts within an hour, for a day. A login attempt is a `POST` to a sign-in
+  page: `/wp-login.php`, `/xmlrpc.php`, `/user/login`, `/login`, `/users/sign_in`,
+  Joomla's `/administrator/index.php` and the like, plus the sign-in page of an
+  application recognised behind a site (Nextcloud's `/index.php/login`, Jellyfin's
+  `/Users/AuthenticateByName`). A login that succeeds in the end does not excuse the
+  attempts before it. On for a database this release creates; off, and marked new, on an
+  existing one (`stop-bots set-detector login-attempts --enabled true`). Trusted
+  addresses, addresses that logged in over SSH and verified crawlers are never blocked.
+- **Request rate** (`request-rate`): blocks an address that keeps up more than 120
+  requests a minute for an hour, or that NGINX's own rate limit refused (429) a hundred
+  times in the hour, for a day. The threshold is requests a minute
+  (`stop-bots set-detector request-rate --threshold 300`). It is the only defence against
+  a flood an Apache host has, which has no rate limiting here. Off by default, since
+  many people can share one address; what an application recognised behind a site
+  fetches on its own data routes does not count, and trusted addresses and verified
+  crawlers are never blocked.
+- **robots.txt violators** (`robots-violators`): blocks a client that fetched
+  `robots.txt` and then a page it forbids to that client, for a week: a bot named in
+  a `User-agent:` group with `Disallow: /` asking for anything, or anyone asking for the
+  honeypot's trap path. It judges by the robots.txt stop-bots generates, the only one
+  whose rules it knows were served, so it does nothing until that is on
+  (`stop-bots set-robots-txt --enabled true`). Off by default; verified crawlers are
+  never blocked.
+- `list-detectors` marks a detector added since the database was created, and
+  `list-detectors --json` carries it as `new_in_this_release`.
+
 ## [0.3.0] — 2026-10-16
 
 The release that gets stop-bots ready to stand behind a 1.0: an undo for firewall

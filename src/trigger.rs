@@ -82,6 +82,8 @@ pub fn evidence_for(
                 | Detector::AssetRatio
                 | Detector::RotatingUserAgent
                 | Detector::RefererlessCrawl
+                | Detector::LoginAttempts
+                | Detector::RequestRate
         );
         for request in log_text.lines().filter_map(parse_request) {
             let Some((_, hint)) = wanted.get(&request.ip) else {
@@ -117,7 +119,7 @@ fn describe(detector: Detector, request: &Request, hint: Option<&str>) -> Option
                 .then(with_agent)
         }
         // The detector reports the path it matched, as logged.
-        Detector::ProbePaths | Detector::Honeypot => {
+        Detector::ProbePaths | Detector::Honeypot | Detector::RobotsViolators => {
             let matched = hint.map_or(request.path != "/", |path| {
                 request.path == path.split('?').next().unwrap_or("").to_lowercase()
             });
@@ -140,6 +142,17 @@ fn describe(detector: Detector, request: &Request, hint: Option<&str>) -> Option
         }
         Detector::RotatingUserAgent => Some(with_agent()),
         Detector::AssetRatio | Detector::RefererlessCrawl => Some(plain()),
+        // The last request: the rate needs no one line to stand for it.
+        Detector::RequestRate => Some(with_agent()),
+        // The last attempt, on the page the detector named.
+        Detector::LoginAttempts => {
+            let post = request
+                .request
+                .get(..5)
+                .is_some_and(|method| method.eq_ignore_ascii_case("POST "));
+            let page = hint.is_none_or(|path| request.path == path.to_lowercase());
+            (post && page).then(with_agent)
+        }
         Detector::SshScanners => None,
     }
 }

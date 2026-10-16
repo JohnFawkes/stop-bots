@@ -6092,6 +6092,150 @@ fn list_detectors_json_carries_each_detector_s_settings() {
     assert_eq!(repeat["max_days"], 90, "{repeat:#}");
 }
 
+/// `(enabled, new_in_this_release)` of each named detector, as
+/// `list-detectors --json` reports them.
+fn detector_states(fx: &Fixture, names: &[&str]) -> Vec<(String, bool, bool)> {
+    let listed = fx.json(&["list-detectors"]);
+    names
+        .iter()
+        .map(|name| {
+            let row = listed["detectors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["name"] == *name)
+                .unwrap_or_else(|| panic!("no {name}:\n{listed:#}"));
+            (
+                name.to_string(),
+                row["enabled"].as_bool().unwrap(),
+                row["new_in_this_release"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// The detectors added after 0.3 follow their own default on a database
+/// this release creates, and nothing else marks them new there.
+#[test]
+fn a_new_database_starts_the_detectors_added_since_0_3_at_their_defaults() {
+    let fx = Fixture::new();
+    assert_eq!(
+        detector_states(&fx, &["login-attempts", "request-rate", "robots-violators"]),
+        [
+            ("login-attempts".to_string(), true, false),
+            ("request-rate".to_string(), false, false),
+            ("robots-violators".to_string(), false, false),
+        ]
+    );
+}
+
+/// On a database an earlier release created, an upgrade starts none of
+/// them: each is off, and says it is new, until someone chooses.
+#[test]
+fn an_existing_database_leaves_the_detectors_added_since_0_3_off_and_new() {
+    let fx = Fixture::new();
+    fx.db()
+        .set_int_setting(stop_bots::db::keys::DEFAULTS_GENERATION, 2)
+        .unwrap();
+    assert_eq!(
+        detector_states(&fx, &["login-attempts", "request-rate", "robots-violators"]),
+        [
+            ("login-attempts".to_string(), false, true),
+            ("request-rate".to_string(), false, true),
+            ("robots-violators".to_string(), false, true),
+        ]
+    );
+    let listing = fx.run(&["list-detectors"]);
+    let out = String::from_utf8_lossy(&listing.get_output().stdout).into_owned();
+    assert!(
+        out.lines()
+            .any(|l| l.starts_with("login-attempts") && l.contains("new in this release")),
+        "list-detectors was:\n{out}"
+    );
+}
+
+/// A password-guesser in a log given by hand, through the real binary.
+#[test]
+fn run_detector_login_attempts_dry_run_finds_the_password_guesser() {
+    let fx = Fixture::new();
+    let log = fx.db.with_file_name("access.log");
+    let post = |ip: &str| {
+        format!(
+            "{ip} - - [10/Jul/2026:12:00:00 +0000] \"POST /wp-login.php HTTP/1.1\" 200 0 \"-\" \
+             \"Mozilla/5.0\"\n"
+        )
+    };
+    let lines = [
+        post("203.0.113.9").repeat(25),
+        post("198.51.100.4").repeat(3),
+    ]
+    .concat();
+    fs::write(&log, lines).unwrap();
+
+    fx.run(&[
+        "run-detector",
+        "login-attempts",
+        "--access-log",
+        log.to_str().unwrap(),
+        "--dry-run",
+    ])
+    .stdout(predicate::str::contains("Would add 1 new block rule"))
+    .stdout(predicate::str::contains("203.0.113.9"));
+    assert!(
+        fx.db().list_firewall_rules().unwrap().is_empty(),
+        "a dry run wrote a rule"
+    );
+}
+
+/// A client NGINX's rate limit kept refusing, in a log given by hand.
+#[test]
+fn run_detector_request_rate_dry_run_finds_the_client_refused_again_and_again() {
+    let fx = Fixture::new();
+    let log = fx.db.with_file_name("access.log");
+    let lines = [
+        access_line("203.0.113.9", "/", 429, "Mozilla/5.0").repeat(150),
+        access_line("198.51.100.4", "/", 200, "Mozilla/5.0").repeat(20),
+    ]
+    .concat();
+    fs::write(&log, lines).unwrap();
+
+    fx.run(&[
+        "run-detector",
+        "request-rate",
+        "--access-log",
+        log.to_str().unwrap(),
+        "--dry-run",
+    ])
+    .stdout(predicate::str::contains("Would add 1 new block rule"))
+    .stdout(predicate::str::contains("203.0.113.9"));
+}
+
+/// A client that read the generated robots.txt and then went for the trap
+/// it publishes, in a log given by hand.
+#[test]
+fn run_detector_robots_violators_dry_run_finds_the_client_that_ignored_robots_txt() {
+    let fx = Fixture::new();
+    fx.run(&["set-robots-txt", "--enabled", "true"]);
+    let log = fx.db.with_file_name("access.log");
+    let lines = [
+        access_line("203.0.113.9", "/robots.txt", 200, "Bot"),
+        access_line("203.0.113.9", "/stop-bots-trap/x", 404, "Bot"),
+        access_line("198.51.100.4", "/stop-bots-trap/x", 404, "Bot"),
+    ]
+    .concat();
+    fs::write(&log, lines).unwrap();
+
+    fx.run(&[
+        "run-detector",
+        "robots-violators",
+        "--access-log",
+        log.to_str().unwrap(),
+        "--dry-run",
+    ])
+    .stdout(predicate::str::contains("Would add 1 new block rule"))
+    .stdout(predicate::str::contains("203.0.113.9"));
+}
+
 #[test]
 fn list_access_stats_json_lists_each_user_agent_s_hits() {
     let fx = Fixture::new();

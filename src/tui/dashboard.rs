@@ -5226,6 +5226,49 @@ mod tests {
         assert_eq!(dashboard.protection_detail(row), " up to 8x");
     }
 
+    /// The detectors added after 0.3, on a database 0.3 created: each row
+    /// is off and says "new", and `?` says what it blocks, who it might
+    /// catch, and why it is off.
+    #[test]
+    fn a_detector_added_since_0_3_is_new_and_explained_on_an_older_database() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_int_setting(crate::db::keys::DEFAULTS_GENERATION, 2)
+            .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        focus_protection(&mut dashboard, &db);
+
+        for detector in [
+            Detector::LoginAttempts,
+            Detector::RequestRate,
+            Detector::RobotsViolators,
+        ] {
+            let row = ProtectionRow::Detect(detector);
+            let id = detector.id();
+            assert!(
+                !dashboard.protection_enabled(row),
+                "{id} on after an upgrade"
+            );
+            assert_eq!(dashboard.protection_detail(row), " new", "{id}");
+
+            select_detector(&mut dashboard, detector);
+            let text: Vec<String> = dashboard
+                .explain()
+                .body
+                .iter()
+                .map(|line| line.to_string())
+                .collect();
+            let text = text.join("\n");
+            for expected in [
+                detector.about(),
+                detector.risk().unwrap_or_default(),
+                "New since this database was created",
+            ] {
+                assert!(text.contains(expected), "{id}: {expected:?} in:\n{text}");
+            }
+        }
+    }
+
     #[test]
     fn turning_repeat_offenders_off_persists_it() {
         let db = Db::open_in_memory().unwrap();
@@ -5964,7 +6007,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         let rows = dashboard.protection_rows();
-        assert_eq!(rows.len(), 20, "if this changes, so does the panel height");
+        assert_eq!(rows.len(), 23, "if this changes, so does the panel height");
         for row in rows {
             let label = dashboard.protection_label(row);
             assert!(content.contains(&label), "{label:?} is not on screen");

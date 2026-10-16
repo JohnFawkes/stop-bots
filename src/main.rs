@@ -2441,6 +2441,28 @@ fn set_geo_mode(db_path: Option<PathBuf>, mode: GeoModeArg) -> Result<()> {
     let mode: stop_bots::db::GeoMode = mode.into();
     db.set_geo_mode(mode)?;
     say!("Geo mode set to {mode:?}");
+    // What the countries already on the list now mean: switching keeps
+    // the list, so the ones that were blocked become the only ones allowed.
+    let countries = db.list_selected_countries()?.join(" ").to_uppercase();
+    say!(
+        "{}",
+        match (mode, countries.is_empty()) {
+            (stop_bots::db::GeoMode::Blocklist, true) =>
+                "No country is selected, so none is blocked.".to_string(),
+            (stop_bots::db::GeoMode::Blocklist, false) =>
+                format!("Blocked: {countries}. Every other country is allowed."),
+            (stop_bots::db::GeoMode::Allowlist, true) =>
+                "WARNING: no country is selected, so every address is blocked except trusted \
+                 addresses, SSH logins from the last week and private networks. Add the countries \
+                 you allow with `add-country`, or trust your address with `trust --address`."
+                    .to_string(),
+            (stop_bots::db::GeoMode::Allowlist, false) => format!(
+                "Allowed: {countries}. Every other country is blocked on every port; make sure the \
+                 country you connect from is one of them."
+            ),
+        }
+    );
+    say!("Run render-firewall, then apply the script, to enforce it.");
     Ok(())
 }
 

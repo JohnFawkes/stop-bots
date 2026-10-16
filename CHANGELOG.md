@@ -27,6 +27,22 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   It now says no one was checked, and refuses an apply whose rules block every address
   not listed (Allowlist, Only trusted IPs), since that blocks whoever connects next.
   This also applies to `batch --apply` and auto-apply.
+- **Switching the geo mode asks first when it changes what the country list means.** The
+  list is kept across modes, so Blocklist to Allowlist turned the countries you meant to
+  block into the only ones allowed, with nothing said until afterwards. The TUI now names
+  the countries and what they become before switching, as it does for an Allowlist with
+  no country yet, and for Only trusted IPs, which takes every country off the list.
+  `set-geo-mode` prints the same.
+- **Turning on auto-apply of the firewall script asks first**, and says what it does: the
+  scheduled render runs within five minutes of any change to the rules, not daily as the
+  message said, and with auto-apply on it runs the script with no preview.
+- Messages that named a key that does nothing where they appear. Blocks said `F, or a`,
+  and a site's detail view said `apply (a/A)`. `a` and `A` now work in the detail view,
+  and Blocks and Firewall name "a on the Dashboard" in place of `F` and CLI commands.
+- Enter on a Firewall row blocked by a downloaded list did nothing, silently. It now says
+  where the block comes from.
+- The Firewall screen said "No failed SSH logins… this is the good case" when it could not
+  read the SSH log at all. It now says the log could not be read, and how to fix that.
 
 ## [0.2.1] — 2026-10-15
 

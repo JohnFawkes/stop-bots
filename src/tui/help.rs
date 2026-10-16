@@ -242,6 +242,7 @@ mod tests {
                 "Bot settings",
             ),
             ("tui/firewall.rs", include_str!("firewall.rs"), "Firewall"),
+            ("tui/blocks.rs", include_str!("blocks.rs"), "Blocks"),
             ("tui/nginx.rs", include_str!("nginx.rs"), "NGINX"),
             (
                 "tui/site_detail.rs",

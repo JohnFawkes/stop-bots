@@ -457,7 +457,9 @@ impl SiteDetail {
                 ],
             ),
         };
-        (name, own.into_iter().chain(common).collect())
+        // In the search box `a` is a letter of a bot's name.
+        let apply = (self.focus != Focus::Search).then_some(("a/A", "apply site/all"));
+        (name, own.into_iter().chain(apply).chain(common).collect())
     }
 
     fn bot_line(&self, bot: &Bot) -> Line<'static> {

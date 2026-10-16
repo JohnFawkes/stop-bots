@@ -235,6 +235,12 @@ enum Popup {
         preview: Option<std::sync::Arc<crate::preview::ApplyPreview>>,
         selected: usize,
     },
+    /// A change that deserves a second look, with what it does spelled
+    /// out: go ahead (0) or cancel (1). See [`Confirm`].
+    Confirm {
+        what: Confirm,
+        selected: usize,
+    },
     Category {
         category: Category,
         selected: usize,
@@ -285,6 +291,19 @@ enum Popup {
 const GEO_BLOCKLIST: usize = 0;
 const GEO_ALLOWLIST: usize = 1;
 const GEO_TRUSTED_ONLY: usize = 2;
+
+/// What a [`Popup::Confirm`] asks about. Each is a change that is one
+/// keypress to make and does more than its label says: the geo modes reuse
+/// or empty the country list, and auto-apply takes the preview out of
+/// every later apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Confirm {
+    /// Switching the geo mode to this choice (`GEO_*`) while countries are
+    /// on the list, or to an Allowlist with none.
+    GeoMode(usize),
+    /// Switching auto-apply of the firewall script on.
+    AutoApplyFirewall,
+}
 
 #[derive(Debug, Default)]
 pub struct Dashboard {
@@ -1058,6 +1077,10 @@ impl Dashboard {
                 });
                 render_no_logins(frame, area, preview.is_some(), catch_all, selected, theme)
             }
+            Popup::Confirm { what, selected } => {
+                let (title, text, options) = self.confirm_text(what);
+                render_question(frame, area, &title, text, &options, selected, theme)
+            }
             Popup::Category { category, selected } => render_option_list(
                 frame,
                 area,
@@ -1180,6 +1203,7 @@ impl Dashboard {
                 Popup::RenderFirewall { .. } => self.handle_render_firewall_popup_key(key),
                 Popup::ConfirmApply { .. } => self.handle_confirm_apply_popup_key(key, message),
                 Popup::NoLogins { .. } => self.handle_no_logins_popup_key(key, db, message),
+                Popup::Confirm { .. } => self.handle_confirm_popup_key(key, db, message),
             };
         }
 
@@ -1459,21 +1483,14 @@ impl Dashboard {
         }
         if row == ProtectionRow::AutoApplyFirewall {
             let on = selected == 1;
-            db.set_auto_apply_firewall(on)?;
-            self.auto_apply_firewall = on;
-            // Names the refusal, because it is what will most often stop
-            // this doing anything: a host whose SSH log the cron cannot
-            // read renders daily and applies never.
-            *message = Some(if on {
-                "Auto-apply on \u{2014} the daily render will run the script too, unless the \
-                 anti-lockout check cannot run (it needs a readable SSH log)"
-                    .to_string()
-            } else {
-                "Auto-apply off \u{2014} the daily render writes the script and leaves running \
-                 it to you"
-                    .to_string()
-            });
-            return Ok(KeyOutcome::Mutated);
+            if on && !self.auto_apply_firewall {
+                self.popup = Some(Popup::Confirm {
+                    what: Confirm::AutoApplyFirewall,
+                    selected: 0,
+                });
+                return Ok(KeyOutcome::Consumed);
+            }
+            return self.commit_auto_apply_firewall(db, on, message);
         }
         let ProtectionRow::Detect(detector) = row else {
             unreachable!("feeds are committed by commit_feed")
@@ -1781,27 +1798,219 @@ impl Dashboard {
                 let Some(Popup::GeoMode { selected }) = self.popup.take() else {
                     unreachable!("checked above")
                 };
-                if selected == GEO_BLOCKLIST {
-                    db.set_geo_mode(GeoMode::Blocklist)?;
-                    *message = Some("Geo mode set to Blocklist: selected countries are blocked, everything else is allowed".to_string());
-                    return Ok(KeyOutcome::Mutated);
+                if self.geo_needs_confirming(selected) {
+                    self.popup = Some(Popup::Confirm {
+                        what: Confirm::GeoMode(selected),
+                        selected: 0,
+                    });
+                    return Ok(KeyOutcome::Consumed);
                 }
-                db.set_geo_mode(GeoMode::Allowlist)?;
-                if selected == GEO_ALLOWLIST {
-                    *message = Some("Geo mode set to Allowlist: selected countries are the ONLY ones allowed, everything else will be blocked host-wide once render-firewall runs".to_string());
-                    return Ok(KeyOutcome::Mutated);
-                }
-                for country in &self.selected_countries {
-                    db.set_country_selected(country, false)?;
-                }
-                // The warning first: the Log panel cuts a long line short.
-                *message = Some(match self.trusted_addresses {
-                    0 => "Only trusted IPs, and nothing is trusted yet: trust your addresses on the Firewall screen before render-firewall runs, or only SSH logins from the last week and private networks get in".to_string(),
-                    n => format!("Geo mode set to Only trusted IPs: once render-firewall runs, everything is blocked host-wide except {n} trusted address(es), SSH logins from the last week and private networks"),
-                });
-                Ok(KeyOutcome::Mutated)
+                self.commit_geo_mode(db, selected, message)
             }
             _ => Ok(KeyOutcome::Consumed),
+        }
+    }
+
+    /// Whether switching to geo choice `choice` asks first: it changes what
+    /// the countries on the list mean, empties it, or starts an Allowlist
+    /// that, with no country on it, blocks every address not trusted.
+    fn geo_needs_confirming(&self, choice: usize) -> bool {
+        choice != self.geo_choice()
+            && (!self.selected_countries.is_empty() || choice == GEO_ALLOWLIST)
+    }
+
+    /// Stores geo choice `choice`, and says what it now does.
+    fn commit_geo_mode(
+        &mut self,
+        db: &Db,
+        choice: usize,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        if choice == GEO_BLOCKLIST {
+            db.set_geo_mode(GeoMode::Blocklist)?;
+            *message = Some("Geo mode set to Blocklist: selected countries are blocked, everything else is allowed".to_string());
+            return Ok(KeyOutcome::Mutated);
+        }
+        db.set_geo_mode(GeoMode::Allowlist)?;
+        if choice == GEO_ALLOWLIST {
+            *message = Some(if self.selected_countries.is_empty() {
+                "Geo mode set to Allowlist, with no country yet: add the countries you allow (Enter on the Geo list) before you apply".to_string()
+            } else {
+                "Geo mode set to Allowlist: selected countries are the ONLY ones allowed, everything else is blocked host-wide once applied".to_string()
+            });
+            return Ok(KeyOutcome::Mutated);
+        }
+        for country in &self.selected_countries {
+            db.set_country_selected(country, false)?;
+        }
+        let removed = if self.selected_countries.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Removed from the Geo list: {}.",
+                self.selected_countries.join(" ").to_uppercase()
+            )
+        };
+        // The warning first: the Log panel cuts a long line short.
+        *message = Some(match self.trusted_addresses {
+            0 => format!("Only trusted IPs, and nothing is trusted yet: trust your addresses on the Firewall screen before you apply, or only SSH logins from the last week and private networks get in.{removed}"),
+            n => format!("Geo mode set to Only trusted IPs: once applied, everything is blocked host-wide except {n} trusted address(es), SSH logins from the last week and private networks.{removed}"),
+        });
+        Ok(KeyOutcome::Mutated)
+    }
+
+    /// Stores auto-apply of the firewall script, once confirmed when it
+    /// goes on.
+    fn commit_auto_apply_firewall(
+        &mut self,
+        db: &Db,
+        on: bool,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        db.set_auto_apply_firewall(on)?;
+        self.auto_apply_firewall = on;
+        // Names the refusal, because it is what will most often stop this
+        // doing anything: a host whose SSH log the cron cannot read
+        // renders and never applies.
+        *message = Some(if on {
+            "Auto-apply on \u{2014} the scheduled render runs the script too, within minutes of a \
+             change, unless the anti-lockout check cannot run (it needs a readable SSH log)"
+                .to_string()
+        } else {
+            "Auto-apply off \u{2014} the scheduled render writes the script and leaves running it \
+             to you"
+                .to_string()
+        });
+        Ok(KeyOutcome::Mutated)
+    }
+
+    /// See [`Popup::Confirm`]: Enter on the first option goes ahead,
+    /// anything that cancels changes nothing.
+    fn handle_confirm_popup_key(
+        &mut self,
+        key: KeyEvent,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(Popup::Confirm { what, selected }) = &mut self.popup else {
+            unreachable!("dispatched on this variant")
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => *selected = 0,
+            KeyCode::Down | KeyCode::Char('j') => *selected = 1,
+            KeyCode::Enter | KeyCode::Char(' ') if *selected == 0 => {
+                let what = *what;
+                self.popup = None;
+                return match what {
+                    Confirm::GeoMode(choice) => self.commit_geo_mode(db, choice, message),
+                    Confirm::AutoApplyFirewall => {
+                        self.commit_auto_apply_firewall(db, true, message)
+                    }
+                };
+            }
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char(' ') => {
+                self.popup = None;
+                *message = Some("Nothing changed.".to_string());
+            }
+            _ => {}
+        }
+        Ok(KeyOutcome::Consumed)
+    }
+
+    /// The title, explanation and two answers of a [`Popup::Confirm`].
+    fn confirm_text(&self, what: Confirm) -> (String, Vec<Line<'static>>, [String; 2]) {
+        let countries = self.selected_countries.join(" ").to_uppercase();
+        match what {
+            Confirm::GeoMode(choice) => {
+                let (title, go) = match choice {
+                    GEO_BLOCKLIST => ("Switch to Blocklist?", "Switch to Blocklist"),
+                    GEO_ALLOWLIST => ("Switch to Allowlist?", "Switch to Allowlist"),
+                    _ => ("Switch to Only trusted IPs?", "Switch to Only trusted IPs"),
+                };
+                let mut text: Vec<Line<'static>> = Vec::new();
+                match choice {
+                    GEO_BLOCKLIST => text.push(
+                        format!(
+                            "Allowed now: {countries}. In Blocklist these become the \
+                             blocked countries: visitors from them are turned away, and everyone \
+                             else gets in."
+                        )
+                        .into(),
+                    ),
+                    GEO_ALLOWLIST if self.selected_countries.is_empty() => text.push(
+                        "No country is on the Geo list yet. Until you add one, Allowlist blocks \
+                         every address on every port, except trusted addresses, SSH logins from \
+                         the last week and private networks."
+                            .into(),
+                    ),
+                    GEO_ALLOWLIST => {
+                        text.push(
+                            format!(
+                                "Blocked now: {countries}. In Allowlist these become the \
+                                 ONLY countries allowed: every other country is blocked, on \
+                                 every port."
+                            )
+                            .into(),
+                        );
+                        text.push("".into());
+                        text.push(
+                            "Make sure the country you connect from is on the list."
+                                .yellow()
+                                .into(),
+                        );
+                    }
+                    _ => {
+                        text.push(
+                            format!(
+                                "This takes {countries} off the Geo list: Only trusted IPs \
+                                 is Allowlist with no country. Write them down if you want them \
+                                 back."
+                            )
+                            .into(),
+                        );
+                        text.push("".into());
+                        text.push(
+                            format!(
+                                "Everything is then blocked except {} trusted address(es), SSH \
+                                 logins from the last week and private networks.",
+                                self.trusted_addresses
+                            )
+                            .into(),
+                        );
+                    }
+                }
+                text.push("".into());
+                text.push(if self.auto_apply_firewall {
+                    "Auto-apply is on: this reaches the firewall within minutes."
+                        .yellow()
+                        .into()
+                } else {
+                    "Nothing changes on the host until you apply (a).".into()
+                });
+                (
+                    title.to_string(),
+                    text,
+                    [go.to_string(), "Cancel".to_string()],
+                )
+            }
+            Confirm::AutoApplyFirewall => (
+                "Apply the firewall script automatically?".to_string(),
+                vec![
+                    "The scheduled render runs within five minutes of any change to the rules, \
+                     such as a detector's block or a setting changed here, and at least once a \
+                     day. With this on, it also runs the script as root, with no preview."
+                        .into(),
+                    "".into(),
+                    "Every apply still goes through the SSH lock-out check, and is refused when \
+                     the SSH log cannot be read. It runs only while this TUI is open, or from \
+                     cron (`stop-bots install cron`)."
+                        .into(),
+                ],
+                [
+                    "Turn auto-apply on".to_string(),
+                    "Keep applying by hand".to_string(),
+                ],
+            ),
         }
     }
 
@@ -2285,11 +2494,34 @@ fn render_no_logins(
     );
     text.push("".into());
     text.push("Do you log into this server over SSH?".bold().into());
-    let options = [
-        "Yes, keep the check on",
-        "No, I never log in over SSH: turn the check off",
-    ];
-    for (i, option) in options.into_iter().enumerate() {
+    render_question(
+        frame,
+        area,
+        "No successful SSH logins",
+        text,
+        &[
+            "Yes, keep the check on".to_string(),
+            "No, I never log in over SSH: turn the check off".to_string(),
+        ],
+        selected,
+        theme,
+    );
+}
+
+/// A popup that explains before it asks: `text`, wrapped, then `options`,
+/// the selected one reversed, then the keys. Sized to its text, up to 76
+/// columns.
+fn render_question(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    mut text: Vec<Line<'static>>,
+    options: &[String],
+    selected: usize,
+    theme: Theme,
+) {
+    text.push("".into());
+    for (i, option) in options.iter().enumerate() {
         let line = Line::from(format!("  {option}"));
         text.push(if i == selected { line.reversed() } else { line });
     }
@@ -2305,7 +2537,7 @@ fn render_no_logins(
     let popup_area = centered_rect(width, height as u16 + 2, area);
     let paragraph = Paragraph::new(text)
         .wrap(Wrap { trim: false })
-        .block(crate::tui::popup("No successful SSH logins", theme));
+        .block(crate::tui::popup(title, theme));
     frame.render_widget(Clear, popup_area);
     frame.render_widget(paragraph, popup_area);
 }
@@ -3311,10 +3543,19 @@ mod tests {
         dashboard.popup = Some(Popup::GeoMode { selected: 0 });
 
         let mut message = None;
-        // Move to "Allowlist" and confirm.
+        // Move to "Allowlist", choose it, and confirm: with no country
+        // on the list, it blocks everything not trusted, so it asks.
         dashboard
             .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
             .unwrap();
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        assert!(
+            matches!(dashboard.popup, Some(Popup::Confirm { .. })),
+            "{:?}",
+            dashboard.popup
+        );
         let outcome = dashboard
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
@@ -3353,6 +3594,10 @@ mod tests {
         });
 
         let mut message = None;
+        // Choose it, then confirm taking NL off the list.
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
         let outcome = dashboard
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
@@ -3370,6 +3615,114 @@ mod tests {
             "message was: {message}"
         );
         assert_eq!(dashboard.geo_choice(), GEO_TRUSTED_ONLY);
+    }
+
+    /// Blocklist to Allowlist keeps the list and turns it inside out: the
+    /// countries that were blocked become the only ones allowed. It says
+    /// so, naming them, before anything changes.
+    #[test]
+    fn switching_blocklist_to_allowlist_asks_first_and_names_the_countries() {
+        let db = Db::open_in_memory().unwrap();
+        db.replace_country_ranges("cn", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        db.set_country_selected("cn", true).unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.popup = Some(Popup::GeoMode {
+            selected: GEO_ALLOWLIST,
+        });
+        let mut message = None;
+
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        let Some(Popup::Confirm { what, .. }) = dashboard.popup.clone() else {
+            panic!("expected a confirmation, got {:?}", dashboard.popup);
+        };
+        let (_, text, _) = dashboard.confirm_text(what);
+        let text: String = text.iter().map(|line| line.to_string()).collect();
+        assert!(
+            text.contains("CN") && text.contains("ONLY countries allowed"),
+            "{text}"
+        );
+        assert_eq!(db.get_geo_mode().unwrap(), GeoMode::Blocklist, "not yet");
+
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Esc), &db, &mut message)
+            .unwrap();
+        assert_eq!(
+            db.get_geo_mode().unwrap(),
+            GeoMode::Blocklist,
+            "Esc changed it"
+        );
+        assert!(dashboard.popup.is_none(), "{:?}", dashboard.popup);
+    }
+
+    /// The same mode, or a switch that changes nothing about the list,
+    /// does not ask.
+    #[test]
+    fn a_geo_switch_with_no_countries_to_lose_does_not_ask() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        for (choice, asks) in [
+            (GEO_BLOCKLIST, false),
+            (GEO_TRUSTED_ONLY, false),
+            (GEO_ALLOWLIST, true),
+        ] {
+            assert_eq!(
+                dashboard.geo_needs_confirming(choice),
+                asks,
+                "choice {choice} from Blocklist with no country"
+            );
+        }
+    }
+
+    /// Auto-apply takes the preview out of every later apply, so switching
+    /// it on asks; switching it off does not.
+    #[test]
+    fn auto_apply_asks_before_switching_on_and_not_off() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        let mut message = None;
+
+        dashboard
+            .commit_protection(&db, ProtectionRow::AutoApplyFirewall, 1, &mut message)
+            .unwrap();
+        assert!(
+            !db.get_auto_apply_firewall().unwrap(),
+            "on before the answer"
+        );
+        assert!(
+            matches!(
+                dashboard.popup,
+                Some(Popup::Confirm {
+                    what: Confirm::AutoApplyFirewall,
+                    ..
+                })
+            ),
+            "{:?}",
+            dashboard.popup
+        );
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        assert!(db.get_auto_apply_firewall().unwrap(), "{message:?}");
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|m| m.contains("within minutes")),
+            "{message:?}"
+        );
+
+        dashboard
+            .commit_protection(&db, ProtectionRow::AutoApplyFirewall, 0, &mut message)
+            .unwrap();
+        assert!(!db.get_auto_apply_firewall().unwrap());
+        assert!(dashboard.popup.is_none(), "{:?}", dashboard.popup);
     }
 
     /// With nothing trusted, the message says so before the firewall is

@@ -4538,7 +4538,8 @@ impl Host {
         host.stop_bots(
             "set-site-rule --site test.example --rule no-accept-language --enabled true",
         );
-        host.stop_bots("add-exempt-path --site other.example --path /wp-json/");
+        // 0.1.1's spelling: this is 0.1.1 running.
+        host.stop_bots("exempt-path --site other.example --path /wp-json/");
         host.stop_bots("apply-blocks");
         host.stop_bots("add-firewall-rule --address 203.0.113.50");
         // An SSH log with nobody in it, for the lockout check to read: with

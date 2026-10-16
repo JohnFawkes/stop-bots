@@ -1295,8 +1295,12 @@ fn dashboard_geo_mode_toggle_switches_to_allowlist() {
     // "blocklist" at the same cells to be a needle.)
     send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\r");
+    // With no country on the list it blocks every address not trusted,
+    // so it asks first.
+    session.exp_string("Switch").unwrap();
+    send_key(&mut session, "\r");
     session.exp_string("Geo mode").unwrap();
-    session.exp_string("Allowlist:").unwrap();
+    session.exp_string("Allowlist,").unwrap();
 
     send_key(&mut session, "q");
     session

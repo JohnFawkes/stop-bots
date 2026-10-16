@@ -139,6 +139,9 @@ enum Detail {
 #[derive(Debug, Default)]
 pub struct Firewall {
     ssh_rows: Vec<SshRow>,
+    /// Whether the last refresh had no SSH log to read: not the same as a
+    /// log with no failed login in it, which is the good case.
+    ssh_log_missing: bool,
     ua_rows: Vec<UaRow>,
     ssh_state: ListState,
     ua_state: ListState,
@@ -169,6 +172,7 @@ impl Firewall {
     /// panel rather than as a wait.
     pub fn refresh(&mut self, db: &Db, ssh_log_text: Option<&str>) -> Result<()> {
         let live = Live::load(db, ssh_log_text)?;
+        self.ssh_log_missing = ssh_log_text.is_none();
         self.ssh_rows = live.ssh;
         self.ua_rows = live.user_agents;
         self.trusted = crate::dynamic::trusted_entries(db)?;
@@ -582,7 +586,12 @@ impl Firewall {
                     return Ok(KeyOutcome::Consumed);
                 };
                 if row.status.is_blocklist() {
-                    // Blocklist items cannot be toggled
+                    // Not a block made here, so not one to undo here.
+                    *message = Some(format!(
+                        "{} is blocked by a downloaded list (a country or a feed on the \
+                         Dashboard), not by hand; T trusts it past every list.",
+                        row.address
+                    ));
                     return Ok(KeyOutcome::Consumed);
                 }
                 if row.status.is_trusted() {
@@ -592,7 +601,7 @@ impl Firewall {
                 if row.status.is_blocked() {
                     db.unblock_address(&row.address)?;
                     *message = Some(format!(
-                        "Unblocked {} — run render-firewall (then apply the script) to lift the enforced block.",
+                        "Unblocked {} — apply everything (a on the Dashboard) to lift the enforced block.",
                         row.address
                     ));
                 } else {
@@ -602,7 +611,7 @@ impl Firewall {
                         Some(&crate::dynamic::attempts_evidence(row.count)),
                     )?;
                     *message = Some(format!(
-                        "Permanently blocked {} — run render-firewall (then apply the script) to enforce it.",
+                        "Permanently blocked {} — apply everything (a on the Dashboard) to enforce it.",
                         row.address
                     ));
                 }
@@ -617,7 +626,12 @@ impl Firewall {
                     return Ok(KeyOutcome::Consumed);
                 };
                 if row.status.is_blocklist() {
-                    // Blocklist items cannot be toggled
+                    // Not a block made here, so not one to undo here.
+                    *message = Some(format!(
+                        "\"{}\" is blocked by a bot list, not by hand: allow its bot on Bot \
+                         settings, or T trusts it.",
+                        row.user_agent
+                    ));
                     return Ok(KeyOutcome::Consumed);
                 }
                 if row.status.is_trusted() {
@@ -627,8 +641,8 @@ impl Firewall {
                 if row.status.is_blocked() {
                     db.unblock_user_agent(&row.user_agent)?;
                     *message = Some(format!(
-                        "Unblocked user agent \"{}\" — run apply-blocks to remove it from the {} \
-                         config.",
+                        "Unblocked user agent \"{}\" — apply everything (a on the Dashboard) to \
+                         remove it from the {} config.",
                         row.user_agent,
                         crate::webserver::WebServer::configured().label()
                     ));
@@ -638,7 +652,8 @@ impl Firewall {
                         return Ok(KeyOutcome::Consumed);
                     }
                     *message = Some(format!(
-                        "Permanently blocked user agent \"{}\" — run apply-blocks to enforce it.",
+                        "Permanently blocked user agent \"{}\" — apply everything (a on the Dashboard) \
+                         to enforce it.",
                         row.user_agent
                     ));
                 }
@@ -693,6 +708,9 @@ impl Firewall {
                 .collect(),
             if reading {
                 "Reading the SSH log…"
+            } else if self.ssh_log_missing {
+                // One line, as the list draws it: the way out first.
+                "No SSH log could be read. Run as root, or: stop-bots set-log-paths --ssh-log <path>"
             } else if self.ssh_rows.is_empty() {
                 "No failed SSH logins in the current log. Nothing to block — this is the good case."
             } else {
@@ -2023,8 +2041,47 @@ mod tests {
         assert!(content.contains("curl/8.0"), "content was:\n{content}");
     }
 
+    /// A log that could not be read is not a log with no failed login in
+    /// it: the panel must not call it the good case.
     #[test]
-    fn enter_on_blocklist_row_is_a_no_op() {
+    fn an_unreadable_ssh_log_is_not_shown_as_no_failed_logins() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = Firewall::default();
+        let draw = |screen: &mut Firewall| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|frame| {
+                    screen.render(
+                        frame,
+                        frame.area(),
+                        Theme::Dark,
+                        &std::collections::HashSet::new(),
+                    )
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        screen.refresh(&db, None).unwrap();
+        let missing = draw(&mut screen);
+        assert!(missing.contains("No SSH log could be read"), "{missing}");
+        assert!(!missing.contains("good case"), "{missing}");
+
+        screen.refresh(&db, Some("")).unwrap();
+        let empty = draw(&mut screen);
+        assert!(empty.contains("good case"), "{empty}");
+    }
+
+    /// A list's block is not one to undo here; Enter says where it comes
+    /// from rather than doing nothing silently.
+    #[test]
+    fn enter_on_blocklist_row_changes_nothing_and_says_why() {
         let db = Db::open_in_memory().unwrap();
         let mut screen = Firewall {
             ssh_rows: vec![SshRow {
@@ -2042,13 +2099,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome, KeyOutcome::Consumed);
-        assert!(message.is_none());
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|m| m.contains("downloaded list")),
+            "{message:?}"
+        );
         // Verify no firewall rules were added
         assert!(db.list_firewall_rules().unwrap().is_empty());
     }
 
     #[test]
-    fn enter_on_blocklist_ua_row_is_a_no_op() {
+    fn enter_on_blocklist_ua_row_changes_nothing_and_says_why() {
         let db = Db::open_in_memory().unwrap();
         let mut screen = Firewall {
             ua_rows: vec![UaRow {
@@ -2067,7 +2129,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome, KeyOutcome::Consumed);
-        assert!(message.is_none());
+        assert!(
+            message.as_deref().is_some_and(|m| m.contains("bot list")),
+            "{message:?}"
+        );
         // Verify no user agents were blocked
         assert!(db.list_blocked_user_agents().unwrap().is_empty());
     }

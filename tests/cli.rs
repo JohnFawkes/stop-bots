@@ -2857,6 +2857,27 @@ fn a_batch_dry_run_says_what_would_change_and_changes_nothing() {
     assert_eq!(db.get_firewall_rendered_signature().unwrap(), None);
 }
 
+/// Switching the mode keeps the country list, so what it now means is said
+/// with it: the countries that were blocked are the only ones allowed, and
+/// an Allowlist with none blocks everything not trusted.
+#[test]
+fn set_geo_mode_says_what_the_country_list_now_means() {
+    let fixture = Fixture::new();
+
+    let empty = fixture.run(&["set-geo-mode", "--mode", "allowlist"]);
+    let empty = String::from_utf8_lossy(&empty.get_output().stdout).into_owned();
+    assert!(
+        empty.contains("WARNING: no country is selected"),
+        "stdout:\n{empty}"
+    );
+
+    fixture.run(&["set-geo-mode", "--mode", "blocklist"]);
+    fixture.run(&["add-country", "--country", "cn"]);
+    let allow = fixture.run(&["set-geo-mode", "--mode", "allowlist"]);
+    let allow = String::from_utf8_lossy(&allow.get_output().stdout).into_owned();
+    assert!(allow.contains("Allowed: CN"), "stdout:\n{allow}");
+}
+
 /// With no SSH login on record, Only trusted IPs blocks whoever connects
 /// next. The dry run says so, and that the apply would be refused, rather
 /// than "lockout check passed".

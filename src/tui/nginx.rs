@@ -298,6 +298,9 @@ impl Nginx {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
         if let Some(detail) = &mut self.detail {
             detail.render(frame, area, theme);
+            if let Some(popup) = &self.popup {
+                self.render_popup(frame, area, popup, theme);
+            }
             return;
         }
 
@@ -434,7 +437,7 @@ impl Nginx {
 
     /// The footer's key hints for the focused panel.
     pub fn hints(&self) -> crate::tui::Hints {
-        if let Some(detail) = &self.detail {
+        if let Some(detail) = self.detail.as_ref().filter(|_| self.popup.is_none()) {
             return detail.hints();
         }
         if self.alert.is_some() {
@@ -552,6 +555,10 @@ impl Nginx {
             return Ok(KeyOutcome::Consumed);
         }
 
+        if self.popup.is_some() {
+            return self.handle_confirm_popup_key(key);
+        }
+
         if let Some(detail) = &mut self.detail {
             let outcome = detail.handle_key(key, db, message)?;
             return Ok(match outcome {
@@ -562,12 +569,14 @@ impl Nginx {
                     self.detail = None;
                     KeyOutcome::Consumed
                 }
+                // Every change made here ends "apply (a/A) to write it",
+                // so the keys work here too: this site, or every site.
+                KeyOutcome::Ignored if matches!(key.code, KeyCode::Char('a' | 'A')) => {
+                    self.open_apply_popup(key.code == KeyCode::Char('A'));
+                    KeyOutcome::Consumed
+                }
                 other => other,
             });
-        }
-
-        if self.popup.is_some() {
-            return self.handle_confirm_popup_key(key);
         }
 
         if self.setting_popup.is_some() {
@@ -593,6 +602,26 @@ impl Nginx {
         match self.focus {
             Focus::Settings => self.handle_settings_panel_key(key, message),
             Focus::Sites => self.handle_site_list_key(key, db),
+        }
+    }
+
+    /// Asks before applying the selected site, or with `all` every site.
+    /// The selection is the site a detail view is open on, if one is.
+    fn open_apply_popup(&mut self, all: bool) {
+        let action = if all {
+            (!self.sites.is_empty()).then_some(PopupAction::ApplyAll)
+        } else {
+            self.list_state
+                .selected()
+                .filter(|index| *index < self.sites.len())
+                .map(PopupAction::Apply)
+        };
+        if let Some(action) = action {
+            self.popup = Some(Popup {
+                action,
+                options: vec!["Cancel", "Apply now"],
+                selected: 0,
+            });
         }
     }
 
@@ -735,25 +764,11 @@ impl Nginx {
                 Ok(KeyOutcome::Consumed)
             }
             KeyCode::Char('a') => {
-                if let Some(index) = self.list_state.selected() {
-                    if index < self.sites.len() {
-                        self.popup = Some(Popup {
-                            action: PopupAction::Apply(index),
-                            options: vec!["Cancel", "Apply now"],
-                            selected: 0,
-                        });
-                    }
-                }
+                self.open_apply_popup(false);
                 Ok(KeyOutcome::Consumed)
             }
             KeyCode::Char('A') => {
-                if !self.sites.is_empty() {
-                    self.popup = Some(Popup {
-                        action: PopupAction::ApplyAll,
-                        options: vec!["Cancel", "Apply now"],
-                        selected: 0,
-                    });
-                }
+                self.open_apply_popup(true);
                 Ok(KeyOutcome::Consumed)
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
@@ -1678,6 +1693,42 @@ mod tests {
 
         assert_eq!(outcome, KeyOutcome::Consumed);
         assert!(screen.detail.is_none());
+    }
+
+    /// Every change in a site's detail view says "apply (a/A) to write
+    /// it", so the keys work there: `a` asks to apply that site, and the
+    /// answer applies it, with the detail view still open behind.
+    #[test]
+    fn a_inside_a_site_detail_asks_to_apply_that_site() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_site("example.com", "/etc/nginx/sites-enabled/example.com")
+            .unwrap();
+        let mut screen = test_screen();
+        screen.refresh(&db).unwrap();
+        let mut message = None;
+        let mut press = |screen: &mut Nginx, code| {
+            screen
+                .handle_key(KeyEvent::from(code), &db, &mut message)
+                .unwrap()
+        };
+
+        press(&mut screen, KeyCode::Enter);
+        assert_eq!(press(&mut screen, KeyCode::Char('a')), KeyOutcome::Consumed);
+        assert!(
+            screen
+                .popup
+                .as_ref()
+                .is_some_and(|popup| matches!(popup.action, PopupAction::Apply(0))),
+            "{:?}",
+            screen.popup
+        );
+
+        press(&mut screen, KeyCode::Down);
+        assert_eq!(
+            press(&mut screen, KeyCode::Enter),
+            KeyOutcome::SiteAction(SiteAction::Apply(0))
+        );
+        assert!(screen.detail.is_some(), "the detail view stays open");
     }
 
     #[test]

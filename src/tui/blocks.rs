@@ -182,8 +182,8 @@ impl Blocks {
                     self.confirm = None;
                     let removed = db.remove_firewall_rules_from(filter, false)?;
                     *message = Some(format!(
-                        "Removed {removed} rule(s) from {} — write and apply the firewall \
-                         script (F, or a) to lift them.",
+                        "Removed {removed} rule(s) from {} — apply everything (a on the \
+                         Dashboard) to lift them.",
                         filter.label()
                     ));
                     Ok(KeyOutcome::Mutated)
@@ -234,8 +234,8 @@ impl Blocks {
                 let by_detector = rule.source.and_then(|s| s.detector()).is_some();
                 db.remove_firewall_rule(id)?;
                 *message = Some(format!(
-                    "Removed the rule for {address}{} — write and apply the firewall script \
-                     (F, or a) to lift it.",
+                    "Removed the rule for {address}{} — apply everything (a on the \
+                     Dashboard) to lift it.",
                     if by_detector {
                         "; its detector leaves it alone for now (T on Firewall trusts it for good)"
                     } else {

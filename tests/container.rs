@@ -3335,9 +3335,12 @@ fn a_stranger_follows_the_quick_start(distro: Distro, web: Web) {
     let untouched = host.sh(&default_site);
     let plan = host.quick_start("stop-bots batch --dry-run --diff");
     for (what, needle) in [
+        // A fresh host has no SSH login on record, and nothing in a first
+        // apply blocks every address, so the check says it found no one
+        // to check rather than that it passed, and lets the apply through.
         (
             "the SSH log the lockout check reads",
-            "lockout check passed",
+            "lockout check found no one to check",
         ),
         ("the block it would add", "+    # BEGIN stop-bots"),
         ("a scanner the binary knows", "ModatScanner"),

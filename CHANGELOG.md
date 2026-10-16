@@ -31,6 +31,11 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - The lock-out check counts the SSH session the TUI or CLI runs in as connected, read
   from its environment (it still works under `sudo`), so a log that rotated or a journal
   that keeps nothing no longer hides it.
+- **Upgrade tests from every release since 0.1.0.** The database, NGINX site and firewall
+  script that the released 0.1.0, 0.1.1, 0.2.0 and 0.2.1 binaries wrote are now test
+  fixtures. The tests check that this build reads back every setting in them and
+  re-applies over those files in place. `scripts/upgrade-fixture.sh` records each new
+  release the same way.
 
 ### Fixed
 

@@ -7,7 +7,7 @@ a new release of that minor rather than being backported to older ones.
 
 | Version                | Supported |
 | ---------------------- | --------- |
-| latest minor (`0.2.x`) | yes       |
+| latest minor (`0.3.x`) | yes       |
 | anything older         | no        |
 
 From `1.0.0`, a patch or minor release keeps the command line, the `--json` output, the

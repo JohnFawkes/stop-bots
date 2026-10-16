@@ -8,49 +8,23 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
-The database gains a schema version (offences, for repeat offenders). A release before
-this one refuses the upgraded database rather than misreading it. To go back, put back
-the copy the upgrade kept, `/var/lib/stop-bots/db.sqlite3.bak-v6`, then install the
-older release; settings changed since the upgrade are lost.
+## [0.3.0] — 2026-10-16
 
-### Changed
+The release that gets stop-bots ready to stand behind a 1.0: an undo for firewall
+applies, a `?` that explains every screen, `--json` for scripts, repeat offenders blocked
+for longer, and a command line tidied into the shape 1.0 will keep. Every old command
+spelling still works and says what replaces it.
 
-- **The command line has one shape for each kind of verb**, before 1.0 freezes it:
-  - **`run-detector <detector>`** runs any detector over a log by hand, all ten of them,
-    in place of the five `block-*` verbs.
-  - **Lists have `add-*`/`remove-*` verbs**: `add-trusted`/`remove-trusted` in place of
-    `trust` and `trust --remove`, and `add-exempt-path`/`remove-exempt-path` in place of
-    `exempt-path` and `exempt-path --remove`.
-  - **`update-*` updates every source of its kind** unless one is named:
-    `update-bot-lists` (every bot list; it updated well-known-bots alone before),
-    `update-crawler-ranges` (was `update-ip-ranges`, one crawler at a time),
-    `update-reputation-sources` (every feed switched on; was `update-reputation-source`,
-    one at a time) and `update-country-ranges` (every selected country).
-  - **`set-web-server nginx`** takes NGINX's commands and root, in place of
-    `set-nginx-commands`.
+**Before upgrading:** the database gains a schema version (offences, for repeat
+offenders), and a release before this one refuses the upgraded database rather than
+misreading it. To go back, put back the copy the upgrade kept,
+`/var/lib/stop-bots/db.sqlite3.bak-v6`, then install the older release; settings changed
+since the upgrade are lost. Repeat offenders arrives off on an existing database
+(`stop-bots set-repeat-offenders --enabled true`), as new blocking behaviour always does.
 
-  `CONTRIBUTING.md` writes the conventions down.
-
-### Deprecated
-
-Each still works as before, prints a one-line warning on stderr naming its replacement,
-and goes in 2.0.0:
-
-- `block-ssh-scanners` (and `block-scanners`), `block-web-scanners`,
-  `block-spoofed-crawlers`, `block-probe-paths`, `block-honeypot`: use
-  `run-detector <detector>`.
-- `trust`: use `add-trusted`; `trust --remove`: use `remove-trusted`.
-- `exempt-path`: use `add-exempt-path`; `exempt-path --remove`: use
-  `remove-exempt-path`.
-- `update-ip-ranges`: use `update-crawler-ranges`.
-- `update-reputation-source`: use `update-reputation-sources`.
-- `set-nginx-commands`: use `set-web-server nginx`.
-
-### Fixed
-
-- **SSH scanners on a host that takes keys only** are counted when they reach sshd's
-  `MaxAuthTries`: `maximum authentication attempts exceeded for …` is now read as a failed
-  login. Such a scanner leaves no `Failed` line, so before this only its disconnect counted.
+**After upgrading:** an apply from the TUI, or `render-firewall --apply` and
+`batch --apply` run from a terminal, now asks you to keep the new rules within 60 seconds
+and puts the previous ones back if nobody answers. Cron and scripts are unaffected.
 
 ### Added
 
@@ -110,7 +84,44 @@ and goes in 2.0.0:
   re-applies over those files in place. `scripts/upgrade-fixture.sh` records each new
   release the same way.
 
+### Changed
+
+- **The command line has one shape for each kind of verb**, before 1.0 freezes it:
+  - **`run-detector <detector>`** runs any detector over a log by hand, all ten of them,
+    in place of the five `block-*` verbs.
+  - **Lists have `add-*`/`remove-*` verbs**: `add-trusted`/`remove-trusted` in place of
+    `trust` and `trust --remove`, and `add-exempt-path`/`remove-exempt-path` in place of
+    `exempt-path` and `exempt-path --remove`.
+  - **`update-*` updates every source of its kind** unless one is named:
+    `update-bot-lists` (every bot list; it updated well-known-bots alone before),
+    `update-crawler-ranges` (was `update-ip-ranges`, one crawler at a time),
+    `update-reputation-sources` (every feed switched on; was `update-reputation-source`,
+    one at a time) and `update-country-ranges` (every selected country).
+  - **`set-web-server nginx`** takes NGINX's commands and root, in place of
+    `set-nginx-commands`.
+
+  `CONTRIBUTING.md` writes the conventions down.
+
+### Deprecated
+
+Each still works as before, prints a one-line warning on stderr naming its replacement,
+and goes in 2.0.0:
+
+- `block-ssh-scanners` (and `block-scanners`), `block-web-scanners`,
+  `block-spoofed-crawlers`, `block-probe-paths`, `block-honeypot`: use
+  `run-detector <detector>`.
+- `trust`: use `add-trusted`; `trust --remove`: use `remove-trusted`.
+- `exempt-path`: use `add-exempt-path`; `exempt-path --remove`: use
+  `remove-exempt-path`.
+- `update-ip-ranges`: use `update-crawler-ranges`.
+- `update-reputation-source`: use `update-reputation-sources`.
+- `set-nginx-commands`: use `set-web-server nginx`.
+
 ### Fixed
+
+- **SSH scanners on a host that takes keys only** are counted when they reach sshd's
+  `MaxAuthTries`: `maximum authentication attempts exceeded for …` is now read as a failed
+  login. Such a scanner leaves no `Failed` line, so before this only its disconnect counted.
 
 - **An SSH log with no login in it passed the lock-out check.** It said "lockout check
   passed: … no connected client would be blocked" when no one had been checked at all.
@@ -2411,7 +2422,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ivankovic/stop-bots/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/ivankovic/stop-bots/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ivankovic/stop-bots/compare/v0.1.1...v0.2.0
 [0.2.0-rc.2]: https://github.com/ivankovic/stop-bots/compare/v0.2.0-rc.1...v0.2.0-rc.2

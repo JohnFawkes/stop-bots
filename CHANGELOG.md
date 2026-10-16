@@ -25,8 +25,8 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   everything with the block's status is reported as not checked rather than clean.
   Read-only, four seconds at most, and absent on a host with no sites. It runs with
   the rest of the health probe, so `stop-bots status`, the TUI and the schedule all
-  ask, and the access log shows requests for these paths from `127.0.0.1`, which no
-  detector blocks.
+  ask. The access log shows requests for these paths from `127.0.0.1`; no detector
+  blocks them, and `status` leaves them out of what it says about the log.
 
 ## [0.3.0] — 2026-10-16
 

@@ -63,9 +63,9 @@ use futures::StreamExt;
 use crate::webserver::{Listen, SiteListens};
 
 /// The agent every request is sent as: a current Firefox, so that no bot
-/// list (and not the old-browsers list) refuses it. The path that cannot
-/// exist, `/stop-bots-exposure-check-…`, is what tells these requests
-/// apart in an access log.
+/// list (and not the old-browsers list) refuses it. With the path that
+/// cannot exist, `/stop-bots-exposure-check-…`, it is what tells these
+/// requests apart in an access log ([`is_own_request`]).
 pub const USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0";
 
@@ -121,6 +121,22 @@ const fn lesser(path: &'static str, looks_like: fn(&[u8]) -> bool) -> Sensitive 
         secret: false,
         looks_like,
     }
+}
+
+/// What the path that cannot exist starts with.
+const ABSENT_PREFIX: &str = "/stop-bots-exposure-check-";
+
+/// Whether a logged request is one of this check's own: from loopback,
+/// as [`USER_AGENT`], for one of [`PATHS`] or the path that cannot exist.
+///
+/// The access log's readers leave these out. Every probe adds twenty
+/// lines per site from `127.0.0.1`, and on a quiet host that is enough to
+/// make the log read as mostly a proxy's, and to count a Firefox nobody
+/// runs among the clients this host serves.
+pub fn is_own_request(ip: &IpAddr, user_agent: &str, path: &str) -> bool {
+    ip.is_loopback()
+        && user_agent == USER_AGENT
+        && (path.starts_with(ABSENT_PREFIX) || PATHS.iter().any(|p| p.path == path))
 }
 
 /// Whether `path` is one of the [`Sensitive::secret`] ones. A path this
@@ -439,7 +455,7 @@ async fn fetch(client: &reqwest::Client, url: &str) -> reqwest::Result<(Shape, V
 async fn check_target(client: &reqwest::Client, target: &Target, block_status: u16) -> Outcome {
     let origin = target.origin();
     let absent = format!(
-        "{origin}/stop-bots-exposure-check-{:x}",
+        "{origin}{ABSENT_PREFIX}{:x}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()

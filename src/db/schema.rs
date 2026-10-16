@@ -69,7 +69,9 @@ pub const CURRENT_VERSION: u32 = 8;
 /// - **1**: everything that existed at 0.1.
 /// - **2**: longer blocks for repeat offenders
 ///   (`protection::REPEAT_ESCALATION_INTRODUCED_IN`).
-pub const DEFAULTS_GENERATION: u32 = 2;
+/// - **3**: probe paths that are probes only where their application is
+///   absent (`protection::APP_PROBE_PATHS_INTRODUCED_IN`).
+pub const DEFAULTS_GENERATION: u32 = 3;
 
 /// One step from version `n - 1` to version `n`, where `n` is its position
 /// in [`MIGRATIONS`] counting from one.

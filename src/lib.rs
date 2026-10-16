@@ -133,4 +133,6 @@ pub mod uadetail;
 #[doc(hidden)]
 pub mod uninstall;
 #[doc(hidden)]
+pub mod webapps;
+#[doc(hidden)]
 pub mod webserver;

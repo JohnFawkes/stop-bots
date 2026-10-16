@@ -2071,6 +2071,19 @@ pub fn server_names_for(config_path: &Path, server_name: &str) -> Vec<String> {
 ///
 /// `None` when the file cannot be read, which allows nothing.
 pub fn site_service(config_path: &Path, server_name: &str) -> Option<crate::services::Service> {
+    crate::services::recognise(&site_directives(config_path, server_name)?)
+}
+
+/// Every directive of every `server` block in `config_path` that declares
+/// one of `server_name`'s names, as its name and its arguments: what
+/// [`site_service`] and [`crate::webapps`] read a site from, with this
+/// project's own blocks taken out first, as [`site_service`] says.
+///
+/// `None` when the file cannot be read or no block declares the name.
+pub fn site_directives(
+    config_path: &Path,
+    server_name: &str,
+) -> Option<Vec<(String, Vec<String>)>> {
     let content = without_injected_blocks(&fs::read_to_string(config_path).ok()?);
     let blocks = parse_server_blocks(&content);
     let names = blocks
@@ -2086,7 +2099,7 @@ pub fn site_service(config_path: &Path, server_name: &str) -> Option<crate::serv
     {
         directives.extend(directives_within(&tokens, block.open, block.close));
     }
-    crate::services::recognise(&directives)
+    Some(directives)
 }
 
 /// Each directive whose tokens lie between the byte offsets `open` and

@@ -278,6 +278,30 @@ pub(crate) fn logging_fake(dir: &std::path::Path, name: &str, body: &str) -> std
     path
 }
 
+/// Scans an NGINX site named `server_name` whose document root holds
+/// `files` (each an empty file), as `scan-sites` would have stored it.
+/// The returned directory holds both, and must be kept alive.
+pub(crate) fn site_serving(db: &Db, server_name: &str, files: &[&str]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("www");
+    std::fs::create_dir_all(&root).unwrap();
+    for file in files {
+        std::fs::write(root.join(file), "").unwrap();
+    }
+    let config = dir.path().join(server_name);
+    std::fs::write(
+        &config,
+        format!(
+            "server {{\n    server_name {server_name};\n    root {};\n}}\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    db.upsert_site(server_name, config.to_str().unwrap())
+        .unwrap();
+    dir
+}
+
 /// Every call the fakes in `dir` received, one a line.
 pub(crate) fn fake_calls(dir: &std::path::Path) -> Vec<String> {
     journalctl_calls(dir)

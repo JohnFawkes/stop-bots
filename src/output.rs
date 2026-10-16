@@ -204,6 +204,32 @@ pub struct ProbePaths {
     pub built_in: Vec<String>,
     /// Added with `set-probe-paths`.
     pub extra: Vec<String>,
+    /// Probes only where their application is absent
+    /// (`set-detector probe-paths --app-aware`).
+    pub conditional: ConditionalProbePaths,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConditionalProbePaths {
+    /// Whether the detector counts them at all.
+    pub enabled: bool,
+    /// Off on a database older than the feature, until someone chooses.
+    pub new_in_this_release: bool,
+    pub paths: Vec<ConditionalProbePath>,
+}
+
+/// One conditional path, as a request that names no site is judged.
+#[derive(Debug, Serialize)]
+pub struct ConditionalProbePath {
+    pub path: String,
+    /// The applications that make it legitimate.
+    pub apps: Vec<&'static str>,
+    /// Whether a request for it is a probe on this host now: on, and no
+    /// site runs or might run any of `apps`.
+    pub active: bool,
+    /// Why it is not a probe here, when it is not; `null` when the only
+    /// reason is that the setting is off.
+    pub reason: Option<String>,
 }
 
 /// `list-detectors --json`.

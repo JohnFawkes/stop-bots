@@ -1412,6 +1412,17 @@ pub fn server_names_for(config_path: &Path, server_name: &str) -> Vec<String> {
 /// This project's own block is taken out first: it quotes upstream
 /// user-agent patterns, which could name anything.
 pub fn site_service(config_path: &Path, server_name: &str) -> Option<crate::services::Service> {
+    crate::services::recognise(&site_directives(config_path, server_name)?)
+}
+
+/// Every directive of every `<VirtualHost>` in `config_path` that
+/// declares one of `server_name`'s names, under the name of the NGINX
+/// directive that does the same (see [`site_service`]): what
+/// [`crate::webapps`] reads a site from, as `nginx::site_directives`.
+pub fn site_directives(
+    config_path: &Path,
+    server_name: &str,
+) -> Option<Vec<(String, Vec<String>)>> {
     let content = without_injected_blocks(&fs::read_to_string(config_path).ok()?);
     let hosts = virtual_hosts(&content);
     let names = hosts
@@ -1419,13 +1430,14 @@ pub fn site_service(config_path: &Path, server_name: &str) -> Option<crate::serv
         .find(|host| host.names.iter().any(|name| name == server_name))?
         .names
         .clone();
-    let directives: Vec<(String, Vec<String>)> = hosts
-        .iter()
-        .filter(|host| host.names.iter().any(|name| names.contains(name)))
-        .flat_map(|host| host.directives.iter())
-        .map(|(name, arguments)| (nginx_equivalent(name).to_string(), arguments.clone()))
-        .collect();
-    crate::services::recognise(&directives)
+    Some(
+        hosts
+            .iter()
+            .filter(|host| host.names.iter().any(|name| names.contains(name)))
+            .flat_map(|host| host.directives.iter())
+            .map(|(name, arguments)| (nginx_equivalent(name).to_string(), arguments.clone()))
+            .collect(),
+    )
 }
 
 /// The NGINX directive that does what Apache's `name` (lowercased) does,

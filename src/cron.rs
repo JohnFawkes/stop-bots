@@ -1595,6 +1595,39 @@ mod tests {
         );
     }
 
+    /// The scheduled pass judges `/wp-login.php` by the site the line
+    /// names, where the format logs `$host`: a probe on the static site,
+    /// the administrator's own login on the WordPress one.
+    #[test]
+    fn the_scheduled_pass_judges_the_wordpress_login_by_the_site_it_was_for() {
+        use crate::testing::{nginx_time, now_secs, site_serving};
+        let db = test_db();
+        let _static = site_serving(&db, "static.example", &["index.html"]);
+        let _blog = site_serving(&db, "blog.example", &["wp-login.php"]);
+        let dir = tempfile::tempdir().unwrap();
+        let login = |ip: &str, site: &str| {
+            format!(
+                "{ip} - - [{}] \"GET /wp-login.php HTTP/1.1\" 200 1 \"-\" \"curl/8\" \"{site}\"\n",
+                nginx_time(now_secs() - 60)
+            )
+        };
+        std::fs::write(
+            dir.path().join("access.log"),
+            login("203.0.113.5", "static.example") + &login("198.51.100.7", "blog.example"),
+        )
+        .unwrap();
+
+        pass(&db, dir.path(), &[CronJob::Detect(Detector::ProbePaths)]);
+
+        let blocked: Vec<String> = db
+            .list_firewall_rules()
+            .unwrap()
+            .into_iter()
+            .map(|rule| rule.address)
+            .collect();
+        assert_eq!(blocked, ["203.0.113.5"]);
+    }
+
     #[test]
     fn render_firewall_writes_the_script_and_reports_success() {
         let db = test_db();

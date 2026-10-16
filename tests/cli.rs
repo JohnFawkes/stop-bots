@@ -101,6 +101,25 @@ impl Fixture {
         write_site(&self.nginx_root, name)
     }
 
+    /// One `server` block named `name` whose document root holds `files`
+    /// (each empty), scanned.
+    fn scan_site_serving(&self, name: &str, files: &[&str]) {
+        let root = self._tmp.path().join("www").join(name);
+        fs::create_dir_all(&root).unwrap();
+        for file in files {
+            fs::write(root.join(file), "").unwrap();
+        }
+        fs::write(
+            self.nginx_root.join(format!("{name}.conf")),
+            format!(
+                "server {{\n    server_name {name};\n    root {};\n}}\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        self.scan_sites();
+    }
+
     fn robots_txt(&self) -> std::path::PathBuf {
         self.managed.join("robots.txt")
     }
@@ -462,7 +481,10 @@ fn block_spoofed_crawlers_is_inert_without_ranges_then_blocks_a_forged_googlebot
 }
 
 /// Probe-path detection end to end, including the property the built-in
-/// list is chosen for: a legitimate admin path must survive it.
+/// list is chosen for: a legitimate admin path must survive it. With no
+/// site scanned, nothing says WordPress is absent, so its login is not a
+/// probe either (see `run_detector_probe_paths_blocks_the_wordpress_login_
+/// only_without_wordpress` for a host that has been scanned).
 #[test]
 fn block_probe_paths_blocks_a_dotenv_probe_but_not_a_wordpress_login() {
     let tmp = tempfile::tempdir().unwrap();
@@ -5939,6 +5961,93 @@ fn list_probe_paths_json_separates_built_in_from_extra() {
         Some(stop_bots::accesslog::DEFAULT_PROBE_PATHS.len()),
         "{paths:#}"
     );
+}
+
+/// The conditional paths say, each, whether a request for it is a probe
+/// on this host, and if not, which site serves it.
+#[test]
+fn list_probe_paths_json_says_which_app_paths_are_probes_here() {
+    let fx = Fixture::new();
+    fx.scan_site_serving("blog.example", &["wp-login.php"]);
+
+    let listed = fx.json(&["list-probe-paths"]);
+
+    let conditional = &listed["conditional"];
+    assert_eq!(conditional["enabled"], true, "{conditional:#}");
+    let path = |name: &str| {
+        conditional["paths"]
+            .as_array()
+            .and_then(|paths| paths.iter().find(|p| p["path"] == name))
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} not listed: {conditional:#}"))
+    };
+    let login = path("/wp-login.php");
+    assert_eq!(login["active"], false, "{login:#}");
+    assert!(
+        login["reason"]
+            .as_str()
+            .is_some_and(|why| why.starts_with("blog.example: ")),
+        "{login:#}"
+    );
+    assert_eq!(path("/phpmyadmin")["active"], true, "{conditional:#}");
+}
+
+#[test]
+fn list_probe_paths_explains_each_app_path() {
+    let fx = Fixture::new();
+    fx.scan_site_serving("static.example", &["index.html"]);
+
+    let out = fx.run(&["list-probe-paths"]).get_output().stdout.clone();
+
+    let out = String::from_utf8_lossy(&out);
+    assert!(
+        out.contains("Probes for absent apps: on.")
+            && out.contains("/wp-login.php   WordPress            probe on this host"),
+        "stdout was:\n{out}"
+    );
+}
+
+/// The one-off detector blocks a WordPress login on a host without
+/// WordPress, and never on one with it.
+#[test]
+fn run_detector_probe_paths_blocks_the_wordpress_login_only_without_wordpress() {
+    for (files, blocked) in [(&["index.html"][..], 1), (&["wp-login.php"][..], 0)] {
+        let fx = Fixture::new();
+        fx.scan_site_serving("example.com", files);
+        let log = fx._tmp.path().join("access.log");
+        fs::write(
+            &log,
+            access_line("203.0.113.9", "/wp-login.php", 200, "curl/8"),
+        )
+        .unwrap();
+
+        fx.run(&[
+            "run-detector",
+            "probe-paths",
+            "--access-log",
+            log.to_str().unwrap(),
+        ]);
+
+        let rules = stop_bots::db::Db::open(&fx.db)
+            .unwrap()
+            .list_firewall_rules()
+            .unwrap();
+        assert_eq!(rules.len(), blocked, "{files:?}: {rules:?}");
+    }
+}
+
+#[test]
+fn set_detector_switches_probes_for_absent_apps() {
+    let fx = Fixture::new();
+
+    fx.run(&["set-detector", "probe-paths", "--app-aware", "false"]);
+
+    let listed = fx.json(&["list-probe-paths"]);
+    assert_eq!(listed["conditional"]["enabled"], false, "{listed:#}");
+    fx.cmd(&["set-detector", "web-scanners", "--app-aware", "true"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("probe-paths only"));
 }
 
 #[test]

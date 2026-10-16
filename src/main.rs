@@ -523,6 +523,13 @@ enum Command {
         /// and 1 for asset-ratio, rotating-ua and refererless.
         #[arg(long)]
         window_hours: Option<i64>,
+        /// probe-paths only: also count /wp-login.php, /phpmyadmin and the
+        /// other paths of an application where no site runs it
+        /// (`list-probe-paths` shows each, and why). On for a database
+        /// created by a release that has it; off on one an earlier release
+        /// created, until you turn it on.
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        app_aware: Option<bool>,
     },
     /// Block a whole IPv4 /24 when several of its addresses are flagged.
     ///
@@ -1843,7 +1850,18 @@ async fn run() -> Result<()> {
             ttl_days,
             threshold,
             window_hours,
-        }) => set_detector(db, detector, enabled, ttl_days, threshold, window_hours),
+            app_aware,
+        }) => set_detector(
+            db,
+            detector,
+            DetectorChanges {
+                enabled,
+                ttl_days,
+                threshold,
+                window_hours,
+                app_aware,
+            },
+        ),
         Some(Command::SetRepeatOffenders { enabled }) => set_repeat_offenders(db, enabled),
         Some(Command::SetSubnetEscalation { enabled, min }) => {
             set_subnet_escalation(db, enabled, min)
@@ -3442,21 +3460,38 @@ fn list_detectors(db_path: Option<PathBuf>, json: bool) -> Result<()> {
     );
     say!("{}", repeat_offenders_line(&db)?);
     say!(
+        "{} `stop-bots list-probe-paths` shows its paths.",
+        app_aware_line(&db)?
+    );
+    say!(
         "The schedule (`stop-bots tick`, or the TUI while it is open) and `batch` run the \
          ones that are on."
     );
     Ok(())
 }
 
-fn set_detector(
-    db_path: Option<PathBuf>,
-    detector: DetectorArg,
+/// What `set-detector` was asked to change; `None` leaves each as it is.
+struct DetectorChanges {
     enabled: Option<bool>,
     ttl_days: Option<i64>,
     threshold: Option<i64>,
     window_hours: Option<i64>,
+    app_aware: Option<bool>,
+}
+
+fn set_detector(
+    db_path: Option<PathBuf>,
+    detector: DetectorArg,
+    changes: DetectorChanges,
 ) -> Result<()> {
     use stop_bots::protection::{MAX_TTL_DAYS, MAX_WINDOW_HOURS};
+    let DetectorChanges {
+        enabled,
+        ttl_days,
+        threshold,
+        window_hours,
+        app_aware,
+    } = changes;
 
     let db = open_db(db_path)?;
     let d = detector.0;
@@ -3488,8 +3523,15 @@ fn set_detector(
         );
     }
 
+    if app_aware.is_some() && d != Detector::ProbePaths {
+        anyhow::bail!("--app-aware is a setting of probe-paths only");
+    }
+
     if let Some(value) = threshold {
         d.set_threshold(&db, value)?;
+    }
+    if let Some(on) = app_aware {
+        stop_bots::protection::set_app_probe_paths(&db, on)?;
     }
     if let Some(days) = ttl_days {
         d.set_ttl_days(&db, days)?;
@@ -3510,6 +3552,13 @@ fn set_detector(
         "WINDOW"
     );
     say!("{}", detector_line(&db, detector)?);
+    if d == Detector::ProbePaths {
+        say!(
+            "{} When on, {}; `stop-bots list-probe-paths` shows which, and why.",
+            app_aware_line(&db)?,
+            stop_bots::protection::app_probe_paths_summary()
+        );
+    }
     if enabled == Some(false) {
         // The distinction the README draws, said where it bites.
         say!(
@@ -5022,6 +5071,19 @@ fn set_probe_paths(db_path: Option<PathBuf>, paths: String) -> Result<()> {
 fn list_probe_paths(db_path: Option<PathBuf>, json: bool) -> Result<()> {
     let db = open_db(db_path)?;
     let extra = stop_bots::protection::extra_probe_paths(&db)?;
+    let enabled = stop_bots::protection::app_probe_paths(&db)?;
+    let new_here = stop_bots::protection::app_probe_paths_is_new_here(&db)?;
+    let probes = stop_bots::logscan::app_probes(&db)?;
+    let conditional: Vec<stop_bots::output::ConditionalProbePath> = probes
+        .host()
+        .iter()
+        .map(|(path, verdict)| stop_bots::output::ConditionalProbePath {
+            path: format!("/{path}"),
+            apps: stop_bots::webapps::apps_serving(path),
+            active: enabled && *verdict == stop_bots::webapps::Verdict::Probe,
+            reason: verdict.reason().map(str::to_string),
+        })
+        .collect();
     if json {
         return stop_bots::output::print(&stop_bots::output::ProbePaths {
             built_in: stop_bots::accesslog::DEFAULT_PROBE_PATHS
@@ -5029,6 +5091,11 @@ fn list_probe_paths(db_path: Option<PathBuf>, json: bool) -> Result<()> {
                 .map(ToString::to_string)
                 .collect(),
             extra,
+            conditional: stop_bots::output::ConditionalProbePaths {
+                enabled,
+                new_in_this_release: new_here,
+                paths: conditional,
+            },
         });
     }
     say!("Built-in (always checked):");
@@ -5043,7 +5110,41 @@ fn list_probe_paths(db_path: Option<PathBuf>, json: bool) -> Result<()> {
             say!("  {}", terminal_safe(path));
         }
     }
+    say!(
+        "{} Each of these is a probe only where no site runs its application:",
+        app_aware_line(&db)?
+    );
+    for path in &conditional {
+        let state = match (&path.reason, path.active) {
+            (_, true) => "probe on this host".to_string(),
+            (None, false) => "would be a probe on this host".to_string(),
+            (Some(why), false) => format!("not a probe: {why}"),
+        };
+        say!(
+            "  {:<15} {:<20} {}",
+            path.path,
+            path.apps.join(", "),
+            terminal_safe(&state)
+        );
+    }
+    say!(
+        "A request whose log line names its site ($host) is judged by that site alone; \
+         one that names none, by every site on the host."
+    );
     Ok(())
+}
+
+/// Whether app-aware probe paths are on, as `list-probe-paths` and
+/// `set-detector probe-paths --app-aware` say it.
+fn app_aware_line(db: &Db) -> Result<String> {
+    use stop_bots::protection::{app_probe_paths, app_probe_paths_is_new_here};
+    let state = if app_probe_paths_is_new_here(db)? {
+        "off (new in this release: `stop-bots set-detector probe-paths --app-aware true` \
+         turns it on)"
+    } else {
+        on_off(app_probe_paths(db)?)
+    };
+    Ok(format!("Probes for absent apps: {state}."))
 }
 
 fn block_honeypot(

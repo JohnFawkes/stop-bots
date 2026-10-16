@@ -182,6 +182,11 @@ enum ProtectionRow {
     /// changes how long each of their blocks lasts; a plain Off/On, since
     /// the lengths are fixed (`protection::escalated_ttl_days`).
     RepeatOffenders,
+    /// Whether the probe-paths detector also counts the paths of an
+    /// application no site runs (`protection::app_probe_paths`). Beside
+    /// repeat offenders, for the same reason: it changes what one of the
+    /// detectors above does, and is a plain Off/On.
+    AppProbePaths,
     /// Whether the daily render also *runs* the script it writes
     /// (`Db::get_auto_apply_firewall`).
     ///
@@ -366,6 +371,11 @@ pub struct Dashboard {
     /// Whether that row is new here, as a new detector's is
     /// (`protection::repeat_escalation_is_new_here`).
     repeat_offenders_new: bool,
+    /// `protection::app_probe_paths`, for `ProtectionRow::AppProbePaths`.
+    app_probe_paths: bool,
+    /// Whether that row is new here
+    /// (`protection::app_probe_paths_is_new_here`).
+    app_probe_paths_new: bool,
     /// Every third-party CIDR feed, ordered by id — the order
     /// `ProtectionRow::Feed`'s index refers to.
     reputation: Vec<crate::db::ReputationSource>,
@@ -431,6 +441,8 @@ impl Dashboard {
             .collect::<Result<_>>()?;
         self.repeat_offenders = crate::protection::repeat_escalation(db)?;
         self.repeat_offenders_new = crate::protection::repeat_escalation_is_new_here(db)?;
+        self.app_probe_paths = crate::protection::app_probe_paths(db)?;
+        self.app_probe_paths_new = crate::protection::app_probe_paths_is_new_here(db)?;
         self.reputation = db.list_reputation_sources()?;
         self.hosting_asns = db.list_hosting_asns()?;
         self.crawlers = ipranges::crawler_sources(db)?;
@@ -793,25 +805,60 @@ impl Dashboard {
     fn explain_protection(&self, row: ProtectionRow) -> Explanation {
         let label = self.protection_label(row);
         match row {
-            ProtectionRow::Detect(detector) => Explanation::new(label)
-                .para(detector.about())
-                .now(if self.protection_enabled(row) {
-                    format!(
-                        "on, blocking each address it catches for {} day(s).",
-                        self.protection_ttl_days(row)
+            ProtectionRow::Detect(detector) => {
+                let mut explanation = Explanation::new(label)
+                    .para(detector.about())
+                    .now(if self.protection_enabled(row) {
+                        format!(
+                            "on, blocking each address it catches for {} day(s).",
+                            self.protection_ttl_days(row)
+                        )
+                    } else if self.new_detectors.contains(&detector) {
+                        "off. New since this database was created, so it has not been \
+                         switched on for you."
+                            .to_string()
+                    } else {
+                        "off.".to_string()
+                    })
+                    .warn_if(detector.risk());
+                if detector == Detector::ProbePaths {
+                    explanation = explanation.para(format!(
+                        "Probes for absent apps, further down this list, is {}: with it on, \
+                         /wp-login.php, /phpmyadmin and the like also count, but only where no \
+                         site runs WordPress or phpMyAdmin. `stop-bots list-probe-paths` shows \
+                         each path and why it counts here or not.",
+                        if self.app_probe_paths { "on" } else { "off" }
+                    ));
+                }
+                explanation
+                    .para(
+                        "It reads the log every minute while the TUI is open, or from cron. \
+                         Each block records the log line behind it, on the Blocks screen. \
+                         Space switches it; Enter also sets for how long it blocks.",
                     )
-                } else if self.new_detectors.contains(&detector) {
+                    .takes_effect(self.auto_apply_firewall)
+            }
+            ProtectionRow::AppProbePaths => Explanation::new(label)
+                .para(
+                    "Paths that are a scanner's on a host without the application they belong \
+                     to: /wp-login.php, /wp-admin and /xmlrpc.php without WordPress, \
+                     /phpmyadmin without phpMyAdmin. With this on, the Probe paths detector \
+                     blocks a request for one of them, on a site that does not run the \
+                     application. Where the log line does not say which site it was for, \
+                     only when no site here runs it.",
+                )
+                .now(if self.app_probe_paths {
+                    "on."
+                } else if self.app_probe_paths_new {
                     "off. New since this database was created, so it has not been switched \
                      on for you."
-                        .to_string()
                 } else {
-                    "off.".to_string()
+                    "off: only the built-in and extra probe paths count."
                 })
-                .warn_if(detector.risk())
                 .para(
-                    "It reads the log every minute while the TUI is open, or from cron. Each \
-                     block records the log line behind it, on the Blocks screen. Space \
-                     switches it; Enter also sets for how long it blocks.",
+                    "A site whose files this cannot see, such as one that passes requests to \
+                     another server, counts as running every application. `stop-bots \
+                     list-probe-paths` shows each path and why it counts here or not.",
                 )
                 .takes_effect(self.auto_apply_firewall),
             ProtectionRow::Feed(i) => {
@@ -1341,7 +1388,7 @@ impl Dashboard {
             // height it was for every host that does not use the mode.
             .filter(|detector| *detector != Detector::RobotsTxt || self.humans_only)
             .map(ProtectionRow::Detect)
-            .chain([ProtectionRow::RepeatOffenders])
+            .chain([ProtectionRow::RepeatOffenders, ProtectionRow::AppProbePaths])
             .chain((0..self.reputation.len()).map(ProtectionRow::Feed))
             .chain([
                 ProtectionRow::HostingProviders,
@@ -1361,6 +1408,7 @@ impl Dashboard {
                 .unwrap_or_default(),
             ProtectionRow::RepeatOffenders => "Repeat offenders".to_string(),
             ProtectionRow::HostingProviders => "Hosting providers".to_string(),
+            ProtectionRow::AppProbePaths => "Probes for absent apps".to_string(),
             ProtectionRow::AutoApplyFirewall => "Auto-apply the script".to_string(),
             ProtectionRow::LockoutCheck => "SSH lock-out check".to_string(),
         }
@@ -1376,6 +1424,7 @@ impl Dashboard {
             ProtectionRow::Feed(i) => self.reputation.get(i).is_some_and(|s| s.enabled),
             ProtectionRow::RepeatOffenders => self.repeat_offenders,
             ProtectionRow::HostingProviders => !self.hosting_asns.is_empty(),
+            ProtectionRow::AppProbePaths => self.app_probe_paths,
             ProtectionRow::AutoApplyFirewall => self.auto_apply_firewall,
             ProtectionRow::LockoutCheck => self.ssh_lockout_check,
         }
@@ -1387,6 +1436,7 @@ impl Dashboard {
         match row {
             ProtectionRow::Detect(detector) => self.new_detectors.contains(&detector),
             ProtectionRow::RepeatOffenders => self.repeat_offenders_new,
+            ProtectionRow::AppProbePaths => self.app_probe_paths_new,
             _ => false,
         }
     }
@@ -1404,6 +1454,7 @@ impl Dashboard {
             ProtectionRow::Feed(_)
             | ProtectionRow::HostingProviders
             | ProtectionRow::RepeatOffenders
+            | ProtectionRow::AppProbePaths
             | ProtectionRow::AutoApplyFirewall
             | ProtectionRow::LockoutCheck => 0,
         }
@@ -1443,7 +1494,7 @@ impl Dashboard {
             ProtectionRow::RepeatOffenders if self.repeat_offenders => {
                 format!(" up to {}x", crate::protection::ESCALATION_MAX_MULTIPLIER)
             }
-            ProtectionRow::RepeatOffenders => String::new(),
+            ProtectionRow::RepeatOffenders | ProtectionRow::AppProbePaths => String::new(),
             _ if self.protection_enabled(row) => format!(" {}d", self.protection_ttl_days(row)),
             _ => String::new(),
         }
@@ -1971,6 +2022,23 @@ impl Dashboard {
             } else {
                 "Repeat offenders off \u{2014} an address blocked again gets its detector's \
                  TTL, however often it comes back"
+                    .to_string()
+            });
+            return Ok(KeyOutcome::Mutated);
+        }
+        if row == ProtectionRow::AppProbePaths {
+            let on = selected == 1;
+            crate::protection::set_app_probe_paths(db, on)?;
+            self.app_probe_paths = on;
+            self.app_probe_paths_new = false;
+            *message = Some(if on {
+                format!(
+                    "Probes for absent apps on \u{2014} {}",
+                    crate::protection::app_probe_paths_summary()
+                )
+            } else {
+                "Probes for absent apps off \u{2014} only the built-in and extra probe paths \
+                 count"
                     .to_string()
             });
             return Ok(KeyOutcome::Mutated);
@@ -5179,6 +5247,43 @@ mod tests {
         );
     }
 
+    /// On a database from 0.3.0, probes for absent apps are off and say
+    /// "new", as a new detector does, until the operator chooses.
+    #[test]
+    fn app_probe_paths_are_new_on_an_older_database_until_switched() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_int_setting(crate::db::keys::DEFAULTS_GENERATION, 2)
+            .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        let row = ProtectionRow::AppProbePaths;
+        assert!(!dashboard.protection_enabled(row), "on after an upgrade");
+        assert_eq!(dashboard.protection_detail(row), " new");
+
+        let mut message = None;
+        dashboard
+            .commit_protection(&db, row, 1, &mut message)
+            .unwrap();
+
+        assert!(crate::protection::app_probe_paths(&db).unwrap());
+        assert_eq!(dashboard.protection_detail(row), "");
+    }
+
+    #[test]
+    fn the_probe_paths_explanation_says_whether_absent_apps_count() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let explanation = dashboard.explain_protection(ProtectionRow::Detect(Detector::ProbePaths));
+
+        let text = format!("{explanation:?}");
+        assert!(
+            text.contains("Probes for absent apps, further down this list, is on"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn choosing_an_on_option_stores_both_the_toggle_and_its_ttl() {
         let db = Db::open_in_memory().unwrap();
@@ -5364,13 +5469,14 @@ mod tests {
         let detectors = Detector::ALL.len() - 1;
         assert_eq!(
             rows.len(),
-            // ...plus `RepeatOffenders`, between the detectors and the
-            // feeds, and the `HostingProviders`, `AutoApplyFirewall` and
-            // `LockoutCheck` rows, which sit after the feeds. None of the
-            // four is a detector.
-            detectors + ReputationSourceKind::ALL.len() + 4
+            // ...plus `RepeatOffenders` and `AppProbePaths`, between the
+            // detectors and the feeds, and the `HostingProviders`,
+            // `AutoApplyFirewall` and `LockoutCheck` rows, which sit after
+            // the feeds. None of the five is a detector.
+            detectors + ReputationSourceKind::ALL.len() + 5
         );
         assert_eq!(rows[detectors], ProtectionRow::RepeatOffenders);
+        assert_eq!(rows[detectors + 1], ProtectionRow::AppProbePaths);
         assert!(rows[..detectors].iter().all(|r| r.is_detector()));
         assert!(rows[detectors..].iter().all(|r| !r.is_detector()));
     }
@@ -5858,7 +5964,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         let rows = dashboard.protection_rows();
-        assert_eq!(rows.len(), 19, "if this changes, so does the panel height");
+        assert_eq!(rows.len(), 20, "if this changes, so does the panel height");
         for row in rows {
             let label = dashboard.protection_label(row);
             assert!(content.contains(&label), "{label:?} is not on screen");

@@ -70,8 +70,9 @@ pub const CURRENT_VERSION: u32 = 8;
 /// - **2**: longer blocks for repeat offenders
 ///   (`protection::REPEAT_ESCALATION_INTRODUCED_IN`).
 /// - **3**: the detectors added after 0.3
-///   (`protection::MORE_DETECTORS_INTRODUCED_IN`), and probe paths that are
-///   probes only where their application is absent
+///   (`protection::MORE_DETECTORS_INTRODUCED_IN`), among them the port-scan
+///   detector, off by default even on a new database; and probe paths that
+///   are probes only where their application is absent
 ///   (`protection::APP_PROBE_PATHS_INTRODUCED_IN`).
 pub const DEFAULTS_GENERATION: u32 = 3;
 

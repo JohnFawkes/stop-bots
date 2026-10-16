@@ -63,6 +63,9 @@ pub struct LogPaths {
     /// The SSH authentication log, feeding the SSH scanner detector and —
     /// more importantly — the anti-lockout window.
     pub ssh: Option<PathBuf>,
+    /// The kernel log, feeding the port-scan detector (see
+    /// [`crate::portscan`]).
+    pub kernel: Option<PathBuf>,
     /// The web server whose access log is read when none is stored.
     pub server: crate::webserver::WebServer,
     /// Its config root, which decides where that default is: Apache logs
@@ -101,6 +104,28 @@ impl LogPaths {
         match flag.or(self.ssh.as_deref()) {
             Some(path) => crate::sshlog::SshSource::File(path.to_path_buf()),
             None => crate::sshlog::SshSource::Search,
+        }
+    }
+
+    /// The kernel log this run should read, by the same precedence, and
+    /// with the same kind of search as the SSH log's: `kern.log`,
+    /// `messages`, then the journal.
+    pub fn kernel(&self, flag: Option<&Path>) -> crate::portscan::KernelSource {
+        match flag.or(self.kernel.as_deref()) {
+            Some(path) => crate::sshlog::SshSource::File(path.to_path_buf()),
+            None => crate::sshlog::SshSource::Search,
+        }
+    }
+
+    /// What to name in a report when the kernel log could not be read:
+    /// the path given or stored, or what the search tries.
+    pub fn kernel_description(&self, flag: Option<&Path>) -> String {
+        match flag.or(self.kernel.as_deref()) {
+            Some(path) => path.display().to_string(),
+            None => format!(
+                "{}, then the journal",
+                crate::portscan::DEFAULT_KERNEL_LOG_PATHS.join(", ")
+            ),
         }
     }
 

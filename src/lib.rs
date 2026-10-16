@@ -107,6 +107,8 @@ pub mod nginx;
 #[doc(hidden)]
 pub mod output;
 #[doc(hidden)]
+pub mod portscan;
+#[doc(hidden)]
 pub mod present;
 #[doc(hidden)]
 pub mod preview;

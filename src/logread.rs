@@ -446,6 +446,8 @@ pub struct JournalQuery<'a> {
     pub program: &'a Path,
     /// Units to match, any of them.
     pub units: &'a [&'a str],
+    /// Field matches, such as `_TRANSPORT=kernel`, passed as they are.
+    pub matches: &'a [&'a str],
     /// Only entries after this cursor, from an earlier read.
     pub after_cursor: Option<&'a str>,
     /// Only entries at or after this Unix time.
@@ -463,6 +465,7 @@ impl<'a> JournalQuery<'a> {
             args.push("-u".to_string());
             args.push(unit.to_string());
         }
+        args.extend(self.matches.iter().map(|m| m.to_string()));
         // JSON, not `short-iso`: every entry carries its own cursor, so a
         // read can stop after any of them. Each is printed as `short-iso`
         // would print it (see `journal_line`); `cat` would drop the time,
@@ -970,6 +973,7 @@ mod tests {
         JournalQuery {
             program,
             units: &["ssh", "sshd"],
+            matches: &[],
             after_cursor: None,
             since: None,
             last: None,

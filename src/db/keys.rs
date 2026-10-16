@@ -125,6 +125,10 @@ pub const DETECT_SSH_SCANNERS_MIN_ATTEMPTS: &str = "detect_ssh_scanners_min_atte
 pub const DETECT_WEB_SCANNERS_MIN_PATHS: &str = "detect_web_scanners_min_paths";
 pub const DETECT_LOGIN_ATTEMPTS_MIN: &str = "detect_login_attempts_min";
 pub const DETECT_REQUEST_RATE_PER_MINUTE: &str = "detect_request_rate_per_minute";
+/// The port-scan detector's trap ports, comma-separated (see
+/// `portscan::configured_ports`). Unset is the built-in list.
+pub const DETECT_PORT_SCANNERS_PORTS: &str = "detect_port_scanners_ports";
+pub const DETECT_PORT_SCANNERS_MIN_PORTS: &str = "detect_port_scanners_min_ports";
 
 // ---- downloads ----
 
@@ -180,6 +184,8 @@ pub const ALL: &[&str] = &[
     DETECT_WEB_SCANNERS_MIN_PATHS,
     DETECT_LOGIN_ATTEMPTS_MIN,
     DETECT_REQUEST_RATE_PER_MINUTE,
+    DETECT_PORT_SCANNERS_PORTS,
+    DETECT_PORT_SCANNERS_MIN_PORTS,
     HEALTH_PROBE,
     HEALTH_PROBE_AT,
     REFRESH_LEASE,

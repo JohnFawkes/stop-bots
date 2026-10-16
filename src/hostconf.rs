@@ -85,6 +85,7 @@ const APACHE_RELOAD: &str = "apache_reload_command";
 const APACHE_ROOT: &str = "apache_root";
 const ACCESS_LOG: &str = "access_log";
 const SSH_LOG: &str = "ssh_log";
+const KERNEL_LOG: &str = "kernel_log";
 
 /// The host settings. `None` for any of them means "not set": the
 /// built-in default, as it was when nothing was stored in the database.
@@ -110,6 +111,8 @@ pub struct HostConf {
     pub access_log: Option<PathBuf>,
     /// The SSH log, which the lockout guard reads.
     pub ssh_log: Option<PathBuf>,
+    /// The kernel log, which the port-scan detector reads.
+    pub kernel_log: Option<PathBuf>,
 }
 
 impl HostConf {
@@ -167,6 +170,7 @@ impl HostConf {
                 APACHE_ROOT => conf.apache_root = value.map(PathBuf::from),
                 ACCESS_LOG => conf.access_log = value.map(PathBuf::from),
                 SSH_LOG => conf.ssh_log = value.map(PathBuf::from),
+                KERNEL_LOG => conf.kernel_log = value.map(PathBuf::from),
                 other => bail!("line {number} sets `{other}`, which is not a host setting"),
             }
             seen.push(key);
@@ -197,6 +201,7 @@ impl HostConf {
             &self.apache_root,
             &self.access_log,
             &self.ssh_log,
+            &self.kernel_log,
         ]
         .into_iter()
         .flatten()
@@ -233,6 +238,7 @@ impl HostConf {
             (APACHE_ROOT, path_text(&self.apache_root)),
             (ACCESS_LOG, path_text(&self.access_log)),
             (SSH_LOG, path_text(&self.ssh_log)),
+            (KERNEL_LOG, path_text(&self.kernel_log)),
         ];
         for (key, value) in lines {
             if let Some(value) = value {
@@ -307,6 +313,7 @@ impl HostConf {
         LogPaths {
             access: self.access_log.clone(),
             ssh: self.ssh_log.clone(),
+            kernel: self.kernel_log.clone(),
             server: self.web_server(),
             root: self.root(None),
         }
@@ -653,6 +660,7 @@ mod tests {
             apache_root: Some("/srv/web apache".into()),
             access_log: Some("/srv/logs/access.log".into()),
             ssh_log: None,
+            kernel_log: Some("/srv/logs/kern.log".into()),
         };
         conf.save_to(&path).unwrap();
         assert_eq!(HostConf::load_from(&path).unwrap(), conf);

@@ -51,6 +51,7 @@ pub enum ScanKind {
     LoginAttempt,
     RequestRate,
     RobotsViolator,
+    PortScan,
 }
 
 impl ScanKind {
@@ -69,6 +70,7 @@ impl ScanKind {
             Detector::LoginAttempts => ScanKind::LoginAttempt,
             Detector::RequestRate => ScanKind::RequestRate,
             Detector::RobotsViolators => ScanKind::RobotsViolator,
+            Detector::PortScanners => ScanKind::PortScan,
         }
     }
 
@@ -86,6 +88,7 @@ impl ScanKind {
             ScanKind::LoginAttempt => "password-guessing IP",
             ScanKind::RequestRate => "flooding IP",
             ScanKind::RobotsViolator => "robots.txt violator",
+            ScanKind::PortScan => "port-scanning IP",
         }
     }
 }
@@ -312,7 +315,65 @@ pub fn run_detector(
         | D::RobotsViolators => {
             excluding_known_crawlers(db, detector, hinted(convicted), ttl_days, trigger)
         }
+        D::PortScanners => {
+            // Every trap port each address tried inside the window, not
+            // only the first: the list is the evidence.
+            let candidates = convicted
+                .into_iter()
+                .map(|(ip, _)| {
+                    let ports = ports_tried(&rows, &ip, since);
+                    (ip, Some(crate::portscan::join(&ports)))
+                })
+                .collect();
+            add_block_rules(db, detector, found, candidates, 0, true, ttl_days, trigger)
+        }
     }
+}
+
+/// The trap ports `address` tried at or after `since`, from the port-scan
+/// detector's evidence rows, sorted.
+fn ports_tried(rows: &[crate::evidence::Row], address: &str, since: i64) -> Vec<u16> {
+    let mut ports: Vec<u16> = rows
+        .iter()
+        .filter(|row| row.address == address && row.tally.last >= since)
+        .filter_map(|row| match &row.item {
+            crate::evidence::Item::Seen(port) => port.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// Finds addresses in `log_text` (a kernel log) that tried at least
+/// `threshold` different trap ports (see [`crate::portscan::scanning_ips`])
+/// and blocks each, recording the ports it tried. For the one-off
+/// `run-detector port-scanners`; the schedule decides on stored evidence
+/// instead.
+pub fn block_port_scanners(
+    db: &Db,
+    threshold: usize,
+    ttl_days: i64,
+    log_text: &str,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    let candidates: Vec<(String, Option<String>)> =
+        crate::portscan::scanning_ips(log_text, threshold)
+            .into_iter()
+            .map(|(ip, ports)| (ip, Some(crate::portscan::join(&ports))))
+            .collect();
+    let found = candidates.len();
+    add_block_rules(
+        db,
+        Detector::PortScanners,
+        found,
+        candidates,
+        0,
+        true,
+        ttl_days,
+        Trigger::log(log_text, dry_run),
+    )
 }
 
 /// Finds scanning IPs in `log_text` (an SSH log's contents — see
@@ -953,6 +1014,7 @@ fn evidence_line(detector: Detector, item: Option<&str>, line: Option<&String>) 
         (Detector::RobotsViolators, Some(path)) => {
             format!("fetched robots.txt, then {path}, which it forbids")
         }
+        (Detector::PortScanners, Some(ports)) => crate::portscan::evidence_line(ports),
         (_, None) => return None,
     })
 }
@@ -2195,6 +2257,82 @@ mod tests {
                 now: at,
             })
             .unwrap());
+    }
+
+    /// `ip` tried each of `ports` once, at `at`, as the kernel log said.
+    fn tried_ports(db: &Db, ip: &str, ports: &[u16], at: i64) {
+        for port in ports {
+            observe(
+                db,
+                Detector::PortScanners,
+                ip,
+                Item::seen(&port.to_string()),
+                at,
+                1,
+            );
+        }
+    }
+
+    /// Two different trap ports is a scan, by default; one port is not,
+    /// however often; a stored threshold moves the line.
+    #[test]
+    fn a_port_scanner_is_blocked_at_its_threshold_of_distinct_trap_ports() {
+        let cases: [(&str, &[u16], Option<i64>, bool); 5] = [
+            ("one port", &[23], None, false),
+            ("two ports", &[23, 445], None, true),
+            ("many ports", &[23, 445, 3389, 5900], None, true),
+            ("two ports, threshold three", &[23, 445], Some(3), false),
+            (
+                "three ports, threshold three",
+                &[23, 445, 3389],
+                Some(3),
+                true,
+            ),
+        ];
+        for (what, ports, threshold, blocked) in cases {
+            let db = Db::open_in_memory().unwrap();
+            if let Some(threshold) = threshold {
+                Detector::PortScanners
+                    .set_threshold(&db, threshold)
+                    .unwrap();
+            }
+            let now = now_secs();
+            tried_ports(&db, "203.0.113.5", ports, now - 60);
+
+            let outcome = run_detector(&db, Detector::PortScanners, 5, now, false).unwrap();
+
+            assert_eq!(
+                !outcome.newly_blocked.is_empty(),
+                blocked,
+                "{what}: {outcome:?}"
+            );
+        }
+    }
+
+    /// The block says which ports, all of them, so whoever reads it can
+    /// see it was a scan and not a client with the wrong address.
+    #[test]
+    fn a_port_scanner_s_block_records_every_trap_port_it_tried() {
+        let db = Db::open_in_memory().unwrap();
+        let now = now_secs();
+        tried_ports(&db, "203.0.113.5", &[3389, 23, 445], now - 60);
+
+        run_detector(&db, Detector::PortScanners, 5, now, false).unwrap();
+
+        let rule = db
+            .list_firewall_rules()
+            .unwrap()
+            .into_iter()
+            .find(|rule| rule.address == "203.0.113.5")
+            .expect("not blocked");
+        assert_eq!(
+            rule.evidence.as_deref(),
+            Some("new connections to trap ports 23, 445, 3389")
+        );
+        assert_eq!(
+            rule.source,
+            Some(RuleSource::Detector(Detector::PortScanners))
+        );
     }
 
     fn probe_at(db: &Db, ip: &str, at: i64) {

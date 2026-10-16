@@ -52,7 +52,8 @@
 //! A log is read when a due job wants it and not otherwise: the access log
 //! for access-stats and any access-log detector that is on, the SSH log
 //! for the SSH detector's job (on or off: the logins it records keep the
-//! anti-lockout window fed) and the firewall render's guard.
+//! anti-lockout window fed) and the firewall render's guard, and the
+//! kernel log for the port-scan detector when it is on.
 //!
 //! A read feeds *every* consumer of that log, due or not, because the
 //! cursor moves past the lines for all of them at once.
@@ -68,7 +69,7 @@ use crate::db::evidence::{Ingest, IngestStep, INGEST_CHUNK};
 use crate::db::Db;
 use crate::evidence::Evidence;
 use crate::hostlog::{self, source_key, Chunk, Cursor, LogReader, Request, Sources};
-use crate::protection::Detector;
+use crate::protection::{Detector, DetectorLog};
 use crate::sshlog::{self, SshSource};
 
 /// The logs a pass may read: flags from the command line, which win over
@@ -77,6 +78,7 @@ use crate::sshlog::{self, SshSource};
 pub struct Flags {
     pub ssh_log: Option<PathBuf>,
     pub access_log: Option<PathBuf>,
+    pub kernel_log: Option<PathBuf>,
     /// The paths the host settings name ([`crate::hostconf`]), used where
     /// no flag is given.
     pub stored: crate::logpaths::LogPaths,
@@ -85,11 +87,13 @@ pub struct Flags {
 impl Flags {
     /// Where these say the logs are, for reading them in process.
     pub fn sources(&self) -> Sources {
-        Sources::new(
+        let mut sources = Sources::new(
             &self.stored,
             self.access_log.as_deref(),
             self.ssh_log.as_deref(),
-        )
+        );
+        sources.kernel = self.stored.kernel(self.kernel_log.as_deref());
+        sources
     }
 }
 
@@ -105,6 +109,7 @@ pub struct Plan {
     now: i64,
     access: Option<AccessPlan>,
     ssh: Option<SshPlan>,
+    kernel: Option<KernelPlan>,
     /// Where the flags say the logs are: what a pass that reads them in
     /// process reads (see [`Plan::sources`]).
     sources: Sources,
@@ -134,10 +139,19 @@ struct SshPlan {
     look_back: i64,
 }
 
+#[derive(Debug, Clone)]
+struct KernelPlan {
+    /// The stored cursor of every place the kernel log might be.
+    cursors: Vec<Cursor>,
+    /// The oldest a trap hit may be and still count, which is also how far
+    /// back a first read of the journal looks.
+    cutoff: i64,
+}
+
 impl Plan {
     /// Whether this pass reads anything at all.
     pub fn reads_anything(&self) -> bool {
-        self.access.is_some() || self.ssh.is_some()
+        self.access.is_some() || self.ssh.is_some() || self.kernel.is_some()
     }
 
     /// The logs the flags it was planned with name, to [`read`] them in
@@ -165,7 +179,20 @@ fn now() -> i64 {
 fn wants_access_log(db: &Db, job: CronJob) -> Result<bool> {
     Ok(match job {
         CronJob::RecordAccessStats => true,
-        CronJob::Detect(detector) => !detector.spec().uses_ssh_log && detector.is_enabled(db)?,
+        CronJob::Detect(detector) => {
+            detector.spec().log == DetectorLog::Access && detector.is_enabled(db)?
+        }
+        _ => false,
+    })
+}
+
+/// Whether `job` wants the kernel log: the port-scan detector's, when it
+/// is on.
+fn wants_kernel_log(db: &Db, job: CronJob) -> Result<bool> {
+    Ok(match job {
+        CronJob::Detect(detector) => {
+            detector.spec().log == DetectorLog::Kernel && detector.is_enabled(db)?
+        }
         _ => false,
     })
 }
@@ -224,10 +251,39 @@ pub fn plan(db: &Db, jobs: &[CronJob], flags: &Flags) -> Result<Plan> {
         None
     };
 
+    let mut wants_kernel = false;
+    for job in jobs {
+        wants_kernel |= wants_kernel_log(db, *job)?;
+    }
+    let kernel = if wants_kernel {
+        let mut candidates: Vec<String> = match &sources.kernel {
+            SshSource::File(path) => vec![source_key(path)],
+            SshSource::Search => sources
+                .kernel_search
+                .iter()
+                .map(|p| source_key(p))
+                .collect(),
+        };
+        candidates.push(crate::portscan::JOURNAL_SOURCE.to_string());
+        let mut cursors = Vec::new();
+        for source in candidates {
+            if let Some(at) = db.get_log_cursor(&source)? {
+                cursors.push(Cursor { source, at });
+            }
+        }
+        Some(KernelPlan {
+            cursors,
+            cutoff: now - Detector::PortScanners.window_seconds(db)?,
+        })
+    } else {
+        None
+    };
+
     Ok(Plan {
         now,
         access,
         ssh,
+        kernel,
         sources,
     })
 }
@@ -237,7 +293,7 @@ pub fn plan(db: &Db, jobs: &[CronJob], flags: &Flags) -> Result<Plan> {
 pub fn watch(db: &Db, now: i64) -> Result<Watch> {
     let mut detectors = Vec::new();
     for detector in Detector::ALL {
-        if !detector.spec().uses_ssh_log && detector.is_enabled(db)? {
+        if detector.spec().log == DetectorLog::Access && detector.is_enabled(db)? {
             detectors.push((detector, Some(now - detector.window_seconds(db)?)));
         }
     }
@@ -400,6 +456,11 @@ pub struct AccessFindings {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct KernelFindings {
+    pub evidence: Evidence,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct SshFindings {
     pub evidence: Evidence,
     /// Every address that logged in, in what was read.
@@ -412,6 +473,7 @@ pub struct Read {
     now: i64,
     pub access: Option<Outcome<AccessFindings>>,
     pub ssh: Option<Outcome<SshFindings>>,
+    pub kernel: Option<Outcome<KernelFindings>>,
 }
 
 /// Reads what `plan` asks for, through `reader` — [`Plan::sources`].
@@ -424,6 +486,10 @@ pub fn read(plan: &Plan, reader: &dyn LogReader) -> Read {
             .as_ref()
             .map(|access| read_access(access, plan.now, reader)),
         ssh: plan.ssh.as_ref().map(|ssh| read_ssh(ssh, plan.now, reader)),
+        kernel: plan
+            .kernel
+            .as_ref()
+            .map(|kernel| read_kernel(kernel, plan.now, reader)),
     }
 }
 
@@ -555,6 +621,34 @@ fn read_ssh(plan: &SshPlan, now: i64, reader: &dyn LogReader) -> Outcome<SshFind
     }
 }
 
+fn read_kernel(plan: &KernelPlan, now: i64, reader: &dyn LogReader) -> Outcome<KernelFindings> {
+    let request = Request {
+        since: Some(plan.cutoff),
+        ..Request::new(hostlog::Log::Kernel, plan.cursors.clone())
+    };
+    let mut observer: Option<crate::portscan::Observer> = None;
+    let followed = follow(reader, request, &mut |chunk| {
+        let observer = observer.get_or_insert_with(|| {
+            crate::portscan::Observer::new(plan.cutoff, now, chunk.resumed.then_some(now))
+        });
+        for line in chunk.lines.split_terminator('\n') {
+            observer.line(line);
+        }
+    });
+    match followed {
+        Ok(done) => Outcome::Read(LogRead {
+            source: done.source,
+            from: done.from,
+            to: done.to,
+            amount: done.amount,
+            findings: KernelFindings {
+                evidence: observer.map(|o| o.finish()).unwrap_or_default(),
+            },
+        }),
+        Err(tried) => Outcome::Unavailable(tried),
+    }
+}
+
 /// Whether a log was there to read, after [`apply`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Availability {
@@ -580,6 +674,7 @@ pub struct Applied {
     pub now: i64,
     pub access: Availability,
     pub ssh: Availability,
+    pub kernel: Availability,
     /// Addresses that logged in over SSH, in what this pass read.
     pub logins: Vec<String>,
     /// The access-stats tally of what this pass read.
@@ -604,6 +699,18 @@ pub fn apply(db: &Db, read: Read) -> Result<Applied> {
 enum Log {
     Access,
     Ssh,
+    Kernel,
+}
+
+impl Applied {
+    /// Whether the log `detector` reads was there to read in this pass.
+    pub fn log_for(&self, detector: Detector) -> &Availability {
+        match detector.spec().log {
+            DetectorLog::Access => &self.access,
+            DetectorLog::Ssh => &self.ssh,
+            DetectorLog::Kernel => &self.kernel,
+        }
+    }
 }
 
 /// What a pass read, being stored one transaction at a time: each log's
@@ -626,6 +733,7 @@ pub fn store(read: Read) -> Storing {
         now: read.now,
         access: Availability::NotRead,
         ssh: Availability::NotRead,
+        kernel: Availability::NotRead,
         logins: Vec::new(),
         stats: crate::accessstats::AccessStatsOutcome::default(),
         access_counts: Counts::default(),
@@ -676,6 +784,25 @@ pub fn store(read: Read) -> Storing {
         }
     }
 
+    match read.kernel {
+        None => {}
+        Some(Outcome::Unavailable(tried)) => applied.kernel = Availability::Unavailable(tried),
+        Some(Outcome::Read(log)) => {
+            pending.push((
+                Log::Kernel,
+                Ingest::new(
+                    &log.source,
+                    log.from.as_deref(),
+                    log.to.as_deref(),
+                    log.findings.evidence,
+                    HashMap::new(),
+                    Vec::new(),
+                    read.now,
+                ),
+            ));
+        }
+    }
+
     // Stepped from the back.
     pending.reverse();
     Storing {
@@ -712,6 +839,7 @@ impl Storing {
                         self.applied.access = read;
                     }
                     Log::Ssh => self.applied.ssh = read,
+                    Log::Kernel => self.applied.kernel = read,
                 }
             }
             return Ok(None);
@@ -772,6 +900,7 @@ mod tests {
         db: Db,
         access: PathBuf,
         auth: PathBuf,
+        kern: PathBuf,
         /// No flags, and both logs named by the host settings.
         flags: Flags,
     }
@@ -780,13 +909,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let access = dir.path().join("access.log");
         let auth = dir.path().join("auth.log");
+        let kern = dir.path().join("kern.log");
         std::fs::write(&access, "").unwrap();
         std::fs::write(&auth, "").unwrap();
+        std::fs::write(&kern, "").unwrap();
         let db = Db::open_in_memory().unwrap();
         let flags = Flags {
             stored: crate::logpaths::LogPaths {
                 access: Some(access.clone()),
                 ssh: Some(auth.clone()),
+                kernel: Some(kern.clone()),
                 ..Default::default()
             },
             ..Flags::default()
@@ -796,6 +928,7 @@ mod tests {
             db,
             access,
             auth,
+            kern,
             flags,
         }
     }
@@ -1025,6 +1158,117 @@ mod tests {
             .unwrap();
         let lines: u64 = rows.iter().map(|r| r.tally.count).sum();
         assert_eq!(lines, 3);
+    }
+
+    /// A trap hit a minute ago, as rsyslog writes it to `kern.log`.
+    fn trap_hit(ip: &str, port: u16) -> String {
+        format!(
+            "{} host kernel: [1.0] stop-bots-trap: IN=eth0 OUT= SRC={ip} DST=192.0.2.1 \
+             PROTO=TCP SPT=40000 DPT={port} SYN URGP=0\n",
+            iso(now() - 60)
+        )
+    }
+
+    /// With the port-scan detector on, the kernel log is read like the
+    /// others, from where the last pass stopped, into evidence the
+    /// detector convicts on.
+    #[test]
+    fn the_kernel_log_feeds_the_port_scan_detector_once_per_line() {
+        let host = host();
+        Detector::PortScanners.set_enabled(&host.db, true).unwrap();
+        append(&host.kern, "unrelated kernel line\n");
+        append(&host.kern, &trap_hit("203.0.113.7", 23));
+        let jobs = [CronJob::Detect(Detector::PortScanners)];
+
+        let first = run(&host.db, &jobs, &host.flags).unwrap();
+        append(&host.kern, &trap_hit("203.0.113.7", 445));
+        run(&host.db, &jobs, &host.flags).unwrap();
+        run(&host.db, &jobs, &host.flags).unwrap();
+
+        assert!(first.kernel.is_readable(), "{:?}", first.kernel);
+        let rows = host
+            .db
+            .evidence_rows(Detector::PortScanners, 0, Rule::Distinct(2))
+            .unwrap();
+        let counted: u64 = rows.iter().map(|row| row.tally.count).sum();
+        assert_eq!((rows.len(), counted), (2, 2), "{rows:?}");
+        let outcome =
+            crate::scanblock::run_detector(&host.db, Detector::PortScanners, 1, now(), true)
+                .unwrap();
+        assert_eq!(outcome.newly_blocked, ["203.0.113.7"], "{outcome:?}");
+    }
+
+    /// Off, it reads nothing: the kernel log is not touched at all.
+    #[test]
+    fn the_kernel_log_is_not_read_while_the_port_scan_detector_is_off() {
+        let host = host();
+        let plan = plan(
+            &host.db,
+            &[CronJob::Detect(Detector::PortScanners)],
+            &host.flags,
+        )
+        .unwrap();
+        assert!(!plan.reads_anything());
+    }
+
+    /// An unreadable kernel log says so, and names what it tried.
+    #[test]
+    fn an_unreadable_kernel_log_is_unavailable_and_says_where_it_looked() {
+        let host = host();
+        Detector::PortScanners.set_enabled(&host.db, true).unwrap();
+        std::fs::remove_file(&host.kern).unwrap();
+
+        let applied = run(
+            &host.db,
+            &[CronJob::Detect(Detector::PortScanners)],
+            &host.flags,
+        )
+        .unwrap();
+
+        assert_eq!(
+            applied.kernel,
+            Availability::Unavailable(host.kern.display().to_string())
+        );
+    }
+
+    /// From the journal, the kernel's own messages are asked for, from a
+    /// cursor after the first read.
+    #[test]
+    fn the_kernel_journal_is_read_by_transport_and_from_its_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::testing::fake_journalctl(
+            dir.path(),
+            &format!(
+                "echo '{}'",
+                crate::testing::kernel_journal_entry(
+                    "s=k1",
+                    now() - 60,
+                    "stop-bots-trap: IN=eth0 OUT= SRC=203.0.113.8 DST=192.0.2.1 PROTO=TCP \
+                     SPT=1 DPT=3389 SYN URGP=0"
+                )
+            ),
+        );
+        let db = Db::open_in_memory().unwrap();
+        Detector::PortScanners.set_enabled(&db, true).unwrap();
+        let jobs = [CronJob::Detect(Detector::PortScanners)];
+        let journal = |db: &Db| {
+            let mut plan = plan(db, &jobs, &Flags::default()).unwrap();
+            plan.sources.kernel_search = vec![dir.path().join("no-kern.log")];
+            plan.with_journalctl(&dir.path().join("journalctl"))
+        };
+
+        let first = apply(&db, read_here(&journal(&db))).unwrap();
+        apply(&db, read_here(&journal(&db))).unwrap();
+
+        assert!(first.kernel.is_readable(), "{:?}", first.kernel);
+        let calls = crate::testing::journalctl_calls(dir.path());
+        assert!(calls[0].starts_with("_TRANSPORT=kernel "), "{calls:?}");
+        assert!(calls[0].contains("--since=@"), "{calls:?}");
+        assert!(calls[1].contains("--after-cursor=s=k1"), "{calls:?}");
+        let rows = db
+            .evidence_rows(Detector::PortScanners, 0, Rule::Once)
+            .unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
     }
 
     /// Two readers from the same cursor: the second stores nothing, so

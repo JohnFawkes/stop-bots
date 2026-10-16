@@ -60,6 +60,17 @@
 //! in the chain until the script is rendered and applied again. A rule
 //! already expired at render time is left out.
 //!
+//! ## Trap ports
+//!
+//! With the port-scan detector on, the chain ends with a `LOG` (with
+//! [`crate::portscan::LOG_PREFIX`], under a `limit`) of new connections to
+//! the trap ports and a `DROP` of everything to them, in both families.
+//! Last, so every address rule is decided first. The chain is also jumped
+//! to from `FORWARD`, so both rules match only `--dst-type LOCAL`: a
+//! packet DNAT'd to a container is never trapped. `multiport` takes
+//! fifteen ports at most, so a longer list is several pairs of rules. See
+//! [`crate::portscan`].
+//!
 //! ## Default-deny (allowlist) mode
 //!
 //! For allowlist geo-blocking (block everything except selected countries),
@@ -220,7 +231,47 @@ fn jumps(out: &mut String, tool: &str, indent: &str) {
 /// field on [`FirewallRule`] yet, so UDP-specific rules aren't
 /// representable (see TODO.md).
 pub fn render(rules: &[FirewallRule], now: i64) -> String {
-    let plan = Plan::new(rules, now);
+    render_with_trap(rules, None, now)
+}
+
+/// The most ports one `multiport` match takes.
+const MULTIPORT_MAX: usize = 15;
+
+/// The trap's rules, the same for both families: see the module docs.
+fn trap_lines(trap: &crate::portscan::Trap) -> Vec<String> {
+    let mut lines = Vec::new();
+    for ports in trap.ports.chunks(MULTIPORT_MAX) {
+        let ports = ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let matched =
+            format!("-A {CHAIN} -p tcp -m multiport --dports {ports} -m addrtype --dst-type LOCAL");
+        lines.push(format!(
+            "{matched} --syn -m limit --limit {} -j LOG --log-prefix \"{}\"",
+            crate::portscan::LOG_RATE,
+            crate::portscan::LOG_PREFIX
+        ));
+        lines.push(format!("{matched} -j DROP"));
+    }
+    lines
+}
+
+/// [`render`], with the port-scan detector's `trap` at the end of the
+/// chain (see the module docs).
+pub fn render_with_trap(
+    rules: &[FirewallRule],
+    trap: Option<&crate::portscan::Trap>,
+    now: i64,
+) -> String {
+    let mut plan = Plan::new(rules, now);
+    let (v4_rules, v6_rules) = (plan.v4.len(), plan.v6.len());
+    if let Some(trap) = trap {
+        let lines = trap_lines(trap);
+        plan.v4.extend(lines.iter().cloned());
+        plan.v6.extend(lines);
+    }
 
     let mut out = String::new();
     out.push_str("#!/bin/sh\n");
@@ -237,10 +288,11 @@ pub fn render(rules: &[FirewallRule], now: i64) -> String {
     out.push_str("# Existing rules in those chains, all other chains, and every chain\n");
     out.push_str("# policy are left alone. IPv6 rules get the same chain in ip6tables.\n");
     out.push_str(&format!(
-        "# {} IPv4 rule(s), {} IPv6 rule(s).\n",
-        plan.v4.len(),
-        plan.v6.len()
+        "# {v4_rules} IPv4 rule(s), {v6_rules} IPv6 rule(s).\n"
     ));
+    if let Some(trap) = trap {
+        crate::nftables::trap_comment(&mut out, trap);
+    }
     for address in &plan.skipped {
         // `{:?}`, not `{}`: an unvalidated address can contain a newline,
         // which would end the comment and make the remainder of it a
@@ -275,12 +327,11 @@ pub fn render(rules: &[FirewallRule], now: i64) -> String {
         &plan.v6,
     );
     jumps(&mut out, "ip6tables", "    ");
-    if !plan.v6.is_empty() {
+    if v6_rules > 0 {
         out.push_str("else\n");
         out.push_str(&format!(
-            "    echo \"stop-bots: ip6tables cannot be used on this host, so {} IPv6 rule(s) \
-             were not applied\" >&2\n",
-            plan.v6.len()
+            "    echo \"stop-bots: ip6tables cannot be used on this host, so {v6_rules} IPv6 \
+             rule(s) were not applied\" >&2\n"
         ));
         out.push_str("    exit 1\n");
     }
@@ -632,6 +683,99 @@ mod tests {
             disabled("10.0.0.1"),
         ];
         crate::golden::assert_golden("firewall.iptables.sh", &render(&rules, NOW));
+    }
+
+    /// The same rule set with the port-scan detector's trap.
+    #[test]
+    fn rendered_script_with_a_trap_matches_the_golden() {
+        let rules = vec![
+            allow("203.0.113.7"),
+            block("198.51.100.0/24"),
+            block_port("192.0.2.9", 22),
+            block("2001:db8::/32"),
+            block_until("192.0.2.77", NOW + 90_000),
+            disabled("10.0.0.1"),
+        ];
+        crate::golden::assert_golden(
+            "firewall-trap.iptables.sh",
+            &render_with_trap(&rules, Some(&crate::testing::trap()), NOW),
+        );
+    }
+
+    /// In both families, every address rule comes first: an SSH login or
+    /// a trusted address is accepted before the trap sees it.
+    #[test]
+    fn the_trap_comes_after_every_address_rule_in_both_families() {
+        let script = render_with_trap(
+            &[allow("203.0.113.7"), allow("2001:db8::7")],
+            Some(&crate::testing::trap()),
+            NOW,
+        );
+        for (delimiter, allowed) in [
+            ("STOP_BOTS_IPV4", "203.0.113.7"),
+            ("STOP_BOTS_IPV6", "2001:db8::7"),
+        ] {
+            let fragment = fragment_of(&script, delimiter);
+            let allow = fragment
+                .iter()
+                .position(|l| l.contains(&format!("-s {allowed} -j ACCEPT")))
+                .unwrap_or_else(|| panic!("no allow in {delimiter}:\n{script}"));
+            let log = fragment.iter().position(|l| l.contains("-j LOG")).unwrap();
+            let drop = fragment
+                .iter()
+                .position(|l| l.contains("--dports") && l.ends_with("-j DROP"))
+                .unwrap();
+            assert!(allow < log && log < drop, "{delimiter}:\n{fragment:#?}");
+        }
+    }
+
+    /// The chain is jumped to from FORWARD too, so the trap matches only
+    /// traffic for this host: never a port DNAT'd to a container.
+    #[test]
+    fn the_trap_matches_only_traffic_for_this_host() {
+        let script = render_with_trap(&[], Some(&crate::testing::trap()), NOW);
+        let trap_lines: Vec<&str> = script.lines().filter(|l| l.contains("--dports")).collect();
+        assert_eq!(
+            trap_lines.len(),
+            4,
+            "a LOG and a DROP per family:\n{script}"
+        );
+        for line in trap_lines {
+            assert!(line.contains("-m addrtype --dst-type LOCAL"), "{line}");
+        }
+    }
+
+    /// `multiport` takes fifteen ports; more is another pair of rules.
+    #[test]
+    fn more_trap_ports_than_one_multiport_takes_are_split() {
+        let ports: Vec<u16> = (2000..2020).collect();
+        let trap = crate::portscan::resolve(&ports, &[], &[]);
+        let script = render_with_trap(&[], Some(&trap), NOW);
+        let v4 = fragment_of(&script, "STOP_BOTS_IPV4");
+        let drops: Vec<&&str> = v4.iter().filter(|l| l.contains("--dports")).collect();
+        assert_eq!(drops.len(), 4, "{v4:#?}");
+        for line in drops {
+            let list = line
+                .split("--dports ")
+                .nth(1)
+                .unwrap()
+                .split(' ')
+                .next()
+                .unwrap();
+            assert!(list.split(',').count() <= MULTIPORT_MAX, "{line}");
+        }
+    }
+
+    /// The header counts address rules, as `status` and "wrote N rule(s)"
+    /// do: the trap adds none.
+    #[test]
+    fn the_trap_is_not_counted_as_rules() {
+        let script = render_with_trap(&[block("1.2.3.4")], Some(&crate::testing::trap()), NOW);
+        assert!(
+            script.contains("# 1 IPv4 rule(s), 0 IPv6 rule(s).\n"),
+            "{script}"
+        );
+        assert!(!script.contains("ip6tables cannot be used"), "{script}");
     }
 
     /// The database now refuses such a row, so this can only come from a

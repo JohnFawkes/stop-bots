@@ -90,6 +90,16 @@ pub(crate) fn block_until(address: &str, expires_at: i64) -> FirewallRule {
     }
 }
 
+/// The port-scan detector's trap with the built-in ports, on a host where
+/// MySQL listens: what a typical web host renders.
+pub(crate) fn trap() -> crate::portscan::Trap {
+    crate::portscan::resolve(
+        &crate::portscan::DEFAULT_TRAP_PORTS,
+        &[22, 80, 443, 3306],
+        &[22],
+    )
+}
+
 /// A rule that exists but is switched off — renderers must skip it.
 pub(crate) fn disabled(address: &str) -> FirewallRule {
     FirewallRule {
@@ -275,6 +285,24 @@ pub(crate) fn journal_entry(cursor: &str, at: i64, message: &str) -> String {
         "SYSLOG_IDENTIFIER": "sshd",
         "_PID": "1",
         "_SYSTEMD_UNIT": "ssh.service",
+        "MESSAGE": message,
+    })
+    .to_string();
+    format!(
+        "{{\"__CURSOR\":{},{}",
+        serde_json::Value::from(cursor),
+        &rest[1..]
+    )
+}
+
+/// A kernel message as `journalctl -o json` prints it: no pid, and
+/// `kernel` for the identifier, as the kernel's own entries have.
+pub(crate) fn kernel_journal_entry(cursor: &str, at: i64, message: &str) -> String {
+    let rest = serde_json::json!({
+        "__REALTIME_TIMESTAMP": (at * 1_000_000).to_string(),
+        "_HOSTNAME": "host",
+        "SYSLOG_IDENTIFIER": "kernel",
+        "_TRANSPORT": "kernel",
         "MESSAGE": message,
     })
     .to_string();

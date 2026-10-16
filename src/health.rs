@@ -176,6 +176,17 @@ pub struct Probe {
     /// can say: the operator's next question is always which file.
     #[serde(default)]
     pub access_log_path: Option<String>,
+    /// Whether the kernel log, which the port-scan detector reads, could
+    /// be read, and what was tried. `None` in a probe from before it was
+    /// carried here.
+    #[serde(default)]
+    pub kernel_log_readable: Option<bool>,
+    #[serde(default)]
+    pub kernel_log_path: Option<String>,
+    /// Whether `ss` could say what listens, which the port-scan
+    /// detector's trap needs. `None` in a probe from before it was asked.
+    #[serde(default)]
+    pub listening_known: Option<bool>,
     /// Which user agents the blocking policy turned away in the access
     /// log this probe read, with how much each still had served. Empty
     /// when the log could not be read.
@@ -409,6 +420,9 @@ pub fn probe(
         ssh_log_readable: Some(ssh_readable),
         access_log_readable: Some(access_readable),
         access_log_path: Some(paths.access_description(None)),
+        kernel_log_readable: Some(crate::portscan::kernel_log_is_readable(&paths.kernel(None))),
+        kernel_log_path: Some(paths.kernel_description(None)),
+        listening_known: Some(crate::portscan::listening_ports().is_some()),
         access_log_clients: access_readable.then_some((survey.public, survey.counts.parsed)),
         access_log_lines: access_readable.then_some((survey.counts.lines, survey.counts.parsed)),
         access_log_unparsed_sample: survey.unparsed_sample.clone(),
@@ -877,7 +891,7 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     // overlapping feeds would read as a ruleset that is behind.
     let loadable = firewall::loaded_entries(&rules, backend, now_secs());
     let applied = db.get_firewall_applied_signature()?.as_deref()
-        == Some(firewall::rules_signature(&rules).as_str());
+        == Some(firewall::current_signature(db)?.as_str());
     checks.push(firewall_enforced(probe, loadable, applied));
     checks.push(firewall_persistence(probe, backend));
     checks.push(script_freshness(db, expected, backend)?);
@@ -892,6 +906,9 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     checks.push(disk_room(probe));
     checks.push(database_size(db)?);
     checks.push(log_sources(probe));
+    if let Some(check) = port_scan_sources(db, probe)? {
+        checks.push(check);
+    }
     checks.push(access_log_format(probe));
     checks.push(access_log_clients(probe));
     if let Some(check) = cdn_edges(probe) {
@@ -2320,6 +2337,62 @@ fn log_sources(probe: &Probe) -> Check {
     }
 }
 
+/// What the port-scan detector needs and may not have, when it is on: a
+/// kernel log it can read, and `ss` to see what listens. Absent when the
+/// detector is off, or the probe is older than these questions.
+///
+/// Each failure is silent where it happens: an unreadable kernel log
+/// leaves the trap dropping and logging with nothing reading the log, and
+/// no `ss` leaves no trap at all. Both look like "no scanners found".
+fn port_scan_sources(db: &Db, probe: &Probe) -> Result<Option<Check>> {
+    if !crate::protection::Detector::PortScanners.is_enabled(db)? {
+        return Ok(None);
+    }
+    if probe.kernel_log_readable.is_none() && probe.listening_known.is_none() {
+        return Ok(None);
+    }
+    let mut problems = Vec::new();
+    let mut fixes = Vec::new();
+    if probe.kernel_log_readable == Some(false) {
+        let tried = probe
+            .kernel_log_path
+            .as_deref()
+            .map(|path| format!(" (tried {path})"))
+            .unwrap_or_default();
+        problems.push(format!(
+            "the kernel log is unreadable{tried}, so trap hits are dropped and never read"
+        ));
+        fixes.push(
+            "stop-bots set-log-paths --kernel-log <path> (/var/log/kern.log under rsyslog), \
+             or run as root so the journal's kernel messages can be read"
+                .to_string(),
+        );
+    }
+    if probe.listening_known == Some(false) {
+        problems.push(
+            "`ss` could not be run, so the firewall traps no port: what listens is unknown"
+                .to_string(),
+        );
+        fixes.push("install iproute2, which provides `ss`".to_string());
+    }
+    let (level, detail, fix) = if problems.is_empty() {
+        (
+            Level::Ok,
+            "the kernel log is readable and what listens is known".to_string(),
+            None,
+        )
+    } else {
+        (Level::Warn, problems.join("; "), Some(fixes.join("; ")))
+    };
+    Ok(Some(Check {
+        id: "port-scan-sources",
+        title: "Port-scan detector",
+        level,
+        detail,
+        fix,
+    }))
+}
+
 /// Where the last probe is kept, so both front-ends can render a report
 /// without shelling out.
 pub const PROBE_KEY: &str = crate::db::keys::HEALTH_PROBE;
@@ -2417,6 +2490,9 @@ mod tests {
             ssh_log_readable: Some(true),
             access_log_readable: Some(true),
             access_log_path: None,
+            kernel_log_readable: Some(true),
+            kernel_log_path: None,
+            listening_known: Some(true),
             access_log_clients: Some((40, 41)),
             access_log_lines: Some((41, 41)),
             access_log_unparsed_sample: None,
@@ -2446,6 +2522,46 @@ mod tests {
             .unwrap();
         db.set_reputation_source_enabled("aws", true).unwrap();
         db
+    }
+
+    /// The port-scan detector's needs, said only when it is on: an
+    /// unreadable kernel log and a missing `ss` each make it find nothing
+    /// without failing anywhere.
+    #[test]
+    fn the_port_scan_detector_warns_when_it_cannot_read_or_cannot_see() {
+        let db = db();
+        let unreadable = Probe {
+            kernel_log_readable: Some(false),
+            kernel_log_path: Some("/var/log/kern.log".to_string()),
+            ..healthy()
+        };
+        let no_ss = Probe {
+            listening_known: Some(false),
+            ..healthy()
+        };
+        assert!(
+            port_scan_sources(&db, &unreadable).unwrap().is_none(),
+            "said while the detector is off"
+        );
+
+        crate::protection::Detector::PortScanners
+            .set_enabled(&db, true)
+            .unwrap();
+        let cases = [
+            ("healthy", healthy(), Level::Ok, "readable"),
+            ("unreadable", unreadable, Level::Warn, "/var/log/kern.log"),
+            ("no ss", no_ss, Level::Warn, "`ss`"),
+        ];
+        for (what, probe, level, says) in cases {
+            let check = port_scan_sources(&db, &probe).unwrap().unwrap();
+            assert_eq!(check.level, level, "{what}: {check:?}");
+            assert!(check.detail.contains(says), "{what}: {check:?}");
+            assert_eq!(
+                check.fix.is_some(),
+                level == Level::Warn,
+                "{what}: {check:?}"
+            );
+        }
     }
 
     fn renewing_over_http() -> Probe {

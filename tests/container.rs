@@ -2645,6 +2645,104 @@ fn a_blocked_client_container_cannot_reach_the_server() {
     );
 }
 
+// ---- the port-scan detector, against a real firewall ----
+
+impl Client {
+    /// Opens a TCP connection to `port` on `host` and says how it went:
+    /// curl's exit code, 7 for a refusal (a closed port answering) and 28
+    /// for a timeout (a port whose packets are dropped).
+    fn connect(&self, host: &str, port: u16) -> String {
+        let (_, stdout, _) = exec_in(
+            &self.name,
+            &format!("curl -s --max-time 3 telnet://{host}:{port} </dev/null; echo $?"),
+        );
+        stdout.trim().to_string()
+    }
+}
+
+/// The joins between the halves, for one backend: the trap loads into a
+/// real firewall, drops a real client's connection to a trap port while
+/// other closed ports still refuse, and the client that a kernel log names
+/// for two trap ports is then blocked from the web server.
+///
+/// The kernel log line is written by hand, in the kernel's format, with
+/// the real client's address: a container's network namespace does not
+/// log to the kernel log (`nf_log_all_netns` is off), and a container
+/// could not read it if it did. The parser's side of that format is
+/// tested in `portscan`; this is the rest.
+fn port_scan_end_to_end(backend: &str) {
+    let net = Network::create(&format!("stop-bots-portscan-{backend}-net"));
+    let server = Server::start_on_network(&format!("stop-bots-portscan-{backend}"), &net);
+    let client = Client::start(&format!("stop-bots-portscan-{backend}-client"), &net);
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    let address = client.address();
+
+    server.stop_bots("set-detector port-scanners --enabled true");
+    server.render_and_load(backend);
+
+    let script = server.sh("cat /tmp/fw");
+    assert!(
+        script.contains("stop-bots-trap: "),
+        "no trap in the script:\n{script}"
+    );
+    assert_eq!(
+        client.connect(&server.name, 23),
+        "28",
+        "a trap port was not dropped. script:\n{script}"
+    );
+    assert_eq!(
+        client.connect(&server.name, 8081),
+        "7",
+        "a closed port that is no trap port no longer refuses. script:\n{script}"
+    );
+    assert_eq!(
+        client.get(&server.name, "--max-time 5"),
+        "200",
+        "the trap stopped the web server. script:\n{script}"
+    );
+
+    let line = |port: u16| {
+        format!(
+            "Oct 16 10:00:00 server kernel: [100.000000] stop-bots-trap: IN=eth0 OUT= \
+             SRC={address} DST=198.51.100.1 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=1 DF \
+             PROTO=TCP SPT=40000 DPT={port} WINDOW=64240 RES=0x00 SYN URGP=0"
+        )
+    };
+    server.sh(&format!(
+        "printf '%s\\n%s\\n' '{}' '{}' > /tmp/kern.log",
+        line(23),
+        line(445)
+    ));
+    let found = server.stop_bots("run-detector port-scanners --kernel-log /tmp/kern.log");
+    assert!(
+        found.contains(&address),
+        "the detector did not find {address}:\n{found}"
+    );
+    server.render_and_load(backend);
+
+    assert_eq!(
+        client.get(&server.name, "--max-time 5"),
+        "000",
+        "the port scanner was blocked but still reaches the web server"
+    );
+}
+
+#[test]
+fn a_port_scanner_is_trapped_then_blocked_under_nftables() {
+    if !enabled() {
+        return;
+    }
+    port_scan_end_to_end("nftables");
+}
+
+#[test]
+fn a_port_scanner_is_trapped_then_blocked_under_iptables() {
+    if !enabled() {
+        return;
+    }
+    port_scan_end_to_end("iptables");
+}
+
 // ---- batch mode: does one command really do the lot? ----
 
 /// `batch --apply` is the only thing in this project that enforces

@@ -183,6 +183,7 @@ pub fn detector_name(detector: Detector) -> &'static str {
         Detector::LoginAttempts => "login-attempts",
         Detector::RequestRate => "request-rate",
         Detector::RobotsViolators => "robots-violators",
+        Detector::PortScanners => "port-scanners",
     }
 }
 

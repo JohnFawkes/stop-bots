@@ -1303,8 +1303,8 @@ impl Observer {
                         .map(|_| Item::seen(&line.path))
                 }
             }
-            // Not an access-log detector.
-            Detector::SshScanners => None,
+            // Not access-log detectors.
+            Detector::SshScanners | Detector::PortScanners => None,
         }
     }
 
@@ -1357,7 +1357,8 @@ fn allows_app_requests(detector: Detector) -> bool {
         | Detector::RobotsTxt
         | Detector::LoginAttempts
         | Detector::RobotsViolators
-        | Detector::SshScanners => false,
+        | Detector::SshScanners
+        | Detector::PortScanners => false,
     }
 }
 

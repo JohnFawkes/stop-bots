@@ -90,6 +90,7 @@ pub fn check_label(check: &Check) -> &'static str {
         "disk-room" => "disk",
         "database-size" => "database",
         "log-sources" => "logs",
+        "port-scan-sources" => "port scans",
         "access-log-format" => "log format",
         "access-log-clients" => "clients",
         "cdn-edges" => "cdn",

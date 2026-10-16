@@ -297,6 +297,7 @@ fn scan_logs(db: &Db, options: &BatchOptions) -> Vec<Step> {
     let flags = crate::logscan::Flags {
         ssh_log: options.ssh_log.clone(),
         access_log: options.access_log.clone(),
+        kernel_log: None,
         stored: options.host.log_paths(),
     };
     let applied = match crate::logscan::run(db, &jobs, &flags) {
@@ -347,12 +348,7 @@ fn run_one_detector(
     if !detector.is_enabled(db)? {
         return Ok("off".to_string());
     }
-    let log = if detector.spec().uses_ssh_log {
-        &applied.ssh
-    } else {
-        &applied.access
-    };
-    if !log.is_readable() {
+    if !applied.log_for(detector).is_readable() {
         return Ok("skipped: log unavailable".to_string());
     }
     let ttl = detector.ttl_days(db)?;

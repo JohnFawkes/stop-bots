@@ -283,6 +283,24 @@ fn every_setting_a_release_changed_reads_back_the_same() {
     }
 }
 
+/// Probes for absent apps make the probe-paths detector block more, so no
+/// upgrade switches them on: off on every release's database, and marked
+/// new until the operator chooses.
+#[test]
+fn no_release_s_database_gains_probes_for_absent_apps() {
+    for release in RELEASES {
+        let host = UpgradedHost::of(release);
+        let listed: serde_json::Value =
+            serde_json::from_str(&host.run(&["list-probe-paths", "--json"])).unwrap();
+        let conditional = &listed["conditional"];
+        assert_eq!(conditional["enabled"], false, "{release}: {conditional:#}");
+        assert_eq!(
+            conditional["new_in_this_release"], true,
+            "{release}: {conditional:#}"
+        );
+    }
+}
+
 #[test]
 fn every_release_s_firewall_rules_read_back_the_same() {
     use FirewallAction::{Allow, Block};

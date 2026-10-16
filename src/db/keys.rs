@@ -113,6 +113,11 @@ pub const DETECT_SUBNET_ESCALATION_MIN: &str = "detect_subnet_escalation_min";
 /// `protection::repeat_escalation`). Unset on a database nobody has
 /// switched it on, which reads by the database's defaults generation.
 pub const DETECT_REPEAT_OFFENDERS: &str = "detect_repeat_offenders";
+/// Whether the probe-paths detector also counts the paths of applications
+/// that are absent (see `protection::app_probe_paths`). Unset on a
+/// database nobody has switched it on, which reads by the database's
+/// defaults generation.
+pub const DETECT_PROBE_PATHS_APP_AWARE: &str = "detect_probe_paths_app_aware";
 pub const DETECT_ASSET_RATIO_MIN_PAGES: &str = "detect_asset_ratio_min_pages";
 pub const DETECT_ROTATING_UA_MIN: &str = "detect_rotating_ua_min";
 pub const DETECT_REFERERLESS_MIN_PATHS: &str = "detect_refererless_min_paths";
@@ -165,6 +170,7 @@ pub const ALL: &[&str] = &[
     DETECT_SUBNET_ESCALATION,
     DETECT_SUBNET_ESCALATION_MIN,
     DETECT_REPEAT_OFFENDERS,
+    DETECT_PROBE_PATHS_APP_AWARE,
     DETECT_ASSET_RATIO_MIN_PAGES,
     DETECT_ROTATING_UA_MIN,
     DETECT_REFERERLESS_MIN_PATHS,

@@ -241,12 +241,18 @@ fn watch(db: &Db, now: i64) -> Result<Watch> {
             detectors.push((detector, Some(now - detector.window_seconds(db)?)));
         }
     }
+    let app_probes = if detectors.iter().any(|(d, _)| *d == Detector::ProbePaths) {
+        app_probes_if_on(db)?
+    } else {
+        crate::webapps::AppProbes::default()
+    };
     Ok(Watch {
         detectors,
         probe_paths: crate::protection::probe_paths(db)?,
         honeypot: crate::protection::honeypot_path(db)?,
         claims: crate::scanblock::crawler_claims(db)?,
         hosted: hosted(db)?,
+        app_probes,
     })
 }
 
@@ -268,6 +274,82 @@ pub fn hosted(db: &Db) -> Result<crate::services::Hosted> {
         }
     }
     Ok(crate::services::Hosted::new(sites))
+}
+
+/// [`app_probes`] when app-aware probe paths are on (see
+/// `protection::app_probe_paths`); nothing, so no path counts, when they
+/// are off. What the probe-paths detector reads.
+pub fn app_probes_if_on(db: &Db) -> Result<crate::webapps::AppProbes> {
+    if !crate::protection::app_probe_paths(db)? {
+        return Ok(crate::webapps::AppProbes::default());
+    }
+    app_probes(db)
+}
+
+/// Which of [`crate::webapps::APPS`]' paths are probes on which site.
+///
+/// Read from the configs and the document roots as they are now, on every
+/// pass, for the reason [`hosted`] is: installing WordPress must stop its
+/// login page counting as a probe within a minute, not at the next
+/// `scan-sites`.
+pub fn app_probes(db: &Db) -> Result<crate::webapps::AppProbes> {
+    // A host settings file that cannot be read is no reason to fail a
+    // pass, nor to guess: nothing is a probe.
+    let Ok(host) = crate::hostconf::HostConf::load() else {
+        return Ok(crate::webapps::AppProbes::default());
+    };
+    let server = host.web_server();
+    // A test command of its own is how a server in a container is set up
+    // (see `set-web-server --test`): its document roots are paths in the
+    // container, and a directory of the same name here says nothing.
+    let files_here = match server {
+        crate::webserver::WebServer::Nginx => host.nginx_test_command.is_none(),
+        crate::webserver::WebServer::Apache => host.apache_test_command.is_none(),
+    };
+    let mut sites = Vec::new();
+    for site in db.list_sites()? {
+        let path = Path::new(&site.config_path);
+        let directives = server.site_directives(path, &site.server_name);
+        let verdicts = crate::webapps::inspect_site(directives.as_deref(), files_here);
+        sites.push((server.server_names_for(path, &site.server_name), verdicts));
+    }
+    // Unit tests never read the host's own config: there, the root is
+    // the stock one, and nothing points it elsewhere.
+    let global = if cfg!(test) {
+        crate::webapps::Verdicts::default()
+    } else {
+        global_config(server, &server.global_conf_dir(&host.root(None)))
+    };
+    Ok(crate::webapps::AppProbes::new(sites, &global))
+}
+
+/// What the server-wide config in `dir` serves, as
+/// [`crate::webapps::inspect_global`] reads it: every file in it but this
+/// project's own, with this project's blocks taken out.
+fn global_config(server: crate::webserver::WebServer, dir: &Path) -> crate::webapps::Verdicts {
+    /// Larger than any config file, smaller than a mistake.
+    const MAX_BYTES: u64 = 1 << 20;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return crate::webapps::inspect_global(&[]);
+    };
+    let mut files = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let path = entry.path();
+        if name.starts_with("stop-bots")
+            || !path.is_file()
+            || path.metadata().map_or(true, |m| m.len() > MAX_BYTES)
+        {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            files.push((
+                path.display().to_string(),
+                server.without_injected_blocks(&text),
+            ));
+        }
+    }
+    crate::webapps::inspect_global(&files)
 }
 
 /// The access-stats offset 0.0.x kept for `path`.

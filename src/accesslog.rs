@@ -45,6 +45,7 @@ use crate::evidence::{Evidence, Item, Rule};
 use crate::ipranges::{cidr_contains, is_local_or_private};
 use crate::protection::Detector;
 use crate::services::Hosted;
+use crate::webapps::AppProbes;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
@@ -570,10 +571,21 @@ pub const DEFAULT_PROBE_PATHS: [&str; 13] = [
 /// an internal backup job walking a checkout isn't an attacker.
 /// Deduplicated (first matching path wins per IP) and sorted.
 pub fn probe_path_ips(log_text: &str, probe_paths: &[String]) -> Vec<(String, String)> {
+    app_probe_path_ips(log_text, probe_paths, &AppProbes::default())
+}
+
+/// [`probe_path_ips`], also counting a request for one of
+/// [`crate::webapps::APPS`]' paths where `app_probes` says it is a probe.
+pub fn app_probe_path_ips(
+    log_text: &str,
+    probe_paths: &[String],
+    app_probes: &AppProbes,
+) -> Vec<(String, String)> {
     convicted_in_text(
         log_text,
         Watch {
             probe_paths: probe_paths.to_vec(),
+            app_probes: app_probes.clone(),
             ..Watch::only(Detector::ProbePaths)
         },
         Rule::Once,
@@ -846,6 +858,9 @@ pub struct Watch {
     /// requests the 404 and behavioural detectors do not count (see
     /// [`crate::services`]).
     pub hosted: Hosted,
+    /// Which of [`crate::webapps::APPS`]' paths are probes where: empty,
+    /// so none is, unless app-aware probe paths are on.
+    pub app_probes: AppProbes,
 }
 
 impl Watch {
@@ -858,6 +873,7 @@ impl Watch {
             honeypot: crate::protection::HONEYPOT_PATH_DEFAULT.to_string(),
             claims: Vec::new(),
             hosted: Hosted::default(),
+            app_probes: AppProbes::default(),
         }
     }
 
@@ -1033,10 +1049,18 @@ impl Observer {
             Detector::SpoofedCrawlers => impersonates(line, &self.watch.claims).map(Item::seen),
             Detector::ProbePaths => {
                 let path = line.path.to_lowercase();
-                self.needles
+                if self
+                    .needles
                     .iter()
                     .any(|needle| path.contains(needle.as_str()))
-                    .then(|| Item::seen(&line.path))
+                {
+                    return Some(Item::seen(&line.path));
+                }
+                let hosts = line.host.iter().chain(&line.trailing).map(String::as_str);
+                self.watch
+                    .app_probes
+                    .probe(hosts, &line.path)
+                    .map(|_| Item::seen(&line.path))
             }
             // Anchored, as the `Disallow:` line that publishes it is: a
             // crawler that obeys robots.txt avoids exactly the paths that

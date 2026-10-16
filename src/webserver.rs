@@ -329,6 +329,31 @@ impl WebServer {
         }
     }
 
+    /// Every directive of the blocks that serve `server_name` in
+    /// `config_path`, under NGINX's directive names: what
+    /// [`crate::webapps`] recognises an application from.
+    pub fn site_directives(
+        self,
+        config_path: &Path,
+        server_name: &str,
+    ) -> Option<Vec<(String, Vec<String>)>> {
+        match self {
+            WebServer::Nginx => nginx::site_directives(config_path, server_name),
+            WebServer::Apache => apache::site_directives(config_path, server_name),
+        }
+    }
+
+    /// The directory of server-wide config every site inherits: NGINX's
+    /// `conf.d`, Apache's `conf-enabled`. An `Alias /phpmyadmin` there,
+    /// which Debian's phpMyAdmin package puts in Apache's, serves the path
+    /// on every site.
+    pub fn global_conf_dir(self, root: &Path) -> PathBuf {
+        match self {
+            WebServer::Nginx => nginx::conf_d_dir(root),
+            WebServer::Apache => apache::conf_enabled_dir(root),
+        }
+    }
+
     /// Where the web console's Web Access put its own site, in subdomain
     /// mode, in a release that had one: `uninstall` takes it out.
     pub fn console_site_path(self, root: &Path) -> PathBuf {

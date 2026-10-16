@@ -159,6 +159,60 @@ pub fn probe_paths(db: &Db) -> Result<Vec<String>> {
     Ok(paths)
 }
 
+/// `settings` key: whether the probe-paths detector also counts the paths
+/// of applications this host does not run, such as `/wp-login.php` where
+/// no site is WordPress (see [`crate::webapps`]).
+pub const APP_PROBE_PATHS: &str = keys::DETECT_PROBE_PATHS_APP_AWARE;
+
+/// The defaults generation app-aware probe paths arrived in (see
+/// `db::schema::DEFAULTS_GENERATION`). On by default on a database created
+/// at this generation or later; off, and marked new, on one created
+/// before, until the operator chooses: it makes an existing detector block
+/// more, and an upgrade never does that by itself.
+pub const APP_PROBE_PATHS_INTRODUCED_IN: u32 = 3;
+
+// A generation this binary creates, or it would be on nowhere; and a later
+// one than repeat offenders', or every database from 0.3.0 would have it on.
+const _: () = assert!(
+    APP_PROBE_PATHS_INTRODUCED_IN > REPEAT_ESCALATION_INTRODUCED_IN
+        && APP_PROBE_PATHS_INTRODUCED_IN <= crate::db::schema::DEFAULTS_GENERATION
+);
+
+/// Whether the probe-paths detector counts absent applications' paths:
+/// the stored switch, or, where nobody has switched it, whether the
+/// database is new enough to have it by default.
+pub fn app_probe_paths(db: &Db) -> Result<bool> {
+    Ok(match db.get_bool_setting_if_set(APP_PROBE_PATHS)? {
+        Some(chosen) => chosen,
+        None => APP_PROBE_PATHS_INTRODUCED_IN <= db.defaults_generation()?,
+    })
+}
+
+/// Whether app-aware probe paths arrived after this database was created
+/// and nobody has chosen either way: off, and marked "new" the way a new
+/// detector is (see [`Detector::is_new_here`]).
+pub fn app_probe_paths_is_new_here(db: &Db) -> Result<bool> {
+    Ok(APP_PROBE_PATHS_INTRODUCED_IN > db.defaults_generation()?
+        && db.get_bool_setting_if_set(APP_PROBE_PATHS)?.is_none())
+}
+
+pub fn set_app_probe_paths(db: &Db, enabled: bool) -> Result<()> {
+    db.set_bool_setting(APP_PROBE_PATHS, enabled)
+}
+
+/// What app-aware probe paths do, in one sentence, for the CLI and the
+/// Dashboard.
+pub fn app_probe_paths_summary() -> String {
+    format!(
+        "{} also count as probes where no site runs the application they belong to",
+        crate::webapps::conditional_paths()
+            .iter()
+            .map(|path| format!("/{path}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 /// `settings` key: the trap path itself.
 pub const HONEYPOT_PATH: &str = keys::DETECT_HONEYPOT_PATH;
 
@@ -434,7 +488,9 @@ impl Detector {
             }
             Detector::ProbePaths => {
                 "Blocks an address on a single request for a file no visitor asks for, such as \
-                 /.env or /.git/config: someone looking for leaked passwords and keys."
+                 /.env or /.git/config: someone looking for leaked passwords and keys. With \
+                 \"Probes for absent apps\" on, also /wp-login.php, /phpmyadmin and the like, \
+                 where no site here runs WordPress or phpMyAdmin."
             }
             Detector::Injection => {
                 "Blocks an address on a single request carrying a known exploit, such as \
@@ -1153,6 +1209,41 @@ mod tests {
         );
         set_repeat_escalation(&db, true).unwrap();
         assert!(repeat_escalation(&db).unwrap(), "switched on, reads off");
+    }
+
+    // ---- app-aware probe paths ----
+
+    #[test]
+    fn app_probe_paths_are_on_for_a_new_database() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(app_probe_paths(&db).unwrap(), "off on a new database");
+        assert!(
+            !app_probe_paths_is_new_here(&db).unwrap(),
+            "marked new on the database it shipped with"
+        );
+    }
+
+    /// An upgrade never makes a detector block more by itself: on a
+    /// database from 0.3.0 or before, it is off, and new, until chosen.
+    #[test]
+    fn app_probe_paths_are_off_and_new_on_an_older_database_until_chosen() {
+        for generation in [1, 2] {
+            let db = Db::open_in_memory().unwrap();
+            db.set_int_setting(crate::db::keys::DEFAULTS_GENERATION, generation)
+                .unwrap();
+            assert!(!app_probe_paths(&db).unwrap(), "{generation}: on");
+            assert!(
+                app_probe_paths_is_new_here(&db).unwrap(),
+                "{generation}: not marked new"
+            );
+
+            set_app_probe_paths(&db, true).unwrap();
+            assert!(app_probe_paths(&db).unwrap(), "{generation}: switched on");
+            assert!(
+                !app_probe_paths_is_new_here(&db).unwrap(),
+                "{generation}: still new after choosing"
+            );
+        }
     }
 
     #[test]

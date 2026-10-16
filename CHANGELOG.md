@@ -48,6 +48,23 @@ back, put back the copy the upgrade kept, `/var/lib/stop-bots/db.sqlite3.bak-v7`
   ask. The access log shows requests for these paths from `127.0.0.1`; no detector
   blocks them, and `status` leaves them out of what it says about the log.
 
+- **Probes for absent apps.** The probe-paths detector also blocks a request for
+  `/wp-login.php`, `/wp-admin`, `/wp-includes` or `/xmlrpc.php` where no site runs
+  WordPress (or, for `/xmlrpc.php`, Drupal), and for `/phpmyadmin` or `/pma` where none
+  runs phpMyAdmin. An application is recognised from each site's config (its name in a
+  `root`, an upstream, an `include` or a `location`; the path itself named anywhere) and
+  from its document root (`wp-config.php`, `wp-login.php`, `config.inc.php`, Drupal's
+  core files, or the path existing, at the root or one directory below). Where a log line
+  names its site (`$host` in the log format), that site decides; where it does not, as in
+  NGINX's default combined format, the path counts only when no site on the host runs the
+  application. A site this cannot see into (one that passes requests to an unrecognised
+  upstream, a document root that is not on this host, a web server in a container) counts
+  as running every application, so never blocks its login page. `stop-bots
+  list-probe-paths` (and `--json`) lists each path and why it is or is not a probe here;
+  the Dashboard has a "Probes for absent apps" row. On for a new database; off, and
+  marked new, on one an earlier release created:
+  `stop-bots set-detector probe-paths --app-aware true` turns it on.
+
 ## [0.3.0] — 2026-10-16
 
 The release that gets stop-bots ready to stand behind a 1.0: an undo for firewall

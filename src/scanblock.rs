@@ -481,7 +481,8 @@ pub fn block_probe_paths(
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
     let paths = crate::protection::probe_paths(db)?;
-    let hits = accesslog::probe_path_ips(log_text, &paths);
+    let apps = crate::logscan::app_probes_if_on(db)?;
+    let hits = accesslog::app_probe_path_ips(log_text, &paths, &apps);
     let found = hits.len();
     let candidates = hits
         .into_iter()
@@ -1679,6 +1680,45 @@ mod tests {
         db.set_text_setting(crate::protection::PROBE_PATHS_EXTRA, "/internal-only")
             .unwrap();
         assert_eq!(block_probe_paths(&db, 5, &log, true).unwrap().candidates, 1);
+    }
+
+    #[test]
+    fn block_probe_paths_blocks_the_wordpress_login_where_no_site_is_wordpress() {
+        let db = Db::open_in_memory().unwrap();
+        let _site = crate::testing::site_serving(&db, "example.com", &["index.html"]);
+        let log = probe_line("203.0.113.9", "/wp-login.php");
+
+        let outcome = block_probe_paths(&db, 5, &log, true).unwrap();
+
+        assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
+    }
+
+    /// The property the whole feature rests on: an administrator signing
+    /// in to their own WordPress is never a probe.
+    #[test]
+    fn block_probe_paths_never_blocks_the_login_of_a_wordpress_host() {
+        let db = Db::open_in_memory().unwrap();
+        let _site = crate::testing::site_serving(
+            &db,
+            "example.com",
+            &["index.php", "wp-login.php", "wp-config.php"],
+        );
+        let log =
+            probe_line("203.0.113.9", "/wp-login.php") + &probe_line("203.0.113.10", "/wp-admin/");
+
+        let outcome = block_probe_paths(&db, 5, &log, true).unwrap();
+
+        assert_eq!(outcome.candidates, 0, "{:?}", outcome.newly_blocked);
+    }
+
+    #[test]
+    fn block_probe_paths_leaves_the_wordpress_login_alone_when_switched_off() {
+        let db = Db::open_in_memory().unwrap();
+        let _site = crate::testing::site_serving(&db, "example.com", &["index.html"]);
+        crate::protection::set_app_probe_paths(&db, false).unwrap();
+        let log = probe_line("203.0.113.9", "/wp-login.php");
+
+        assert_eq!(block_probe_paths(&db, 5, &log, true).unwrap().candidates, 0);
     }
 
     #[test]

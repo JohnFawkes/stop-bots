@@ -31,6 +31,15 @@ settings changed since the upgrade are lost.
   reaches the host, with the keys for that panel beside it. This covers every detector,
   feed, country, category, crawler range, bot, request rule, site, trusted entry and
   block. `?` again opens the full key reference, which is what `?` alone used to do.
+- **`--json` on `status` and every `list-*` command**: `list-firewall-rules`,
+  `list-probe-paths`, `list-detectors`, `list-access-stats`, `list-reputation-sources`,
+  `list-selected-countries`, `list-categories`, `list-bots`, `list-turned-away` and
+  `list-trusted`. Each prints one JSON object (`{"rules": [...]}`,
+  `{"checks": [...], "summary": {...}}`, ...) with times as Unix seconds and values in
+  lowercase, as the command line spells them. `status --json` exits 1 on a critical
+  check, as `status` does. Without the flag the output is unchanged. The field names
+  become part of the stable contract at 1.0: fields may be added, never renamed or
+  removed in a minor (`RELEASING.md`).
 
 - **A question when no one has logged in over SSH.** The TUI's "Apply everything" asks
   "Do you log into this server over SSH?" before its preview when the SSH log holds no

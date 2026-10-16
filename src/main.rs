@@ -78,6 +78,10 @@ const ACCESS_LOG_HELP: &str = "Read this access log instead of the stored one \
 (`set-log-paths`), else /var/log/nginx/access.log, or for Apache /var/log/apache2/access.log \
 (/var/log/httpd/access_log in RHEL's /etc/httpd)";
 
+/// Help text shared by `status --json` and every `list-* --json`.
+const JSON_HELP: &str = "Print one JSON object instead of text. Its field names are part of \
+the stable contract from 1.0: fields may be added, never renamed or removed";
+
 /// Help text shared by every detector subcommand's `--dry-run`.
 const DRY_RUN_HELP: &str = "Show what would be blocked without storing anything";
 
@@ -233,9 +237,14 @@ enum Command {
     ListTurnedAway {
         #[arg(long, help = ACCESS_LOG_HELP)]
         access_log: Option<PathBuf>,
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
     },
     /// List every trusted address and user agent
-    ListTrusted,
+    ListTrusted {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
     /// List every stored firewall rule: its id, where it came from and why.
     ///
     /// Each rule shows its source — the detector that added it, or `cli`,
@@ -247,6 +256,8 @@ enum Command {
         /// takes it), `cli`, `tui`, `web` or `before-0.1`
         #[arg(long, value_parser = source_arg)]
         source: Option<SourceFilter>,
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
     },
     /// Remove a firewall rule by id, or every rule from one source.
     ///
@@ -474,7 +485,10 @@ enum Command {
         paths: String,
     },
     /// List every probe path currently checked, built-in and extra
-    ListProbePaths,
+    ListProbePaths {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
     /// Block anything that fetched the honeypot trap path.
     ///
     /// Scans the web server's access log for anything that fetched the honeypot
@@ -516,7 +530,10 @@ enum Command {
     /// These are the settings the internal cron and `batch` run the
     /// detectors with. Change them with `set-detector`, and IPv4 /24
     /// escalation with `set-subnet-escalation`.
-    ListDetectors,
+    ListDetectors {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
     /// Switch a detector on or off, and set its TTL, threshold and window.
     ///
     /// These are what the schedule (`stop-bots tick`, or the TUI while it
@@ -596,7 +613,10 @@ enum Command {
         access_log: Option<PathBuf>,
     },
     /// List recorded user-agent hit counts, most-seen first
-    ListAccessStats,
+    ListAccessStats {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
     /// Prune stale rows and compact the database.
     ///
     /// Drops user-agent statistics not seen in 90 days (and any excess over
@@ -672,7 +692,10 @@ enum Command {
     ///
     /// Lists every third-party CIDR feed with its on/off state and how many
     /// ranges it currently holds.
-    ListReputationSources,
+    ListReputationSources {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
     /// Download one country's IP ranges (does not select it).
     ///
     /// Downloads and stores IPdeny's current aggregated CIDR list for one
@@ -715,7 +738,10 @@ enum Command {
         country: String,
     },
     /// List the current geo mode and every selected country
-    ListSelectedCountries,
+    ListSelectedCountries {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
     /// Set whether a category of bots is allowed or blocked.
     ///
     /// Without --site this is the host-wide default for the category:
@@ -742,6 +768,8 @@ enum Command {
         /// Show this site's overrides too, by its server_name
         #[arg(long)]
         site: Option<String>,
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
     },
     /// Allow or block one bot, whatever its category says.
     ///
@@ -767,6 +795,8 @@ enum Command {
         /// Only bots whose slug or name contains this, ignoring case
         #[arg(long)]
         search: Option<String>,
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
     },
     /// Turn NGINX rate limiting on or off, and set its parameters.
     ///
@@ -1108,6 +1138,11 @@ enum Command {
         /// the host now. Cheap, and what the dashboards show.
         #[arg(long)]
         cached: bool,
+        /// Print every check as one JSON object instead of text; the exit
+        /// status is the same. Its field names are part of the stable
+        /// contract from 1.0: fields may be added, never renamed or removed
+        #[arg(long, conflicts_with = "quiet")]
+        json: bool,
     },
     /// One unattended pass over everything, for a real cron entry.
     ///
@@ -1569,7 +1604,8 @@ async fn run() -> Result<()> {
             ssh_log,
             quiet,
             cached,
-        }) => run_status(db, ssh_log, quiet, cached),
+            json,
+        }) => run_status(db, ssh_log, quiet, cached, json),
         Some(Command::Batch {
             root,
             apply,
@@ -1620,7 +1656,7 @@ async fn run() -> Result<()> {
             port,
             action,
         }) => add_firewall_rule(db, address, port, &action),
-        Some(Command::ListFirewallRules { source }) => list_firewall_rules(db, source),
+        Some(Command::ListFirewallRules { source, json }) => list_firewall_rules(db, source, json),
         Some(Command::RemoveFirewallRule {
             id,
             source,
@@ -1667,14 +1703,14 @@ async fn run() -> Result<()> {
             dry_run,
         }) => block_probe_paths(db, ttl_days, access_log, dry_run),
         Some(Command::SetProbePaths { paths }) => set_probe_paths(db, paths),
-        Some(Command::ListProbePaths) => list_probe_paths(db),
+        Some(Command::ListProbePaths { json }) => list_probe_paths(db, json),
         Some(Command::BlockHoneypot {
             ttl_days,
             access_log,
             dry_run,
         }) => block_honeypot(db, ttl_days, access_log, dry_run),
         Some(Command::SetHoneypotPath { path }) => set_honeypot_path(db, path),
-        Some(Command::ListDetectors) => list_detectors(db),
+        Some(Command::ListDetectors { json }) => list_detectors(db, json),
         Some(Command::SetDetector {
             detector,
             enabled,
@@ -1687,7 +1723,7 @@ async fn run() -> Result<()> {
             set_subnet_escalation(db, enabled, min)
         }
         Some(Command::RecordAccessStats { access_log }) => record_access_stats(db, access_log),
-        Some(Command::ListAccessStats) => list_access_stats(db),
+        Some(Command::ListAccessStats { json }) => list_access_stats(db, json),
         Some(Command::Maintain { force_compact }) => maintain(db, force_compact),
         Some(Command::UpdateIpRanges { source_id, source }) => {
             update_ip_ranges(db, source_id, source).await
@@ -1698,22 +1734,22 @@ async fn run() -> Result<()> {
         Some(Command::SetReputationSource { source_id, enabled }) => {
             set_reputation_source(db, source_id, enabled)
         }
-        Some(Command::ListReputationSources) => list_reputation_sources(db),
+        Some(Command::ListReputationSources { json }) => list_reputation_sources(db, json),
         Some(Command::UpdateCountryRanges { country, source }) => {
             update_country_ranges(db, country, source).await
         }
         Some(Command::SetGeoMode { mode }) => set_geo_mode(db, mode),
         Some(Command::AddCountry { country }) => set_country_selected(db, country, true),
         Some(Command::RemoveCountry { country }) => set_country_selected(db, country, false),
-        Some(Command::ListSelectedCountries) => list_selected_countries(db),
+        Some(Command::ListSelectedCountries { json }) => list_selected_countries(db, json),
         Some(Command::SetCategory {
             category,
             policy,
             site,
         }) => set_category(db, category, policy, site),
-        Some(Command::ListCategories { site }) => list_categories(db, site),
+        Some(Command::ListCategories { site, json }) => list_categories(db, site, json),
         Some(Command::SetBot { bot, policy, site }) => set_bot(db, bot, policy, site),
-        Some(Command::ListBots { search }) => list_bots(db, search),
+        Some(Command::ListBots { search, json }) => list_bots(db, search, json),
         Some(Command::SetLogPaths {
             access_log,
             ssh_log,
@@ -1762,8 +1798,10 @@ async fn run() -> Result<()> {
             user_agent,
             remove,
         }) => trust(db, address, user_agent, remove),
-        Some(Command::ListTurnedAway { access_log }) => list_turned_away(db, access_log),
-        Some(Command::ListTrusted) => list_trusted(db),
+        Some(Command::ListTurnedAway { access_log, json }) => {
+            list_turned_away(db, access_log, json)
+        }
+        Some(Command::ListTrusted { json }) => list_trusted(db, json),
         Some(Command::SetRobotsTxt { enabled }) => set_robots_txt(db, enabled),
         Some(Command::SetAutoApply { enabled }) => set_auto_apply(db, enabled),
         Some(Command::SetAutoApplyFirewall { enabled }) => set_auto_apply_firewall(db, enabled),
@@ -1961,6 +1999,7 @@ fn run_status(
     ssh_log: Option<PathBuf>,
     quiet: bool,
     cached: bool,
+    json: bool,
 ) -> Result<()> {
     use stop_bots::health::{self, Level};
 
@@ -1996,6 +2035,11 @@ fn run_status(
         (health::assess(&db, &probe)?, None)
     };
 
+    if json {
+        stop_bots::output::print(&stop_bots::output::Status::new(&report, taken_at))?;
+        return exit_status(&report);
+    }
+
     let shown: Vec<_> = if quiet {
         report.at_least(Level::Warn)
     } else {
@@ -2021,7 +2065,13 @@ fn run_status(
     }
     say!();
 
-    if report.worst() == Level::Critical {
+    exit_status(&report)
+}
+
+/// `status`'s exit status, the same with `--json` as without: an error,
+/// and so 1, when anything is critical.
+fn exit_status(report: &stop_bots::health::Report) -> Result<()> {
+    if report.worst() == stop_bots::health::Level::Critical {
         // `bail!` rather than `exit(1)`: it prints the reason, and the
         // reason is the whole value of a non-zero status here.
         anyhow::bail!("this host is not protected the way it is configured to be");
@@ -2282,7 +2332,11 @@ fn source_arg(value: &str) -> Result<SourceFilter, String> {
     })
 }
 
-fn list_firewall_rules(db_path: Option<PathBuf>, source: Option<SourceFilter>) -> Result<()> {
+fn list_firewall_rules(
+    db_path: Option<PathBuf>,
+    source: Option<SourceFilter>,
+    json: bool,
+) -> Result<()> {
     let db = open_db(db_path)?;
     db.prune_expired_firewall_rules()?;
     let query = stop_bots::db::BlockQuery {
@@ -2290,6 +2344,11 @@ fn list_firewall_rules(db_path: Option<PathBuf>, source: Option<SourceFilter>) -
         search: String::new(),
     };
     let rules = db.blocks_page(&query, 0, usize::MAX >> 1)?;
+    if json {
+        return stop_bots::output::print(&stop_bots::output::FirewallRules {
+            rules: rules.iter().map(Into::into).collect(),
+        });
+    }
     if rules.is_empty() {
         match source {
             Some(source) => say!("No firewall rules from {}.", source.name()),
@@ -2568,12 +2627,28 @@ fn set_reputation_source(db_path: Option<PathBuf>, source_id: String, enabled: b
     Ok(())
 }
 
-fn list_reputation_sources(db_path: Option<PathBuf>) -> Result<()> {
+fn list_reputation_sources(db_path: Option<PathBuf>, json: bool) -> Result<()> {
     use stop_bots::ipranges::reputation::{self, ReputationSourceKind};
 
     let db = open_db(db_path)?;
     reputation::register_all_reputation_sources(&db)?;
-    for source in db.list_reputation_sources()? {
+    let sources = db.list_reputation_sources()?;
+    if json {
+        let sources = sources
+            .into_iter()
+            .map(|source| stop_bots::output::ReputationSourceRow {
+                warning: ReputationSourceKind::from_id(&source.id).and_then(|k| k.warning()),
+                id: source.id,
+                name: source.name,
+                url: source.url,
+                enabled: source.enabled,
+                last_fetched_at: source.last_fetched_at,
+                range_count: source.range_count,
+            })
+            .collect();
+        return stop_bots::output::print(&stop_bots::output::ReputationSources { sources });
+    }
+    for source in sources {
         let state = if source.enabled { "ON " } else { "OFF" };
         let fetched = match source.last_fetched_at {
             Some(_) => format!("{} range(s)", source.range_count),
@@ -2785,12 +2860,30 @@ fn trust(
     Ok(())
 }
 
-fn list_turned_away(db_path: Option<PathBuf>, access_log: Option<PathBuf>) -> Result<()> {
+fn list_turned_away(
+    db_path: Option<PathBuf>,
+    access_log: Option<PathBuf>,
+    json: bool,
+) -> Result<()> {
     let db = open_db(db_path)?;
     let response = db.get_block_response()?;
     let log_text = read_access_log(&db, access_log.as_deref())?;
     let turned_away =
         stop_bots::accesslog::turned_away_user_agents(&log_text, response.status_code());
+
+    if json {
+        return stop_bots::output::print(&stop_bots::output::TurnedAway {
+            block_status: response.status_code(),
+            user_agents: turned_away
+                .into_iter()
+                .map(|entry| stop_bots::output::TurnedAwayRow {
+                    user_agent: entry.user_agent,
+                    refused: entry.refused,
+                    served: entry.served,
+                })
+                .collect(),
+        });
+    }
 
     if turned_away.is_empty() {
         say!("Nothing in this log was turned away.");
@@ -2826,8 +2919,14 @@ fn list_turned_away(db_path: Option<PathBuf>, access_log: Option<PathBuf>) -> Re
     Ok(())
 }
 
-fn list_trusted(db_path: Option<PathBuf>) -> Result<()> {
+fn list_trusted(db_path: Option<PathBuf>, json: bool) -> Result<()> {
     let db = open_db(db_path)?;
+    if json {
+        return stop_bots::output::print(&stop_bots::output::Trusted {
+            addresses: db.list_trusted_addresses()?,
+            user_agents: db.list_trusted_user_agents()?,
+        });
+    }
     let entries = stop_bots::dynamic::trusted_entries(&db)?;
     if entries.is_empty() {
         say!("Nothing is trusted.");
@@ -3017,8 +3116,37 @@ fn detector_line(db: &Db, detector: DetectorArg) -> Result<String> {
     ))
 }
 
-fn list_detectors(db_path: Option<PathBuf>) -> Result<()> {
+fn list_detectors(db_path: Option<PathBuf>, json: bool) -> Result<()> {
     let db = open_db(db_path)?;
+    if json {
+        let mut detectors = Vec::new();
+        for detector in DetectorArg::ALL {
+            let d = detector.0;
+            detectors.push(stop_bots::output::DetectorRow {
+                name: detector.name(),
+                label: d.spec().label,
+                enabled: d.is_enabled(&db)?,
+                follows_humans_only: !d.is_operator_controlled(),
+                ttl_days: d.ttl_days(&db)?,
+                threshold: d.threshold(&db)?,
+                window_hours: d.window_hours(&db)?,
+            });
+        }
+        return stop_bots::output::print(&stop_bots::output::Detectors {
+            detectors,
+            subnet_escalation: stop_bots::output::SubnetEscalation {
+                enabled: stop_bots::protection::subnet_escalation(&db)?.is_some(),
+                min: stop_bots::protection::subnet_escalation_min(&db)?,
+            },
+            repeat_offenders: stop_bots::output::RepeatOffenders {
+                enabled: stop_bots::protection::repeat_escalation(&db)?,
+                new_in_this_release: stop_bots::protection::repeat_escalation_is_new_here(&db)?,
+                max_multiplier: stop_bots::protection::ESCALATION_MAX_MULTIPLIER,
+                max_days: stop_bots::protection::ESCALATION_MAX_DAYS,
+                memory_days: stop_bots::protection::OFFENCE_MEMORY_DAYS,
+            },
+        });
+    }
     say!(
         "{:<17} {:<4} {:>6} {:>9} {:>6}",
         "DETECTOR",
@@ -3239,9 +3367,12 @@ fn set_category(
     Ok(())
 }
 
-fn list_categories(db_path: Option<PathBuf>, site: Option<String>) -> Result<()> {
+fn list_categories(db_path: Option<PathBuf>, site: Option<String>, json: bool) -> Result<()> {
     let db = open_db(db_path)?;
     let site = site.map(|name| find_site(&db, &name)).transpose()?;
+    if json {
+        return stop_bots::output::print(&categories_json(&db, site.as_ref())?);
+    }
 
     match &site {
         None => say!("{:<9} POLICY", "CATEGORY"),
@@ -3303,6 +3434,66 @@ fn list_categories(db_path: Option<PathBuf>, site: Option<String>) -> Result<()>
         say!("{HUMANS_ONLY_NOTE}");
     }
     Ok(())
+}
+
+/// What `list-categories --json` prints: the same facts as the text, in
+/// the same order.
+fn categories_json(
+    db: &Db,
+    site: Option<&stop_bots::db::Site>,
+) -> Result<stop_bots::output::Categories> {
+    use stop_bots::output::{
+        policy_name, BotOverrideRow, Categories, CategoryRow, SiteCategories, SiteCategoryRow,
+    };
+
+    let mut categories = Vec::new();
+    for category in CATEGORIES {
+        categories.push(CategoryRow {
+            category: category_name(category),
+            policy: policy_name(db.get_stored_category_default(category.into())?),
+        });
+    }
+    let site = match site {
+        None => None,
+        Some(site) => {
+            let mut site_categories = Vec::new();
+            for category in CATEGORIES {
+                site_categories.push(SiteCategoryRow {
+                    category: category_name(category),
+                    policy: db
+                        .get_site_category_override(site.id, category.into())?
+                        .map(policy_name),
+                });
+            }
+            let bots = db.list_bots()?;
+            let bot_overrides = db
+                .site_bot_overrides(site.id)?
+                .into_iter()
+                .map(|over| BotOverrideRow {
+                    bot: bots
+                        .iter()
+                        .find(|b| b.id == over.bot_id)
+                        .map_or_else(|| "(unknown bot)".to_string(), |b| b.slug.clone()),
+                    policy: policy_name(over.policy),
+                })
+                .collect();
+            Some(SiteCategories {
+                server_name: site.server_name.clone(),
+                categories: site_categories,
+                bot_overrides,
+            })
+        }
+    };
+    Ok(Categories {
+        categories,
+        old_browsers: if db.get_block_old_browsers()? {
+            "blocked"
+        } else {
+            "allowed"
+        },
+        humans_only: db.get_humans_only()?,
+        site,
+    })
 }
 
 /// Finds a bot by slug, failing with the way to look one up rather than a
@@ -3369,7 +3560,22 @@ fn set_bot(
     Ok(())
 }
 
-fn list_bots(db_path: Option<PathBuf>, search: Option<String>) -> Result<()> {
+/// A bot's categories, as `set-category --category` names them.
+fn bot_categories(bot: &stop_bots::db::Bot) -> Vec<&'static str> {
+    let mut categories = Vec::new();
+    if bot.is_scanner {
+        categories.push("scanner");
+    }
+    if bot.is_search_engine {
+        categories.push("search");
+    }
+    if bot.is_ai {
+        categories.push("ai");
+    }
+    categories
+}
+
+fn list_bots(db_path: Option<PathBuf>, search: Option<String>, json: bool) -> Result<()> {
     use stop_bots::db::BotStatus;
 
     let db = open_db(db_path)?;
@@ -3382,6 +3588,22 @@ fn list_bots(db_path: Option<PathBuf>, search: Option<String>) -> Result<()> {
             None => true,
         })
         .collect();
+    if json {
+        let bots = bots
+            .into_iter()
+            .map(|bot| stop_bots::output::BotRow {
+                status: match bot.status {
+                    BotStatus::Default => "default",
+                    BotStatus::Allowed => "allowed",
+                    BotStatus::Blocked => "blocked",
+                },
+                categories: bot_categories(&bot),
+                slug: bot.slug,
+                name: bot.name,
+            })
+            .collect();
+        return stop_bots::output::print(&stop_bots::output::Bots { bots });
+    }
     if bots.is_empty() {
         match &search {
             Some(s) => say!("No bot matches {s:?}."),
@@ -3396,16 +3618,7 @@ fn list_bots(db_path: Option<PathBuf>, search: Option<String>) -> Result<()> {
             BotStatus::Allowed => "allowed",
             BotStatus::Blocked => "blocked",
         };
-        let mut categories = Vec::new();
-        if bot.is_scanner {
-            categories.push("scanner");
-        }
-        if bot.is_search_engine {
-            categories.push("search");
-        }
-        if bot.is_ai {
-            categories.push("ai");
-        }
+        let categories = bot_categories(&bot);
         let categories = if categories.is_empty() {
             "-".to_string()
         } else {
@@ -3874,10 +4087,16 @@ fn set_country_selected(db_path: Option<PathBuf>, country: String, selected: boo
     Ok(())
 }
 
-fn list_selected_countries(db_path: Option<PathBuf>) -> Result<()> {
+fn list_selected_countries(db_path: Option<PathBuf>, json: bool) -> Result<()> {
     let db = open_db(db_path)?;
     let mode = db.get_geo_mode()?;
     let countries = db.list_selected_countries()?;
+    if json {
+        return stop_bots::output::print(&stop_bots::output::SelectedCountries {
+            geo_mode: stop_bots::output::geo_mode_name(mode),
+            countries,
+        });
+    }
     say!("Geo mode: {mode:?}");
     if countries.is_empty() {
         say!("No countries selected.");
@@ -4202,9 +4421,18 @@ fn set_probe_paths(db_path: Option<PathBuf>, paths: String) -> Result<()> {
     Ok(())
 }
 
-fn list_probe_paths(db_path: Option<PathBuf>) -> Result<()> {
+fn list_probe_paths(db_path: Option<PathBuf>, json: bool) -> Result<()> {
     let db = open_db(db_path)?;
     let extra = stop_bots::protection::extra_probe_paths(&db)?;
+    if json {
+        return stop_bots::output::print(&stop_bots::output::ProbePaths {
+            built_in: stop_bots::accesslog::DEFAULT_PROBE_PATHS
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            extra,
+        });
+    }
     say!("Built-in (always checked):");
     for path in stop_bots::accesslog::DEFAULT_PROBE_PATHS {
         say!("  {path}");
@@ -4451,9 +4679,20 @@ fn record_access_stats(db_path: Option<PathBuf>, access_log: Option<PathBuf>) ->
 
 /// Lists every recorded user agent's accumulated hit count, most-seen
 /// first (see [`stop_bots::db::Db::list_user_agent_stats`]).
-fn list_access_stats(db_path: Option<PathBuf>) -> Result<()> {
+fn list_access_stats(db_path: Option<PathBuf>, json: bool) -> Result<()> {
     let db = open_db(db_path)?;
     let stats = db.list_user_agent_stats()?;
+    if json {
+        let user_agents = stats
+            .into_iter()
+            .map(|stat| stop_bots::output::AccessStatRow {
+                user_agent: stat.user_agent,
+                hit_count: stat.hit_count,
+                last_seen_at: stat.last_seen_at,
+            })
+            .collect();
+        return stop_bots::output::print(&stop_bots::output::AccessStats { user_agents });
+    }
     if stats.is_empty() {
         say!("No user-agent stats recorded yet — run record-access-stats first.");
         return Ok(());
@@ -4711,6 +4950,29 @@ mod tests {
     #[test]
     fn the_command_line_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    /// A script reads `status` and every `list-*` the same way, so one
+    /// added later without `--json` fails here rather than in a script.
+    #[test]
+    fn status_and_every_list_command_take_json() {
+        let listing: Vec<clap::Command> = subcommands()
+            .into_iter()
+            .filter(|c| c.get_name() == "status" || c.get_name().starts_with("list-"))
+            .collect();
+        assert!(listing.len() >= 11, "too few found: {}", listing.len());
+        for command in listing {
+            let json = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == "json")
+                .unwrap_or_else(|| panic!("`{}` has no --json", command.get_name()));
+            let help = json.get_help().map(|h| h.to_string()).unwrap_or_default();
+            assert!(
+                help.contains("stable contract from 1.0"),
+                "`{} --json` does not say its fields are a contract: {help:?}",
+                command.get_name()
+            );
+        }
     }
 
     /// `--db` is global: accepted before or after the subcommand.
@@ -5159,6 +5421,6 @@ mod tests {
         let db_path = tmp.path().join("db.sqlite3");
         Db::open(&db_path).unwrap();
 
-        list_access_stats(Some(db_path)).unwrap();
+        list_access_stats(Some(db_path), false).unwrap();
     }
 }

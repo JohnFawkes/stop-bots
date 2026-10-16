@@ -332,8 +332,10 @@ break; from `1.0.0` on, nothing in the contract below breaks before `2.0.0`.
 - **The command line:** every verb and flag, the values each accepts, and what each
   does. Exit codes: `0` for success, non-zero for a failure or a refusal (a lockout
   guard that refuses an apply exits non-zero, which is what makes cron mail someone).
-- **The JSON output** of `--json`: fields may be added, never renamed, retyped or
-  removed.
+- **The JSON output** of `status --json` and every `list-* --json`: fields may be added,
+  never renamed, retyped or removed, and the spelling of enumerated values (`"block"`,
+  `"critical"`) stays what it is. Free text inside a field, such as a check's `detail`
+  and `fix`, is human-readable output and may change.
 - **The database:** a release opens every database an earlier release wrote, with the
   settings in it intact, and a database a `1.x.y` release has used can still be opened
   by the release before it in the same minor, so going back one patch release is safe.

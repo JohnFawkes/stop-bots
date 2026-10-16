@@ -1,7 +1,7 @@
 # Every target here is a name, not a file. Without this a directory named
 # `build` or `test` — both plausible — would make `make test` say
 # "up to date" and run nothing.
-.PHONY: help unit-test integration-test stranger-test test hooks screenshots demo build deploy
+.PHONY: help unit-test integration-test stranger-test test bench hooks screenshots demo build deploy
 
 # `cargo nextest run` where it is installed, plain `cargo test` otherwise.
 # They run the same tests; nextest additionally enforces the per-test
@@ -30,6 +30,7 @@ help:
 	@echo 'integration-test  the container suite: needs a runtime + NET_ADMIN (~1min)'
 	@echo 'stranger-test     the README quick start on fresh Debian 12 and Ubuntu 24.04 (NGINX and Apache), from the .deb'
 	@echo 'test              both, unit first'
+	@echo 'bench             time and peak memory on a 1 GB log and 100k ranges, against budgets (~2min)'
 	@echo 'hooks             install the pre-commit hook (fmt + clippy)'
 	@echo 'screenshots       regenerate docs/screenshots/ from seeded fiction'
 	@echo 'demo              a disposable NGINX container with stop-bots in it, to try it on'
@@ -88,6 +89,16 @@ stranger-test:
 # Unit first: it is the one that fails for a plain mistake, and there is
 # no sense building containers to find out the code doesn't compile.
 test: unit-test integration-test
+
+# The resource benchmark (tests/bench.rs): a 1 GB access log through every
+# detector, and 100k ranges through the firewall render, each against a
+# time and peak-memory budget. Release, because the budgets are for the
+# binary users run; plain `cargo test` for the streamed table, and because
+# nextest's per-test limit is for the suite, not this. Needs about 1.3 GB
+# of disk under target/. STOP_BOTS_BENCH_LOG_MB=100 for a quicker look;
+# the scan's time budget scales with it.
+bench:
+	STOP_BOTS_BENCH=1 cargo test --release --test bench -- --nocapture
 
 # Opt-in, because a hook that installs itself is a hook that surprises
 # someone. See .githooks/pre-commit for what it does.

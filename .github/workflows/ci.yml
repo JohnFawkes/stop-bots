@@ -157,6 +157,26 @@ jobs:
           done
           exit 1
 
+  # Time and peak memory on a large host: a 1 GB access log through every
+  # detector, and 100k ranges through the firewall render, each against a
+  # budget in tests/bench.rs. Its own job because it is release-built and
+  # writes a gigabyte, and so a red one says "slower or bigger" rather
+  # than "broken". The table of results lands in the job summary.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: bench-release
+      - name: Build
+        run: cargo test --release --locked --test bench --no-run
+      - name: Resource benchmark
+        env:
+          STOP_BOTS_BENCH: "1"
+        run: cargo test --release --locked --test bench -- --nocapture
+
   # The badge claims a *floor* of 90%, and this is what enforces it. The
   # figure actually achieved is higher — CONTRIBUTING.md quotes it, with the
   # date it was measured, and is the one place that number lives — but a

@@ -116,6 +116,26 @@ Automated tests should be run frequently during coding.
 
 Benchmarks should be used to measure quality. These should be run on demand.
 
+### Resource benchmark
+
+```
+make bench
+```
+
+`tests/bench.rs` runs the real release binary over what a large host has: a 1 GB NGINX
+access log through every detector (`batch --no-fetch`), 10 MB appended and scanned again,
+and 100,000 country and reputation ranges stored and rendered into an nftables script
+(`render-firewall`). Each step's wall time and peak RSS are checked against a budget, and the
+results printed as a table. It is off unless `STOP_BOTS_BENCH=1`, takes about two minutes
+with the build, and writes 1.3 GB under `target/tmp`. `STOP_BOTS_BENCH_LOG_MB=100` makes
+the log smaller; `STOP_BOTS_BENCH_KEEP=1` keeps the host it built, to profile a step by hand.
+
+CI runs it as the `bench` job. The budgets, and the numbers they were set from, are in
+`BUDGETS` at the top of the file: a few times the measured time and 1.5 times the measured
+memory, so it catches an order-of-magnitude regression (the whole log re-read every pass,
+a render gone quadratic, memory that grows with the log) rather than runner noise. A change
+that genuinely needs more moves the budget in the same commit, and says why.
+
 ### Automated tests
 
 Each file in src/ should end with the test module for that file, as is typical in Rust. These

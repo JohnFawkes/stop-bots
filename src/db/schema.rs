@@ -48,7 +48,7 @@ use super::{keys, Category, GeoMode, Policy};
 /// Always equal to `MIGRATIONS.len()`; a test holds the two together, so
 /// adding a migration without bumping this (or the reverse) fails the
 /// build's tests rather than a user's upgrade.
-pub const CURRENT_VERSION: u32 = 8;
+pub const CURRENT_VERSION: u32 = 7;
 
 /// The generation of defaults this binary creates a database with.
 ///
@@ -139,10 +139,7 @@ pub const MIGRATIONS: &[Migration] = &[
         summary: "offences, how many times a detector has blocked each address",
         apply: v7_offences,
     },
-    Migration {
-        summary: "the evidence age index covers the address the detectors look up",
-        apply: v8_evidence_index_covers_address,
-    },
+
 ];
 
 /// Where the copy of a database at `version` is kept before it is
@@ -863,19 +860,6 @@ fn v7_offences(conn: &Connection) -> rusqlite::Result<()> {
              last_offence_at INTEGER NOT NULL,
              blocked_until INTEGER NOT NULL
          );",
-    )
-}
-
-/// `log_evidence_age` gains `address`, so the detectors' query (every
-/// address seen in the window, then every row for those addresses) is
-/// answered from the index alone. Without it, SQLite read every row in
-/// the window to check its address: the resource benchmark measured each
-/// pass costing time in proportion to the stored evidence, about 2.5 s
-/// with nothing new to read, and this index made the query 6x faster.
-fn v8_evidence_index_covers_address(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "DROP INDEX IF EXISTS log_evidence_age;
-         CREATE INDEX log_evidence_age ON log_evidence (detector, last_seen, address);",
     )
 }
 

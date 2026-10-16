@@ -933,10 +933,7 @@ impl Dashboard {
                     unfetched.join(", ")
                 )
             })
-            .warn(format!(
-                "It {}.",
-                hosting::warning()
-            ))
+            .warn(format!("It {}.", hosting::warning()))
             .para(
                 "Port 80 stays open to these ranges, as to the cloud feeds, unless you chose \
                  otherwise when turning AWS on, so Let's Encrypt can still renew.",

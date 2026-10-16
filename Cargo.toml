@@ -84,8 +84,8 @@ depends = ""
 #
 # The web server is `suggests`, weaker still, because the host running this
 # very often does not have the package at all -- it has NGINX or Apache in a
-# container, with the config on a bind mount. `set-web-server` (and
-# `set-nginx-commands`) exist for exactly that arrangement, and a hard
+# container, with the config on a bind mount. `set-web-server` and
+# `set-log-paths` exist for exactly that arrangement, and a hard
 # dependency would install a second, idle web server on every such host to
 # satisfy a file the real one never reads. Either one will do, hence the
 # alternative; Debian's Apache package is `apache2`.

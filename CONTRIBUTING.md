@@ -332,14 +332,26 @@ machine can check.
   change has one: `set-detector`, `set-category`, `set-old-browsers`, `set-firewall-backend` and
   so on. Give a `set-*` verb no flags and it prints what is stored.
 - **Flags on a verb that runs something apply to that run only.** `batch --backend`,
-  `render-firewall --out`, `tick --ssh-log` and a `block-*` detector's `--threshold`
+  `render-firewall --out`, `tick --ssh-log` and `run-detector --threshold`
   change nothing stored; without them the run uses what is stored.
+- **A list of things has `add-*`, `remove-*` and `list-*` verbs**: `add-country`,
+  `remove-country`, `list-selected-countries`; `add-trusted`, `remove-trusted`,
+  `list-trusted`; `add-exempt-path`, `remove-exempt-path`; `add-firewall-rule`,
+  `remove-firewall-rule`, `list-firewall-rules`. Never a `--remove` flag on the verb that
+  adds.
+- **`update-*` downloads, and is plural: every source of its kind, or one.**
+  `update-bot-lists`, `update-crawler-ranges`, `update-reputation-sources` (every feed
+  switched on) and `update-country-ranges` (every selected country) update all of them,
+  and `--source-id` (`--country` for countries) narrows it to one. `--source <file>`
+  reads one source from a file instead of downloading it.
+- **One verb per action, with the thing it acts on as an argument**: `run-detector
+  <detector>` and `set-detector <detector>`, not a verb per detector.
 - **A stored on/off value takes an explicit value**: `--enabled true|false`. Both directions have to be sayable, and a bare flag can
   only say one. Declare it with `action = clap::ArgAction::Set` and
   `value_name = "true|false"`, as `bool` when the verb exists to set it and
   `Option<bool>` when it is one of several optional settings.
-- **A presence flag is for how this run behaves**: `--force`, `--dry-run`, `--no-fetch`,
-  `--remove`. Never for a stored value.
+- **A presence flag is for how this run behaves**: `--force`, `--dry-run`, `--no-fetch`.
+  Never for a stored value.
 - **`status` and every `list-*` take `--json`**, which prints one JSON object built from
   the output structs in `src/output.rs`, never from a database type. A new `list-*` takes
   it too; a test at the bottom of `src/main.rs` checks.
@@ -350,10 +362,13 @@ machine can check.
   The first line of a doc comment is the summary in `stop-bots --help`: a whole sentence,
   starting with a capital, different from every other command's. Every flag says what it
   does.
-- **Renaming.** Keep the old spelling working for one release as a hidden alias
-  (`#[command(alias = "...")]`, `#[arg(alias = "...")]`, or a hidden flag that prints a
-  deprecation note on stderr), with a test that the old spelling still parses. Then
-  remove it.
+- **Renaming.** The old spelling keeps working until the next major release, and says
+  so on stderr. A renamed verb, or a verb and flag that became a verb, is a row in
+  `DEPRECATED` in `src/main.rs`, which rewrites it to the new spelling before parsing and
+  prints the warning; a test walks every row. A verb that still has its own behaviour
+  stays as a hidden command (`#[command(hide = true)]`) that calls `deprecated(...)`.
+  List it under **Deprecated** in the changelog, and remove it in the next major, under
+  **Removed** (see "Versioning" in `RELEASING.md`).
 
 ## Code structure
 
@@ -404,7 +419,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- ipdetail.rs    <- Everything already known about one address (Firewall detail view)
         |- uadetail.rs    <- The same for one user agent string
         |- health.rs      <- Is this host actually protected? The checks behind `status`
-        |- hint.rs        <- Errors that name the next step (run with sudo, set-nginx-commands)
+        |- hint.rs        <- Errors that name the next step (run with sudo, set-web-server)
         |- host.rs        <- The host name, and where the system programs this runs are
         |- install.rs     <- `stop-bots install`: the cron file and the firewall's boot unit
         |- install/       <- The firewall units 0.0.x wrote, to tell an old unit from an edited one

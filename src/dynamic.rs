@@ -41,7 +41,7 @@ use crate::{ipranges, sshlog};
 
 /// Whether a row's address/user agent is already covered by a stored
 /// block. `Blocked { until: None }` renders as `BLOCKED`; `Some(t)`
-/// (a temporary `firewall_rules` row, e.g. from `block-scanners`) renders
+/// (a temporary `firewall_rules` row, e.g. from `run-detector ssh-scanners`) renders
 /// as `BLOCKED for <relative time>`. `Blocklist` means the item is blocked
 /// by the botlist configuration (bot patterns or IP ranges), not by a manual
 /// block action.

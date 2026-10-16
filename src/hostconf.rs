@@ -216,7 +216,7 @@ impl HostConf {
     pub fn render(&self) -> String {
         let mut out = String::from(
             "# stop-bots host settings. Written by `stop-bots set-web-server`,\n\
-             # `stop-bots set-nginx-commands` and `stop-bots set-log-paths`; read\n\
+             # `stop-bots set-web-server nginx` and `stop-bots set-log-paths`; read\n\
              # by every stop-bots process.\n\
              # Only root may change this file.\n",
         );
@@ -482,7 +482,7 @@ pub fn move_settings(db: &Db, path: &Path, trusted_owner: u32) -> Result<Migrate
                 if key.starts_with("logs:") {
                     "set-log-paths"
                 } else {
-                    "set-nginx-commands"
+                    "set-web-server"
                 }
             ));
             continue;
@@ -842,7 +842,7 @@ mod tests {
             "the row is deleted, so it cannot be migrated from later either"
         );
         let note = migrated.note(&path).unwrap();
-        assert!(note.contains("set-nginx-commands"), "{note}");
+        assert!(note.contains("set-web-server"), "{note}");
     }
 
     #[test]

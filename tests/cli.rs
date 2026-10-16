@@ -415,7 +415,8 @@ fn block_spoofed_crawlers_is_inert_without_ranges_then_blocks_a_forged_googlebot
     let run = |db_path: &Path, log: &Path| {
         stop_bots_bin()
             .args([
-                "block-spoofed-crawlers",
+                "run-detector",
+                "spoofed-crawlers",
                 "--db",
                 db_path.to_str().unwrap(),
                 "--access-log",
@@ -477,7 +478,8 @@ fn block_probe_paths_blocks_a_dotenv_probe_but_not_a_wordpress_login() {
 
     stop_bots_bin()
         .args([
-            "block-probe-paths",
+            "run-detector",
+            "probe-paths",
             "--db",
             db_path.to_str().unwrap(),
             "--access-log",
@@ -531,7 +533,8 @@ fn set_probe_paths_adds_extras_and_reports_unanchored_entries() {
 
     stop_bots_bin()
         .args([
-            "block-probe-paths",
+            "run-detector",
+            "probe-paths",
             "--db",
             db_path.to_str().unwrap(),
             "--access-log",
@@ -585,7 +588,8 @@ fn honeypot_path_is_configurable_and_blocks_whatever_fetches_it() {
 
     stop_bots_bin()
         .args([
-            "block-honeypot",
+            "run-detector",
+            "honeypot",
             "--db",
             db_path.to_str().unwrap(),
             "--access-log",
@@ -890,9 +894,9 @@ fn trust_reaches_the_firewall_script_first_and_nginx_through_the_trust_file() {
     let trust_conf = fx.conf_d.join("stop-bots-trusted.conf");
 
     // Typed with host bits set; stored, and echoed, as the network.
-    fx.run(&["trust", "--address", "203.0.113.77/24"])
+    fx.run(&["add-trusted", "--address", "203.0.113.77/24"])
         .stdout(predicate::str::contains("Trusting 203.0.113.0/24"));
-    fx.run(&["trust", "--user-agent", "UptimeRobot"])
+    fx.run(&["add-trusted", "--user-agent", "UptimeRobot"])
         .stdout(predicate::str::contains("still judge it by its address"));
     fx.run(&["add-firewall-rule", "--address", "203.0.113.9"]);
     fx.run(&["list-trusted"])
@@ -933,8 +937,8 @@ fn trust_reaches_the_firewall_script_first_and_nginx_through_the_trust_file() {
         "the site block does not clear for trusted clients:\n{written}"
     );
 
-    fx.run(&["trust", "--remove", "--address", "203.0.113.0/24"]);
-    fx.run(&["trust", "--remove", "--user-agent", "UptimeRobot"]);
+    fx.run(&["remove-trusted", "--address", "203.0.113.0/24"]);
+    fx.run(&["remove-trusted", "--user-agent", "UptimeRobot"]);
     // Still there until the block that reads it is rewritten: deleting it
     // first would make `nginx -t` fail on an unknown variable.
     assert!(trust_conf.exists());
@@ -988,7 +992,7 @@ fn a_config_that_fails_the_test_is_put_back_byte_for_byte() {
 /// The first thing a host with NGINX in a container meets: no `nginx` on
 /// PATH. The error names the verb that fixes it.
 #[test]
-fn nginx_missing_from_path_points_at_set_nginx_commands() {
+fn nginx_missing_from_path_points_at_set_web_server() {
     let fx = Fixture::new();
     fx.seed_bots();
     fx.write_site("a.example");
@@ -1002,7 +1006,7 @@ fn nginx_missing_from_path_points_at_set_nginx_commands() {
         .failure()
         .stderr(predicate::str::contains("`nginx` isn't on PATH"))
         .stderr(predicate::str::contains(
-            "see `stop-bots set-nginx-commands --help`",
+            "see `stop-bots set-web-server nginx --help`",
         ));
 }
 
@@ -1018,7 +1022,7 @@ fn a_missing_nginx_root_says_how_to_set_it() {
         .failure()
         .stderr(predicate::str::contains("does not exist"))
         .stderr(predicate::str::contains(
-            "stop-bots set-nginx-commands --root <dir>",
+            "stop-bots set-web-server nginx --root <dir>",
         ));
 }
 
@@ -1069,9 +1073,9 @@ fn a_change_to_the_trust_file_alone_still_reloads_nginx() {
             .success()
     };
 
-    fx.run(&["trust", "--user-agent", "UptimeRobot"]);
+    fx.run(&["add-trusted", "--user-agent", "UptimeRobot"]);
     apply(&fx);
-    fx.run(&["trust", "--user-agent", "Pingdom"]);
+    fx.run(&["add-trusted", "--user-agent", "Pingdom"]);
     apply(&fx).stdout(predicate::str::contains("Reloaded NGINX"));
 
     let log = fs::read_to_string(&calls).unwrap();
@@ -1088,10 +1092,13 @@ fn a_change_to_the_trust_file_alone_still_reloads_nginx() {
 fn trust_refuses_what_would_trust_more_than_it_says() {
     let fx = Fixture::new();
     for (args, why) in [
-        (vec!["trust", "--address", "0.0.0.0/0"], "every address"),
-        (vec!["trust", "--user-agent", " "], "every client"),
         (
-            vec!["trust", "--remove", "--address", "203.0.113.7"],
+            vec!["add-trusted", "--address", "0.0.0.0/0"],
+            "every address",
+        ),
+        (vec!["add-trusted", "--user-agent", " "], "every client"),
+        (
+            vec!["remove-trusted", "--address", "203.0.113.7"],
             "is not trusted",
         ),
     ] {
@@ -2265,16 +2272,17 @@ fn repeat_failed_attempt(ip: &str, times: usize) -> String {
 #[test]
 fn a_ttl_past_ten_years_is_refused_on_the_command_line() {
     let fx = Fixture::new();
-    for command in [
-        "block-scanners",
-        "block-web-scanners",
-        "block-spoofed-crawlers",
-        "block-probe-paths",
-        "block-honeypot",
+    for detector in [
+        "ssh-scanners",
+        "web-scanners",
+        "spoofed-crawlers",
+        "probe-paths",
+        "honeypot",
+        "injection",
     ] {
         for days in ["3651", "106751991167301", "-106751991167301"] {
             let flag = format!("--ttl-days={days}");
-            fx.cmd(&[command, "--dry-run", &flag])
+            fx.cmd(&["run-detector", detector, "--dry-run", &flag])
                 .assert()
                 .failure()
                 .stderr(predicate::str::contains("--ttl-days"));
@@ -2293,7 +2301,8 @@ fn block_scanners_adds_a_rule_for_an_ip_over_the_threshold_and_is_idempotent() {
 
     stop_bots_bin()
         .args([
-            "block-scanners",
+            "run-detector",
+            "ssh-scanners",
             "--db",
             db_path,
             "--ssh-log",
@@ -2314,7 +2323,8 @@ fn block_scanners_adds_a_rule_for_an_ip_over_the_threshold_and_is_idempotent() {
     // Re-running against the same log must not add a duplicate rule.
     stop_bots_bin()
         .args([
-            "block-scanners",
+            "run-detector",
+            "ssh-scanners",
             "--db",
             db_path,
             "--ssh-log",
@@ -2340,7 +2350,8 @@ fn block_scanners_ignores_an_ip_below_the_threshold() {
 
     stop_bots_bin()
         .args([
-            "block-scanners",
+            "run-detector",
+            "ssh-scanners",
             "--db",
             db_path,
             "--ssh-log",
@@ -2378,9 +2389,16 @@ fn block_scanners_refuses_a_threshold_of_zero() {
     let log_path = tmp.path().join("auth.log");
     fs::write(&log_path, repeat_failed_attempt("198.51.100.9", 1)).unwrap();
 
-    for command in ["block-scanners", "block-web-scanners"] {
+    for detector in ["ssh-scanners", "web-scanners"] {
         stop_bots_bin()
-            .args([command, "--db", db_path, "--threshold", "0"])
+            .args([
+                "run-detector",
+                detector,
+                "--db",
+                db_path,
+                "--threshold",
+                "0",
+            ])
             .assert()
             .failure()
             .stderr(predicate::str::contains("matches every address in the log"));
@@ -2393,7 +2411,8 @@ fn block_scanners_refuses_a_threshold_of_zero() {
 
     stop_bots_bin()
         .args([
-            "block-scanners",
+            "run-detector",
+            "ssh-scanners",
             "--db",
             db_path,
             "--ssh-log",
@@ -2421,7 +2440,8 @@ fn block_scanners_never_blocks_an_ip_that_eventually_logged_in() {
 
     stop_bots_bin()
         .args([
-            "block-scanners",
+            "run-detector",
+            "ssh-scanners",
             "--db",
             db_path,
             "--ssh-log",
@@ -2451,7 +2471,8 @@ fn block_scanners_dry_run_reports_without_writing() {
 
     stop_bots_bin()
         .args([
-            "block-scanners",
+            "run-detector",
+            "ssh-scanners",
             "--db",
             db_path,
             "--ssh-log",
@@ -2491,7 +2512,8 @@ fn block_web_scanners_adds_a_rule_for_distinct_not_found_paths_and_is_idempotent
 
     stop_bots_bin()
         .args([
-            "block-web-scanners",
+            "run-detector",
+            "web-scanners",
             "--db",
             db_path,
             "--access-log",
@@ -2512,7 +2534,8 @@ fn block_web_scanners_adds_a_rule_for_distinct_not_found_paths_and_is_idempotent
     // Re-running against the same log must not add a duplicate rule.
     stop_bots_bin()
         .args([
-            "block-web-scanners",
+            "run-detector",
+            "web-scanners",
             "--db",
             db_path,
             "--access-log",
@@ -2544,7 +2567,8 @@ fn block_web_scanners_ignores_repeated_hits_on_a_single_dead_path() {
 
     stop_bots_bin()
         .args([
-            "block-web-scanners",
+            "run-detector",
+            "web-scanners",
             "--db",
             db_path,
             "--access-log",
@@ -2577,7 +2601,8 @@ fn block_web_scanners_dry_run_reports_without_writing() {
 
     stop_bots_bin()
         .args([
-            "block-web-scanners",
+            "run-detector",
+            "web-scanners",
             "--db",
             db_path,
             "--access-log",
@@ -2613,7 +2638,8 @@ fn block_scanners_ttl_days_expires_the_rule_by_the_next_list() {
 
     stop_bots_bin()
         .args([
-            "block-scanners",
+            "run-detector",
+            "ssh-scanners",
             "--db",
             db_path,
             "--ssh-log",
@@ -2649,7 +2675,8 @@ fn block_web_scanners_ttl_days_defaults_to_one_day() {
 
     stop_bots_bin()
         .args([
-            "block-web-scanners",
+            "run-detector",
+            "web-scanners",
             "--db",
             db_path,
             "--access-log",
@@ -2694,7 +2721,8 @@ fn list_firewall_rules_shows_expiry_only_for_temporary_rules() {
     fs::write(&log_path, repeat_failed_attempt("198.51.100.9", 25)).unwrap();
     stop_bots_bin()
         .args([
-            "block-scanners",
+            "run-detector",
+            "ssh-scanners",
             "--db",
             db_path,
             "--ssh-log",
@@ -3333,7 +3361,7 @@ fn update_ip_ranges_reads_a_local_file_instead_of_downloading() {
 
     fixture
         .run(&[
-            "update-ip-ranges",
+            "update-crawler-ranges",
             "--source-id",
             "googlebot",
             "--source",
@@ -3407,7 +3435,7 @@ fn update_reputation_source_reads_a_local_file_in_either_format() {
         let fixture = Fixture::new();
         fixture
             .run(&[
-                "update-reputation-source",
+                "update-reputation-sources",
                 "--source-id",
                 source_id,
                 "--source",
@@ -3449,7 +3477,7 @@ fn a_feeds_comments_and_blank_lines_are_not_stored_as_ranges() {
     let fixture = Fixture::new();
 
     fixture.run(&[
-        "update-reputation-source",
+        "update-reputation-sources",
         "--source-id",
         "firehol-level1",
         "--source",
@@ -3470,7 +3498,7 @@ fn a_missing_source_file_names_the_file() {
 
     fixture
         .cmd(&[
-            "update-ip-ranges",
+            "update-crawler-ranges",
             "--source-id",
             "googlebot",
             "--source",
@@ -3872,11 +3900,11 @@ fn apache_hosts_are_told_about_apache_not_nginx() {
     fx.debian_apache();
     for (args, expected) in [
         (
-            &["trust", "--address", "192.0.2.1"][..],
+            &["add-trusted", "--address", "192.0.2.1"][..],
             "never blocked by the firewall or Apache",
         ),
         (
-            &["trust", "--user-agent", "UptimeRobot"],
+            &["add-trusted", "--user-agent", "UptimeRobot"],
             "never blocked by Apache",
         ),
         (
@@ -3969,7 +3997,7 @@ fn apache_on_rhel_writes_the_trust_file_to_conf_d() {
     let (root, site) = fx.rhel_apache();
     fx.seed_bots();
     fx.run(&["scan-sites"]);
-    fx.run(&["trust", "--user-agent", "UptimeRobot"]);
+    fx.run(&["add-trusted", "--user-agent", "UptimeRobot"]);
 
     fx.run(&["apply-blocks", "--no-reload"]);
 
@@ -3993,7 +4021,7 @@ fn apache_refuses_a_trust_file_where_apache_never_reads_it() {
     fs::create_dir_all(root.join("conf-enabled")).unwrap();
     fx.seed_bots();
     fx.run(&["scan-sites"]);
-    fx.run(&["trust", "--user-agent", "UptimeRobot"]);
+    fx.run(&["add-trusted", "--user-agent", "UptimeRobot"]);
 
     fx.cmd(&["apply-blocks", "--no-reload"])
         .assert()
@@ -4091,7 +4119,7 @@ fn apache_uninstall_takes_a_prefix_back_to_how_it_was() {
         "web_server = apache\napache_root = /etc/apache2\n",
     )
     .unwrap();
-    run(&["trust", "--user-agent", "UptimeRobot"]);
+    run(&["add-trusted", "--user-agent", "UptimeRobot"]);
     run(&["set-robots-txt", "--enabled", "true"]);
     run(&[
         "apply-blocks",
@@ -4311,7 +4339,7 @@ fn db_may_come_before_the_subcommand() {
         .args([
             "--db",
             fx.db.to_str().unwrap(),
-            "trust",
+            "add-trusted",
             "--address",
             "203.0.113.7",
         ])
@@ -4330,7 +4358,7 @@ fn stop_bots_db_names_the_database_and_db_overrides_it() {
 
     stop_bots_bin()
         .env("STOP_BOTS_DB", &fx.db)
-        .args(["trust", "--address", "203.0.113.7"])
+        .args(["add-trusted", "--address", "203.0.113.7"])
         .assert()
         .success();
     fx.run(&["list-trusted"])
@@ -4345,15 +4373,116 @@ fn stop_bots_db_names_the_database_and_db_overrides_it() {
 }
 
 /// Renamed for 0.1; the old spelling works for one release.
+/// With nothing to name, an `update-*` that updates every source of its
+/// kind says there is nothing to do rather than downloading anything.
 #[test]
-fn block_scanners_still_works_under_its_old_name() {
+fn an_update_of_everything_with_nothing_chosen_says_so() {
+    let fx = Fixture::new();
+    for (args, says) in [
+        (&["update-country-ranges"][..], "No country is selected"),
+        (&["update-reputation-sources"], "No feed is switched on"),
+    ] {
+        fx.run(args).stdout(predicate::str::contains(says));
+    }
+}
+
+/// `trust --remove` and `exempt-path --remove` became verbs of their own,
+/// and the old spelling still does what it did.
+#[test]
+fn trust_remove_still_removes_and_says_it_is_deprecated() {
+    let fx = Fixture::new();
+    fx.run(&["add-trusted", "--address", "203.0.113.7"]);
+    fx.run(&["trust", "--remove", "--address", "203.0.113.7"])
+        .stderr(predicate::str::contains("use `remove-trusted`"));
+    let listed = fx.run(&["list-trusted"]);
+    let listed = String::from_utf8_lossy(&listed.get_output().stdout).into_owned();
+    assert!(!listed.contains("203.0.113.7"), "still trusted:\n{listed}");
+}
+
+/// The verbs `run-detector` replaced still run the same detector, and say
+/// on stderr what to use instead, until 2.0.0.
+#[test]
+fn the_old_detector_verbs_still_work_and_say_they_are_deprecated() {
     let fx = Fixture::new();
     let log = fx.db.with_file_name("auth.log");
     fs::write(&log, repeat_failed_attempt("198.51.100.9", 25)).unwrap();
 
     for command in ["block-ssh-scanners", "block-scanners"] {
         fx.run(&[command, "--ssh-log", log.to_str().unwrap(), "--dry-run"])
-            .stdout(predicate::str::contains("Would block 198.51.100.9"));
+            .stdout(predicate::str::contains("Would block 198.51.100.9"))
+            .stderr(predicate::str::contains(
+                "is deprecated, use `run-detector ssh-scanners`",
+            ));
+    }
+}
+
+/// The current spellings print no deprecation warning.
+#[test]
+fn run_detector_says_nothing_about_deprecation() {
+    let fx = Fixture::new();
+    let log = fx.db.with_file_name("auth.log");
+    fs::write(&log, repeat_failed_attempt("198.51.100.9", 25)).unwrap();
+
+    fx.run(&[
+        "run-detector",
+        "ssh-scanners",
+        "--ssh-log",
+        log.to_str().unwrap(),
+        "--dry-run",
+    ])
+    .stderr(predicate::str::contains("deprecated").not());
+}
+
+/// Every detector runs by hand now, not only the five that had a verb.
+#[test]
+fn run_detector_runs_every_detector() {
+    let fx = Fixture::new();
+    let log = fx.db.with_file_name("access.log");
+    fs::write(&log, "").unwrap();
+    for detector in [
+        "web-scanners",
+        "spoofed-crawlers",
+        "probe-paths",
+        "injection",
+        "honeypot",
+        "asset-ratio",
+        "rotating-ua",
+        "refererless",
+        "robots-txt",
+    ] {
+        fx.run(&[
+            "run-detector",
+            detector,
+            "--access-log",
+            log.to_str().unwrap(),
+            "--dry-run",
+        ]);
+    }
+}
+
+/// A detector that convicts on one request has no threshold to give, and
+/// each reads the log it reads.
+#[test]
+fn run_detector_refuses_a_flag_its_detector_has_no_use_for() {
+    let fx = Fixture::new();
+    for (args, says) in [
+        (
+            &["run-detector", "injection", "--threshold", "3"][..],
+            "has no threshold",
+        ),
+        (
+            &["run-detector", "ssh-scanners", "--access-log", "/dev/null"],
+            "--ssh-log",
+        ),
+        (
+            &["run-detector", "probe-paths", "--ssh-log", "/dev/null"],
+            "--access-log",
+        ),
+    ] {
+        fx.cmd(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(says));
     }
 }
 
@@ -4423,12 +4552,24 @@ fn a_detector_run_by_hand_uses_the_stored_threshold() {
     fs::write(&log, lines).unwrap();
     let log = log.to_str().unwrap();
 
-    fx.run(&["block-web-scanners", "--access-log", log, "--dry-run"])
-        .stdout(predicate::str::contains("No scanning IPs found"));
+    fx.run(&[
+        "run-detector",
+        "web-scanners",
+        "--access-log",
+        log,
+        "--dry-run",
+    ])
+    .stdout(predicate::str::contains("No scanning IPs found"));
 
     fx.run(&["set-detector", "web-scanners", "--threshold", "4"]);
-    fx.run(&["block-web-scanners", "--access-log", log, "--dry-run"])
-        .stdout(predicate::str::contains("Would block 203.0.113.9"));
+    fx.run(&[
+        "run-detector",
+        "web-scanners",
+        "--access-log",
+        log,
+        "--dry-run",
+    ])
+    .stdout(predicate::str::contains("Would block 203.0.113.9"));
 }
 
 /// Each refusal names why, and a command with one bad flag changes
@@ -4833,7 +4974,7 @@ fn a_detector_s_blocks_are_listed_and_removed_by_source_and_stay_removed() {
     )
     .unwrap();
     let log = log.to_str().unwrap();
-    fx.run(&["block-probe-paths", "--access-log", log]);
+    fx.run(&["run-detector", "probe-paths", "--access-log", log]);
     fx.run(&["add-firewall-rule", "--address", "192.0.2.1"]);
 
     fx.run(&["list-firewall-rules", "--source", "probe-paths"])
@@ -4854,7 +4995,7 @@ fn a_detector_s_blocks_are_listed_and_removed_by_source_and_stay_removed() {
             "Removed 2 firewall rule(s) from probe-paths.",
         ));
 
-    fx.run(&["block-probe-paths", "--access-log", log])
+    fx.run(&["run-detector", "probe-paths", "--access-log", log])
         .stdout(predicate::str::contains("Left 2 alone: unblocked by hand"));
     fx.run(&["list-firewall-rules"])
         .stdout(predicate::str::contains("#3 Block 192.0.2.1 [cli"))
@@ -4963,7 +5104,7 @@ fn a_scratch_root_keeps_its_generated_files_inside_itself() {
     };
 
     run(&["scan-sites", "--root", root]);
-    run(&["trust", "--user-agent", "Pingdom.com_bot"]);
+    run(&["add-trusted", "--user-agent", "Pingdom.com_bot"]);
     run(&["apply-blocks", "--root", root, "--no-reload"]);
 
     let trust_file = fx.nginx_root.join("conf.d/stop-bots-trusted.conf");
@@ -5327,7 +5468,7 @@ fn batch_prints_hostile_step_errors_terminal_safe() {
 /// `block-probe-paths` on `log`, against the database at `db`.
 fn block_probe_paths(db: &Path, log: &Path) -> assert_cmd::assert::Assert {
     stop_bots_bin()
-        .args(["block-probe-paths", "--db", db.to_str().unwrap()])
+        .args(["run-detector", "probe-paths", "--db", db.to_str().unwrap()])
         .args(["--access-log", log.to_str().unwrap()])
         .assert()
         .success()
@@ -5866,8 +6007,8 @@ fn list_turned_away_json_counts_refused_and_served_per_user_agent() {
 #[test]
 fn list_trusted_json_keeps_addresses_and_user_agents_apart() {
     let fx = Fixture::new();
-    fx.run(&["trust", "--address", "203.0.113.7"]);
-    fx.run(&["trust", "--user-agent", "UptimeRobot"]);
+    fx.run(&["add-trusted", "--address", "203.0.113.7"]);
+    fx.run(&["add-trusted", "--user-agent", "UptimeRobot"]);
 
     assert_eq!(
         fx.json(&["list-trusted"]),

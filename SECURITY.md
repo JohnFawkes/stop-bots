@@ -49,7 +49,7 @@ mostly *integrity* failures, not memory safety:
 - **Privilege escalation** via the files the tool writes, the database it opens, or the
   subprocesses it spawns: the web server's config test and graceful reload (`nginx -t`,
   `apache2ctl configtest`, `systemctl reload nginx` or `apache2`, or the commands root
-  stored with `set-web-server` or `set-nginx-commands`), `systemctl`, `nft` and
+  stored with `set-web-server`), `systemctl`, `nft` and
   `iptables`.
 
 ## What does not

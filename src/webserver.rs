@@ -356,7 +356,7 @@ impl WebServer {
     /// The verb that stores this server's commands and config root.
     pub fn commands_verb(self) -> &'static str {
         match self {
-            WebServer::Nginx => "set-nginx-commands",
+            WebServer::Nginx => "set-web-server nginx",
             WebServer::Apache => "set-web-server apache",
         }
     }

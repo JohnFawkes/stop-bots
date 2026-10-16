@@ -339,7 +339,7 @@ fn resource_use_stays_within_budget() {
             Feed::Reputation(id) => host.measure(
                 STORE_RANGES,
                 &[
-                    "update-reputation-source",
+                    "update-reputation-sources",
                     "--source-id",
                     id,
                     "--source",

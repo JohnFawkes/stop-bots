@@ -45,7 +45,7 @@ use anyhow::Result;
 /// only flagged when it puts a crawler's name in its user agent *and* sits
 /// outside the CIDRs that crawler's own operator publishes, and the
 /// published lists are complete by construction. It's also inert until
-/// `update-ip-ranges` has actually fetched something (see
+/// `update-crawler-ranges` has actually fetched something (see
 /// `scanblock::crawler_claims`), so enabling it by default can't do
 /// anything on a fresh install before there's data to check against.
 pub const SPOOFED_CRAWLERS_ENABLED_DEFAULT: bool = true;
@@ -87,7 +87,7 @@ pub const BEHAVIOURAL_WINDOW_HOURS: i64 = 1;
 /// back what windows replaced, a count over everything ever seen.
 pub const MAX_WINDOW_HOURS: i64 = 30 * 24;
 
-/// One day, matching `block-web-scanners` rather than `block-scanners`'
+/// One day, matching `run-detector web-scanners` rather than `run-detector ssh-scanners`'
 /// five. The failure mode worth designing against is a crawler operator
 /// adding a range faster than the daily `UpdateIpRanges` job picks it up:
 /// a real Googlebot address could then be blocked for as long as the TTL.
@@ -106,7 +106,7 @@ pub const PROBE_PATHS_EXTRA: &str = keys::DETECT_PROBE_PATHS_EXTRA;
 /// a threshold there is nothing to tune wrong.
 pub const PROBE_PATHS_ENABLED_DEFAULT: bool = true;
 
-/// Five days, matching `block-scanners` rather than the one day
+/// Five days, matching `run-detector ssh-scanners` rather than the one day
 /// spoofed-crawler detection uses. The difference is who can be caught by
 /// mistake: a mis-detected crawler is a real service you want back
 /// quickly, whereas anything requesting `/.env` has no legitimate business

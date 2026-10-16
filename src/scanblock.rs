@@ -16,7 +16,7 @@
  */
 
 //! Shared "detect scanning IPs, add temporary Block rules" logic behind the
-//! CLI's `block-scanners`/`block-web-scanners` subcommands and the internal
+//! CLI's `run-detector ssh-scanners`/`run-detector web-scanners` subcommands and the internal
 //! cron's `BlockScanners`/`BlockWebScanners` jobs (see [`crate::cron`]) —
 //! pulled out so neither caller can drift from the other, and so neither
 //! ever needs to `println!` from inside detection logic that the TUI (which
@@ -93,7 +93,7 @@ pub struct ScanBlockOutcome {
     /// crawler's published IP range, or a CDN's edge (see [`crate::cdn`]).
     pub skipped_known_crawlers: usize,
     /// Whether the known-crawler exclusion had any ranges to check
-    /// against — `false` means `update-ip-ranges` has never been run for
+    /// against — `false` means `update-crawler-ranges` has never been run for
     /// any of the three crawler sources, so the exclusion is a no-op.
     /// Always `true` (meaningless) for [`block_ssh_scanners`].
     pub crawler_exclusion_active: bool,
@@ -191,8 +191,8 @@ impl ScanBlockOutcome {
 /// What `detector` needs to see before it blocks.
 ///
 /// The threshold is the stored one (see `Detector::threshold`), the same
-/// for every scheduler; the CLI's one-off `block-scanners` and
-/// `block-web-scanners` take theirs from a flag instead. The SSH scanner
+/// for every scheduler; the CLI's one-off `run-detector ssh-scanners` and
+/// `run-detector web-scanners` take theirs from a flag instead. The SSH scanner
 /// counts failed-login lines; the other four that have a threshold count
 /// distinct things; the rest need one line.
 pub fn rule(db: &Db, detector: crate::protection::Detector) -> Result<Rule> {
@@ -350,7 +350,7 @@ pub fn block_web_scanners(
 
 /// Every CIDR published by a known crawler source (Googlebot, Bingbot,
 /// GPTBot — the same three [`ipranges::IpRangeSourceKind::ALL`] sources
-/// `update-ip-ranges` fetches), regardless of `db`'s current category
+/// `update-crawler-ranges` fetches), regardless of `db`'s current category
 /// defaults: this exclusion is about never misidentifying a *verified*
 /// crawler as a scanner via behavioral heuristics, independent of whether
 /// the admin has separately chosen to block that crawler's category
@@ -369,7 +369,7 @@ pub fn known_crawler_ranges(db: &Db) -> Result<Vec<String>> {
 /// holds. **Sources with no stored ranges are dropped**, not included
 /// empty: an empty range list would make every real request from that
 /// crawler look like an impersonation, so a fresh install (or one whose
-/// `update-ip-ranges` has never succeeded) would block the actual
+/// `update-crawler-ranges` has never succeeded) would block the actual
 /// Googlebot. Dropping them makes the detector inert instead, which is the
 /// only safe failure mode here.
 ///
@@ -573,13 +573,17 @@ pub fn block_asset_ratio(
     db: &Db,
     ttl_days: i64,
     log_text: &str,
+    threshold: Option<usize>,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
-    let min_pages = crate::protection::threshold(
-        db,
-        crate::protection::ASSET_RATIO_MIN_PAGES,
-        crate::protection::ASSET_RATIO_MIN_PAGES_DEFAULT,
-    )?;
+    let min_pages = match threshold {
+        Some(n) => n,
+        None => crate::protection::threshold(
+            db,
+            crate::protection::ASSET_RATIO_MIN_PAGES,
+            crate::protection::ASSET_RATIO_MIN_PAGES_DEFAULT,
+        )?,
+    };
     let candidates = accesslog::asset_less_ips(log_text, min_pages);
     excluding_known_crawlers(
         db,
@@ -596,13 +600,17 @@ pub fn block_rotating_ua(
     db: &Db,
     ttl_days: i64,
     log_text: &str,
+    threshold: Option<usize>,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
-    let min_agents = crate::protection::threshold(
-        db,
-        crate::protection::ROTATING_UA_MIN,
-        crate::protection::ROTATING_UA_MIN_DEFAULT,
-    )?;
+    let min_agents = match threshold {
+        Some(n) => n,
+        None => crate::protection::threshold(
+            db,
+            crate::protection::ROTATING_UA_MIN,
+            crate::protection::ROTATING_UA_MIN_DEFAULT,
+        )?,
+    };
     let candidates = accesslog::rotating_user_agent_ips(log_text, min_agents);
     excluding_known_crawlers(
         db,
@@ -619,13 +627,17 @@ pub fn block_refererless(
     db: &Db,
     ttl_days: i64,
     log_text: &str,
+    threshold: Option<usize>,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
-    let min_paths = crate::protection::threshold(
-        db,
-        crate::protection::REFERERLESS_MIN_PATHS,
-        crate::protection::REFERERLESS_MIN_PATHS_DEFAULT,
-    )?;
+    let min_paths = match threshold {
+        Some(n) => n,
+        None => crate::protection::threshold(
+            db,
+            crate::protection::REFERERLESS_MIN_PATHS,
+            crate::protection::REFERERLESS_MIN_PATHS_DEFAULT,
+        )?,
+    };
     let candidates = accesslog::refererless_crawl_ips(log_text, min_paths);
     excluding_known_crawlers(
         db,
@@ -1846,7 +1858,8 @@ mod tests {
     #[test]
     fn block_asset_ratio_blocks_a_client_that_never_fetches_assets() {
         let db = Db::open_in_memory().unwrap();
-        let outcome = block_asset_ratio(&db, 5, &asset_less_log("203.0.113.9"), false).unwrap();
+        let outcome =
+            block_asset_ratio(&db, 5, &asset_less_log("203.0.113.9"), None, false).unwrap();
 
         assert_eq!(outcome.kind, ScanKind::NonBrowser);
         assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
@@ -1864,7 +1877,7 @@ mod tests {
         // An address inside Google's published range.
         let log = asset_less_log("66.249.66.1");
 
-        let outcome = block_asset_ratio(&db, 5, &log, false).unwrap();
+        let outcome = block_asset_ratio(&db, 5, &log, None, false).unwrap();
 
         assert!(outcome.newly_blocked.is_empty(), "{outcome:?}");
         assert_eq!(outcome.skipped_known_crawlers, 1);
@@ -1883,11 +1896,21 @@ mod tests {
             .collect();
 
         // Four agents, default threshold is higher.
-        assert_eq!(block_rotating_ua(&db, 5, &log, true).unwrap().candidates, 0);
+        assert_eq!(
+            block_rotating_ua(&db, 5, &log, None, true)
+                .unwrap()
+                .candidates,
+            0
+        );
 
         db.set_int_setting(crate::protection::ROTATING_UA_MIN, 3)
             .unwrap();
-        assert_eq!(block_rotating_ua(&db, 5, &log, true).unwrap().candidates, 1);
+        assert_eq!(
+            block_rotating_ua(&db, 5, &log, None, true)
+                .unwrap()
+                .candidates,
+            1
+        );
     }
 
     #[test]
@@ -1897,7 +1920,7 @@ mod tests {
             .map(|i| page_line("203.0.113.9", &format!("/p{i}")))
             .collect();
 
-        let outcome = block_refererless(&db, 5, &log, false).unwrap();
+        let outcome = block_refererless(&db, 5, &log, None, false).unwrap();
 
         assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
     }

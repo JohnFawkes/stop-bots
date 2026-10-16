@@ -13,6 +13,39 @@ this one refuses the upgraded database rather than misreading it. To go back, pu
 the copy the upgrade kept, `/var/lib/stop-bots/db.sqlite3.bak-v6`, then install the
 older release; settings changed since the upgrade are lost.
 
+### Changed
+
+- **The command line has one shape for each kind of verb**, before 1.0 freezes it:
+  - **`run-detector <detector>`** runs any detector over a log by hand, all ten of them,
+    in place of the five `block-*` verbs.
+  - **Lists have `add-*`/`remove-*` verbs**: `add-trusted`/`remove-trusted` in place of
+    `trust` and `trust --remove`, and `add-exempt-path`/`remove-exempt-path` in place of
+    `exempt-path` and `exempt-path --remove`.
+  - **`update-*` updates every source of its kind** unless one is named:
+    `update-bot-lists` (every bot list; it updated well-known-bots alone before),
+    `update-crawler-ranges` (was `update-ip-ranges`, one crawler at a time),
+    `update-reputation-sources` (every feed switched on; was `update-reputation-source`,
+    one at a time) and `update-country-ranges` (every selected country).
+  - **`set-web-server nginx`** takes NGINX's commands and root, in place of
+    `set-nginx-commands`.
+
+  `CONTRIBUTING.md` writes the conventions down.
+
+### Deprecated
+
+Each still works as before, prints a one-line warning on stderr naming its replacement,
+and goes in 2.0.0:
+
+- `block-ssh-scanners` (and `block-scanners`), `block-web-scanners`,
+  `block-spoofed-crawlers`, `block-probe-paths`, `block-honeypot`: use
+  `run-detector <detector>`.
+- `trust`: use `add-trusted`; `trust --remove`: use `remove-trusted`.
+- `exempt-path`: use `add-exempt-path`; `exempt-path --remove`: use
+  `remove-exempt-path`.
+- `update-ip-ranges`: use `update-crawler-ranges`.
+- `update-reputation-source`: use `update-reputation-sources`.
+- `set-nginx-commands`: use `set-web-server nginx`.
+
 ### Fixed
 
 - **SSH scanners on a host that takes keys only** are counted when they reach sshd's

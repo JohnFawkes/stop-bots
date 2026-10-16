@@ -41,7 +41,7 @@ pub const DEFAULT_LOG_PATHS: &[&str] = &["/var/log/auth.log", "/var/log/secure"]
 
 /// sshd's systemd unit is named `sshd` on RHEL-derived distros and `ssh` on
 /// Debian-derived ones.
-const SSHD_UNIT_NAMES: &[&str] = &["sshd", "ssh"];
+pub const JOURNAL_UNITS: &[&str] = &["sshd", "ssh"];
 
 /// The result of looking for SSH log data: distinguishes "we found and read
 /// a source, here's its text" from "nothing was even readable" — the
@@ -129,7 +129,8 @@ impl SshSource {
             Located::Journal => {
                 let query = crate::logread::JournalQuery {
                     program: Path::new("journalctl"),
-                    units: SSHD_UNIT_NAMES,
+                    units: JOURNAL_UNITS,
+                    matches: &[],
                     after_cursor: None,
                     since: None,
                     last: Some(1),
@@ -157,11 +158,6 @@ pub fn recent_since() -> i64 {
 /// anything here looks at.
 pub fn is_auth_line(line: &str) -> bool {
     parse_auth_line(line).is_some()
-}
-
-/// The units whose journal is the SSH log, for [`crate::logscan`].
-pub fn journal_units() -> &'static [&'static str] {
-    SSHD_UNIT_NAMES
 }
 
 /// Reads SSH log lines one at a time into what the pipeline keeps from

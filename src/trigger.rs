@@ -66,7 +66,13 @@ pub fn evidence_for(
         return HashMap::new();
     }
     let mut found: HashMap<IpAddr, String> = HashMap::new();
-    if detector.spec().uses_ssh_log {
+    let log = detector.spec().log;
+    if log == crate::protection::DetectorLog::Kernel {
+        // One kernel line names one port, and the block is for several:
+        // the ports the detector reports say more than any one line.
+        return HashMap::new();
+    }
+    if log == crate::protection::DetectorLog::Ssh {
         // The last failure: the most recent of what earned the block.
         for line in log_text.lines() {
             if let Some(ip) = crate::sshlog::failed_login_address(line) {
@@ -153,7 +159,7 @@ fn describe(detector: Detector, request: &Request, hint: Option<&str>) -> Option
             let page = hint.is_none_or(|path| request.path == path.to_lowercase());
             (post && page).then(with_agent)
         }
-        Detector::SshScanners => None,
+        Detector::SshScanners | Detector::PortScanners => None,
     }
 }
 

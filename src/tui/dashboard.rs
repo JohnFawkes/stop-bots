@@ -1002,36 +1002,40 @@ impl Dashboard {
         running_jobs: &std::collections::HashSet<crate::app::Job>,
     ) {
         // Two columns over a log. The left column is *policy* — what this
-        // host blocks by category, by country, and the script those become;
-        // the right column is what the host does on its own — the
-        // detectors and feeds, and the cron that runs them. The log at
-        // the foot is the one panel that spans both, because a message
-        // can come from either side.
+        // host blocks by category, by country, and the script those become —
+        // with the schedule that writes and applies it under it; the right
+        // column is what the host does on its own: every detector and feed.
+        // The log at the foot is the one panel that spans both, because a
+        // message can come from either side.
         //
-        // On a short terminal the panel that gives is Automatic blocking
-        // (`Max`), which falls back to scrolling; Scheduled tasks below it
-        // holds `Min(3)` so that it is never the one that vanishes — it
-        // is the panel reporting what the detectors just did.
+        // Automatic blocking has the right column to itself because it is
+        // the panel that grows: a row per detector and feed, one column of
+        // them at 100 columns wide. On a terminal too short for every row it
+        // scrolls. Scheduled tasks holds `Min(3)` on the left, beside the
+        // script it runs, so it never vanishes: it is the panel reporting
+        // what the detectors just did.
         let [columns_area, log_area] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(LOG_HEIGHT)]).areas(area);
         let [left, right] =
-            Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(columns_area);
 
-        let [settings_area, geo_area, crawlers_area, firewall_area] = Layout::vertical([
-            Constraint::Length(POLICY_ROWS as u16 + 2),
-            Constraint::Min(4),
-            Constraint::Length(ipranges::IpRangeSourceKind::ALL.len() as u16 + 2),
-            Constraint::Length(4),
-        ])
-        .areas(left);
+        let [settings_area, geo_area, crawlers_area, firewall_area, cron_area] =
+            Layout::vertical([
+                Constraint::Length(POLICY_ROWS as u16 + 2),
+                Constraint::Min(4),
+                Constraint::Length(ipranges::IpRangeSourceKind::ALL.len() as u16 + 2),
+                Constraint::Length(4),
+                Constraint::Min(3),
+            ])
+            .areas(left);
         // Measured once for both the height it needs and the drawing:
         // the same width goes into both, and measuring means formatting
         // every row's label.
         let (label_width, columns) = self.protection_columns(right.width);
         let protection_height = self.protection_panel_height(columns);
-        let [protection_area, cron_area] =
-            Layout::vertical([Constraint::Max(protection_height), Constraint::Min(3)]).areas(right);
+        let [protection_area, _] =
+            Layout::vertical([Constraint::Max(protection_height), Constraint::Min(0)]).areas(right);
 
         self.render_categories(frame, settings_area, theme);
         self.render_geo(frame, geo_area, theme);
@@ -6007,7 +6011,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         let rows = dashboard.protection_rows();
-        assert_eq!(rows.len(), 23, "if this changes, so does the panel height");
+        assert_eq!(rows.len(), 24, "if this changes, so does the panel height");
         for row in rows {
             let label = dashboard.protection_label(row);
             assert!(content.contains(&label), "{label:?} is not on screen");

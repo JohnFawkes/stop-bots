@@ -15,9 +15,10 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-//! The two host logs the detectors read, a bounded piece at a time, from
-//! where the last piece stopped: the NGINX access log, and sshd's
-//! authentication lines.
+//! The host logs the detectors read, a bounded piece at a time, from
+//! where the last piece stopped: the NGINX access log, sshd's
+//! authentication lines, and the lines the firewall's trap ports write to
+//! the kernel log.
 //!
 //! [`read`] is the one function that reads them, in process, for the
 //! CLI, the TUI and `tick`. The caller holds a [`LogReader`] and asks it
@@ -44,6 +45,7 @@
 //! user`, as [`crate::sshlog`] reads them — and from the journal only the
 //! entries of sshd's own units. Nothing else in `auth.log` (sudo, cron,
 //! every user's sessions) and nothing else in the journal is returned.
+//! Of the kernel log, only the trap's lines ([`crate::portscan`]).
 //!
 //! The lines come back unparsed, and are parsed where they are used.
 //!
@@ -71,9 +73,6 @@ const MAX_CURSORS: usize = 4;
 /// The stored form of a journal cursor, before journald's own.
 pub const JOURNAL_CURSOR_PREFIX: &str = "journal ";
 
-/// What an unreadable journal is reported as.
-const JOURNAL_TRIED: &str = "journald (units sshd and ssh)";
-
 /// Which log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Log {
@@ -82,7 +81,38 @@ pub enum Log {
     /// sshd's authentication lines: from the auth log file, or the
     /// journal.
     Ssh,
+    /// The trap's lines in the kernel log: from `kern.log`, or the
+    /// journal.
+    Kernel,
 }
+
+/// One of the logs that may be in the journal: which entries are its,
+/// and which of their lines are kept.
+struct JournalLog {
+    /// The key its cursor is stored under.
+    source: &'static str,
+    units: &'static [&'static str],
+    matches: &'static [&'static str],
+    /// What an unreadable journal is reported as.
+    tried: &'static str,
+    keep: fn(&str) -> bool,
+}
+
+const SSH_JOURNAL: JournalLog = JournalLog {
+    source: sshlog::JOURNAL_SOURCE,
+    units: sshlog::JOURNAL_UNITS,
+    matches: &[],
+    tried: "journald (units sshd and ssh)",
+    keep: sshlog::is_auth_line,
+};
+
+const KERNEL_JOURNAL: JournalLog = JournalLog {
+    source: crate::portscan::JOURNAL_SOURCE,
+    units: &[],
+    matches: crate::portscan::JOURNAL_MATCHES,
+    tried: "journald (kernel messages)",
+    keep: crate::portscan::is_trap_line,
+};
 
 /// Where an earlier read of one log stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +220,10 @@ pub struct Sources {
     pub ssh: SshSource,
     /// Where [`SshSource::Search`] looks before the journal.
     pub search: Vec<PathBuf>,
+    /// The kernel log, or the search for it.
+    pub kernel: crate::portscan::KernelSource,
+    /// Where the kernel log's search looks before the journal.
+    pub kernel_search: Vec<PathBuf>,
     /// `journalctl`, except in tests.
     pub journalctl: PathBuf,
 }
@@ -206,6 +240,11 @@ impl Sources {
             access: paths.access_path(access_flag),
             ssh: paths.ssh(ssh_flag),
             search: sshlog::DEFAULT_LOG_PATHS
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+            kernel: paths.kernel(None),
+            kernel_search: crate::portscan::DEFAULT_KERNEL_LOG_PATHS
                 .iter()
                 .map(PathBuf::from)
                 .collect(),
@@ -251,7 +290,20 @@ pub fn read(sources: &Sources, request: &Request) -> Reply {
     let budget = request.max_bytes.clamp(1, MAX_CHUNK);
     match request.log {
         Log::Access => read_access(&sources.access, request, budget),
-        Log::Ssh => read_ssh(sources, request, budget),
+        Log::Ssh => read_located(
+            sources.ssh.locate_among(&sources.search),
+            &SSH_JOURNAL,
+            sources,
+            request,
+            budget,
+        ),
+        Log::Kernel => read_located(
+            sources.kernel.locate_among(&sources.kernel_search),
+            &KERNEL_JOURNAL,
+            sources,
+            request,
+            budget,
+        ),
     }
 }
 
@@ -283,22 +335,25 @@ fn push(lines: &mut String, line: &str) {
     lines.push('\n');
 }
 
-/// Appends `line` if it is one of sshd's authentication lines.
-fn push_auth(lines: &mut String, line: &str) {
-    if sshlog::is_auth_line(line) {
-        push(lines, line);
-    }
-}
-
-fn read_ssh(sources: &Sources, request: &Request, budget: u64) -> Reply {
-    match sources.ssh.locate_among(&sources.search) {
+/// Reads the SSH or the kernel log from where it was found: the lines
+/// `journal.keep` keeps, from a file or from the journal.
+fn read_located(
+    located: Located,
+    journal: &JournalLog,
+    sources: &Sources,
+    request: &Request,
+    budget: u64,
+) -> Reply {
+    match located {
         Located::File(path) => {
             let source = source_key(&path);
             let stored = request.cursor_for(&source);
             let start = stored.and_then(FileCursor::decode);
             let mut lines = String::new();
             match logread::read_chunk(&path, start, budget, &mut |line| {
-                push_auth(&mut lines, line)
+                if (journal.keep)(line) {
+                    push(&mut lines, line);
+                }
             }) {
                 Ok(done) => Reply::Read(Chunk {
                     source,
@@ -312,7 +367,7 @@ fn read_ssh(sources: &Sources, request: &Request, budget: u64) -> Reply {
                 Err(_) => Reply::Unavailable(path.display().to_string()),
             }
         }
-        Located::Journal => read_journal(sources, request, budget),
+        Located::Journal => read_journal(journal, sources, request, budget),
     }
 }
 
@@ -327,37 +382,42 @@ fn is_journal_cursor(cursor: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'=' || b == b';')
 }
 
-fn read_journal(sources: &Sources, request: &Request, budget: u64) -> Reply {
-    let source = sshlog::JOURNAL_SOURCE.to_string();
+fn read_journal(journal: &JournalLog, sources: &Sources, request: &Request, budget: u64) -> Reply {
+    let source = journal.source.to_string();
     let stored = request.cursor_for(&source);
     let after = stored
         .and_then(|stored| stored.strip_prefix(JOURNAL_CURSOR_PREFIX))
         .filter(|cursor| is_journal_cursor(cursor));
     let query = logread::JournalQuery {
         program: &sources.journalctl,
-        units: sshlog::journal_units(),
+        units: journal.units,
+        matches: journal.matches,
         after_cursor: after,
         since: request.since,
         last: None,
         max_bytes: Some(budget),
     };
     let mut lines = String::new();
-    let done = match logread::read_journal(&query, &mut |line| push_auth(&mut lines, line)) {
+    let done = match logread::read_journal(&query, &mut |line| {
+        if (journal.keep)(line) {
+            push(&mut lines, line);
+        }
+    }) {
         Ok(done) => done,
-        Err(_) => return Reply::Unavailable(JOURNAL_TRIED.to_string()),
+        Err(_) => return Reply::Unavailable(journal.tried.to_string()),
     };
     // A first read that found nothing since `since`: a quiet host, or a
     // journal this user cannot see. The newest entry, however old, tells
     // the two apart, and its cursor is where the next read starts.
     let cursor = match (&done.cursor, after) {
-        (None, None) => newest_journal_cursor(&sources.journalctl),
+        (None, None) => newest_journal_cursor(journal, &sources.journalctl),
         (cursor, _) => cursor.clone(),
     };
     // Readable is "it answered, and has at some point had something to
     // say": an unprivileged journalctl succeeds with nothing, and that must
     // not read as a log with no logins in it.
     if cursor.is_none() && after.is_none() {
-        return Reply::Unavailable(JOURNAL_TRIED.to_string());
+        return Reply::Unavailable(journal.tried.to_string());
     }
     Reply::Read(Chunk {
         source,
@@ -372,11 +432,13 @@ fn read_journal(sources: &Sources, request: &Request, budget: u64) -> Reply {
     })
 }
 
-/// The cursor of the newest sshd entry in the journal, if there is one.
-fn newest_journal_cursor(journalctl: &Path) -> Option<String> {
+/// The cursor of the newest entry of `journal`'s in the journal, if there
+/// is one.
+fn newest_journal_cursor(journal: &JournalLog, journalctl: &Path) -> Option<String> {
     let query = logread::JournalQuery {
         program: journalctl,
-        units: sshlog::journal_units(),
+        units: journal.units,
+        matches: journal.matches,
         after_cursor: None,
         since: None,
         last: Some(1),
@@ -394,10 +456,20 @@ fn newest_journal_cursor(journalctl: &Path) -> Option<String> {
 /// `since`, since nothing bounds it. A request at a time, until the log
 /// says there is no more.
 pub fn ssh_since(reader: &dyn LogReader, since: i64) -> Option<String> {
+    log_since(reader, Log::Ssh, since)
+}
+
+/// The trap's kernel log lines since `since`, the way [`ssh_since`] reads
+/// sshd's: for the one-off `run-detector port-scanners`.
+pub fn kernel_since(reader: &dyn LogReader, since: i64) -> Option<String> {
+    log_since(reader, Log::Kernel, since)
+}
+
+fn log_since(reader: &dyn LogReader, log: Log, since: i64) -> Option<String> {
     let mut text = String::new();
     let mut request = Request {
         since: Some(since),
-        ..Request::new(Log::Ssh, Vec::new())
+        ..Request::new(log, Vec::new())
     };
     let mut source: Option<String> = None;
     loop {
@@ -434,6 +506,8 @@ mod tests {
             access: dir.join("access.log"),
             ssh: SshSource::File(dir.join("auth.log")),
             search: vec![dir.join("no-auth.log")],
+            kernel: SshSource::File(dir.join("kern.log")),
+            kernel_search: vec![dir.join("no-kern.log")],
             journalctl: dir.join("journalctl"),
         }
     }
@@ -471,6 +545,31 @@ mod tests {
             "Sep 28 06:00:02 host sshd[1]: Accepted publickey for m from 192.0.2.10 port 2 ssh2\n\
              Sep 28 06:00:05 host sshd[2]: Failed password for root from 203.0.113.5 port 1 ssh2\n"
         );
+    }
+
+    /// Of the kernel log, the trap's lines and nothing else.
+    #[test]
+    fn of_the_kernel_log_only_the_trap_s_lines_come_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let trap = "Oct 16 10:00:03 host kernel: [9.8] stop-bots-trap: IN=eth0 OUT= \
+                    SRC=203.0.113.5 DST=192.0.2.1 PROTO=TCP SPT=1 DPT=23 SYN URGP=0\n";
+        std::fs::write(
+            dir.path().join("kern.log"),
+            format!(
+                "Oct 16 10:00:01 host kernel: [9.7] usb 1-1: new high-speed USB device\n\
+                 {trap}\
+                 Oct 16 10:00:04 host kernel: [9.9] [UFW BLOCK] IN=eth0 SRC=203.0.113.6 \
+                 PROTO=TCP DPT=25\n"
+            ),
+        )
+        .unwrap();
+
+        let read = chunk(read(
+            &sources(dir.path()),
+            &Request::new(Log::Kernel, Vec::new()),
+        ));
+
+        assert_eq!(read.lines, trap);
     }
 
     /// A request names a log, not a path: whatever it offers as a cursor's

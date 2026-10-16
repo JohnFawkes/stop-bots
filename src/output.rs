@@ -236,8 +236,21 @@ pub struct ConditionalProbePath {
 #[derive(Debug, Serialize)]
 pub struct Detectors {
     pub detectors: Vec<DetectorRow>,
+    /// The port-scan detector's trap ports.
+    pub trap_ports: TrapPorts,
     pub subnet_escalation: SubnetEscalation,
     pub repeat_offenders: RepeatOffenders,
+}
+
+/// The trap ports `set-detector port-scanners --ports` sets: what is
+/// configured, before what listens is left out at render time.
+#[derive(Debug, Serialize)]
+pub struct TrapPorts {
+    pub ports: Vec<u16>,
+    /// Whether these are the built-in list.
+    pub default: bool,
+    /// Never trapped, whatever is configured.
+    pub never: Vec<u16>,
 }
 
 /// `set-repeat-offenders`: a repeat block lasts the detector's TTL times

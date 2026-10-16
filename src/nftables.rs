@@ -119,6 +119,17 @@
 //! (the boot unit loads the last one) keeps its blocks for up to that
 //! much longer. It never keeps them for ever.
 //!
+//! ## Trap ports
+//!
+//! With the port-scan detector on, the input chain ends with two more
+//! rules, after the jump into the rules: a new TCP connection to a trap
+//! port is logged with [`crate::portscan::LOG_PREFIX`], at most
+//! [`crate::portscan::LOG_RATE`], and every packet to one is dropped. After
+//! the jump, so every Allow and Block is decided first: an SSH login or a
+//! trusted address is accepted before the trap sees it. On `input` only,
+//! so a port published by a container, which leaves through `forward`, is
+//! never trapped. See [`crate::portscan`].
+//!
 //! This module never executes `nft` itself — applying the generated script
 //! is a manual step for the admin. The container suite
 //! (`tests/container.rs`) loads its output into a real `nft`.
@@ -478,6 +489,16 @@ pub fn loaded_entries(rules: &[FirewallRule], now: i64) -> usize {
 /// [`FirewallRule`] yet, so UDP-specific rules aren't representable (see
 /// TODO.md).
 pub fn render(rules: &[FirewallRule], now: i64) -> String {
+    render_with_trap(rules, None, now)
+}
+
+/// [`render`], with the port-scan detector's `trap` at the end of the
+/// input chain (see the module docs).
+pub fn render_with_trap(
+    rules: &[FirewallRule],
+    trap: Option<&crate::portscan::Trap>,
+    now: i64,
+) -> String {
     let plan = Plan::new(rules, now);
 
     let mut out = String::new();
@@ -496,7 +517,11 @@ pub fn render(rules: &[FirewallRule], now: i64) -> String {
     out.push_str("# containers, whose traffic is DNAT'd past \"input\" entirely.\n");
     out.push_str("#\n");
     out.push_str("# Addresses are in sets, matched first to last by the rules in bot_rules.\n");
-    out.push_str("# An element with a timeout is removed by the kernel when it runs out.\n\n");
+    out.push_str("# An element with a timeout is removed by the kernel when it runs out.\n");
+    if let Some(trap) = trap {
+        trap_comment(&mut out, trap);
+    }
+    out.push('\n');
 
     // Reset just our own table to a fresh, empty state (see module docs for
     // why this is the idempotent idiom rather than `flush chain`).
@@ -528,6 +553,18 @@ pub fn render(rules: &[FirewallRule], now: i64) -> String {
     // crossed a router.
     out.push_str(&format!("add rule {TABLE} {CHAIN} {ND_ACCEPT}\n"));
     out.push_str(&format!("add rule {TABLE} {CHAIN} jump {RULES_CHAIN}\n"));
+    if let Some(trap) = trap {
+        let ports = crate::portscan::join(&trap.ports);
+        out.push_str(&format!(
+            "add rule {TABLE} {CHAIN} tcp dport {{ {ports} }} tcp flags & (fin | syn | rst | ack) \
+             == syn limit rate {} log prefix \"{}\"\n",
+            crate::portscan::LOG_RATE,
+            crate::portscan::LOG_PREFIX
+        ));
+        out.push_str(&format!(
+            "add rule {TABLE} {CHAIN} tcp dport {{ {ports} }} counter drop\n"
+        ));
+    }
 
     // The same short-circuit on the forward path. `iif lo` has no meaning
     // here — a forwarded packet never arrives on the loopback interface —
@@ -632,6 +669,23 @@ pub fn render(rules: &[FirewallRule], now: i64) -> String {
     }
 
     out
+}
+
+/// The header lines that say what the trap is, for either backend.
+pub(crate) fn trap_comment(out: &mut String, trap: &crate::portscan::Trap) {
+    out.push_str("#\n");
+    out.push_str("# Trap ports, for the port-scan detector: a new connection to one from\n");
+    out.push_str(&format!(
+        "# outside is dropped, and logged as \"{}\" for the detector to read.\n",
+        crate::portscan::LOG_PREFIX.trim_end()
+    ));
+    out.push_str(&format!("#   {}\n", crate::portscan::join(&trap.ports)));
+    if !trap.left_out.is_empty() {
+        out.push_str(&format!(
+            "# Left out, because something listens on them or sshd does: {}.\n",
+            crate::portscan::join(&trap.left_out)
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -1322,6 +1376,97 @@ mod tests {
             disabled("10.0.0.1"),
         ];
         crate::golden::assert_golden("firewall.nft", &render(&rules, NOW));
+    }
+
+    /// The same rule set with the port-scan detector's trap.
+    #[test]
+    fn rendered_script_with_a_trap_matches_the_golden() {
+        let rules = vec![
+            allow("203.0.113.7"),
+            block("198.51.100.0/24"),
+            block_port("192.0.2.9", 22),
+            block("2001:db8::/32"),
+            block_until("192.0.2.77", NOW + 90_000),
+            disabled("10.0.0.1"),
+        ];
+        crate::golden::assert_golden(
+            "firewall-trap.nft",
+            &render_with_trap(&rules, Some(&crate::testing::trap()), NOW),
+        );
+    }
+
+    /// The input chain's rules, in order, without the `add rule` in front.
+    fn input_rules(script: &str) -> Vec<&str> {
+        let prefix = format!("add rule {TABLE} {CHAIN} ");
+        script
+            .lines()
+            .filter_map(|line| line.strip_prefix(prefix.as_str()))
+            .collect()
+    }
+
+    /// Every Allow and Block is decided first: the trap is after the jump
+    /// into the rules, so an SSH login or a trusted address is accepted
+    /// before it, whatever port it connects to.
+    #[test]
+    fn the_trap_comes_after_every_address_rule() {
+        let script = render_with_trap(&[allow("203.0.113.7")], Some(&crate::testing::trap()), NOW);
+        let rules = input_rules(&script);
+
+        let jump = rules.iter().position(|r| r.starts_with("jump ")).unwrap();
+        let log = rules
+            .iter()
+            .position(|r| r.contains(" log prefix "))
+            .unwrap();
+        let drop = rules.iter().position(|r| r.ends_with(" drop")).unwrap();
+        assert!(jump < log && log < drop, "input chain:\n{rules:#?}");
+    }
+
+    /// A container's published port is reached through `forward`, and the
+    /// trap is never there: nothing in the forward chain or the rules
+    /// chain mentions a port at all.
+    #[test]
+    fn the_trap_is_on_the_input_path_only() {
+        let script = render_with_trap(&[], Some(&crate::testing::trap()), NOW);
+        for line in script.lines().filter(|line| line.contains("dport")) {
+            assert!(
+                line.starts_with(&format!("add rule {TABLE} {CHAIN} ")),
+                "a trap rule outside the input chain: {line}\n{script}"
+            );
+        }
+    }
+
+    /// Only a new connection is logged, at a rate; every packet to a trap
+    /// port is dropped. 3306 listens here and is not trapped.
+    #[test]
+    fn the_trap_logs_new_connections_at_a_rate_and_drops_every_packet() {
+        let script = render_with_trap(&[], Some(&crate::testing::trap()), NOW);
+        let rules = input_rules(&script);
+        let log = rules.iter().find(|r| r.contains(" log ")).unwrap();
+        let drop = rules.iter().find(|r| r.ends_with(" drop")).unwrap();
+
+        let checks = [
+            (
+                "logs SYNs only",
+                log.contains("tcp flags & (fin | syn | rst | ack) == syn"),
+            ),
+            ("at a rate", log.contains("limit rate 10/second")),
+            (
+                "with the prefix",
+                log.contains("log prefix \"stop-bots-trap: \""),
+            ),
+            ("drops whatever the rate", !drop.contains("limit")),
+            ("traps telnet", drop.contains(" 23,")),
+            ("not what listens", !drop.contains("3306")),
+        ];
+        for (what, holds) in checks {
+            assert!(holds, "{what}:\n{log}\n{drop}");
+        }
+    }
+
+    #[test]
+    fn no_trap_renders_exactly_what_it_always_did() {
+        let rules = [allow("203.0.113.7"), block("198.51.100.0/24")];
+        assert_eq!(render_with_trap(&rules, None, NOW), render(&rules, NOW));
     }
 
     /// Allowlist geo mode's shape: explicit Allows followed by the v4 and

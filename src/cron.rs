@@ -397,7 +397,7 @@ pub fn record_run(db: &Db, job: CronJob, summary: &str) {
 /// scan for attackers.
 pub fn uses_ssh_log(job: CronJob) -> bool {
     match job {
-        CronJob::Detect(detector) => detector.spec().uses_ssh_log,
+        CronJob::Detect(detector) => detector.spec().log == crate::protection::DetectorLog::Ssh,
         CronJob::RenderFirewall => true,
         CronJob::RecordAccessStats
         | CronJob::UpdateIpRanges
@@ -732,13 +732,8 @@ fn run_detector(db: &Db, detector: Detector, applied: &crate::logscan::Applied) 
     if !enabled {
         return "disabled".to_string();
     }
-    let (log, name) = if detector.spec().uses_ssh_log {
-        (&applied.ssh, "SSH log")
-    } else {
-        (&applied.access, "access log")
-    };
-    if !log.is_readable() {
-        return format!("{name} unavailable");
+    if !applied.log_for(detector).is_readable() {
+        return format!("{} unavailable", detector.spec().log.name());
     }
     let ttl = match detector.ttl_days(db) {
         Ok(ttl) => ttl,
@@ -911,6 +906,7 @@ pub async fn tick(db: &Db, settings: &TickSettings<'_>) -> Result<Vec<(CronJob, 
         let flags = crate::logscan::Flags {
             ssh_log: settings.ssh_log.clone(),
             access_log: None,
+            kernel_log: None,
             stored: settings.host.log_paths(),
         };
         let plan = crate::logscan::plan(db, &log_jobs, &flags)?;
@@ -1429,7 +1425,7 @@ mod tests {
         for detector in Detector::ALL {
             assert_eq!(
                 uses_ssh_log(CronJob::Detect(detector)),
-                detector.spec().uses_ssh_log,
+                detector.spec().log == crate::protection::DetectorLog::Ssh,
                 "{} disagreed with its own spec",
                 detector.id()
             );

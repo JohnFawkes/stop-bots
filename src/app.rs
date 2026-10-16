@@ -1077,6 +1077,7 @@ impl App {
         let flags = crate::logscan::Flags {
             ssh_log: self.ssh_log.clone(),
             access_log: None,
+            kernel_log: None,
             stored: self.host().unwrap_or_default().log_paths(),
         };
         let plan = match crate::logscan::plan(&self.db, &jobs, &flags) {

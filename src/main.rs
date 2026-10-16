@@ -427,8 +427,9 @@ enum Command {
     /// trusted ones, private ones, and those inside a verified crawler's
     /// published ranges are never blocked.
     ///
-    /// ssh-scanners reads the SSH log; every other detector reads the web
-    /// server's access log. spoofed-crawlers needs the crawler ranges
+    /// ssh-scanners reads the SSH log, port-scanners the kernel log its
+    /// trap ports write to, and every other detector the web server's
+    /// access log. spoofed-crawlers needs the crawler ranges
     /// (`update-crawler-ranges`), and honeypot and robots-violators need the
     /// generated robots.txt served (`set-robots-txt --enabled true`).
     RunDetector {
@@ -436,11 +437,11 @@ enum Command {
         detector: DetectorArg,
         /// How much evidence from one address before it is blocked, for the
         /// detectors that count (ssh-scanners, web-scanners, asset-ratio,
-        /// rotating-ua, refererless, login-attempts, request-rate). A count
-        /// over the whole log given, except for request-rate, which takes
-        /// requests a minute over its window, ending where the log ends.
-        /// Defaults to the stored threshold (`set-detector`). Must be at
-        /// least 1.
+        /// rotating-ua, refererless, login-attempts, request-rate,
+        /// port-scanners). A count over the whole log given, except for
+        /// request-rate, which takes requests a minute over its window, ending
+        /// where the log ends. Defaults to the stored threshold
+        /// (`set-detector`). Must be at least 1.
         #[arg(long, value_parser = min_threshold)]
         threshold: Option<usize>,
         #[arg(long, value_parser = ttl_days_arg, help = TTL_HELP)]
@@ -451,6 +452,11 @@ enum Command {
         ssh_log: Option<PathBuf>,
         #[arg(long, help = ACCESS_LOG_HELP)]
         access_log: Option<PathBuf>,
+        /// Read this kernel log file instead of the stored one or the
+        /// usual places (kern.log, messages, then the journal)
+        /// (port-scanners only)
+        #[arg(long, conflicts_with_all = ["access_log", "ssh_log"])]
+        kernel_log: Option<PathBuf>,
         #[arg(long, help = DRY_RUN_HELP)]
         dry_run: bool,
     },
@@ -502,8 +508,11 @@ enum Command {
     ///
     /// Only the detectors that count something take a threshold:
     /// ssh-scanners, web-scanners, asset-ratio, rotating-ua, refererless,
-    /// login-attempts and request-rate. For the others one matching request
-    /// is conclusive.
+    /// login-attempts, request-rate and port-scanners. For the others one
+    /// matching request is conclusive.
+    ///
+    /// port-scanners also takes --ports, the trap ports the firewall drops
+    /// and logs.
     ///
     /// robots-txt cannot be switched here: it runs exactly when "humans
     /// only" is on (`set-humans-only`).
@@ -518,10 +527,17 @@ enum Command {
         ttl_days: Option<i64>,
         /// How much evidence from one address before it is blocked: failed
         /// logins, 404'd paths, pages without assets, user agents,
-        /// referer-less pages, login attempts or, for request-rate, requests
-        /// a minute, depending on the detector. At least 2.
+        /// referer-less pages, login attempts, trap ports or, for
+        /// request-rate, requests a minute, depending on the detector. At
+        /// least 2.
         #[arg(long)]
         threshold: Option<i64>,
+        /// port-scanners only: the trap ports, comma-separated, or
+        /// `default` for the built-in list. Never 22, 80 or 443; whatever
+        /// listens, and sshd's port, are left out when the firewall is
+        /// rendered.
+        #[arg(long)]
+        ports: Option<String>,
         /// How far back evidence counts, in hours, from 1 to 720: a log
         /// line older than this is no reason to block. 24 unless changed,
         /// and 1 for asset-ratio, rotating-ua, refererless, login-attempts
@@ -1075,6 +1091,9 @@ enum Command {
         /// and the anti-lockout window.
         #[arg(long)]
         ssh_log: Option<String>,
+        /// The kernel log, feeding the port-scan detector.
+        #[arg(long)]
+        kernel_log: Option<String>,
     },
     /// Set the commands used to test and reload NGINX, and its config root.
     ///
@@ -1841,9 +1860,19 @@ async fn run() -> Result<()> {
             ttl_days,
             ssh_log,
             access_log,
+            kernel_log,
             dry_run,
         }) => run_detector(
-            db, detector.0, threshold, ttl_days, ssh_log, access_log, dry_run,
+            db,
+            detector.0,
+            threshold,
+            ttl_days,
+            DetectorLogs {
+                ssh_log,
+                access_log,
+                kernel_log,
+            },
+            dry_run,
         ),
         Some(Command::SetProbePaths { paths }) => set_probe_paths(db, paths),
         Some(Command::ListProbePaths { json }) => list_probe_paths(db, json),
@@ -1856,6 +1885,7 @@ async fn run() -> Result<()> {
             threshold,
             window_hours,
             app_aware,
+            ports,
         }) => set_detector(
             db,
             detector,
@@ -1865,6 +1895,7 @@ async fn run() -> Result<()> {
                 threshold,
                 window_hours,
                 app_aware,
+                ports,
             },
         ),
         Some(Command::SetRepeatOffenders { enabled }) => set_repeat_offenders(db, enabled),
@@ -1908,7 +1939,8 @@ async fn run() -> Result<()> {
         Some(Command::SetLogPaths {
             access_log,
             ssh_log,
-        }) => run_set_log_paths(db, access_log, ssh_log),
+            kernel_log,
+        }) => run_set_log_paths(db, access_log, ssh_log, kernel_log),
         Some(Command::SetNginxCommands {
             test,
             reload,
@@ -3437,6 +3469,11 @@ fn list_detectors(db_path: Option<PathBuf>, json: bool) -> Result<()> {
         }
         return stop_bots::output::print(&stop_bots::output::Detectors {
             detectors,
+            trap_ports: stop_bots::output::TrapPorts {
+                ports: stop_bots::portscan::configured_ports(&db)?,
+                default: stop_bots::portscan::ports_are_default(&db)?,
+                never: stop_bots::portscan::NEVER_TRAPPED.to_vec(),
+            },
             subnet_escalation: stop_bots::output::SubnetEscalation {
                 enabled: stop_bots::protection::subnet_escalation(&db)?.is_some(),
                 min: stop_bots::protection::subnet_escalation_min(&db)?,
@@ -3468,6 +3505,7 @@ fn list_detectors(db_path: Option<PathBuf>, json: bool) -> Result<()> {
         stop_bots::protection::subnet_escalation_min(&db)?
     );
     say!("{}", repeat_offenders_line(&db)?);
+    say!("{}", trap_ports_line(&db)?);
     say!(
         "{} `stop-bots list-probe-paths` shows its paths.",
         app_aware_line(&db)?
@@ -3479,6 +3517,21 @@ fn list_detectors(db_path: Option<PathBuf>, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The trap ports, as `list-detectors` and `set-detector port-scanners`
+/// say them.
+fn trap_ports_line(db: &Db) -> Result<String> {
+    let ports = stop_bots::portscan::join(&stop_bots::portscan::configured_ports(db)?);
+    let default = if stop_bots::portscan::ports_are_default(db)? {
+        " (the built-in list)"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "Trap ports (port-scanners): {ports}{default}; whatever listens, and sshd's port, are \
+         left out when the firewall is rendered."
+    ))
+}
+
 /// What `set-detector` was asked to change; `None` leaves each as it is.
 struct DetectorChanges {
     enabled: Option<bool>,
@@ -3486,6 +3539,7 @@ struct DetectorChanges {
     threshold: Option<i64>,
     window_hours: Option<i64>,
     app_aware: Option<bool>,
+    ports: Option<String>,
 }
 
 fn set_detector(
@@ -3500,8 +3554,8 @@ fn set_detector(
         threshold,
         window_hours,
         app_aware,
+        ports,
     } = changes;
-
     let db = open_db(db_path)?;
     let d = detector.0;
     let name = detector.name();
@@ -3531,11 +3585,20 @@ fn set_detector(
             counting_detectors()
         );
     }
+    if ports.is_some() && d != Detector::PortScanners {
+        anyhow::bail!("only port-scanners has trap ports; {name} takes no --ports");
+    }
+    if let Some(text) = ports.as_deref().filter(|text| text.trim() != "default") {
+        stop_bots::portscan::parse_ports(text)?;
+    }
 
     if app_aware.is_some() && d != Detector::ProbePaths {
         anyhow::bail!("--app-aware is a setting of probe-paths only");
     }
 
+    if let Some(text) = &ports {
+        stop_bots::portscan::set_ports(&db, text)?;
+    }
     if let Some(value) = threshold {
         d.set_threshold(&db, value)?;
     }
@@ -3567,6 +3630,15 @@ fn set_detector(
             app_aware_line(&db)?,
             stop_bots::protection::app_probe_paths_summary()
         );
+    }
+    if d == Detector::PortScanners {
+        say!("{}", trap_ports_line(&db)?);
+        if d.is_enabled(&db)? {
+            say!(
+                "The trap is in the firewall script from the next render; apply it with \
+                 `stop-bots render-firewall --apply` (or \u{201c}Apply everything\u{201d})."
+            );
+        }
     }
     if enabled == Some(false) {
         // The distinction the README draws, said where it bites.
@@ -3982,6 +4054,7 @@ fn run_set_log_paths(
     db_path: Option<PathBuf>,
     access_log: Option<String>,
     ssh_log: Option<String>,
+    kernel_log: Option<String>,
 ) -> Result<()> {
     // Opened for the migration only: these settings are the host's now
     // (see `hostconf`), and a database left holding the old rows moves
@@ -3989,7 +4062,7 @@ fn run_set_log_paths(
     let _db = open_db(db_path)?;
     let path = stop_bots::hostconf::path();
     let mut host = stop_bots::hostconf::HostConf::load_from(&path)?;
-    if access_log.is_none() && ssh_log.is_none() {
+    if access_log.is_none() && ssh_log.is_none() && kernel_log.is_none() {
         say!("Nothing to change. Current settings:");
     } else {
         // An empty value clears one; a path is stored absolute, because
@@ -4009,6 +4082,9 @@ fn run_set_log_paths(
         if let Some(raw) = &ssh_log {
             host.ssh_log = resolve(raw)?;
         }
+        if let Some(raw) = &kernel_log {
+            host.kernel_log = resolve(raw)?;
+        }
         host.save_to(&path)?;
     }
 
@@ -4023,6 +4099,10 @@ fn run_set_log_paths(
     match &paths.ssh {
         Some(path) => say!("  ssh log:    {}", path.display()),
         None => say!("  ssh log:    auto-detected (auth.log, secure, then journalctl)"),
+    }
+    match &paths.kernel {
+        Some(path) => say!("  kernel log: {}", path.display()),
+        None => say!("  kernel log: auto-detected (kern.log, messages, then journalctl)"),
     }
     Ok(())
 }
@@ -4863,6 +4943,13 @@ fn counting_detectors() -> String {
     }
 }
 
+/// The log flags `run-detector` was given; at most one applies.
+struct DetectorLogs {
+    ssh_log: Option<PathBuf>,
+    access_log: Option<PathBuf>,
+    kernel_log: Option<PathBuf>,
+}
+
 /// `run-detector`: one detector over a whole log, now. The five that had
 /// a verb of their own before keep their wording; the rest share one.
 fn run_detector(
@@ -4870,10 +4957,15 @@ fn run_detector(
     detector: Detector,
     threshold: Option<usize>,
     ttl_days: Option<i64>,
-    ssh_log: Option<PathBuf>,
-    access_log: Option<PathBuf>,
+    logs: DetectorLogs,
     dry_run: bool,
 ) -> Result<()> {
+    use stop_bots::protection::DetectorLog;
+    let DetectorLogs {
+        ssh_log,
+        access_log,
+        kernel_log,
+    } = logs;
     let name = stop_bots::blocks::detector_name(detector);
     if threshold.is_some() && detector.threshold_setting().is_none() {
         anyhow::bail!(
@@ -4882,11 +4974,21 @@ fn run_detector(
             counting_detectors()
         );
     }
-    if detector == Detector::SshScanners && access_log.is_some() {
-        anyhow::bail!("ssh-scanners reads the SSH log: give --ssh-log, not --access-log");
-    }
-    if detector != Detector::SshScanners && ssh_log.is_some() {
-        anyhow::bail!("{name} reads the access log: give --access-log, not --ssh-log");
+    let reads = detector.spec().log;
+    let given = [
+        (ssh_log.is_some(), DetectorLog::Ssh, "--ssh-log"),
+        (access_log.is_some(), DetectorLog::Access, "--access-log"),
+        (kernel_log.is_some(), DetectorLog::Kernel, "--kernel-log"),
+    ];
+    if let Some((_, _, flag)) = given.iter().find(|(set, log, _)| *set && *log != reads) {
+        let wanted = given
+            .iter()
+            .find(|(_, log, _)| *log == reads)
+            .map_or("", |(_, _, flag)| *flag);
+        anyhow::bail!(
+            "{name} reads the {}: give {wanted}, not {flag}",
+            reads.name()
+        );
     }
     match detector {
         Detector::SshScanners => block_scanners(db_path, threshold, ttl_days, ssh_log, dry_run),
@@ -4896,6 +4998,9 @@ fn run_detector(
         Detector::SpoofedCrawlers => block_spoofed_crawlers(db_path, ttl_days, access_log, dry_run),
         Detector::ProbePaths => block_probe_paths(db_path, ttl_days, access_log, dry_run),
         Detector::Honeypot => block_honeypot(db_path, ttl_days, access_log, dry_run),
+        Detector::PortScanners => {
+            block_port_scanners(db_path, threshold, ttl_days, kernel_log, dry_run)
+        }
         Detector::Injection
         | Detector::RobotsTxt
         | Detector::AssetRatio
@@ -4939,6 +5044,38 @@ fn run_detector(
             Ok(())
         }
     }
+}
+
+/// `run-detector port-scanners`: the trap's lines in the kernel log, read
+/// whole, and a block for each address that tried enough trap ports.
+fn block_port_scanners(
+    db_path: Option<PathBuf>,
+    threshold: Option<usize>,
+    ttl_days: Option<i64>,
+    kernel_log: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
+    let db = open_db(db_path)?;
+    let (threshold, ttl_days) =
+        detector_defaults(&db, Detector::PortScanners, threshold, ttl_days)?;
+    let paths = host_settings().unwrap_or_default().log_paths();
+    let source = paths.kernel(kernel_log.as_deref());
+    let Some(log_text) = stop_bots::portscan::read_kernel_log(&source, sshlog::recent_since())
+    else {
+        anyhow::bail!(
+            "couldn't read the kernel log (tried {}) — pass --kernel-log, set one with \
+             `stop-bots set-log-paths --kernel-log <path>`, or run as root",
+            paths.kernel_description(kernel_log.as_deref())
+        );
+    };
+    let outcome =
+        stop_bots::scanblock::block_port_scanners(&db, threshold, ttl_days, &log_text, dry_run)?;
+    if outcome.candidates == 0 {
+        say!("No port scanners found (threshold: {threshold} different trap port(s)).");
+        return Ok(());
+    }
+    print_scan_block_outcome(&outcome);
+    Ok(())
 }
 
 /// Finds scanning IPs in the SSH log and adds a temporary Block rule for
@@ -5388,6 +5525,7 @@ fn record_access_stats(db_path: Option<PathBuf>, access_log: Option<PathBuf>) ->
     let flags = stop_bots::logscan::Flags {
         ssh_log: None,
         access_log,
+        kernel_log: None,
         stored: host.log_paths(),
     };
     let applied =

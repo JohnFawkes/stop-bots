@@ -92,6 +92,30 @@ back, put back the copy the upgrade kept, `/var/lib/stop-bots/db.sqlite3.bak-v7`
 - `list-detectors` marks a detector added since the database was created, and
   `list-detectors --json` carries it as `new_in_this_release`.
 
+- **A port-scan detector, `port-scanners`, that protects the whole host**, not only the
+  web server and SSH. With it on, the firewall script drops new connections to *trap
+  ports*, ports scanners try and a web host does not serve (23, 135, 139, 445, 1433,
+  1521, 2375, 3306, 3389, 5432, 5900, 6379, 9200, 11211 and 27017), and logs them to the
+  kernel log as `stop-bots-trap:`, at most ten lines a second. An address that tries two
+  different trap ports within a day is blocked from every port for five days, and the
+  block records the ports it tried. Never trapped: 22, 80 and 443, sshd's configured
+  port, and anything listening on a non-loopback address when the firewall is rendered
+  (`ss -ltnH`). The trap is on the input path after every address rule, so a trusted
+  address or an SSH login is let through first, and a container's published port is never
+  trapped. nftables and iptables, IPv4 and IPv6.
+  - Off by default, on new databases as on existing ones, where it is marked new: it
+    changes what the host accepts on ports beyond the web server and SSH, and a service
+    started later on a trap port is dropped until the firewall is rendered and applied
+    again.
+  - `stop-bots set-detector port-scanners --enabled true` turns it on; `--ports` sets
+    the trap ports (`default` for the built-in list), `--threshold` the number of
+    different ports. `run-detector port-scanners --kernel-log <file>` judges a kernel
+    log once.
+  - The kernel log is read like the SSH log: `/var/log/kern.log`, then
+    `/var/log/messages`, then the journal's kernel messages, from a stored cursor;
+    `set-log-paths --kernel-log` names it. `status` warns when the detector is on and the
+    kernel log cannot be read, or `ss` cannot be run.
+
 ## [0.3.0] — 2026-10-16
 
 The release that gets stop-bots ready to stand behind a 1.0: an undo for firewall

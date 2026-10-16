@@ -345,6 +345,31 @@ pub enum Detector {
     LoginAttempts,
     RequestRate,
     RobotsViolators,
+    /// Reads the kernel log the firewall's trap ports write: see
+    /// [`crate::portscan`].
+    PortScanners,
+}
+
+/// The log a detector reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectorLog {
+    /// The web server's access log.
+    Access,
+    /// sshd's authentication lines.
+    Ssh,
+    /// The kernel log, for the lines the firewall's trap ports write.
+    Kernel,
+}
+
+impl DetectorLog {
+    /// What a report calls it.
+    pub fn name(self) -> &'static str {
+        match self {
+            DetectorLog::Access => "access log",
+            DetectorLog::Ssh => "SSH log",
+            DetectorLog::Kernel => "kernel log",
+        }
+    }
 }
 
 /// The static facts about a detector: how it's stored, what it's called,
@@ -364,8 +389,8 @@ pub struct DetectorSpec {
     /// How far back evidence counts, in hours: a line older than this is
     /// no longer a reason to block. See [`Detector::window_hours`].
     pub window_hours_default: i64,
-    /// Whether this reads the SSH log rather than the NGINX access log.
-    pub uses_ssh_log: bool,
+    /// Which log this detector's evidence comes from.
+    pub log: DetectorLog,
     /// The defaults generation this detector arrived in (see
     /// `db::schema::DEFAULTS_GENERATION`). On a database created in an
     /// earlier one it is off until the operator turns it on, whatever
@@ -375,7 +400,7 @@ pub struct DetectorSpec {
 }
 
 impl Detector {
-    pub const ALL: [Detector; 13] = [
+    pub const ALL: [Detector; 14] = [
         Detector::SshScanners,
         Detector::WebScanners,
         Detector::SpoofedCrawlers,
@@ -389,6 +414,7 @@ impl Detector {
         Detector::LoginAttempts,
         Detector::RequestRate,
         Detector::RobotsViolators,
+        Detector::PortScanners,
     ];
 
     pub fn spec(self) -> DetectorSpec {
@@ -402,7 +428,7 @@ impl Detector {
                 enabled_default: true,
                 ttl_days_default: 5,
                 window_hours_default: EVIDENCE_WINDOW_HOURS,
-                uses_ssh_log: true,
+                log: DetectorLog::Ssh,
                 introduced_in: 1,
             },
             Detector::WebScanners => DetectorSpec {
@@ -412,7 +438,7 @@ impl Detector {
                 enabled_default: true,
                 ttl_days_default: 1,
                 window_hours_default: EVIDENCE_WINDOW_HOURS,
-                uses_ssh_log: false,
+                log: DetectorLog::Access,
                 introduced_in: 1,
             },
             Detector::SpoofedCrawlers => DetectorSpec {
@@ -422,7 +448,7 @@ impl Detector {
                 enabled_default: SPOOFED_CRAWLERS_ENABLED_DEFAULT,
                 ttl_days_default: SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT,
                 window_hours_default: EVIDENCE_WINDOW_HOURS,
-                uses_ssh_log: false,
+                log: DetectorLog::Access,
                 introduced_in: 1,
             },
             Detector::ProbePaths => DetectorSpec {
@@ -432,7 +458,7 @@ impl Detector {
                 enabled_default: PROBE_PATHS_ENABLED_DEFAULT,
                 ttl_days_default: PROBE_PATHS_TTL_DAYS_DEFAULT,
                 window_hours_default: EVIDENCE_WINDOW_HOURS,
-                uses_ssh_log: false,
+                log: DetectorLog::Access,
                 introduced_in: 1,
             },
             Detector::Injection => DetectorSpec {
@@ -442,7 +468,7 @@ impl Detector {
                 enabled_default: INJECTION_ENABLED_DEFAULT,
                 ttl_days_default: INJECTION_TTL_DAYS_DEFAULT,
                 window_hours_default: EVIDENCE_WINDOW_HOURS,
-                uses_ssh_log: false,
+                log: DetectorLog::Access,
                 introduced_in: 1,
             },
             Detector::RobotsTxt => DetectorSpec {
@@ -456,7 +482,7 @@ impl Detector {
                 enabled_default: false,
                 ttl_days_default: 1,
                 window_hours_default: EVIDENCE_WINDOW_HOURS,
-                uses_ssh_log: false,
+                log: DetectorLog::Access,
                 introduced_in: 1,
             },
             Detector::Honeypot => DetectorSpec {
@@ -466,7 +492,7 @@ impl Detector {
                 enabled_default: HONEYPOT_ENABLED_DEFAULT,
                 ttl_days_default: HONEYPOT_TTL_DAYS_DEFAULT,
                 window_hours_default: EVIDENCE_WINDOW_HOURS,
-                uses_ssh_log: false,
+                log: DetectorLog::Access,
                 introduced_in: 1,
             },
             // The three below are off by default. Each has a false
@@ -479,7 +505,7 @@ impl Detector {
                 enabled_default: false,
                 ttl_days_default: 5,
                 window_hours_default: BEHAVIOURAL_WINDOW_HOURS,
-                uses_ssh_log: false,
+                log: DetectorLog::Access,
                 introduced_in: 1,
             },
             Detector::RotatingUserAgent => DetectorSpec {
@@ -489,7 +515,7 @@ impl Detector {
                 enabled_default: false,
                 ttl_days_default: 5,
                 window_hours_default: BEHAVIOURAL_WINDOW_HOURS,
-                uses_ssh_log: false,
+                log: DetectorLog::Access,
                 introduced_in: 1,
             },
             Detector::RefererlessCrawl => DetectorSpec {
@@ -499,7 +525,7 @@ impl Detector {
                 enabled_default: false,
                 ttl_days_default: 5,
                 window_hours_default: BEHAVIOURAL_WINDOW_HOURS,
-                uses_ssh_log: false,
+                log: DetectorLog::Access,
                 introduced_in: 1,
             },
             // Detectors from here on arrived after 0.3: off on a database
@@ -511,7 +537,7 @@ impl Detector {
                 enabled_default: LOGIN_ATTEMPTS_ENABLED_DEFAULT,
                 ttl_days_default: LOGIN_ATTEMPTS_TTL_DAYS_DEFAULT,
                 window_hours_default: LOGIN_ATTEMPTS_WINDOW_HOURS,
-                uses_ssh_log: false,
+                log: DetectorLog::Access,
                 introduced_in: MORE_DETECTORS_INTRODUCED_IN,
             },
             Detector::RequestRate => DetectorSpec {
@@ -521,7 +547,7 @@ impl Detector {
                 enabled_default: REQUEST_RATE_ENABLED_DEFAULT,
                 ttl_days_default: REQUEST_RATE_TTL_DAYS_DEFAULT,
                 window_hours_default: REQUEST_RATE_WINDOW_HOURS,
-                uses_ssh_log: false,
+                log: DetectorLog::Access,
                 introduced_in: MORE_DETECTORS_INTRODUCED_IN,
             },
             Detector::RobotsViolators => DetectorSpec {
@@ -531,8 +557,22 @@ impl Detector {
                 enabled_default: ROBOTS_VIOLATORS_ENABLED_DEFAULT,
                 ttl_days_default: ROBOTS_VIOLATORS_TTL_DAYS_DEFAULT,
                 window_hours_default: EVIDENCE_WINDOW_HOURS,
-                uses_ssh_log: false,
+                log: DetectorLog::Access,
                 introduced_in: MORE_DETECTORS_INTRODUCED_IN,
+            },
+            // Off by default, new database or old: it adds rules to the
+            // firewall for ports beyond the web server and SSH, and a
+            // service started on one of them after a render is dropped
+            // until the next apply. See `crate::portscan`.
+            Detector::PortScanners => DetectorSpec {
+                id: "block_port_scanners",
+                label: "Port scanners",
+                job_label: "Block port scanners",
+                enabled_default: false,
+                ttl_days_default: 5,
+                window_hours_default: EVIDENCE_WINDOW_HOURS,
+                log: DetectorLog::Kernel,
+                introduced_in: 3,
             },
         }
     }
@@ -609,6 +649,14 @@ impl Detector {
                  path is one such page; a bot that robots.txt shuts out altogether asking for \
                  anything at all is another."
             }
+            Detector::PortScanners => {
+                "Protects the whole host, not only the web server and SSH. The firewall drops \
+                 and logs new connections to trap ports: ports scanners try and a web host \
+                 does not serve, such as telnet, SMB, RDP and the default database ports. An \
+                 address that tries two of them is blocked from every port. Nothing that \
+                 listens when the firewall is rendered is ever a trap port, and neither are \
+                 22, 80, 443 or sshd's port."
+            }
         }
     }
 
@@ -658,6 +706,12 @@ impl Detector {
                  web server's screen), the only one it knows the rules of. A person who reads \
                  robots.txt and then opens a page it forbids by hand is blocked too. It never \
                  blocks a verified search engine.",
+            ),
+            Detector::PortScanners => Some(
+                "A service you start later on a trap port is dropped until the firewall is \
+                 rendered and applied again, which leaves it out. Choose the ports with \
+                 `set-detector port-scanners --ports`. Needs the kernel log readable \
+                 (kern.log, or the journal) and `ss` to see what listens.",
             ),
             _ => None,
         }
@@ -786,6 +840,9 @@ impl Detector {
             Detector::LoginAttempts => Some((LOGIN_ATTEMPTS_MIN, LOGIN_ATTEMPTS_MIN_DEFAULT)),
             Detector::RequestRate => {
                 Some((REQUEST_RATE_PER_MINUTE, REQUEST_RATE_PER_MINUTE_DEFAULT))
+            }
+            Detector::PortScanners => {
+                Some((PORT_SCANNERS_MIN_PORTS, PORT_SCANNERS_MIN_PORTS_DEFAULT))
             }
             Detector::SpoofedCrawlers
             | Detector::ProbePaths
@@ -1031,6 +1088,13 @@ pub fn ordinal(n: u32) -> String {
     };
     format!("{n}{suffix}")
 }
+
+/// Threshold for the port-scan detector: *distinct* trap ports one
+/// address tried. Two: one connection to one port can be a client with
+/// the wrong address or a typo; trying a second port nobody serves is
+/// looking for whatever answers.
+pub const PORT_SCANNERS_MIN_PORTS: &str = keys::DETECT_PORT_SCANNERS_MIN_PORTS;
+pub const PORT_SCANNERS_MIN_PORTS_DEFAULT: i64 = 2;
 
 /// Threshold for the asset-ratio detector: distinct successful page URLs
 /// fetched with no accompanying asset. High, and *distinct* rather than a
@@ -1548,6 +1612,31 @@ mod tests {
             !Detector::ProbePaths.is_new_here(&db).unwrap(),
             "turned off"
         );
+    }
+
+    /// A database created by 0.2 or 0.3 (generation 2) is offered the
+    /// port-scan detector as new, and it is off there until chosen.
+    #[test]
+    fn the_port_scan_detector_is_new_and_off_on_a_generation_2_database() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_int_setting(crate::db::keys::DEFAULTS_GENERATION, 2)
+            .unwrap();
+        let d = Detector::PortScanners;
+        assert!(!d.is_enabled(&db).unwrap(), "on after an upgrade");
+        assert!(d.is_new_here(&db).unwrap(), "not marked new");
+
+        d.set_enabled(&db, true).unwrap();
+        assert!(d.is_enabled(&db).unwrap());
+        assert!(!d.is_new_here(&db).unwrap(), "still new once chosen");
+    }
+
+    /// Off on a new database too: it changes what the host accepts on
+    /// ports beyond the web server and SSH, which nobody asked for yet.
+    #[test]
+    fn the_port_scan_detector_is_off_on_a_new_database() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(!Detector::PortScanners.is_enabled(&db).unwrap());
+        assert!(!Detector::PortScanners.is_new_here(&db).unwrap());
     }
 
     /// Nothing is new on a database created by this very release.

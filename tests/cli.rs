@@ -6473,3 +6473,157 @@ fn every_json_command_prints_hostile_rows_terminal_safe_and_intact() {
     planted.sort();
     assert_eq!(addresses, planted, "the addresses did not survive intact");
 }
+
+// ---- the port-scan detector ----
+
+/// `list-firewall-rules --json`'s rules, by address.
+fn rules_by_address(fx: &Fixture) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let output = fx.cmd(&["list-firewall-rules", "--json"]).output().unwrap();
+    let rules: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    rules["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rule| (rule["address"].as_str().unwrap().to_string(), rule.clone()))
+        .collect()
+}
+
+/// The one-off pass over a kernel log: an address that tried two trap
+/// ports or more is blocked, IPv6 by its /64, with the ports it tried as
+/// the evidence; one port, a private address and another firewall's lines
+/// are not.
+#[test]
+fn run_detector_port_scanners_blocks_what_tried_two_trap_ports() {
+    let fx = Fixture::new();
+
+    fx.run(&[
+        "run-detector",
+        "port-scanners",
+        "--kernel-log",
+        "tests/fixtures/logs/kern.log",
+    ]);
+
+    let rules = rules_by_address(&fx);
+    let blocked: Vec<&String> = rules.keys().collect();
+    assert_eq!(
+        blocked,
+        ["198.51.100.20", "2001:db8::/64"],
+        "rules were: {rules:#?}"
+    );
+    let scanner = &rules["198.51.100.20"];
+    assert_eq!(
+        scanner["evidence"], "new connections to trap ports 23, 445, 3389",
+        "{scanner:#}"
+    );
+    assert_eq!(scanner["source"], "port-scanners", "{scanner:#}");
+}
+
+#[test]
+fn run_detector_port_scanners_reads_the_kernel_log_and_nothing_else() {
+    let fx = Fixture::new();
+    fx.cmd(&[
+        "run-detector",
+        "port-scanners",
+        "--access-log",
+        "tests/fixtures/logs/kern.log",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "port-scanners reads the kernel log: give --kernel-log, not --access-log",
+    ));
+}
+
+/// A `ss` that reports MySQL on every address and Redis on loopback only.
+fn fake_ss(dir: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("ss-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let ss = bin.join("ss");
+    fs::write(
+        &ss,
+        "#!/bin/sh\n\
+         echo 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*'\n\
+         echo 'LISTEN 0 151 0.0.0.0:3306 0.0.0.0:*'\n\
+         echo 'LISTEN 0 4096 127.0.0.1:6379 0.0.0.0:*'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ss, fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+/// Switched on, the next render traps the configured ports, less what
+/// listens beyond loopback; switched off, the script has no trap at all.
+#[test]
+fn the_rendered_firewall_traps_what_nothing_listens_on() {
+    let fx = Fixture::new();
+    let bin = fake_ss(fx._tmp.path());
+    let out = fx._tmp.path().join("firewall.nft");
+    let render = || {
+        fx.cmd(&[
+            "render-firewall",
+            "--backend",
+            "nftables",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .env("PATH", path_with(&bin))
+        .assert()
+        .success();
+        fs::read_to_string(&out).unwrap()
+    };
+
+    let off = render();
+    fx.run(&["set-detector", "port-scanners", "--enabled", "true"]);
+    let on = render();
+
+    assert!(!off.contains("dport"), "a trap while off:\n{off}");
+    let drop = on
+        .lines()
+        .find(|line| line.ends_with(" counter drop"))
+        .unwrap_or_else(|| panic!("no trap:\n{on}"));
+    let checks = [
+        ("traps telnet", drop.contains("{ 23, ")),
+        (
+            "traps Redis, which listens on loopback only",
+            drop.contains(" 6379,"),
+        ),
+        ("not MySQL, which listens", !drop.contains("3306")),
+        ("says why", on.contains("sshd does: 3306.")),
+    ];
+    for (what, holds) in checks {
+        assert!(holds, "{what}:\n{on}");
+    }
+}
+
+/// The trap ports are a setting: never SSH, HTTP or HTTPS, and `default`
+/// goes back to the built-in list. `list-detectors --json` reports them.
+#[test]
+fn set_detector_sets_the_trap_ports_and_refuses_ssh() {
+    let fx = Fixture::new();
+    let trap_ports = || {
+        let output = fx.cmd(&["list-detectors", "--json"]).output().unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        json["trap_ports"].clone()
+    };
+
+    fx.cmd(&["set-detector", "port-scanners", "--ports", "23,22"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("22 cannot be a trap port"));
+    fx.run(&["set-detector", "port-scanners", "--ports", "2323, 23"])
+        .stdout(predicate::str::contains(
+            "Trap ports (port-scanners): 23, 2323;",
+        ));
+    assert_eq!(trap_ports()["ports"], serde_json::json!([23, 2323]));
+    assert_eq!(trap_ports()["default"], false);
+
+    fx.run(&["set-detector", "port-scanners", "--ports", "default"]);
+    assert_eq!(trap_ports()["default"], true);
+    fx.cmd(&["set-detector", "ssh-scanners", "--ports", "23"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "only port-scanners has trap ports",
+        ));
+}

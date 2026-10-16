@@ -538,6 +538,10 @@ pub struct BuiltFirewall {
     /// inside a range with the same verdict that lasts at least as long —
     /// see [`loaded_entries`].
     pub written: usize,
+    /// The port-scan detector's trap ports, when it is on and any are
+    /// left once what listens is taken out (see [`crate::portscan`]).
+    /// Not rules: it adds no address, and no count above includes it.
+    pub trap: Option<crate::portscan::Trap>,
 }
 
 /// Every rule currently in effect — the Allows that nothing may override
@@ -714,12 +718,25 @@ pub fn trusted_allow_rules(db: &Db) -> Result<Vec<FirewallRule>> {
 /// spurious "render again" is a smaller price than code that has to
 /// recognise the old format forever.
 pub fn rules_signature(rules: &[FirewallRule]) -> String {
+    signature(rules, None)
+}
+
+/// [`rules_signature`], and the trap ports: a script that traps different
+/// ports is a different script. With no trap it is exactly
+/// [`rules_signature`], so a host that never turns the port-scan detector
+/// on keeps the signatures it has.
+pub fn signature(rules: &[FirewallRule], trap: Option<&crate::portscan::Trap>) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
     for rule in rules {
         hasher.update(rendered_fields(rule).as_bytes());
         hasher.update(b"\n");
+    }
+    if let Some(trap) = trap {
+        // A line no rule can produce: `rendered_fields` starts with
+        // `FirewallRule`.
+        hasher.update(format!("trap ports {:?}\n", trap.ports).as_bytes());
     }
     hasher
         .finalize()
@@ -765,8 +782,17 @@ fn rendered_fields(rule: &FirewallRule) -> String {
 /// what the internal cron does with it, and far cheaper than the render it
 /// decides against.
 pub fn needs_render(db: &Db) -> Result<bool> {
-    let current = rules_signature(&all_rules(db)?);
+    let current = current_signature(db)?;
     Ok(db.get_firewall_rendered_signature()?.as_deref() != Some(current.as_str()))
+}
+
+/// The [`signature`] of what a render would write now: every rule, and the
+/// trap. Asks `ss` what listens when the port-scan detector is on.
+pub fn current_signature(db: &Db) -> Result<String> {
+    Ok(signature(
+        &all_rules(db)?,
+        crate::portscan::for_render(db)?.as_ref(),
+    ))
 }
 
 /// Gathers every firewall rule (see [`all_rules`]) and renders them for
@@ -797,10 +823,11 @@ pub fn build_script_at(db: &Db, backend: FirewallBackend, now: i64) -> Result<Bu
 
     let mut rules = all_rules(db)?;
     rules.retain(|rule| rule.expires_at.is_none_or(|at| at > now));
+    let trap = crate::portscan::for_render(db)?;
 
     let script = match backend {
-        FirewallBackend::Iptables => iptables::render(&rules, now),
-        FirewallBackend::Nftables => nftables::render(&rules, now),
+        FirewallBackend::Iptables => iptables::render_with_trap(&rules, trap.as_ref(), now),
+        FirewallBackend::Nftables => nftables::render_with_trap(&rules, trap.as_ref(), now),
     };
     let written = loaded_entries(&rules, backend, now);
 
@@ -808,6 +835,7 @@ pub fn build_script_at(db: &Db, backend: FirewallBackend, now: i64) -> Result<Bu
         rules,
         script,
         written,
+        trap,
     })
 }
 
@@ -1209,7 +1237,7 @@ impl FirewallRun {
 pub struct Prepared {
     pub run: FirewallRun,
     pub built: BuiltFirewall,
-    /// [`rules_signature`] of `built.rules`, for [`record`].
+    /// [`signature`] of `built.rules` and its trap, for [`record`].
     pub signature: String,
     /// Whether to run the lockout check at all: [`Db::get_ssh_lockout_check`].
     pub lockout_check: bool,
@@ -1220,7 +1248,7 @@ pub struct Prepared {
 /// at all (see [`build_script`]).
 pub fn prepare(db: &Db, run: FirewallRun) -> Result<Prepared> {
     let built = build_script(db, run.backend)?;
-    let signature = rules_signature(&built.rules);
+    let signature = signature(&built.rules, built.trap.as_ref());
     Ok(Prepared {
         run,
         built,
@@ -1703,7 +1731,7 @@ pub enum ScriptState {
 /// reads as not applied until the first apply: nothing recorded what, if
 /// anything, the kernel was given.
 pub fn script_state(db: &Db) -> Result<ScriptState> {
-    let current = rules_signature(&all_rules(db)?);
+    let current = current_signature(db)?;
     Ok(
         if db.get_firewall_applied_signature()?.as_deref() == Some(current.as_str()) {
             ScriptState::Applied

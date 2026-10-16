@@ -8,8 +8,18 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+The database gains two schema versions (offences for repeat offenders, and an index
+that makes each detector pass faster on a large log). A release before this one refuses
+the upgraded database rather than misreading it. To go back, put back the copy the
+upgrade kept, `/var/lib/stop-bots/db.sqlite3.bak-v6`, then install the older release;
+settings changed since the upgrade are lost.
+
 ### Fixed
 
+- **Each detector pass no longer slows down as evidence piles up.** The query that finds
+  every address seen in a detector's window read every stored row to check its address;
+  an index now answers it, about six times faster on a host with a day of evidence from
+  a 1 GB log.
 - **SSH scanners on a host that takes keys only** are counted when they reach sshd's
   `MaxAuthTries`: `maximum authentication attempts exceeded for …` is now read as a failed
   login. Such a scanner leaves no `Failed` line, so before this only its disconnect counted.

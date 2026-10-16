@@ -814,6 +814,33 @@ impl Dashboard {
                     .para("Space switches it. It is downloaded again every week.")
                     .takes_effect(self.auto_apply_firewall)
             }
+            ProtectionRow::RepeatOffenders => {
+                use crate::protection::{
+                    ESCALATION_MAX_DAYS, ESCALATION_MAX_MULTIPLIER, OFFENCE_MEMORY_DAYS,
+                };
+                Explanation::new(label)
+                    .para(format!(
+                        "An address a detector blocks again, after an earlier block from any \
+                         detector, is blocked for longer: twice the detector's time on the \
+                         second offence, four times on the third, up to {ESCALATION_MAX_MULTIPLIER} \
+                         times and at most {ESCALATION_MAX_DAYS} days. An address is forgotten \
+                         {OFFENCE_MEMORY_DAYS} days after its last block ends."
+                    ))
+                    .now(if self.repeat_offenders {
+                        "on."
+                    } else if self.repeat_offenders_new {
+                        "off. New since this database was created, so it has not been switched \
+                         on for you."
+                    } else {
+                        "off: every block lasts its detector's own time."
+                    })
+                    .para(
+                        "Offences are counted even while this is off, so turning it on uses the \
+                         history. Unblocking an address by hand forgets its offences. The Blocks \
+                         screen shows which offence each block is.",
+                    )
+                    .takes_effect(self.auto_apply_firewall)
+            }
             ProtectionRow::AutoApplyFirewall => Explanation::new(label)
                 .para(
                     "Whether the scheduled render also runs the firewall script it writes. \

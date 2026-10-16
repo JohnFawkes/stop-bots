@@ -4604,24 +4604,42 @@ fn a_0_1_1_nginx_host_applies_what_it_had_after_the_upgrade() {
     );
 }
 
-/// **An NGINX host can still go back to 0.1.1**, as the changelog says.
-/// After the new release has applied, 0.1.1 opens the database and the
-/// host settings, recognises the blocks the new release wrote and
-/// replaces them rather than adding a second, and NGINX loads the result.
+/// **An NGINX host can still go back to 0.1.1, through the backup** the
+/// upgrade made. This release adds to the database's schema, which 0.1.1
+/// refuses to open rather than misread, and leaves the site files alone
+/// when it does. The upgrade kept the database as it was beside it
+/// (`.bak-v6`); with that put back, 0.1.1 recognises the blocks the new
+/// release wrote and replaces them rather than adding a second, and NGINX
+/// loads the result.
 #[test]
-fn a_0_1_1_nginx_host_can_go_back_after_the_upgrade_has_applied() {
+fn a_0_1_1_nginx_host_can_go_back_through_the_pre_upgrade_backup() {
     if !enabled() {
         return;
     }
     let host = Host::set_up_by_0_1_1("stop-bots-upgrade-back");
     host.upgrade_to_the_binary_under_test();
     host.stop_bots("apply-blocks");
+    let sites_before: Vec<String> = UPGRADE_SITES
+        .iter()
+        .map(|(file, _)| host.sh(&format!("cat /etc/nginx/sites-enabled/{file}")))
+        .collect();
 
     host.sh("install -m 755 /usr/local/bin/stop-bots-0.1.1 /usr/local/bin/stop-bots");
     let (ok, stdout, stderr) = host.run(&format!("stop-bots apply-blocks --db {HOST_DB}"));
     assert!(
+        !ok,
+        "0.1.1 opened a database with a newer schema:\n{stdout}{stderr}"
+    );
+    for ((file, _), before) in UPGRADE_SITES.iter().zip(&sites_before) {
+        let after = host.sh(&format!("cat /etc/nginx/sites-enabled/{file}"));
+        assert_eq!(&after, before, "0.1.1's refusal changed {file}");
+    }
+
+    host.sh(&format!("cp {HOST_DB}.bak-v6 {HOST_DB}"));
+    let (ok, stdout, stderr) = host.run(&format!("stop-bots apply-blocks --db {HOST_DB}"));
+    assert!(
         ok,
-        "0.1.1 cannot apply after the upgrade:\n{stdout}{stderr}"
+        "0.1.1 cannot apply with the pre-upgrade database put back:\n{stdout}{stderr}"
     );
     for (file, _) in UPGRADE_SITES {
         let site = host.sh(&format!("cat /etc/nginx/sites-enabled/{file}"));

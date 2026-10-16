@@ -96,6 +96,9 @@ pub const AUTO_APPLY_FIREWALL: &str = "auto_apply_firewall";
 /// Whether a cloud-provider feed leaves port 80 open, so Let's Encrypt
 /// can reach it (see `Db::derived_firewall_entries`).
 pub const CLOUD_PORT_80_OPEN: &str = "firewall:cloud_port_80_open";
+/// Whether every apply is checked against the addresses that log in over
+/// SSH. Off only for someone who said they never log in over SSH.
+pub const SSH_LOCKOUT_CHECK: &str = "firewall:ssh_lockout_check";
 
 // ---- detectors ----
 //
@@ -152,6 +155,7 @@ pub const ALL: &[&str] = &[
     FIREWALL_APPLIED_SIGNATURE,
     AUTO_APPLY_FIREWALL,
     CLOUD_PORT_80_OPEN,
+    SSH_LOCKOUT_CHECK,
     DETECT_PROBE_PATHS_EXTRA,
     DETECT_HONEYPOT_PATH,
     DETECT_SUBNET_ESCALATION,

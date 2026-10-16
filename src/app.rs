@@ -192,6 +192,10 @@ pub struct App {
     /// deterministic (and fast) for tests, and usable on hosts with a
     /// non-standard log path.
     ssh_log: Option<std::path::PathBuf>,
+    /// The address this TUI's own SSH session comes from, read once at
+    /// start ([`crate::sshlog::session_client`]): every firewall run's
+    /// lockout check counts it as connected, whatever the log says.
+    session_client: Option<String>,
     /// Whether a render popup confirmed with "apply after writing" actually
     /// calls `firewall::apply_script()`. Same shape and same reason as
     /// `reload_nginx_for_real`: always `true` for real usage, `false` only for tests
@@ -305,6 +309,12 @@ pub fn firewall_message(outcome: &crate::firewall::FirewallOutcome) -> String {
     let mut message = format!("Firewall: {}", outcome.summary());
     if outcome.refused() && outcome.guard == crate::firewall::Guard::LogUnreadable {
         message.push_str(". Start the TUI with --ssh-log <path>, or run it as root");
+    } else if outcome.refused() && matches!(outcome.guard, crate::firewall::Guard::NoLogins { .. })
+    {
+        message.push_str(
+            ". Trust your address on the Firewall screen, or, if you never log in over SSH, turn \
+             the SSH lock-out check off on the Dashboard",
+        );
     } else if outcome.apply != crate::firewall::ApplyStep::NotAsked && outcome.guard.passed() {
         // The verdict the confirmation showed, said again once it held.
         message.push_str(". The lockout check passed");
@@ -370,6 +380,7 @@ impl App {
             reload_nginx_for_real: reload_nginx,
             apply_firewall: reload_nginx,
             ssh_log,
+            session_client: crate::sshlog::session_client(),
             firewall_out: None,
             host_conf: crate::hostconf::path(),
             update_all: None,
@@ -1309,7 +1320,8 @@ impl App {
         let run = crate::firewall::FirewallRun::new(backend, out_path)
             .apply(apply)
             .for_real(self.apply_firewall)
-            .force(force);
+            .force(force)
+            .protect(self.session_client.clone());
         let prepared = match crate::firewall::prepare(&self.db, run) {
             Ok(prepared) => prepared,
             Err(err) => {
@@ -1571,7 +1583,8 @@ impl App {
             )
             .apply(true)
             .for_real(self.apply_firewall)
-            .dry_run(true);
+            .dry_run(true)
+            .protect(self.session_client.clone());
             crate::firewall::prepare(&self.db, run)
         });
 

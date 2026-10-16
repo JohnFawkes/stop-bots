@@ -424,6 +424,68 @@ fn sshd_message(line: &str) -> Option<&str> {
     Some(repeated.unwrap_or(message))
 }
 
+/// The address this process's own SSH session comes from, if it runs in
+/// one: `SSH_CONNECTION` (or `SSH_CLIENT`) in its own environment, or in
+/// the nearest ancestor's that has it. `sudo` drops both variables, but the
+/// shell that ran it still holds them, and root can read its environment.
+///
+/// For the lockout guard, so that someone connected right now is checked
+/// even when the log holds no login: a log that rotated, a journal that
+/// keeps nothing, or an sshd that logs elsewhere.
+///
+/// `STOP_BOTS_SSH_CLIENT`, when set, is the answer instead (empty for
+/// none): the integration tests set it, so that running them over SSH
+/// does not change what they see. The unit tests never look.
+pub fn session_client() -> Option<String> {
+    if cfg!(test) {
+        return None;
+    }
+    if let Ok(client) = std::env::var("STOP_BOTS_SSH_CLIENT") {
+        return Some(client).filter(|client| !client.is_empty());
+    }
+    let mut pid = std::process::id();
+    for _ in 0..64 {
+        let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+        if let Some(client) = client_from_environ(&environ) {
+            return Some(client);
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        pid = parent_pid(&stat)?;
+        if pid <= 1 {
+            return None;
+        }
+    }
+    None
+}
+
+/// The client address in a NUL-separated environment block: the first
+/// word of `SSH_CONNECTION` or `SSH_CLIENT`, when it is an address.
+fn client_from_environ(environ: &[u8]) -> Option<String> {
+    environ
+        .split(|&byte| byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .filter_map(|entry| {
+            entry
+                .strip_prefix("SSH_CONNECTION=")
+                .or_else(|| entry.strip_prefix("SSH_CLIENT="))
+        })
+        .filter_map(|value| value.split_whitespace().next())
+        .find(|client| client.parse::<std::net::IpAddr>().is_ok())
+        .map(str::to_string)
+}
+
+/// The parent's pid from a `/proc/<pid>/stat` line. The command name in
+/// brackets may hold spaces and brackets of its own, so the fields are
+/// counted from the last `)`.
+fn parent_pid(stat: &str) -> Option<u32> {
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 /// Extracts the client IP from every successful-login line in `log_text`,
 /// deduplicated and sorted for deterministic output. Matches sshd's own
 /// `Accepted <method> for <user> from <ip> port <port> ...` message —
@@ -666,6 +728,25 @@ pub fn failed_attempt_counts(log_text: &str) -> std::collections::HashMap<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_session_client_is_the_first_word_of_ssh_connection() {
+        let environ = b"HOME=/root\0SSH_CONNECTION=203.0.113.5 50122 192.0.2.1 22\0TERM=xterm\0";
+        assert_eq!(client_from_environ(environ).as_deref(), Some("203.0.113.5"));
+        let v6 = b"SSH_CLIENT=2001:db8::5 50122 22\0";
+        assert_eq!(client_from_environ(v6).as_deref(), Some("2001:db8::5"));
+        assert_eq!(
+            client_from_environ(b"HOME=/root\0SSH_CONNECTION=garbage\0"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_parent_pid_is_read_past_a_command_name_with_brackets() {
+        assert_eq!(parent_pid("4242 (sshd) S 4100 4242 4242 0"), Some(4100));
+        assert_eq!(parent_pid("4243 (a) b (c)) S 77 1 1 0"), Some(77));
+        assert_eq!(parent_pid("nonsense"), None);
+    }
 
     #[test]
     fn parse_accepted_ips_extracts_from_syslog_style_lines() {

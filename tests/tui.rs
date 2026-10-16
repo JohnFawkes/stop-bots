@@ -324,6 +324,8 @@ fn spawn_tui_cmd(
     network_tripwire().route(&mut cmd);
     cmd.env("STOP_BOTS_NGINX_CONF_D", generated_dir("conf.d"));
     cmd.env("STOP_BOTS_NGINX_DIR", generated_dir("managed"));
+    // Not the SSH session these tests may themselves run in.
+    cmd.env("STOP_BOTS_SSH_CLIENT", "");
     // Never the host's own settings: on a machine that runs stop-bots, its
     // host.conf named a `docker exec` reload, and the apply tests waited on
     // it until they were killed.

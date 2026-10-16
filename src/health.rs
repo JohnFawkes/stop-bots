@@ -873,6 +873,9 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
         checks.push(check);
     }
     checks.push(ssh_login_allowlist(db)?);
+    if let Some(check) = ssh_lockout_check_off(db)? {
+        checks.push(check);
+    }
     if let Some(check) = lets_encrypt_reachable(&rules, probe) {
         checks.push(check);
     }
@@ -1770,6 +1773,46 @@ fn ssh_login_allowlist(db: &Db) -> Result<Check> {
         detail,
         fix: None,
     })
+}
+
+/// Whether the lock-out check is off on a host where someone does log in
+/// over SSH. It is turned off by answering "I never log in over SSH", and
+/// this is what notices when that stops being true. `None` while it is on.
+fn ssh_lockout_check_off(db: &Db) -> Result<Option<Check>> {
+    if db.get_ssh_lockout_check()? {
+        return Ok(None);
+    }
+    let addresses = db.recent_ssh_login_ips()?;
+    let days = crate::db::SSH_LOGIN_WINDOW_SECONDS / (24 * 60 * 60);
+    let check = if addresses.is_empty() {
+        Check {
+            id: "ssh-lockout-check",
+            title: "SSH lock-out check",
+            level: Level::Ok,
+            detail: format!(
+                "off, and no one has logged in over SSH in the last {days} days: applies are \
+                 not checked against SSH logins"
+            ),
+            fix: None,
+        }
+    } else {
+        Check {
+            id: "ssh-lockout-check",
+            title: "SSH lock-out check",
+            level: Level::Warn,
+            detail: format!(
+                "off, but {} logged in over SSH in the last {days} days: applies are not \
+                 checked against those logins",
+                addresses.join(", ")
+            ),
+            fix: Some(
+                "turn it back on: `stop-bots set-ssh-lockout-check --enabled true`, or the \
+                 SSH lock-out check row on the Dashboard"
+                    .to_string(),
+            ),
+        }
+    };
+    Ok(Some(check))
 }
 
 /// Addresses Let's Encrypt fetched an http-01 challenge from, as a capture
@@ -2952,6 +2995,48 @@ mod tests {
     /// The allowlist has to name its entries, not count them. A count
     /// tells an operator the mechanism works; only the addresses let them
     /// notice one that should no longer be there.
+    #[test]
+    fn the_lockout_check_is_only_reported_when_it_is_off() {
+        let db = db();
+        let report = assess(&db, &healthy()).unwrap();
+        assert!(
+            !report.checks.iter().any(|c| c.id == "ssh-lockout-check"),
+            "on is the default and needs no line"
+        );
+
+        db.set_ssh_lockout_check(false).unwrap();
+        let report = assess(&db, &healthy()).unwrap();
+        assert_eq!(check2(&report, "ssh-lockout-check").level, Level::Ok);
+    }
+
+    /// Off was the answer to "I never log in over SSH"; a login since says
+    /// that answer no longer holds.
+    #[test]
+    fn a_login_while_the_lockout_check_is_off_is_a_warning() {
+        let db = db();
+        db.set_ssh_lockout_check(false).unwrap();
+        db.record_ssh_login_ips(&["203.0.113.5".to_string()])
+            .unwrap();
+
+        let report = assess(&db, &healthy()).unwrap();
+
+        let check = check2(&report, "ssh-lockout-check");
+        assert_eq!(check.level, Level::Warn, "{}", check.detail);
+        assert!(
+            check.detail.contains("203.0.113.5"),
+            "was: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("--enabled true")),
+            "{:?}",
+            check.fix
+        );
+    }
+
     #[test]
     fn the_ssh_allowlist_check_names_the_addresses_it_protects() {
         let db = db();

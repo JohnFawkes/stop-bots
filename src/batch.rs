@@ -402,7 +402,8 @@ fn apply_nginx(db: &Db, options: &BatchOptions) -> Step {
 fn render_and_apply_firewall(db: &Db, options: &BatchOptions) -> Step {
     let run = firewall::FirewallRun::new(options.backend, &options.out)
         .apply(options.apply)
-        .force(options.force);
+        .force(options.force)
+        .protect(crate::sshlog::session_client());
     // Wherever `LogPaths` says the SSH log is: `--ssh-log` first, then the
     // stored path, then a search.
     let source = options.host.log_paths().ssh(options.ssh_log.as_deref());
@@ -411,6 +412,12 @@ fn render_and_apply_firewall(db: &Db, options: &BatchOptions) -> Step {
             let summary = outcome.summary();
             if outcome.succeeded() {
                 Ok(summary)
+            } else if outcome.refused() && matches!(outcome.guard, firewall::Guard::NoLogins { .. })
+            {
+                Err(anyhow::anyhow!(
+                    "{summary}. {}",
+                    firewall::NO_LOGINS_CLI_FIX
+                ))
             } else if outcome.refused() {
                 Err(anyhow::anyhow!(
                     "{summary}. Point --ssh-log at the right file, or --force if you know"

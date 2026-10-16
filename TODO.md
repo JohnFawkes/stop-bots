@@ -51,10 +51,6 @@ path.** Everything is either offline log analysis that writes a database row, or
 text generated into a config file. That is what decides which of these are cheap
 and which are not.
 
-* **Escalating TTL for repeat offenders**, fail2ban style. The formula is
-  trivial; `firewall_rules` persists only `expires_at`, with no offence count or
-  block history. A schema addition, not arithmetic. Worth more now that four
-  detectors write rules with four different TTLs.
 * **ASN / datacenter ranges.** Partly addressed — AWS, Google Cloud and
   DigitalOcean ship as named provider feeds. A generic "datacenter ranges" list
   is deferred because there is no single feed: Azure sits behind a download-page

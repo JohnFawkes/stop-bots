@@ -1583,7 +1583,10 @@ mod tests {
 
         let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
         std::io::Write::write_all(&mut file, probe(now_secs()).as_bytes()).unwrap();
-        assert_eq!(pass(&db, dir.path(), &job)[0].1, "blocked 1 IP(s)");
+        assert_eq!(
+            pass(&db, dir.path(), &job)[0].1,
+            "blocked 1 IP(s), 1 for longer as repeat offender(s)"
+        );
     }
 
     #[test]

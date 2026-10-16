@@ -754,6 +754,111 @@ pub fn set_subnet_escalation(db: &Db, enabled: Option<bool>, min: Option<i64>) -
     Ok(())
 }
 
+// ---- repeat offenders ----
+//
+// Every constant of the escalation is here, and so is the arithmetic: the
+// detectors only ask [`escalated_ttl_days`] how long this offence earns.
+
+/// `settings` key: whether a detector blocks an address it blocked before
+/// for longer than the first time.
+pub const REPEAT_ESCALATION: &str = keys::DETECT_REPEAT_OFFENDERS;
+
+/// The defaults generation escalation arrived in (see
+/// `db::schema::DEFAULTS_GENERATION`). On by default on a database created
+/// at this generation or later; off, and marked new, on one created
+/// before, until the operator chooses: an upgrade never makes a block
+/// longer by itself.
+pub const REPEAT_ESCALATION_INTRODUCED_IN: u32 = 2;
+
+// A generation this binary creates, or escalation would be on nowhere; and
+// a later one than 0.1's, or every upgraded database would have it on.
+const _: () = assert!(
+    REPEAT_ESCALATION_INTRODUCED_IN > 1
+        && REPEAT_ESCALATION_INTRODUCED_IN <= crate::db::schema::DEFAULTS_GENERATION
+);
+
+/// The most a repeat offence multiplies a detector's TTL by: the fourth
+/// offence and every one after it. Doubling, fail2ban's
+/// `bantime.increment` shape, so the second block is twice the first and
+/// a scanner that comes back as soon as each block ends spends
+/// 1 + 2 + 4 + 8 = 15 times the TTL blocked over its first four.
+pub const ESCALATION_MAX_MULTIPLIER: i64 = 8;
+
+/// The longest an escalated block lasts: ninety days, whatever the
+/// detector and the offence. The honeypot's thirty days would otherwise
+/// reach eight months, and an address held that long has as likely
+/// changed hands. A detector whose own TTL is longer keeps it: escalation
+/// only ever lengthens a block.
+pub const ESCALATION_MAX_DAYS: i64 = 90;
+
+/// How long an address must stay out of trouble before its offences are
+/// forgotten: thirty days after its last block *ended*, not after it
+/// began, so a ninety-day block does not wipe the record it was made from.
+pub const OFFENCE_MEMORY_DAYS: i64 = 30;
+
+/// [`OFFENCE_MEMORY_DAYS`] in seconds.
+pub const OFFENCE_MEMORY_SECONDS: i64 = OFFENCE_MEMORY_DAYS * 86_400;
+
+/// How long the `offence`th block of an address lasts, for a detector
+/// whose TTL is `ttl_days`: `ttl_days × 2^(offence − 1)`, the multiplier
+/// capped at [`ESCALATION_MAX_MULTIPLIER`] and the result at
+/// [`ESCALATION_MAX_DAYS`] (or at `ttl_days`, if that is longer). The
+/// first offence, and an offence of 0, which no caller passes, are
+/// `ttl_days` unchanged.
+pub fn escalated_ttl_days(ttl_days: i64, offence: u32) -> i64 {
+    let doublings = offence
+        .saturating_sub(1)
+        .min(ESCALATION_MAX_MULTIPLIER.ilog2());
+    let multiplier = 1i64 << doublings;
+    ttl_days
+        .saturating_mul(multiplier)
+        .min(ESCALATION_MAX_DAYS.max(ttl_days))
+}
+
+/// Whether repeat offenders are blocked for longer: the stored switch,
+/// or, on a database nobody has switched it on, whether the database is
+/// new enough to have it by default (see
+/// [`REPEAT_ESCALATION_INTRODUCED_IN`]).
+pub fn repeat_escalation(db: &Db) -> Result<bool> {
+    Ok(match db.get_bool_setting_if_set(REPEAT_ESCALATION)? {
+        Some(chosen) => chosen,
+        None => REPEAT_ESCALATION_INTRODUCED_IN <= db.defaults_generation()?,
+    })
+}
+
+/// Whether escalation arrived after this database was created and nobody
+/// has chosen either way: off, and marked "new" the way a new detector is
+/// (see [`Detector::is_new_here`]).
+pub fn repeat_escalation_is_new_here(db: &Db) -> Result<bool> {
+    Ok(REPEAT_ESCALATION_INTRODUCED_IN > db.defaults_generation()?
+        && db.get_bool_setting_if_set(REPEAT_ESCALATION)?.is_none())
+}
+
+pub fn set_repeat_escalation(db: &Db, enabled: bool) -> Result<()> {
+    db.set_bool_setting(REPEAT_ESCALATION, enabled)
+}
+
+/// What escalation does, in one sentence, for the CLI and the Dashboard.
+pub fn repeat_escalation_summary() -> String {
+    format!(
+        "each new block of an address doubles its detector's TTL, up to \
+         {ESCALATION_MAX_MULTIPLIER}x and {ESCALATION_MAX_DAYS} days; forgotten \
+         {OFFENCE_MEMORY_DAYS} days after its last block ends"
+    )
+}
+
+/// "2nd", "3rd", "11th": an offence count as people say it.
+pub fn ordinal(n: u32) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
 /// Threshold for the asset-ratio detector: distinct successful page URLs
 /// fetched with no accompanying asset. High, and *distinct* rather than a
 /// request count, because the false positive to avoid is a legitimate API
@@ -976,6 +1081,96 @@ mod tests {
         for d in Detector::ALL {
             assert_eq!(d.is_enabled(&db).unwrap(), d.spec().enabled_default);
             assert_eq!(d.ttl_days(&db).unwrap(), d.spec().ttl_days_default);
+        }
+    }
+
+    // ---- repeat offenders ----
+
+    #[test]
+    fn each_offence_doubles_the_block_up_to_eight_times() {
+        let cases = [
+            ("first offence", 5, 1, 5),
+            ("second", 5, 2, 10),
+            ("third", 5, 3, 20),
+            ("fourth: eight times", 5, 4, 40),
+            ("fifth: still eight times", 5, 5, 40),
+            ("a hundredth: still eight times", 5, 100, 40),
+            ("a one-day detector's fourth", 1, 4, 8),
+            ("no offence counts as the first", 5, 0, 5),
+        ];
+        for (what, ttl, offence, expected) in cases {
+            assert_eq!(escalated_ttl_days(ttl, offence), expected, "{what}");
+        }
+    }
+
+    #[test]
+    fn an_escalated_block_lasts_ninety_days_at_most() {
+        let cases = [
+            ("honeypot, second offence", 30, 2, 60),
+            ("honeypot, third offence", 30, 3, ESCALATION_MAX_DAYS),
+            ("two weeks, fourth offence", 14, 4, ESCALATION_MAX_DAYS),
+            ("a TTL already past the cap is kept", 365, 3, 365),
+        ];
+        for (what, ttl, offence, expected) in cases {
+            assert_eq!(escalated_ttl_days(ttl, offence), expected, "{what}");
+        }
+    }
+
+    /// The largest TTL anything stores must not overflow when escalated.
+    #[test]
+    fn escalating_the_longest_ttl_does_not_overflow() {
+        assert_eq!(escalated_ttl_days(MAX_TTL_DAYS, 4), MAX_TTL_DAYS);
+        assert_eq!(escalated_ttl_days(i64::MAX, 4), i64::MAX);
+    }
+
+    #[test]
+    fn escalation_is_on_for_a_new_database() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(repeat_escalation(&db).unwrap(), "off on a new database");
+        assert!(
+            !repeat_escalation_is_new_here(&db).unwrap(),
+            "marked new on the database it shipped with"
+        );
+    }
+
+    /// An upgrade never lengthens a block by itself: on a database from
+    /// before escalation it is off, and new, until someone chooses.
+    #[test]
+    fn escalation_is_off_and_new_on_an_older_database_until_chosen() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_int_setting(crate::db::keys::DEFAULTS_GENERATION, 1)
+            .unwrap();
+        assert!(!repeat_escalation(&db).unwrap(), "on after an upgrade");
+        assert!(
+            repeat_escalation_is_new_here(&db).unwrap(),
+            "not marked new"
+        );
+
+        set_repeat_escalation(&db, false).unwrap();
+        assert!(
+            !repeat_escalation_is_new_here(&db).unwrap(),
+            "still new after choosing off"
+        );
+        set_repeat_escalation(&db, true).unwrap();
+        assert!(repeat_escalation(&db).unwrap(), "switched on, reads off");
+    }
+
+    #[test]
+    fn offences_read_as_ordinals() {
+        let cases = [
+            (1, "1st"),
+            (2, "2nd"),
+            (3, "3rd"),
+            (4, "4th"),
+            (11, "11th"),
+            (12, "12th"),
+            (13, "13th"),
+            (21, "21st"),
+            (22, "22nd"),
+            (111, "111th"),
+        ];
+        for (n, expected) in cases {
+            assert_eq!(ordinal(n), expected, "{n}");
         }
     }
 

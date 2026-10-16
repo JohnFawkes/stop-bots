@@ -252,6 +252,9 @@ impl Db {
             // range's evidence is kept per address inside it, which the
             // record's overlap check covers instead.
             self.forget_evidence_before(&rule.address, now)?;
+            // An operator's unblock says the block was a mistake: the
+            // next offence, if one comes, is a first again.
+            self.forget_offences(&rule.address)?;
         }
         Ok(())
     }

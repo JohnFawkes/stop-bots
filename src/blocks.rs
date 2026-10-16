@@ -238,6 +238,25 @@ pub fn source_name(source: Option<RuleSource>) -> &'static str {
     source.map_or(LEGACY_NAME, RuleSource::name)
 }
 
+/// "3rd offence", for a detector's block of an address it has blocked
+/// before; `None` for a first offence and for any other rule. `offences`
+/// is [`crate::db::Db::repeat_offences`].
+///
+/// The count is the address's, not the rule's, and that is the same
+/// thing here: a new offence is only counted when there is no live block
+/// for the address, so a detector's live block is always the latest one.
+pub fn offence_note(
+    rule: &crate::db::FirewallRule,
+    offences: &std::collections::HashMap<String, u32>,
+) -> Option<String> {
+    let by_detector = rule.source.is_some_and(|s| s.detector().is_some());
+    if !by_detector || rule.action != crate::db::FirewallAction::Block {
+        return None;
+    }
+    let count = *offences.get(&rule.address)?;
+    (count > 1).then(|| format!("{} offence", crate::protection::ordinal(count)))
+}
+
 /// `text` as it is safe to store and show: one line, no control
 /// characters, at most [`MAX_EVIDENCE_BYTES`].
 ///

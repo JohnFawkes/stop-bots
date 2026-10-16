@@ -5227,3 +5227,86 @@ fn batch_prints_hostile_step_errors_terminal_safe() {
         "the failing step should still name the root, defanged:\n{printed}"
     );
 }
+
+// ---- repeat offenders ----
+
+/// `block-probe-paths` on `log`, against the database at `db`.
+fn block_probe_paths(db: &Path, log: &Path) -> assert_cmd::assert::Assert {
+    stop_bots_bin()
+        .args(["block-probe-paths", "--db", db.to_str().unwrap()])
+        .args(["--access-log", log.to_str().unwrap()])
+        .assert()
+        .success()
+}
+
+/// How long the live block of `address` was made for, in days.
+fn days_blocked(db: &Path, address: &str) -> i64 {
+    let rules = stop_bots::db::Db::open(db)
+        .unwrap()
+        .list_firewall_rules()
+        .unwrap();
+    let rule = rules
+        .iter()
+        .find(|r| r.address == address)
+        .unwrap_or_else(|| panic!("{address} is not blocked; rules: {rules:?}"));
+    (rule.expires_at.unwrap() - rule.created_at.unwrap() + 43_200) / 86_400
+}
+
+/// Ends every block now, the way its expiry would.
+fn let_every_block_lapse(db: &Path) {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .execute("UPDATE firewall_rules SET expires_at = 1", [])
+        .unwrap();
+}
+
+#[test]
+fn a_second_block_after_the_first_expired_is_longer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("db.sqlite3");
+    let log = tmp.path().join("access.log");
+    fs::write(&log, access_line("203.0.113.9", "/.env", 404, "curl/8")).unwrap();
+
+    block_probe_paths(&db, &log);
+    assert_eq!(days_blocked(&db, "203.0.113.9"), 5, "the first block");
+    let_every_block_lapse(&db);
+
+    block_probe_paths(&db, &log).stdout(predicate::str::contains(
+        "Added block rule for 203.0.113.9, expiring in 10 day(s), its 2nd offence",
+    ));
+    assert_eq!(days_blocked(&db, "203.0.113.9"), 10, "the second block");
+
+    stop_bots(&["list-firewall-rules", "--db", db.to_str().unwrap()])
+        .stdout(predicate::str::contains("2nd offence"));
+}
+
+/// An upgrade never makes a block longer by itself: on a database an
+/// earlier release created, the second block is as long as the first
+/// until the operator turns repeat offenders on.
+#[test]
+fn on_an_upgraded_database_repeat_offenders_is_off_until_turned_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("db.sqlite3");
+    restore_0_0_15(&db);
+    let log = tmp.path().join("access.log");
+    fs::write(&log, access_line("203.0.113.9", "/.env", 404, "curl/8")).unwrap();
+    let db_arg = db.to_str().unwrap();
+
+    stop_bots(&["list-detectors", "--db", db_arg])
+        .stdout(predicate::str::contains("Repeat offenders: off (new"));
+    block_probe_paths(&db, &log);
+    let_every_block_lapse(&db);
+    block_probe_paths(&db, &log);
+    // The fixture set probe paths to nine days.
+    assert_eq!(days_blocked(&db, "203.0.113.9"), 9, "escalated while off");
+
+    stop_bots(&["set-repeat-offenders", "--enabled", "true", "--db", db_arg])
+        .stdout(predicate::str::contains("Repeat offenders: on."));
+    let_every_block_lapse(&db);
+    block_probe_paths(&db, &log);
+    assert_eq!(
+        days_blocked(&db, "203.0.113.9"),
+        36,
+        "the third offence, counted while it was off"
+    );
+}

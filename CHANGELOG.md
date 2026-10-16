@@ -8,8 +8,18 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+The database gains two schema versions (offences for repeat offenders, and an index
+that makes each detector pass faster on a large log). A release before this one refuses
+the upgraded database rather than misreading it. To go back, put back the copy the
+upgrade kept, `/var/lib/stop-bots/db.sqlite3.bak-v6`, then install the older release;
+settings changed since the upgrade are lost.
+
 ### Fixed
 
+- **Each detector pass no longer slows down as evidence piles up.** The query that finds
+  every address seen in a detector's window read every stored row to check its address;
+  an index now answers it, about six times faster on a host with a day of evidence from
+  a 1 GB log.
 - **SSH scanners on a host that takes keys only** are counted when they reach sshd's
   `MaxAuthTries`: `maximum authentication attempts exceeded for …` is now read as a failed
   login. Such a scanner leaves no `Failed` line, so before this only its disconnect counted.
@@ -28,6 +38,18 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   new row on the Dashboard (SSH lock-out check) and a new command,
   `set-ssh-lockout-check --enabled true|false`. Addresses that log in over SSH are still
   let through with the check off, and `status` warns if anyone logs in while it is off.
+- **Repeat offenders are blocked for longer.** When a detector blocks an address again
+  after its earlier block ended, the block doubles: twice the detector's TTL for the
+  second offence, four times for the third, eight times from the fourth on, and never
+  more than 90 days (a detector whose own TTL is longer keeps it). An address is
+  forgotten 30 days after its last block ends, or as soon as you unblock it by hand.
+  Finding an address that is still blocked is not a new offence, and trusted addresses
+  and addresses that log in over SSH are never blocked, so never counted. It is a new
+  row on the Dashboard (Repeat offenders), a new command,
+  `set-repeat-offenders --enabled true|false`, and a line in `list-detectors`. The Blocks
+  screen and `list-firewall-rules` say "2nd offence", "3rd offence" and so on. On for a
+  new database; **off on an existing one** until you turn it on, and marked "new" there.
+  Offences are counted either way, so turning it on later has a history to go by.
 - The lock-out check counts the SSH session the TUI or CLI runs in as connected, read
   from its environment (it still works under `sudo`), so a log that rotated or a journal
   that keeps nothing no longer hides it.

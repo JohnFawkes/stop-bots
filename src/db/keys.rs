@@ -109,6 +109,10 @@ pub const DETECT_PROBE_PATHS_EXTRA: &str = "detect_probe_paths_extra";
 pub const DETECT_HONEYPOT_PATH: &str = "detect_honeypot_path";
 pub const DETECT_SUBNET_ESCALATION: &str = "detect_subnet_escalation";
 pub const DETECT_SUBNET_ESCALATION_MIN: &str = "detect_subnet_escalation_min";
+/// Whether a repeat offender is blocked for longer each time (see
+/// `protection::repeat_escalation`). Unset on a database nobody has
+/// switched it on, which reads by the database's defaults generation.
+pub const DETECT_REPEAT_OFFENDERS: &str = "detect_repeat_offenders";
 pub const DETECT_ASSET_RATIO_MIN_PAGES: &str = "detect_asset_ratio_min_pages";
 pub const DETECT_ROTATING_UA_MIN: &str = "detect_rotating_ua_min";
 pub const DETECT_REFERERLESS_MIN_PATHS: &str = "detect_refererless_min_paths";
@@ -160,6 +164,7 @@ pub const ALL: &[&str] = &[
     DETECT_HONEYPOT_PATH,
     DETECT_SUBNET_ESCALATION,
     DETECT_SUBNET_ESCALATION_MIN,
+    DETECT_REPEAT_OFFENDERS,
     DETECT_ASSET_RATIO_MIN_PAGES,
     DETECT_ROTATING_UA_MIN,
     DETECT_REFERERLESS_MIN_PATHS,

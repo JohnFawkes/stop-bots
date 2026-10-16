@@ -29,6 +29,7 @@ pub mod evidence;
 pub mod guard;
 pub mod keys;
 mod managed;
+mod offences;
 pub mod schema;
 mod uapage;
 

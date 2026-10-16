@@ -566,6 +566,23 @@ enum Command {
         #[arg(long)]
         min: Option<i64>,
     },
+    /// Block repeat offenders for longer.
+    ///
+    /// When on, a detector that blocks an address again after its earlier
+    /// block ended doubles the block: twice the detector's TTL for the
+    /// second offence, four times for the third, and eight times from the
+    /// fourth on, but never more than 90 days (or the detector's own TTL,
+    /// if that is longer). An address is forgotten 30 days after its last
+    /// block ends, or when you unblock it by hand. Trusted addresses and
+    /// addresses that log in over SSH are never blocked, so never counted.
+    ///
+    /// On for a database created by a release that has it; off on one an
+    /// earlier release created, until you turn it on.
+    SetRepeatOffenders {
+        /// Whether repeat offenders are blocked for longer
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
     /// Tally which user agents are getting through successfully.
     ///
     /// Reads the web server's access log and adds up, per user agent, the requests
@@ -1665,6 +1682,7 @@ async fn run() -> Result<()> {
             threshold,
             window_hours,
         }) => set_detector(db, detector, enabled, ttl_days, threshold, window_hours),
+        Some(Command::SetRepeatOffenders { enabled }) => set_repeat_offenders(db, enabled),
         Some(Command::SetSubnetEscalation { enabled, min }) => {
             set_subnet_escalation(db, enabled, min)
         }
@@ -2280,8 +2298,9 @@ fn list_firewall_rules(db_path: Option<PathBuf>, source: Option<SourceFilter>) -
         return Ok(());
     }
     let now = now_secs();
+    let offences = db.repeat_offences(now)?;
     for rule in &rules {
-        say!("{}", rule_line(rule, now));
+        say!("{}", rule_line(rule, now, &offences));
     }
     Ok(())
 }
@@ -2295,7 +2314,14 @@ fn list_firewall_rules(db_path: Option<PathBuf>, source: Option<SourceFilter>) -
 /// into the database has not been through
 /// [`stop_bots::blocks::evidence_line`], so a newline in it would forge a
 /// second rule underneath.
-fn rule_line(rule: &FirewallRule, now: i64) -> String {
+///
+/// A detector's block of an address blocked before says which offence it
+/// is, from `offences` ([`Db::repeat_offences`]).
+fn rule_line(
+    rule: &FirewallRule,
+    now: i64,
+    offences: &std::collections::HashMap<String, u32>,
+) -> String {
     let port = rule.port.map(|p| format!(":{p}")).unwrap_or_default();
     let status = if rule.enabled { "" } else { " (disabled)" };
     let expiry = rule
@@ -2311,8 +2337,11 @@ fn rule_line(rule: &FirewallRule, now: i64) -> String {
         .as_deref()
         .map(|line| format!(": {}", terminal_safe(line)))
         .unwrap_or_default();
+    let offence = stop_bots::blocks::offence_note(rule, offences)
+        .map(|note| format!(", {note}"))
+        .unwrap_or_default();
     format!(
-        "#{} {:?} {}{port}{status}{expiry} [{}{added}]{evidence}",
+        "#{} {:?} {}{port}{status}{expiry} [{}{added}{offence}]{evidence}",
         rule.id,
         rule.action,
         terminal_safe(&rule.address),
@@ -3007,6 +3036,7 @@ fn list_detectors(db_path: Option<PathBuf>) -> Result<()> {
         on_off(stop_bots::protection::subnet_escalation(&db)?.is_some()),
         stop_bots::protection::subnet_escalation_min(&db)?
     );
+    say!("{}", repeat_offenders_line(&db)?);
     say!(
         "The schedule (`stop-bots tick`, or the TUI while it is open) and `batch` run the \
          ones that are on."
@@ -3081,6 +3111,37 @@ fn set_detector(
         say!(
             "Blocks it already added stay until they expire; remove one with \
              `stop-bots remove-firewall-rule`."
+        );
+    }
+    Ok(())
+}
+
+/// Whether repeat offenders are blocked for longer, as `list-detectors`
+/// and `set-repeat-offenders` say it.
+fn repeat_offenders_line(db: &Db) -> Result<String> {
+    use stop_bots::protection::{
+        repeat_escalation, repeat_escalation_is_new_here, repeat_escalation_summary,
+    };
+    let state = if repeat_escalation_is_new_here(db)? {
+        "off (new in this release: `stop-bots set-repeat-offenders --enabled true` turns it on)"
+            .to_string()
+    } else {
+        on_off(repeat_escalation(db)?).to_string()
+    };
+    Ok(format!(
+        "Repeat offenders: {state}. When on, {}.",
+        repeat_escalation_summary()
+    ))
+}
+
+fn set_repeat_offenders(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    stop_bots::protection::set_repeat_escalation(&db, enabled)?;
+    say!("{}", repeat_offenders_line(&db)?);
+    if !enabled {
+        say!(
+            "Blocks already made stay as long as they were made for; offences are still \
+             counted, so turning it back on picks up where it left off."
         );
     }
     Ok(())
@@ -4304,13 +4365,20 @@ fn read_ssh_log(db: &Db, ssh_log: Option<&Path>) -> Result<String> {
 /// from the [`stop_bots::scanblock::ScanBlockOutcome`] it now gets handed.
 fn print_scan_block_outcome(outcome: &stop_bots::scanblock::ScanBlockOutcome) {
     for ip in &outcome.newly_blocked {
+        let (days, offence) = match outcome.repeat_offenders.iter().find(|r| &r.address == ip) {
+            Some(r) => (
+                r.ttl_days,
+                format!(
+                    ", its {} offence",
+                    stop_bots::protection::ordinal(r.offence)
+                ),
+            ),
+            None => (outcome.ttl_days, String::new()),
+        };
         if outcome.dry_run {
-            say!("Would block {ip} for {} day(s) (dry run)", outcome.ttl_days);
+            say!("Would block {ip} for {days} day(s){offence} (dry run)");
         } else {
-            say!(
-                "Added block rule for {ip}, expiring in {} day(s)",
-                outcome.ttl_days
-            );
+            say!("Added block rule for {ip}, expiring in {days} day(s){offence}");
         }
     }
     if outcome.skipped_unblocked > 0 {
@@ -4327,10 +4395,19 @@ fn print_scan_block_outcome(outcome: &stop_bots::scanblock::ScanBlockOutcome) {
         );
     } else if outcome.dry_run {
         say!(
-            "Would add {} new block rule(s), each expiring after {} day(s). Re-run without \
-             --dry-run to apply.",
+            "Would add {} new block rule(s), expiring after {} day(s) unless a repeat offender's \
+             is longer. Re-run without --dry-run to apply.",
             outcome.newly_blocked.len(),
             outcome.ttl_days
+        );
+    } else if !outcome.repeat_offenders.is_empty() {
+        say!(
+            "Added {} new block rule(s), expiring after {} day(s), or longer for the {} \
+             repeat offender(s). Not applied automatically — run render-firewall, then apply \
+             the generated script, to actually enforce them.",
+            outcome.newly_blocked.len(),
+            outcome.ttl_days,
+            outcome.repeat_offenders.len()
         );
     } else {
         say!(

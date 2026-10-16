@@ -8,6 +8,26 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Added
+
+- **`status` says whether your sites serve their secrets.** The probe-paths detector
+  blocks whoever asks for `/.env`; the new `exposed-files` check says whether they got
+  it. Each site the web server's config names is asked, over loopback at the port it
+  listens on and with its own name (TLS included, certificate unchecked), for 19 files
+  scanners look for: `.env`, `.git/config`, `.git/HEAD`, `.svn/entries`,
+  `.aws/credentials`, private keys, `.htpasswd`, SQL dumps, config backups,
+  `.DS_Store` and phpinfo pages. A file counts only when it is answered 200, unlike
+  the answer for a page that cannot exist, and looks like the file (`[core]` in a git
+  config, `KEY=` lines in a `.env`), so a single-page app answering every path with
+  its `index.html` reports nothing. Critical for credentials, repositories and dumps,
+  a warning for the rest, with the NGINX or Apache lines that deny them. Asked as a
+  current browser, so the site's own blocks do not turn it away; a site that answers
+  everything with the block's status is reported as not checked rather than clean.
+  Read-only, four seconds at most, and absent on a host with no sites. It runs with
+  the rest of the health probe, so `stop-bots status`, the TUI and the schedule all
+  ask. The access log shows requests for these paths from `127.0.0.1`; no detector
+  blocks them, and `status` leaves them out of what it says about the log.
+
 ## [0.3.0] — 2026-10-16
 
 The release that gets stop-bots ready to stand behind a 1.0: an undo for firewall

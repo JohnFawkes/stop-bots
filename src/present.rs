@@ -98,6 +98,7 @@ pub fn check_label(check: &Check) -> &'static str {
         "ssh-login-allowlist" => "ssh",
         "ssh-lockout-check" => "lockout",
         "lets-encrypt-reachable" => "certs",
+        "exposed-files" => "exposed",
         "trusted" => "trusted",
         "skipped-entries" => "skipped",
         _ => check.title,

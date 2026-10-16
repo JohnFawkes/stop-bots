@@ -63,6 +63,8 @@ pub mod event;
 #[doc(hidden)]
 pub mod evidence;
 #[doc(hidden)]
+pub mod exposure;
+#[doc(hidden)]
 pub mod fetch;
 #[doc(hidden)]
 pub mod firewall;

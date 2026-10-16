@@ -148,6 +148,7 @@ async fn main() -> Result<()> {
             config_root: None,
             apache_rewrite_enabled: None,
             http_renewals: Some(0),
+            exposed_files: None,
         },
     )?;
 

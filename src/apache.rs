@@ -257,6 +257,8 @@ struct VirtualHost {
     /// The same thing NGINX's `is_tls` is load-bearing for — see
     /// `nginx::ServerBlock::is_tls`.
     is_tls: bool,
+    /// The addresses on the `<VirtualHost ...>` line, as written.
+    addresses: Vec<String>,
     /// Byte offset of the line after `<VirtualHost ...>`, where a block
     /// is inserted.
     open: usize,
@@ -369,6 +371,7 @@ fn virtual_hosts(content: &str) -> Vec<VirtualHost> {
                         VirtualHost {
                             names: Vec::new(),
                             is_tls,
+                            addresses: args.clone(),
                             open: line.end,
                             close: line.end,
                             directives: Vec::new(),
@@ -451,6 +454,42 @@ pub fn discover_sites(root: &Path) -> Result<Vec<DiscoveredSite>> {
             sites.push(DiscoveredSite {
                 server_name: host.names[0].clone(),
                 config_path: path.to_path_buf(),
+            });
+        }
+    }
+    Ok(sites)
+}
+
+/// Every `<VirtualHost>` under `root`, with the addresses it is served
+/// on: [`discover_sites`]' walk, keeping what the health check needs to
+/// ask the site something over loopback. A host with `SSLEngine on` is
+/// TLS on every address it names.
+pub fn site_listens(root: &Path) -> Result<Vec<SiteListens>> {
+    if !root.exists() {
+        anyhow::bail!("{} does not exist", root.display());
+    }
+    let mut sites = Vec::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for host in virtual_hosts(&content) {
+            let listens = host
+                .addresses
+                .iter()
+                .filter_map(|address| Listen::parse_address(address))
+                .map(|(address, port)| Listen {
+                    address,
+                    port,
+                    tls: host.is_tls,
+                })
+                .collect();
+            sites.push(SiteListens {
+                server_name: host.names[0].clone(),
+                listens,
             });
         }
     }
@@ -1591,6 +1630,29 @@ mod tests {
         assert_eq!(
             virtual_hosts(SITE)[0].names,
             vec!["example.com", "www.example.com"]
+        );
+    }
+
+    #[test]
+    fn each_host_listens_where_its_section_says_with_its_tls() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("sites.conf"), TWO_HOSTS).unwrap();
+
+        let seen: Vec<(String, Vec<(u16, bool)>)> = site_listens(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|site| {
+                let ports = site.listens.iter().map(|l| (l.port, l.tls)).collect();
+                (site.server_name, ports)
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("example.com".to_string(), vec![(80, false)]),
+                ("example.com".to_string(), vec![(443, true)]),
+                ("other.example".to_string(), vec![(80, false)]),
+            ]
         );
     }
 

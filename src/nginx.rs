@@ -60,6 +60,9 @@ pub struct ServerBlock {
     /// has both blocks under one `server_name`, so a per-site setting
     /// reaches both. See `BlockConfig::reject_http_1x`.
     pub is_tls: bool,
+    /// Every `listen` directly in the block, in order. Empty when it has
+    /// none, which NGINX reads as port 80.
+    pub listens: Vec<crate::webserver::Listen>,
     open: usize,
     close: usize,
 }
@@ -161,6 +164,7 @@ fn parse_server_blocks(content: &str) -> Vec<ServerBlock> {
     // Parallel to `names_stack`: whether the block currently being scanned
     // has shown any sign of terminating TLS.
     let mut tls_stack: Vec<bool> = Vec::new();
+    let mut listens_stack: Vec<Vec<crate::webserver::Listen>> = Vec::new();
     let mut blocks = Vec::new();
     let mut prev_word: Option<&str> = None;
 
@@ -174,6 +178,7 @@ fn parse_server_blocks(content: &str) -> Vec<ServerBlock> {
                 if is_server {
                     names_stack.push(Vec::new());
                     tls_stack.push(false);
+                    listens_stack.push(Vec::new());
                 }
                 prev_word = None;
             }
@@ -182,9 +187,11 @@ fn parse_server_blocks(content: &str) -> Vec<ServerBlock> {
                     if is_server {
                         let names = names_stack.pop().unwrap_or_default();
                         let is_tls = tls_stack.pop().unwrap_or(false);
+                        let listens = listens_stack.pop().unwrap_or_default();
                         blocks.push(ServerBlock {
                             names,
                             is_tls,
+                            listens,
                             open,
                             close: *off,
                         });
@@ -205,6 +212,21 @@ fn parse_server_blocks(content: &str) -> Vec<ServerBlock> {
                     if let Some(top) = tls_stack.last_mut() {
                         *top = true;
                     }
+                }
+                if word == "listen" && directly_in_server {
+                    let mut j = idx + 1;
+                    let mut args = Vec::new();
+                    while j < tokens.len() && !matches!(tokens[j].0.as_str(), ";" | "{" | "}") {
+                        args.push(tokens[j].0.as_str());
+                        j += 1;
+                    }
+                    if let Some(listen) = listen_directive(&args) {
+                        if let Some(top) = listens_stack.last_mut() {
+                            top.push(listen);
+                        }
+                    }
+                    // Not skipped past: an `ssl` among them is also what
+                    // marks the block TLS, below.
                 }
                 if word == "server_name" && directly_in_server {
                     let mut j = idx + 1;
@@ -234,6 +256,24 @@ fn parse_server_blocks(content: &str) -> Vec<ServerBlock> {
     }
 
     blocks
+}
+
+/// One `listen` directive's arguments as a [`Listen`](crate::webserver::Listen):
+/// `443 ssl`, `[::]:80`, `127.0.0.1:8080`. `None` for a Unix socket, and
+/// for `quic`, which is UDP and answers nothing a TCP request can ask.
+/// Port 443 counts as TLS without the `ssl` parameter, for the configs
+/// that still say `ssl on;` instead.
+fn listen_directive(args: &[&str]) -> Option<crate::webserver::Listen> {
+    let (first, params) = args.split_first()?;
+    if params.contains(&"quic") {
+        return None;
+    }
+    let (address, port) = crate::webserver::Listen::parse_address(first)?;
+    Some(crate::webserver::Listen {
+        address,
+        port,
+        tls: params.contains(&"ssl") || port == 443,
+    })
 }
 
 /// `regex` as an NGINX double-quoted string, quotes included, written so
@@ -1891,6 +1931,33 @@ pub fn discover_sites(root: &Path) -> Result<Vec<DiscoveredSite>> {
                 sites.push(DiscoveredSite {
                     server_name: name.clone(),
                     config_path: path.to_path_buf(),
+                });
+            }
+        }
+    }
+    Ok(sites)
+}
+
+/// Every named `server` block under `root`, with the addresses it listens
+/// on: [`discover_sites`]' walk, keeping what the health check needs to
+/// ask the site something over loopback.
+pub fn site_listens(root: &Path) -> Result<Vec<crate::webserver::SiteListens>> {
+    if !root.exists() {
+        anyhow::bail!("{} does not exist", root.display());
+    }
+    let mut sites = Vec::new();
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for block in parse_server_blocks(&content) {
+            if let Some(name) = block.names.first() {
+                sites.push(crate::webserver::SiteListens {
+                    server_name: name.clone(),
+                    listens: block.listens,
                 });
             }
         }
@@ -4498,6 +4565,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_reads_each_listen_with_its_address_port_and_tls() {
+        let content = concat!(
+            "server {\n",
+            "    listen 443 ssl;\n",
+            "    listen [::]:8443 ssl http2;\n",
+            "    listen 127.0.0.1:8080;\n",
+            "    listen 443 quic;\n",
+            "    listen unix:/run/a.sock;\n",
+            "    server_name a.example;\n}\n"
+        );
+        let listen = |address: Option<&str>, port, tls| crate::webserver::Listen {
+            address: address.map(|a| a.parse().unwrap()),
+            port,
+            tls,
+        };
+        assert_eq!(
+            parse_server_blocks(content)[0].listens,
+            [
+                listen(None, 443, true),
+                listen(Some("::"), 8443, true),
+                listen(Some("127.0.0.1"), 8080, false),
+            ]
+        );
+    }
+
+    #[test]
     fn parse_marks_a_plain_listen_block_as_not_tls() {
         let content = "server {\n    listen 80;\n    server_name a.example;\n}\n";
         assert!(!parse_server_blocks(content)[0].is_tls);
@@ -5464,6 +5557,7 @@ mod tests {
         let plain = ServerBlock {
             names: vec!["a.example".to_string()],
             is_tls: false,
+            listens: Vec::new(),
             open: 0,
             close: 0,
         };
@@ -5481,6 +5575,7 @@ mod tests {
         let tls = ServerBlock {
             names: vec!["a.example".to_string()],
             is_tls: true,
+            listens: Vec::new(),
             open: 0,
             close: 0,
         };

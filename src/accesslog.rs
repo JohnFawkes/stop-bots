@@ -366,6 +366,12 @@ struct ParsedLine {
 }
 
 impl ParsedLine {
+    /// One of the health probe's own requests ([`crate::exposure`]), which
+    /// is not traffic: neither a client of this host nor a line about it.
+    fn is_health_probe(&self) -> bool {
+        crate::exposure::is_own_request(&self.ip, &self.user_agent, &self.path)
+    }
+
     /// Whether this is one of an application's own clients' requests on
     /// its data routes: see [`crate::services`].
     fn is_app_request(&self, hosted: &Hosted) -> bool {
@@ -967,8 +973,12 @@ impl Observer {
         if text.trim().is_empty() {
             return;
         }
+        let parsed = parse_line(text);
+        if parsed.as_ref().is_some_and(ParsedLine::is_health_probe) {
+            return;
+        }
         self.counts.lines += 1;
-        let Some(line) = parse_line(text) else {
+        let Some(line) = parsed else {
             return;
         };
         self.counts.parsed += 1;
@@ -1224,8 +1234,12 @@ impl Survey {
         if text.trim().is_empty() {
             return;
         }
+        let parsed = parse_line(text);
+        if parsed.as_ref().is_some_and(ParsedLine::is_health_probe) {
+            return;
+        }
         self.counts.lines += 1;
-        let Some(line) = parse_line(text) else {
+        let Some(line) = parsed else {
             if self.unparsed_sample.is_none() {
                 self.unparsed_sample = Some(printable_sample(text));
             }
@@ -2502,6 +2516,33 @@ mod tests {
             survey.unparsed_sample.as_deref(),
             Some("203.0.113.5 custom-format \u{fffd}[31m hello"),
             "the first unparsed line, with its escape sequence defused"
+        );
+    }
+
+    /// The exposed-files check asks every site for twenty paths each
+    /// probe, from loopback. Counted, a quiet host's log reads as mostly
+    /// a proxy's.
+    #[test]
+    fn a_survey_leaves_out_the_health_probes_own_requests() {
+        let own = |ip: &str, path: &str| {
+            format!(
+                "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/2.0\" 404 162 \"-\" \"{}\"\n",
+                crate::exposure::USER_AGENT
+            )
+        };
+        let mut survey = Survey::new(403);
+        survey.line(&own("127.0.0.1", "/.env"));
+        survey.line(&own("::1", "/stop-bots-exposure-check-18a3f"));
+        survey.line(&own("127.0.0.1", "/"));
+        survey.line(&own("203.0.113.5", "/.env"));
+
+        assert_eq!(
+            survey.counts,
+            Counts {
+                lines: 2,
+                parsed: 2
+            },
+            "only the request for / and the public one are traffic"
         );
     }
 

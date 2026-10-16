@@ -1,6 +1,6 @@
 pkgbase = stop-bots-bin
 	pkgdesc = A TUI and CLI that help you configure NGINX or Apache and your firewall to stop bad bots and still allow good bots (prebuilt binary)
-	pkgver = 0.2.0
+	pkgver = 0.3.0
 	pkgrel = 1
 	url = https://github.com/ivankovic/stop-bots
 	arch = x86_64
@@ -10,11 +10,11 @@ pkgbase = stop-bots-bin
 	optdepends = apache: to apply the generated site blocking rules, instead of nginx
 	optdepends = nftables: to apply the generated firewall script
 	optdepends = iptables: alternative firewall backend
-	provides = stop-bots=0.2.0
+	provides = stop-bots=0.3.0
 	conflicts = stop-bots
-	source_x86_64 = stop-bots-0.2.0-x86_64.tar.gz::https://github.com/ivankovic/stop-bots/releases/download/v0.2.0/stop-bots-0.2.0-x86_64-unknown-linux-musl.tar.gz
-	sha256sums_x86_64 = e68d29d7505c88477f067f4deab5771822783cb3f884d3f04e673aed29565e15
-	source_aarch64 = stop-bots-0.2.0-aarch64.tar.gz::https://github.com/ivankovic/stop-bots/releases/download/v0.2.0/stop-bots-0.2.0-aarch64-unknown-linux-musl.tar.gz
-	sha256sums_aarch64 = 13476e8df9b46a5a947e60f1686bad742735e152750813bebec1052ed3599d92
+	source_x86_64 = stop-bots-0.3.0-x86_64.tar.gz::https://github.com/ivankovic/stop-bots/releases/download/v0.3.0/stop-bots-0.3.0-x86_64-unknown-linux-musl.tar.gz
+	sha256sums_x86_64 = e54e41249bc9adf49d63f3ee72032fbd704761adce9a331b34f007947aefa0b0
+	source_aarch64 = stop-bots-0.3.0-aarch64.tar.gz::https://github.com/ivankovic/stop-bots/releases/download/v0.3.0/stop-bots-0.3.0-aarch64-unknown-linux-musl.tar.gz
+	sha256sums_aarch64 = 1e9546b3ad31d6ae1ecfb5a7ad65cc5fdf6b521f6494984b3ea82c123728724c
 
 pkgname = stop-bots-bin

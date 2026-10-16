@@ -171,7 +171,7 @@ CRATES="
 	kurbo@0.13.1
 	lab@0.11.0
 	lazy_static@1.5.0
-	libc@0.2.189
+	libc@0.2.190
 	libm@0.2.16
 	libsqlite3-sys@0.38.2
 	line-clipping@0.3.8
@@ -286,9 +286,9 @@ CRATES="
 	serde@1.0.229
 	serde_core@1.0.229
 	serde_derive@1.0.229
-	serde_json@1.0.151
+	serde_json@1.0.154
 	sha2@0.10.9
-	sha2@0.11.0
+	sha2@0.11.1
 	shlex@2.0.1
 	signal-hook-mio@0.2.5
 	signal-hook-registry@1.4.8
@@ -338,7 +338,7 @@ CRATES="
 	tokio-macros@2.7.2
 	tokio-rustls@0.26.5
 	tokio-util@0.7.19
-	tokio@1.53.1
+	tokio@1.53.2
 	tower-http@0.6.11
 	tower-layer@0.3.3
 	tower-service@0.3.3

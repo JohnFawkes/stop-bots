@@ -307,52 +307,85 @@ two.
 
 ## Versioning
 
-The version number describes the program, not the Rust library. From `0.1.0` on, the
-contract a version makes is:
+The version number describes the program, not the Rust library, and follows
+[semver](https://semver.org) strictly: a patch release fixes things, a minor release
+adds things, and only a major release takes anything away. `0.x` minors were allowed to
+break; from `1.0.0` on, nothing in the contract below breaks before `2.0.0`.
 
-- **the command line**: every verb and flag, and what each one does;
-- **the database**: a release opens every database an earlier release wrote, with the
-  settings in it intact, and a database a `0.1.x` release has used can still be opened
-  by any earlier `0.1.x`, so going back one patch release is safe;
-- **the files it writes**: the NGINX blocks it injects, the managed `conf.d` files, the
-  firewall script and the systemd units, including the markers it finds its own text by
-  (`# BEGIN stop-bots (DO NOT EDIT)` and its siblings);
-- **the paths it uses**: `/var/lib/stop-bots`, `/etc/stop-bots` and the files in them,
+### The contract
+
+- **The command line:** every verb and flag, the values each accepts, and what each
+  does. Exit codes: `0` for success, non-zero for a failure or a refusal (a lockout
+  guard that refuses an apply exits non-zero, which is what makes cron mail someone).
+- **The JSON output** of `--json`: fields may be added, never renamed, retyped or
+  removed.
+- **The database:** a release opens every database an earlier release wrote, with the
+  settings in it intact, and a database a `1.x.y` release has used can still be opened
+  by the release before it in the same minor, so going back one patch release is safe.
+  Settings keys keep their names.
+- **The files it writes:** the NGINX and Apache blocks it injects, the managed `conf.d`
+  files, the firewall script, the systemd units (`stop-bots-firewall.service` and the
+  rest) and `/etc/cron.d/stop-bots`, including the markers it finds its own text by
+  (`# BEGIN stop-bots (DO NOT EDIT)` and its siblings). Output *between* the markers
+  may change, as long as the next release recognises and replaces what the previous one
+  wrote.
+- **The paths it uses:** `/var/lib/stop-bots`, `/etc/stop-bots` and the files in them,
   and every other default location.
+- **`STOP_BOTS_DB`**, the one environment variable meant for users. The others
+  (`STOP_BOTS_NGINX_DIR`, `STOP_BOTS_HOST_CONF`, `STOP_BOTS_SSH_CLIENT` and the like) are
+  hooks for the test suite and can change in any release.
 
-A `0.1.x` patch release breaks none of that. A change that does waits for the next
-minor, `0.2.0`, and is written up in the changelog. In practice, **breaking** means:
+### Not in the contract
 
-- removing or renaming a verb or a flag without keeping the old name as an alias;
-- changing what an existing flag or verb does in a way a script relying on it would
-  notice;
-- writing a database that a previous `0.1.x` cannot open or would misread;
-- changing a generated-file marker, so that a newer release no longer recognises what
-  an older one wrote (or the other way round), or changing a default path.
+- **The TUI:** its keys, screens and layout. They are for a person, who adapts, and
+  freezing them would stop it getting easier to use.
+- **The wording of human-readable output**, on the terminal or in the TUI. A script
+  that needs to read output uses `--json`.
+- **The Rust library.** `src/lib.rs` makes every module `pub` so that `main.rs`,
+  `tests/` and `examples/` can reach them. The modules are `#[doc(hidden)]`, the crate
+  documentation says there is no supported Rust API, and any of it can change in any
+  release, patch releases included. The product is the binary; a designed library would
+  be a second product with its own users, and nobody has asked for one.
 
-Adding a verb, a flag or a setting is not breaking. Nor is changing generated output
-*between* the markers, as long as the program still recognises and replaces what the
-previous release wrote there.
+### Breaking, adding and deprecating
 
-**The library is not part of the contract.** `src/lib.rs` makes every module `pub` so
-that `main.rs`, `tests/` and `examples/` can reach them. The modules are
-`#[doc(hidden)]`, the crate documentation says there is no supported Rust API, and any
-of it can change in any release, patch releases included. Designing a public Rust API
-is not a goal for `1.0` either. The product is the binary; a designed library would be a
-second product with its own users, and nobody has asked for one.
+**Breaking** means:
 
-The contract above has held since `0.1.0`. Before it, while the version was `0.0.x`,
-cargo treated every release as breaking and so did this project; `ROADMAP.md`'s
-checklist for 0.1 is what had to hold to leave that behind, and its "After 0.1, towards
-1.0" section is what has to hold next.
+- removing or renaming a verb, a flag or a JSON field;
+- changing what an existing verb or flag does in a way a script relying on it would
+  notice, including its exit code;
+- writing a database that the previous patch release cannot open or would misread;
+- changing a generated-file marker or a default path, so that a newer release no longer
+  recognises what an older one wrote (or the other way round).
 
-Going back across a minor release is not part of the contract. In particular an Apache
-host cannot go back from `0.2.0` to `0.1.x` without removing what `0.2.0` wrote first;
-step 2 above has the details, and the `0.2.0` changelog has to repeat them.
+Adding a verb, a flag, a setting or a JSON field is not breaking.
 
-The MSRV in `Cargo.toml` (`rust-version`) is enforced by a dedicated CI job. Raising it
-changes who can build the program, so it waits for a minor release too; a dependency
-raising *its* MSRV shows up as that job going red.
+**Deprecating** is how something leaves without breaking anyone:
+
+1. In any minor release, the old name becomes a hidden alias of the new one (a hidden
+   clap alias for a verb or flag) and keeps working exactly as before.
+2. Using it prints one line to stderr: `warning: --old is deprecated, use --new; it will
+   be removed in 2.0.0`. Cron mails stderr, so a host run unattended hears about it
+   without anyone reading a changelog.
+3. The changelog lists it under **Deprecated** in that release.
+4. It is removed in the next major release, and listed under **Removed** there.
+
+Before `1.0.0` the same rules held within a minor (`0.1.x`, `0.2.x`); `0.x` minors could
+break, and `0.2.0` did. Going back across a minor release is not part of the contract.
+In particular an Apache host cannot go back from `0.2.0` to `0.1.x` without removing what
+`0.2.0` wrote first; step 2 above has the details, and the `0.2.0` changelog repeats them.
+
+### Supported platforms and Rust
+
+- **Platforms:** Debian and Ubuntu with systemd, from the APT repository, the release
+  binaries or `cargo install`. Arch Linux through the AUR and Gentoo through GURU, once
+  each is published from `packaging/`. Anything else may work (the binaries are static)
+  but is not tested.
+- **Security fixes** go into a new release of the latest minor only; nothing is
+  backported (see `SECURITY.md`).
+- **The MSRV** in `Cargo.toml` (`rust-version`) is enforced by a dedicated CI job. A
+  minor release may raise it, and says so in the changelog; a patch release never does.
+  A dependency raising *its* MSRV shows up as that job going red.
 
 ## The README's claims
 

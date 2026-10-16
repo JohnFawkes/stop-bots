@@ -139,7 +139,7 @@ curl -fsSL https://ivankovic.github.io/stop-bots/dists/stable/InRelease | head
 
 ## Releasing
 
-Do all seven steps, in order. An earlier draft of this section claimed the first release
+Do all eight steps, in order. An earlier draft of this section claimed the first release
 could start at step 3 because the version and changelog were already in place. The version
 was; the changelog was not. `0.0.1` had been written against the original scope in August
 and then sat untouched while five months of work accumulated under `Unreleased`, so
@@ -261,6 +261,21 @@ shipped with it. Step 2 is cheap to run and the only thing that catches that.
 
    Debian and Ubuntu are **not** in this step: the `.deb`s were built and published by
    step 5. `packaging/README.md` says which packages need a human and which do not.
+
+8. **Add the release's upgrade fixture**, so every later release is tested against
+   what this one wrote. Download the published `x86_64` tarball into an empty directory
+   outside the checkout, check it against `SHA256SUMS`, and record what that binary
+   writes:
+
+   ```
+   scripts/upgrade-fixture.sh /tmp/sb-0.0.1/stop-bots-0.0.1-x86_64-unknown-linux-musl/stop-bots 0.0.1
+   ```
+
+   The script's header has the download commands. It writes
+   `tests/fixtures/db/db-0.0.1.sql` and `tests/fixtures/upgrade/0.0.1/`; add `"0.0.1"`
+   to `RELEASES` in `tests/upgrade.rs`, run `cargo test --test upgrade`, and commit the
+   three together. Use the released binary, not one built from the tag: the fixture is
+   evidence of what users actually installed.
 
 If something is wrong before step 6, delete the tag and the release, fix it, and start
 again:

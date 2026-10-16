@@ -80,6 +80,9 @@ pub enum Job {
     /// Working out what "Apply everything" would change, before asking.
     /// See [`App::start_apply_preview`].
     PreviewApply,
+    /// Keeping or reverting an apply that was waiting for an answer. See
+    /// [`App::start_firewall_settle`].
+    SettleFirewall,
 }
 
 impl Job {
@@ -100,6 +103,7 @@ impl Job {
             Job::UpdateEverything => "downloading every list".to_string(),
             Job::RefreshCrawlerRanges(kind) => format!("downloading {}", kind.name()),
             Job::PreviewApply => "working out what applying would change".to_string(),
+            Job::SettleFirewall => "settling the firewall change".to_string(),
         }
     }
 }
@@ -249,6 +253,15 @@ pub struct App {
     /// outcome against that job rather than leaving it looking like it
     /// never ran. Same flag-then-finish shape as `apply_everything`.
     cron_apply_nginx: bool,
+    /// An apply that is loaded and waiting for "keep these firewall
+    /// rules?" — see [`crate::revert`]. Asked over every screen.
+    pub keep_firewall: Option<tui::keep_firewall::KeepFirewall>,
+    /// How long that question waits before the previous rules come back
+    /// (`tui --confirm-timeout`).
+    pub confirm_timeout: std::time::Duration,
+    /// The programs a keep or a revert runs. A field so a test can hand
+    /// it fakes.
+    pub revert_tools: crate::revert::Tools,
 }
 
 /// The state of one "Update everything", pressed or scheduled.
@@ -417,6 +430,9 @@ impl App {
             crawler_refresh_lease: None,
             apply_everything: false,
             cron_apply_nginx: false,
+            keep_firewall: None,
+            confirm_timeout: crate::revert::DEFAULT_TIMEOUT,
+            revert_tools: crate::revert::Tools::host(),
         };
         botlist::register_all_sources(&app.db)?;
         // Same reason bot-list sources are registered here: the Dashboard's
@@ -536,7 +552,10 @@ impl App {
     /// job's result) without needing a real terminal.
     fn handle_event(&mut self, event: Event) -> Result<()> {
         match event {
-            Event::Tick => self.check_cron()?,
+            Event::Tick => {
+                self.check_keep_firewall();
+                self.check_cron()?;
+            }
             Event::Crossterm(crossterm::event::Event::Key(key_event))
                 if key_event.kind == KeyEventKind::Press =>
             {
@@ -566,6 +585,9 @@ impl App {
             Event::App(AppEvent::NginxReloaded { result }) => self.finish_nginx_reload(result),
             Event::App(AppEvent::FirewallRendered { outcome }) => {
                 self.finish_firewall_render(*outcome)?
+            }
+            Event::App(AppEvent::FirewallSettled { result }) => {
+                self.finish_firewall_settle(result)?
             }
             Event::App(AppEvent::ApplyPreviewed { preview }) => self.finish_apply_preview(&preview),
             Event::App(AppEvent::SitesScanned { sites }) => self.finish_site_scan(sites)?,
@@ -1346,10 +1368,13 @@ impl App {
         // `App::ssh_log_text`, the cached copy Firewall draws from), the
         // write, and `nft -f`. The policy is `firewall::FirewallRun`'s,
         // shared with every other front-end.
+        // Always confirm-or-revert: someone is at this terminal, and an
+        // apply that cuts them off is what it is there for.
         let run = crate::firewall::FirewallRun::new(backend, out_path)
             .apply(apply)
             .for_real(self.apply_firewall)
             .force(force)
+            .confirm(Some(self.confirm_timeout))
             .protect(self.session_client.clone());
         let prepared = match crate::firewall::prepare(&self.db, run) {
             Ok(prepared) => prepared,
@@ -1384,8 +1409,73 @@ impl App {
         self.jobs_in_flight.remove(&Job::RenderFirewall);
         crate::firewall::record(&self.db, &outcome)?;
         self.message = Some(firewall_message(&outcome));
+        if let Some(pending) = outcome.pending() {
+            let left = pending.seconds_left(now_secs()).max(0) as u64;
+            self.keep_firewall = Some(tui::keep_firewall::KeepFirewall::new(
+                pending.clone(),
+                outcome.script.clone(),
+                outcome.signature.clone(),
+                std::time::Duration::from_secs(left),
+            ));
+        }
         // The signature the Dashboard's script row compares against has
         // just moved, so that row is stale wherever it is.
+        self.refresh()
+    }
+
+    /// Reverts an apply nobody answered for in time. The timer outside
+    /// this process fires at the same moment; whichever runs first
+    /// settles it, and the other finds nothing to do.
+    fn check_keep_firewall(&mut self) {
+        if self
+            .keep_firewall
+            .as_ref()
+            .is_some_and(|keep| keep.expired())
+        {
+            self.start_firewall_settle(crate::revert::Answer::NoAnswer);
+        }
+    }
+
+    /// Keeps or reverts the apply waiting in [`Self::keep_firewall`], as
+    /// `answer` says, on the blocking pool: a revert runs `nft -f`, and
+    /// both wait for the apply lock. No `Db` is involved until
+    /// [`Self::finish_firewall_settle`].
+    fn start_firewall_settle(&mut self, answer: crate::revert::Answer) {
+        let Some(keep) = &self.keep_firewall else {
+            return;
+        };
+        if self.jobs_in_flight.contains(&Job::SettleFirewall) {
+            return;
+        }
+        self.jobs_in_flight.insert(Job::SettleFirewall);
+        let (pending, script) = (keep.pending.clone(), keep.script.clone());
+        let tools = self.revert_tools.clone();
+        let sender = self.events.sender();
+        tokio::task::spawn_blocking(move || {
+            let result = crate::revert::settle(&tools, &pending, &script, answer)
+                .map_err(|err| format!("{err:#}"));
+            let _ = sender.send(Event::App(AppEvent::FirewallSettled { result }));
+        });
+    }
+
+    /// Closes the question and says how it ended. A kept apply is recorded
+    /// as applied now, which the Dashboard's script row reads.
+    fn finish_firewall_settle(
+        &mut self,
+        result: Result<crate::revert::Settled, String>,
+    ) -> Result<()> {
+        self.jobs_in_flight.remove(&Job::SettleFirewall);
+        let keep = self.keep_firewall.take();
+        self.message = Some(match result {
+            Ok(crate::revert::Settled::Kept(message)) => {
+                if let Some(keep) = keep {
+                    self.db.set_firewall_applied_signature(&keep.signature)?;
+                }
+                format!("{message}.")
+            }
+            Ok(settled) => format!("{}.", settled.message()),
+            Err(err) => format!("Firewall: {err}"),
+        });
         self.refresh()
     }
 
@@ -1781,6 +1871,13 @@ impl App {
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
             self.events.send(AppEvent::Quit);
+            return Ok(());
+        }
+
+        if self.keep_firewall.is_some() {
+            if let Some(answer) = tui::keep_firewall::KeepFirewall::answer(key) {
+                self.start_firewall_settle(answer);
+            }
             return Ok(());
         }
 
@@ -2993,6 +3090,125 @@ mod tests {
             "the stored backend was iptables, so the script must be a shell script"
         );
         assert!(!app.apply_everything, "the chain flag must be cleared");
+    }
+
+    /// An apply that has run with a revert armed — for real, against the
+    /// fakes in `dir` — as `finish_firewall_render` receives it. The apply
+    /// itself is the one step a unit test cannot run (`nft` is found on
+    /// `PATH`), so it is the one step set by hand.
+    fn awaiting_outcome(app: &mut App, dir: &std::path::Path) -> crate::firewall::FirewallOutcome {
+        app.revert_tools = crate::testing::fake_revert_tools(dir);
+        let applied = dir.join("fw.nft");
+        let run = crate::firewall::FirewallRun::new(FirewallBackend::Nftables, &applied)
+            .apply(true)
+            .for_real(false);
+        let prepared = crate::firewall::prepare(&app.db, run).unwrap();
+        let mut outcome =
+            crate::firewall::execute(prepared, crate::firewall::SshLog::Connected(Some(&[])));
+        let pending = crate::revert::arm(
+            &app.revert_tools,
+            FirewallBackend::Nftables,
+            &applied,
+            crate::revert::DEFAULT_TIMEOUT,
+            now_secs(),
+        )
+        .unwrap();
+        outcome.apply = crate::firewall::ApplyStep::AwaitingConfirmation(pending);
+        outcome
+    }
+
+    /// The apply comes back, wherever the operator is, and asks.
+    async fn applied_and_asking(app: &mut App, dir: &std::path::Path) {
+        let outcome = awaiting_outcome(app, dir);
+        app.handle_event(Event::App(AppEvent::FirewallRendered {
+            outcome: Box::new(outcome),
+        }))
+        .unwrap();
+        assert!(app.keep_firewall.is_some(), "the question should be open");
+    }
+
+    #[tokio::test]
+    async fn y_keeps_a_waiting_apply_and_records_it_as_applied() {
+        let mut app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        app.screen = Screen::Blocks;
+        applied_and_asking(&mut app, dir.path()).await;
+        let signature = app.keep_firewall.as_ref().unwrap().signature.clone();
+
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('y')))
+            .unwrap();
+        drain_background_work(&mut app).await;
+
+        let message = app.message.clone().unwrap_or_default();
+        assert!(
+            message.starts_with("Kept the new firewall rules"),
+            "message was: {message}"
+        );
+        assert!(app.keep_firewall.is_none(), "the question should be closed");
+        assert!(dir.path().join("fw.nft").exists(), "message was: {message}");
+        assert_eq!(
+            app.db.get_firewall_applied_signature().unwrap(),
+            Some(signature)
+        );
+    }
+
+    #[tokio::test]
+    async fn escape_reverts_a_waiting_apply_now() {
+        let mut app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        applied_and_asking(&mut app, dir.path()).await;
+
+        app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
+        drain_background_work(&mut app).await;
+
+        assert_eq!(
+            app.message.as_deref(),
+            Some(
+                "Reverted to no stop-bots firewall rules, as there were none before (you said no)."
+            )
+        );
+        assert!(!dir.path().join("fw.nft").exists(), "nothing was kept");
+        assert_eq!(app.db.get_firewall_applied_signature().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn nobody_answering_by_the_deadline_reverts() {
+        let mut app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        applied_and_asking(&mut app, dir.path()).await;
+        let keep = app.keep_firewall.take().unwrap();
+        app.keep_firewall = Some(tui::keep_firewall::KeepFirewall::new(
+            keep.pending,
+            keep.script,
+            keep.signature,
+            std::time::Duration::ZERO,
+        ));
+
+        app.check_keep_firewall();
+        drain_background_work(&mut app).await;
+
+        let message = app.message.clone().unwrap_or_default();
+        assert!(
+            message.contains("(no confirmation within 60 s)"),
+            "message was: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn while_asking_no_other_key_does_anything() {
+        let mut app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        applied_and_asking(&mut app, dir.path()).await;
+
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('5')))
+            .unwrap();
+
+        assert_eq!(app.screen, Screen::Dashboard, "the key went through");
+        assert!(app.keep_firewall.is_some(), "the question was closed");
+        assert!(
+            !app.jobs_in_flight.contains(&Job::SettleFirewall),
+            "the key answered the question"
+        );
     }
 
     /// `a` rewrites every site and runs the firewall script as root, so it

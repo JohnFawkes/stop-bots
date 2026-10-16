@@ -1005,20 +1005,30 @@ pub(crate) fn unsafe_directory(
 /// once; a second one waits briefly, then says another is applying.
 pub fn apply_script(backend: FirewallBackend, out_path: &Path) -> Result<()> {
     Installed::detect().check(backend)?;
+    run_script(backend, &crate::host::program(loader(backend)), out_path)
+}
+
+/// The program that runs `backend`'s script: `nft` (as `nft -f`) or `sh`.
+pub fn loader(backend: FirewallBackend) -> &'static str {
+    match backend {
+        FirewallBackend::Iptables => "sh",
+        FirewallBackend::Nftables => "nft",
+    }
+}
+
+/// [`apply_script`] with the loader given — `program` is `nft` or `sh`,
+/// per [`loader`] — and without the check that it is installed. For
+/// [`crate::revert`], whose tests hand it a fake.
+pub fn run_script(backend: FirewallBackend, program: &Path, out_path: &Path) -> Result<()> {
     let _lock = crate::applylock::hold()?;
-    let (program, args, what): (_, &[&str], _) = match backend {
-        FirewallBackend::Iptables => (
-            "sh",
-            &[],
-            "failed to run `sh` on the generated iptables script",
-        ),
+    let (args, what): (&[&str], _) = match backend {
+        FirewallBackend::Iptables => (&[], "failed to run `sh` on the generated iptables script"),
         FirewallBackend::Nftables => (
-            "nft",
             &["-f"],
             "failed to run `nft -f` on the generated nftables script",
         ),
     };
-    let output = std::process::Command::new(crate::host::program(program))
+    let output = std::process::Command::new(program)
         .args(args)
         .arg(out_path)
         .env("PATH", crate::host::path_with_sbin())
@@ -1060,13 +1070,19 @@ pub fn apply_script(backend: FirewallBackend, out_path: &Path) -> Result<()> {
 /// habit already points at. Moving the *rendered* one is what changes
 /// nothing for a host that upgrades.
 pub fn rendered_path(applied: &Path) -> std::path::PathBuf {
+    sibling_path(applied, "next")
+}
+
+/// `applied` with `tag` before its extension: `firewall.<tag>.nft`.
+/// [`rendered_path`] is `next`; [`crate::revert::previous_path`] is `prev`.
+pub fn sibling_path(applied: &Path, tag: &str) -> std::path::PathBuf {
     let stem = applied
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let name = match applied.extension() {
-        Some(ext) => format!("{stem}.next.{}", ext.to_string_lossy()),
-        None => format!("{stem}.next"),
+        Some(ext) => format!("{stem}.{tag}.{}", ext.to_string_lossy()),
+        None => format!("{stem}.{tag}"),
     };
     applied.with_file_name(name)
 }
@@ -1086,8 +1102,11 @@ pub fn rendered_path(applied: &Path) -> std::path::PathBuf {
 ///   connected client would be blocked, unless `force`. "The check could
 ///   not run" is not "the check passed", whoever is watching.
 /// - **An apply runs the rendered script and then promotes it** to
-///   `applied_path`, the file the boot unit loads. A failed apply promotes
-///   nothing.
+///   `applied_path`, the file the boot unit loads, keeping the one it
+///   replaces as [`crate::revert::previous_path`]. A failed apply promotes
+///   nothing. With `confirm`, a revert is armed first and nothing is
+///   promoted until the operator keeps it (see [`crate::revert`]).
+/// - **No apply runs while another waits to be kept**, whoever asks.
 /// - **The rendered signature is recorded on every write, the applied one
 ///   on every apply** (see [`record`]); a dry run records neither.
 ///
@@ -1119,6 +1138,12 @@ pub struct FirewallRun {
     /// Addresses the guard must treat as connected besides those the SSH
     /// log shows: see [`check_lockout_protecting`].
     pub protect: Vec<String>,
+    /// Confirm-or-revert: arm a revert that fires after this long before
+    /// running the script, and leave the applied script alone until the
+    /// operator keeps it ([`ApplyStep::AwaitingConfirmation`]). `None`
+    /// applies and promotes at once, as cron and scripts do. See
+    /// [`crate::revert`].
+    pub confirm: Option<std::time::Duration>,
 }
 
 impl FirewallRun {
@@ -1134,6 +1159,7 @@ impl FirewallRun {
             force: false,
             dry_run: false,
             protect: Vec::new(),
+            confirm: None,
         }
     }
 
@@ -1151,6 +1177,14 @@ impl FirewallRun {
 
     pub fn dry_run(self, dry_run: bool) -> Self {
         FirewallRun { dry_run, ..self }
+    }
+
+    /// Asks for confirm-or-revert with `timeout`, or not (`None`).
+    pub fn confirm(self, timeout: Option<std::time::Duration>) -> Self {
+        FirewallRun {
+            confirm: timeout,
+            ..self
+        }
     }
 
     /// Adds `addresses` to what the guard must not block.
@@ -1220,6 +1254,10 @@ pub enum ApplyStep {
     /// Ran, and the script is now the one loaded at boot (or, in a dry run,
     /// would be).
     Applied,
+    /// Ran, with a revert armed: the kernel has the new rules, the
+    /// applied script is still the previous one, and both stay that way
+    /// until [`crate::revert::keep`] or the revert settles it.
+    AwaitingConfirmation(crate::revert::Pending),
     /// Ran, but copying it over the applied script failed, so a reboot
     /// loads the previous one.
     AppliedNotSaved(String),
@@ -1329,14 +1367,20 @@ pub fn execute(prepared: Prepared, ssh_log: SshLog<'_>) -> FirewallOutcome {
         ApplyStep::Applied
     } else if let Some(busy) = busy {
         ApplyStep::Failed(busy)
+    } else if let Some(waiting) = crate::revert::waiting(&run.applied_path, now_secs()) {
+        // Applying over an unconfirmed change would make its revert put
+        // back the wrong rules: refused, whoever asks, cron included.
+        ApplyStep::Failed(waiting.blocking_message(now_secs()))
+    } else if let Some(timeout) = run.confirm {
+        apply_with_revert(&run, timeout)
     } else {
         match apply_script(run.backend, &run.rendered_path) {
             Err(err) => ApplyStep::Failed(format!("{err:#}")),
             Ok(()) if run.rendered_path == run.applied_path => ApplyStep::Applied,
-            Ok(()) => match write_script(&run.applied_path, &built.script) {
-                Ok(()) => ApplyStep::Applied,
+            Ok(()) => match crate::revert::promote(&run.applied_path, &built.script) {
+                Ok(_) => ApplyStep::Applied,
                 Err(err) => ApplyStep::AppliedNotSaved(format!(
-                    "could not copy it to {}: {err}",
+                    "could not copy it to {}: {err:#}",
                     run.applied_path.display()
                 )),
             },
@@ -1361,6 +1405,33 @@ pub fn execute(prepared: Prepared, ssh_log: SshLog<'_>) -> FirewallOutcome {
     }
 }
 
+/// The confirm-or-revert apply. The revert is armed *before* the script
+/// runs, so there is no moment at which the new rules are loaded and
+/// nothing will take them out again. Nothing is promoted to the applied
+/// script: that is [`crate::revert::keep`]'s, once someone has said so —
+/// which also means a reboot before then loads the previous rules.
+fn apply_with_revert(run: &FirewallRun, timeout: std::time::Duration) -> ApplyStep {
+    let tools = crate::revert::Tools::host();
+    let pending =
+        match crate::revert::arm(&tools, run.backend, &run.applied_path, timeout, now_secs()) {
+            Ok(pending) => pending,
+            Err(err) => {
+                return ApplyStep::Failed(format!(
+                    "could not arm the automatic revert, so nothing was applied: {err:#}"
+                ));
+            }
+        };
+    match apply_script(run.backend, &run.rendered_path) {
+        Ok(()) => ApplyStep::AwaitingConfirmation(pending),
+        Err(err) => {
+            // `nft -f` and `iptables-restore` change nothing when they
+            // fail, so there is nothing for the revert to undo.
+            crate::revert::disarm(&tools, &pending);
+            ApplyStep::Failed(format!("{err:#}"))
+        }
+    }
+}
+
 /// Records what `outcome` wrote and applied: the rendered signature on a
 /// write, the applied one on an apply. A dry run records nothing.
 pub fn record(db: &Db, outcome: &FirewallOutcome) -> Result<()> {
@@ -1370,7 +1441,8 @@ pub fn record(db: &Db, outcome: &FirewallOutcome) -> Result<()> {
     if outcome.write == WriteStep::Written {
         db.set_firewall_rendered_signature(&outcome.signature)?;
     }
-    if outcome.applied() {
+    // An apply waiting for confirmation is recorded once it is kept.
+    if outcome.applied() && !outcome.awaiting_confirmation() {
         db.set_firewall_applied_signature(&outcome.signature)?;
     }
     Ok(())
@@ -1390,8 +1462,23 @@ impl FirewallOutcome {
         !self.dry_run
             && matches!(
                 self.apply,
-                ApplyStep::Applied | ApplyStep::AppliedNotSaved(_)
+                ApplyStep::Applied
+                    | ApplyStep::AppliedNotSaved(_)
+                    | ApplyStep::AwaitingConfirmation(_)
             )
+    }
+
+    /// The revert armed for this apply, while nobody has kept it.
+    pub fn pending(&self) -> Option<&crate::revert::Pending> {
+        match &self.apply {
+            ApplyStep::AwaitingConfirmation(pending) => Some(pending),
+            _ => None,
+        }
+    }
+
+    /// Whether this apply is loaded but not yet kept.
+    pub fn awaiting_confirmation(&self) -> bool {
+        self.pending().is_some()
     }
 
     /// Whether the guard refused something — the write or the apply — so a
@@ -1406,7 +1493,10 @@ impl FirewallOutcome {
         self.write == WriteStep::Written
             && matches!(
                 self.apply,
-                ApplyStep::NotAsked | ApplyStep::NotForReal | ApplyStep::Applied
+                ApplyStep::NotAsked
+                    | ApplyStep::NotForReal
+                    | ApplyStep::Applied
+                    | ApplyStep::AwaitingConfirmation(_)
             )
     }
 
@@ -1494,6 +1584,10 @@ impl FirewallOutcome {
             ApplyStep::Applied => out.push_str(&format!(
                 "; {}applied, and {applied} is what loads at boot",
                 if self.dry_run { "would be " } else { "" }
+            )),
+            ApplyStep::AwaitingConfirmation(pending) => out.push_str(&format!(
+                "; applied, and put back as it was in {} s unless you keep it",
+                pending.seconds_left(now_secs())
             )),
             ApplyStep::AppliedNotSaved(err) => out.push_str(&format!(
                 "; applied, but {err}, so a reboot loads the previous rules"

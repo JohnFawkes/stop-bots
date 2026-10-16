@@ -26,6 +26,7 @@ pub mod dashboard;
 pub mod explain;
 pub mod firewall;
 pub mod help;
+pub mod keep_firewall;
 pub mod nginx;
 pub mod palette;
 pub mod site_detail;
@@ -471,6 +472,13 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     }
     if let Some(explain) = &app.explain {
         explain.render(frame, body, app.theme);
+    }
+    // Over everything: until it is answered, nothing else takes a key.
+    if let Some(keep) = &app.keep_firewall {
+        let settling = app
+            .jobs_in_flight
+            .contains(&crate::app::Job::SettleFirewall);
+        keep.render(frame, body, app.theme, settling);
     }
 
     render_footer(app, frame, footer);

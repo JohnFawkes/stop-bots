@@ -440,7 +440,7 @@ pub fn run(plan: &Plan, target: Target, options: &Options) -> Report {
     // 2. The live rules. See the module docs for why before NGINX.
     if target.firewall() {
         if plan.host {
-            remove_nft_table(plan, options, &mut report);
+            remove_nft_table(&plan.nft, options, &mut report);
             for iptables in &plan.iptables {
                 remove_iptables_chain(options, &mut report, iptables);
             }
@@ -525,17 +525,52 @@ fn name_of(program: &Path) -> String {
         .unwrap_or_else(|| program.display().to_string())
 }
 
-fn remove_nft_table(plan: &Plan, options: &Options, report: &mut Report) {
+/// Takes this project's live rules out of the kernel for `backend` and
+/// nothing else: the nft table, or the iptables and ip6tables chains with
+/// every jump into them. What [`crate::revert`] does when there was no
+/// applied script to go back to. `iptables` is `iptables` and `ip6tables`.
+pub fn remove_live_rules(
+    backend: crate::firewall::FirewallBackend,
+    nft: &Path,
+    iptables: &[PathBuf],
+) -> Result<()> {
+    let options = Options::default();
+    let mut report = Report::default();
+    match backend {
+        crate::firewall::FirewallBackend::Nftables => {
+            remove_nft_table(nft, &options, &mut report);
+        }
+        crate::firewall::FirewallBackend::Iptables => {
+            for program in iptables {
+                remove_iptables_chain(&options, &mut report, program);
+            }
+        }
+    }
+    let failed: Vec<String> = report
+        .steps
+        .iter()
+        .filter_map(|step| match &step.outcome {
+            Outcome::Failed(err) => Some(format!("{}: {err}", step.what)),
+            _ => None,
+        })
+        .collect();
+    if !failed.is_empty() {
+        anyhow::bail!("{}", failed.join("; "));
+    }
+    Ok(())
+}
+
+fn remove_nft_table(nft: &Path, options: &Options, report: &mut Report) {
     let [family, table] = NFT_TABLE;
     let what = format!("nft delete table {family} {table}");
     // Asked, not assumed: `nft` missing, or no such table, is nothing to
     // do. Either way the listing fails, and neither is a failure here.
-    if run_program(&plan.nft, &["list", "table", family, table]).is_err() {
+    if run_program(nft, &["list", "table", family, table]).is_err() {
         report.skip(what, format!("there is no {family} {table} table"));
         return;
     }
     report.step(options, what, || {
-        run_program(&plan.nft, &["delete", "table", family, table]).map(|_| ())
+        run_program(nft, &["delete", "table", family, table]).map(|_| ())
     });
 }
 

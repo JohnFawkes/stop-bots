@@ -188,7 +188,14 @@ fn fake_tools(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let bin = dir.join("fakebin");
     fs::create_dir_all(&bin).unwrap();
     let log = dir.join("calls.log");
-    for tool in ["nginx", "apache2ctl", "systemctl", "nft", "docker"] {
+    for tool in [
+        "nginx",
+        "apache2ctl",
+        "systemctl",
+        "nft",
+        "docker",
+        "systemd-run",
+    ] {
         let path = bin.join(tool);
         fs::write(
             &path,
@@ -2007,6 +2014,93 @@ fn a_failed_apply_leaves_the_boot_script_as_it_was() {
         fs::read_to_string(&applied).unwrap(),
         "# what was applied last week\n"
     );
+}
+
+/// `render-firewall --apply` against a fake `nft`, writing the applied
+/// script to `applied`, with no terminal on stdin — as from cron.
+fn apply_without_a_terminal(tmp: &Path, bin: &Path, applied: &Path) {
+    stop_bots_bin()
+        .env("PATH", path_with(bin))
+        .args(["render-firewall", "--apply"])
+        .args(["--db", tmp.join("db.sqlite3").to_str().unwrap()])
+        .args(["--out", applied.to_str().unwrap()])
+        .args(["--ssh-log", "tests/fixtures/logs/auth.log"])
+        .assert()
+        .success();
+}
+
+/// Confirm-or-revert needs someone to answer. Cron and scripts have no
+/// terminal, so they apply as they always did: no timer, no record, and
+/// the new script is the boot script at once.
+#[test]
+fn without_a_terminal_an_apply_arms_no_revert() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bin, calls) = fake_tools(tmp.path());
+    let applied = tmp.path().join("firewall.nft");
+
+    apply_without_a_terminal(tmp.path(), &bin, &applied);
+
+    let log = fs::read_to_string(&calls).unwrap_or_default();
+    assert!(!log.contains("systemd-run"), "calls were:\n{log}");
+    assert!(
+        !tmp.path().join("firewall.nft.pending").exists(),
+        "no revert should be waiting"
+    );
+    assert!(applied.exists(), "the apply is the boot script at once");
+}
+
+/// Every apply keeps the applied script it replaces beside it, so the
+/// rules from before the last apply are always one command away.
+#[test]
+fn an_apply_keeps_the_script_it_replaces_as_prev() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bin, _calls) = fake_tools(tmp.path());
+    let applied = tmp.path().join("firewall.nft");
+    fs::write(&applied, "# what was applied last week\n").unwrap();
+
+    apply_without_a_terminal(tmp.path(), &bin, &applied);
+
+    assert_eq!(
+        fs::read_to_string(tmp.path().join("firewall.prev.nft"))
+            .ok()
+            .as_deref(),
+        Some("# what was applied last week\n")
+    );
+}
+
+/// `revert-firewall` by hand, with nothing waiting: loads the previous
+/// script and swaps the two files, so a second run goes forward again.
+#[test]
+fn revert_firewall_goes_back_to_the_previous_script() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bin, calls) = fake_tools(tmp.path());
+    let applied = tmp.path().join("firewall.nft");
+    let previous = tmp.path().join("firewall.prev.nft");
+    fs::write(&applied, "# new\n").unwrap();
+    fs::write(&previous, "# old\n").unwrap();
+
+    stop_bots_bin()
+        .env("PATH", path_with(&bin))
+        .args(["revert-firewall", "--backend", "nftables"])
+        .args(["--db", tmp.path().join("db.sqlite3").to_str().unwrap()])
+        .args(["--out", applied.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Reverted to the previous firewall rules",
+        ));
+
+    let log = fs::read_to_string(&calls).unwrap();
+    assert_eq!(log.trim(), format!("nft -f {}", previous.display()));
+    let files = [(&applied, "# old\n"), (&previous, "# new\n")];
+    for (path, expected) in files {
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            expected,
+            "{}",
+            path.display()
+        );
+    }
 }
 
 #[test]

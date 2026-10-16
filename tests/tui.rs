@@ -1359,33 +1359,51 @@ fn dashboard_geo_mode_only_trusted_ips() {
         .expect("process should exit after q on the Dashboard");
 }
 
+/// Fake `nft`, `systemd-run` and `systemctl` in `dir/fakebin`, each
+/// appending `<name> <args>` to `dir/calls.log` and succeeding: the
+/// programs a confirm-or-revert apply drives. `systemd-run` must be one of
+/// them — the real one would be asked to start a timer on this machine.
+fn fake_firewall_tools(dir: &Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let fakebin = dir.join("fakebin");
+    std::fs::create_dir_all(&fakebin).unwrap();
+    let calls = dir.join("calls.log");
+    for tool in ["nft", "systemd-run", "systemctl"] {
+        std::fs::write(
+            fakebin.join(tool),
+            format!(
+                "#!/bin/sh\necho \"{tool} $*\" >> \"{}\"\nexit 0\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(fakebin.join(tool), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    (fakebin, calls)
+}
+
+/// The programs the fakes saw, one call a line.
+fn calls(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
 /// The one code path in the whole project that *executes* a generated
 /// firewall script — the render popup's "apply after writing" toggle —
-/// driven end to end against a fake `nft` on PATH. Everything real runs:
-/// the popup, the path editing, the render, the write, the process spawn,
-/// the exit-code handling; only the binary that PATH resolves is ours.
+/// driven end to end against a fake `nft` on PATH, and kept when asked.
+/// Everything real runs: the popup, the path editing, the render, the
+/// write, arming the revert, the process spawn, the exit-code handling;
+/// only the binaries PATH resolves are ours.
 #[test]
-fn dashboard_render_popup_applies_the_script_through_nft() {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
+fn dashboard_render_popup_arms_a_revert_applies_and_keeps_on_y() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("db.sqlite3");
     let out_path = tmp.path().join("fw.nft");
-
-    // A fake nft that records its argv and succeeds.
-    let fakebin = tmp.path().join("fakebin");
-    fs::create_dir_all(&fakebin).unwrap();
-    let calls = tmp.path().join("calls.log");
-    fs::write(
-        fakebin.join("nft"),
-        format!(
-            "#!/bin/sh\necho \"nft $@\" >> \"{}\"\nexit 0\n",
-            calls.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(fakebin.join("nft"), fs::Permissions::from_mode(0o755)).unwrap();
+    let (fakebin, log) = fake_firewall_tools(tmp.path());
 
     let mut session = spawn_tui_with_fake_tools(&db_path, &fakebin);
     session.exp_string("Dashboard").unwrap();
@@ -1407,23 +1425,106 @@ fn dashboard_render_popup_applies_the_script_through_nft() {
     // to nftables).
     send_key(&mut session, " ");
     send_key(&mut session, "\r");
-    session.exp_string("applied").unwrap();
+    session.exp_string("Reverting").unwrap();
+    assert!(
+        !out_path.exists(),
+        "nothing is the boot script until it is kept"
+    );
+    send_key(&mut session, "y");
+    session.exp_string("Kept").unwrap();
 
-    // The rendered script is what runs; once it has, it is copied to the
-    // path the popup named, which is the one a boot unit loads.
+    // Armed, then applied, then disarmed — in that order.
     let rendered = tmp.path().join("fw.next.nft");
-    let log = fs::read_to_string(&calls).expect("nft should have been invoked");
-    assert_eq!(log.trim(), format!("nft -f {}", rendered.display()));
-    let script = fs::read_to_string(&out_path).expect("the applied script should be in place");
-    assert!(script.contains("table"), "script was: {script}");
+    let seen = calls(&log);
+    let programs: Vec<&str> = seen
+        .iter()
+        .map(|call| call.split(' ').next().unwrap())
+        .collect();
     assert_eq!(
-        fs::read_to_string(&rendered).unwrap(),
+        programs,
+        ["systemd-run", "nft", "systemctl"],
+        "calls were: {seen:#?}"
+    );
+    assert_eq!(seen[1], format!("nft -f {}", rendered.display()));
+    assert!(
+        seen[0].contains("revert-firewall")
+            && seen[2].starts_with("systemctl stop stop-bots-revert-"),
+        "calls were: {seen:#?}"
+    );
+    let script = std::fs::read_to_string(&out_path).expect("the kept script should be in place");
+    assert_eq!(
+        std::fs::read_to_string(&rendered).unwrap(),
         script,
         "what runs at boot must be what was applied"
     );
 
     send_key(&mut session, "q");
     session.exp_eof().unwrap();
+}
+
+/// `render-firewall --apply` on a terminal: the same question, asked on
+/// the command line. Without a terminal (every test in `tests/cli.rs`) it
+/// is never asked.
+fn spawn_render_firewall_apply(tmp: &Path, fakebin: &Path) -> PtySession {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stop-bots"));
+    cmd.args(["render-firewall", "--apply"])
+        .args(["--db", tmp.join("db.sqlite3").to_str().unwrap()])
+        .args(["--out", tmp.join("fw.nft").to_str().unwrap()])
+        .args(["--ssh-log", "tests/fixtures/logs/auth.log"])
+        .env("PATH", path_with(fakebin))
+        .env("STOP_BOTS_HOST_CONF", generated_dir("host.conf"))
+        .env("STOP_BOTS_SSH_CLIENT", "")
+        .env_remove("STOP_BOTS_DB");
+    network_tripwire().route(&mut cmd);
+    spawn_in_pty(cmd, 32, 200, Duration::from_millis(timeout_ms()))
+}
+
+#[test]
+fn render_firewall_apply_on_a_terminal_keeps_the_rules_on_y() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (fakebin, log) = fake_firewall_tools(tmp.path());
+
+    let mut session = spawn_render_firewall_apply(tmp.path(), &fakebin);
+    session.exp_string("Reverting").unwrap();
+    send_key(&mut session, "y\n");
+    session.exp_string("Kept").unwrap();
+    session.exp_eof().unwrap();
+
+    let seen = calls(&log);
+    assert!(
+        seen.first()
+            .is_some_and(|call| call.starts_with("systemd-run")),
+        "the revert should be armed before anything runs; calls were: {seen:#?}"
+    );
+    assert!(
+        tmp.path().join("fw.nft").exists(),
+        "a kept apply is the boot script"
+    );
+}
+
+#[test]
+fn render_firewall_apply_on_a_terminal_reverts_on_n() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (fakebin, log) = fake_firewall_tools(tmp.path());
+
+    let mut session = spawn_render_firewall_apply(tmp.path(), &fakebin);
+    session.exp_string("Reverting").unwrap();
+    send_key(&mut session, "n\n");
+    session.exp_string("Reverted").unwrap();
+    session.exp_eof().unwrap();
+
+    // There was no applied script before, so "the previous rules" are no
+    // stop-bots table at all.
+    let seen = calls(&log);
+    assert!(
+        seen.iter()
+            .any(|call| call == "nft delete table inet stop_bots"),
+        "calls were: {seen:#?}"
+    );
+    assert!(
+        !tmp.path().join("fw.nft").exists(),
+        "a reverted apply never becomes the boot script"
+    );
 }
 
 /// Screen 5 lists a rule no other screen shows — one the CLI added — with

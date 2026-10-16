@@ -111,6 +111,11 @@ pub struct BatchOptions {
     /// `--no-fetch --apply` is a reasonable pair. It also makes this whole
     /// module testable without a network.
     pub no_fetch: bool,
+    /// Confirm-or-revert ([`crate::revert`]): arm a revert, apply, and ask
+    /// on the terminal whether to keep the new firewall rules, within this
+    /// long. `None` — no terminal, `--no-confirm`, every cron entry —
+    /// applies as it always did.
+    pub confirm: Option<std::time::Duration>,
     /// The host settings: the NGINX commands, and the logs to read where
     /// no flag names them. See [`crate::hostconf`].
     pub host: crate::hostconf::HostConf,
@@ -403,6 +408,7 @@ fn render_and_apply_firewall(db: &Db, options: &BatchOptions) -> Step {
     let run = firewall::FirewallRun::new(options.backend, &options.out)
         .apply(options.apply)
         .force(options.force)
+        .confirm(options.confirm)
         .protect(crate::sshlog::session_client());
     // Wherever `LogPaths` says the SSH log is: `--ssh-log` first, then the
     // stored path, then a search.
@@ -410,6 +416,9 @@ fn render_and_apply_firewall(db: &Db, options: &BatchOptions) -> Step {
     let outcome =
         firewall::render_and_apply(db, run, firewall::SshLog::Read(&source)).and_then(|outcome| {
             let summary = outcome.summary();
+            if let Some(pending) = outcome.pending() {
+                return settle_on_terminal(db, &outcome, pending);
+            }
             if outcome.succeeded() {
                 Ok(summary)
             } else if outcome.refused() && matches!(outcome.guard, firewall::Guard::NoLogins { .. })
@@ -433,6 +442,29 @@ fn render_and_apply_firewall(db: &Db, options: &BatchOptions) -> Step {
     step
 }
 
+/// Asks whether to keep an apply that is waiting for it, and settles it
+/// as answered: a kept one is recorded as applied, a reverted one fails
+/// the step.
+fn settle_on_terminal(
+    db: &Db,
+    outcome: &firewall::FirewallOutcome,
+    pending: &crate::revert::Pending,
+) -> Result<String> {
+    use crate::revert::Settled;
+    crate::say!("firewall: {}.", outcome.summary());
+    let timeout = std::time::Duration::from_secs(pending.timeout_secs().max(1) as u64);
+    let answer = crate::revert::ask_on_terminal(timeout);
+    let tools = crate::revert::Tools::host();
+    match crate::revert::settle(&tools, pending, &outcome.script, answer)? {
+        Settled::Kept(message) => {
+            db.set_firewall_applied_signature(&outcome.signature)?;
+            Ok(message)
+        }
+        Settled::Reverted(message) => Err(anyhow::anyhow!("{message}")),
+        Settled::Nothing(message) => Ok(message),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +481,7 @@ mod tests {
             access_log: Some(dir.join("no-access.log")),
             force: false,
             no_fetch: true,
+            confirm: None,
             host: crate::hostconf::HostConf::default(),
         }
     }

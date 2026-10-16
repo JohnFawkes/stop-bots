@@ -277,9 +277,12 @@ Roughly in the order they would matter to a user:
 4. **A resource benchmark in CI**: a 1 GB log and 100k ranges, with budgets.
 5. **Upgrade tests from every released 0.x** database and generated file.
 6. **IPv6 for iptables**, or an explicit IPv4-only backend with nftables as the
-   recommendation.
+   recommendation. *Done:* the script loads IPv6 rules with `ip6tables-restore` into a
+   `STOP-BOTS` chain of the same shape, and fails loudly on a host without `ip6tables`
+   (`the_iptables_backend_loads_ipv6_rules_into_ip6tables` in `tests/container.rs`).
 7. **SSH detection on key-only hosts**: `Connection closed by authenticating user …
-   [preauth]` and `maximum authentication attempts exceeded`.
+   [preauth]` and `maximum authentication attempts exceeded`. *Done:* `sshlog.rs`
+   counts both.
 8. **One job layer for the TUI and `tick`.** The TUI starts each scheduled job on a
    background thread and `tick` runs them in line; both go through `cron.rs`, but the
    dispatch exists twice (`App::check_cron` and `cron::tick`).

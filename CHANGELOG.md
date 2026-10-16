@@ -8,6 +8,12 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Fixed
+
+- **SSH scanners on a host that takes keys only** are counted when they reach sshd's
+  `MaxAuthTries`: `maximum authentication attempts exceeded for …` is now read as a failed
+  login. Such a scanner leaves no `Failed` line, so before this only its disconnect counted.
+
 ### Added
 
 - **A question when no one has logged in over SSH.** The TUI's "Apply everything" asks

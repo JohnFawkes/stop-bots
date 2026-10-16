@@ -39,9 +39,6 @@ eventually ask for, with the reason it isn't there.
   bot override is only visible once you open its detail view.
 * **`FirewallRule` has no protocol field.** Ports always render as TCP, in both
   backends, though bot traffic can be UDP.
-* **`iptables::render` skips IPv6 rules entirely.** Fine while `nftables` covers
-  both families; IPv6 on iptables would mean generating a second `ip6tables`
-  script, not extending this one.
 * **`Theme::detect` only reads `COLORFGBG`.** Everything else gets the dark
   default and the manual `c` toggle.
 * **No quit confirmation.** `q` on the Dashboard exits immediately, which is

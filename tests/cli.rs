@@ -2857,6 +2857,52 @@ fn a_batch_dry_run_says_what_would_change_and_changes_nothing() {
     assert_eq!(db.get_firewall_rendered_signature().unwrap(), None);
 }
 
+/// With no SSH login on record, Only trusted IPs blocks whoever connects
+/// next. The dry run says so, and that the apply would be refused, rather
+/// than "lockout check passed".
+#[test]
+fn a_batch_dry_run_with_no_ssh_logins_refuses_a_rule_that_blocks_everyone() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    fixture.write_site("example.com");
+    fixture.run(&["set-geo-mode", "--mode", "allowlist"]);
+    let empty_log = fixture.managed.with_file_name("auth.log");
+    fs::write(&empty_log, "").unwrap();
+    let out = fixture.firewall_script();
+
+    let output = fixture
+        .cmd(&[
+            "batch",
+            "--no-fetch",
+            "--apply",
+            "--dry-run",
+            "--root",
+            fixture.nginx_root.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--ssh-log",
+            empty_log.to_str().unwrap(),
+            "--access-log",
+            "/dev/null",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for (what, expected) in [
+        ("why", "no one has logged in over SSH"),
+        ("the rule", "0.0.0.0/0"),
+        ("the verdict", "would not be applied"),
+        ("the way past it", "set-ssh-lockout-check --enabled false"),
+    ] {
+        assert!(stdout.contains(expected), "no {what} in:\n{stdout}");
+    }
+    assert!(
+        !stdout.contains("lockout check passed"),
+        "nobody was checked:\n{stdout}"
+    );
+}
+
 /// And `--diff` shows how: the site's new block and the script's rules.
 #[test]
 fn a_batch_dry_run_with_diff_prints_every_change() {

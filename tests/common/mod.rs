@@ -63,7 +63,10 @@ pub fn stop_bots_bin() -> Command {
         // The host settings file is `/etc/stop-bots/host.conf` otherwise,
         // which a test must neither read nor write. A test that sets one
         // points this at a file of its own.
-        .env("STOP_BOTS_HOST_CONF", generated_dir("host.conf"));
+        .env("STOP_BOTS_HOST_CONF", generated_dir("host.conf"))
+        // The lockout check counts the SSH session it runs in as
+        // connected; not the one a developer runs the tests from.
+        .env("STOP_BOTS_SSH_CLIENT", "");
     for name in NetworkTripwire::UNSET {
         cmd.env_remove(name);
     }

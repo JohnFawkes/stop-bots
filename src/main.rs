@@ -891,6 +891,24 @@ enum Command {
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
+    /// Check every firewall apply against the addresses that log in over SSH.
+    ///
+    /// On by default. Every apply, by hand or by cron, is refused when its
+    /// rules would block an address that logged in over SSH in the last
+    /// week, or the session it runs in. When no one has logged in for a
+    /// week, an apply whose rules block every address not listed
+    /// (Allowlist, Only trusted IPs) is refused too, as it would block
+    /// whoever connects next.
+    ///
+    /// Turn it off on a server you never log into over SSH, such as one you
+    /// reach through your provider's console. Addresses that do log in are
+    /// still let through ahead of every block; only the check is skipped.
+    #[command(name = "set-ssh-lockout-check")]
+    SetSshLockoutCheck {
+        /// Whether applies are checked against SSH logins
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
     /// Serve humans and nothing else.
     ///
     /// Blocks every catalogued bot whatever its category, and gives any
@@ -1732,6 +1750,7 @@ async fn run() -> Result<()> {
         Some(Command::SetAutoApply { enabled }) => set_auto_apply(db, enabled),
         Some(Command::SetAutoApplyFirewall { enabled }) => set_auto_apply_firewall(db, enabled),
         Some(Command::SetCloudPort80 { enabled }) => set_cloud_port_80(db, enabled),
+        Some(Command::SetSshLockoutCheck { enabled }) => set_ssh_lockout_check(db, enabled),
         Some(Command::SetHumansOnly { enabled }) => set_humans_only(db, enabled),
         Some(Command::SetOldBrowsers { enabled }) => set_old_browsers(db, enabled),
         Some(Command::ShowRobotsTxt) => show_robots_txt(db),
@@ -2142,7 +2161,8 @@ fn preview_batch(db_path: Option<PathBuf>, request: BatchRequest, diff: bool) ->
     let (backend, out) = firewall_target(&db, request.backend, request.out)?;
     let run = stop_bots::firewall::FirewallRun::new(backend, out)
         .apply(request.apply)
-        .force(request.force);
+        .force(request.force)
+        .protect(stop_bots::sshlog::session_client());
     // The flag, else the path `set-log-paths` stored, else the search.
     let source = host.log_paths().ssh(request.ssh_log.as_deref());
     let preview = stop_bots::preview::apply_everything(
@@ -2160,6 +2180,13 @@ fn preview_batch(db_path: Option<PathBuf>, request: BatchRequest, diff: bool) ->
     );
     for line in preview.lines() {
         say!("{line}");
+    }
+    if preview
+        .firewall
+        .as_ref()
+        .is_ok_and(|outcome| matches!(outcome.guard, stop_bots::firewall::Guard::NoLogins { .. }))
+    {
+        say!("{}.", stop_bots::firewall::NO_LOGINS_CLI_FIX);
     }
     if diff {
         say_inline!("{}", preview.diff());
@@ -2860,6 +2887,21 @@ fn set_cloud_port_80(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
     db.set_cloud_port_80_open(enabled)?;
     say!("{}", cloud_port_80_line(enabled));
     say!("Run render-firewall, then apply the script, to enforce it.");
+    Ok(())
+}
+
+fn set_ssh_lockout_check(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    db.set_ssh_lockout_check(enabled)?;
+    if enabled {
+        say!("The SSH lock-out check is on: every firewall apply is checked against SSH logins.");
+    } else {
+        say!(
+            "The SSH lock-out check is off: firewall applies are no longer checked against SSH \
+             logins. Addresses that log in over SSH are still let through. \
+             `stop-bots status` warns if someone logs in over SSH while it is off."
+        );
+    }
     Ok(())
 }
 
@@ -3780,7 +3822,12 @@ fn report_lockout_guard(outcome: &stop_bots::firewall::FirewallOutcome) {
             }
         ),
         stop_bots::firewall::Guard::Ran(risks) if !risks.is_empty() => print_lockout_warning(risks),
-        stop_bots::firewall::Guard::Ran(_) => {}
+        stop_bots::firewall::Guard::NoLogins { .. } => say_err!(
+            "Note: {}. {}.",
+            outcome.guard.describe(),
+            stop_bots::firewall::NO_LOGINS_CLI_FIX
+        ),
+        stop_bots::firewall::Guard::Ran(_) | stop_bots::firewall::Guard::Off => {}
     }
 }
 
@@ -3852,7 +3899,8 @@ fn render_firewall(db_path: Option<PathBuf>, request: RenderRequest) -> Result<(
     let (backend, applied) = firewall_target(&db, request.backend, named)?;
     let mut run = stop_bots::firewall::FirewallRun::new(backend, applied)
         .apply(request.apply)
-        .force(request.force);
+        .force(request.force)
+        .protect(stop_bots::sshlog::session_client());
     if let (Some(out), false) = (&request.out, request.apply) {
         run = run.rendered_at(out);
     }

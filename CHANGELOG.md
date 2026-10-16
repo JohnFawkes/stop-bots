@@ -8,6 +8,26 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Added
+
+- **A question when no one has logged in over SSH.** The TUI's "Apply everything" asks
+  "Do you log into this server over SSH?" before its preview when the SSH log holds no
+  login from the last week. Answering no turns the lock-out check off, which is also a
+  new row on the Dashboard (SSH lock-out check) and a new command,
+  `set-ssh-lockout-check --enabled true|false`. Addresses that log in over SSH are still
+  let through with the check off, and `status` warns if anyone logs in while it is off.
+- The lock-out check counts the SSH session the TUI or CLI runs in as connected, read
+  from its environment (it still works under `sudo`), so a log that rotated or a journal
+  that keeps nothing no longer hides it.
+
+### Fixed
+
+- **An SSH log with no login in it passed the lock-out check.** It said "lockout check
+  passed: … no connected client would be blocked" when no one had been checked at all.
+  It now says no one was checked, and refuses an apply whose rules block every address
+  not listed (Allowlist, Only trusted IPs), since that blocks whoever connects next.
+  This also applies to `batch --apply` and auto-apply.
+
 ## [0.2.1] — 2026-10-15
 
 A fix worth taking if a host renews a Let's Encrypt certificate over HTTP and has the

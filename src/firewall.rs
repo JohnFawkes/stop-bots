@@ -365,9 +365,21 @@ pub enum Guard {
     /// The SSH log was read. These currently-connected `(ip,
     /// matching_rule_address)` pairs would end up blocked; empty is a pass.
     Ran(Vec<(String, String)>),
+    /// The SSH log was read, but no one has logged in over SSH in the last
+    /// week, so there was no client to check the rules against.
+    /// `catch_all` is the rule that drops every address not allowed ahead
+    /// of it, when there is one: with no client known, that is the one
+    /// rule certain to block whoever connects next, so it refuses. Without
+    /// one, nothing in the rules can be shown to block anyone in
+    /// particular, and it passes.
+    NoLogins { catch_all: Option<String> },
     /// No SSH log could be found or read, so there was nothing to check
     /// against. Not a risk in itself, and not a pass either.
     LogUnreadable,
+    /// Turned off by someone who said they never log in over SSH
+    /// (`set-ssh-lockout-check`, or the TUI's question when there are no
+    /// logins). The SSH-login Allows are still written.
+    Off,
 }
 
 impl Guard {
@@ -376,13 +388,20 @@ impl Guard {
     pub fn risks(&self) -> &[(String, String)] {
         match self {
             Guard::Ran(risks) => risks,
-            Guard::LogUnreadable => &[],
+            Guard::NoLogins { .. } | Guard::LogUnreadable | Guard::Off => &[],
         }
     }
 
-    /// Whether the guard ran *and* found nothing.
+    /// Whether the apply may go ahead: the guard ran and found nothing,
+    /// found no one to check and no rule that blocks everyone, or was
+    /// turned off.
     pub fn passed(&self) -> bool {
-        matches!(self, Guard::Ran(risks) if risks.is_empty())
+        match self {
+            Guard::Ran(risks) => risks.is_empty(),
+            Guard::NoLogins { catch_all } => catch_all.is_none(),
+            Guard::LogUnreadable => false,
+            Guard::Off => true,
+        }
     }
 
     /// One line for any front-end: what the guard found.
@@ -400,11 +419,45 @@ impl Guard {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Guard::NoLogins { catch_all: None } => format!(
+                "lockout check found no one to check: no one has logged in over SSH in the last \
+                 {NO_LOGINS_DAYS} days, and no rule blocks every address"
+            ),
+            Guard::NoLogins {
+                catch_all: Some(rule),
+            } => format!(
+                "lockout check FAILED: no one has logged in over SSH in the last \
+                 {NO_LOGINS_DAYS} days, and {rule} blocks every address not allowed ahead of it, \
+                 so whoever connects next is blocked"
+            ),
             Guard::LogUnreadable => "lockout check could not run: no SSH log could be read \
                                      (pass --ssh-log, or run as root)"
                 .to_string(),
+            Guard::Off => "lockout check is off: you said you never log in over SSH \
+                           (`stop-bots set-ssh-lockout-check --enabled true` turns it back on)"
+                .to_string(),
         }
     }
+}
+
+/// What the CLI says gets past [`Guard::NoLogins`].
+pub const NO_LOGINS_CLI_FIX: &str = "Trust the address you log in from \
+    (`stop-bots trust --address <address>`), or, if you never log in over SSH, turn the check off \
+    (`stop-bots set-ssh-lockout-check --enabled false`)";
+
+/// The SSH login window, in days, as the guard's messages say it.
+const NO_LOGINS_DAYS: i64 = crate::db::SSH_LOGIN_WINDOW_SECONDS / 86_400;
+
+/// The first rule that drops every address of a family not allowed ahead
+/// of it: an enabled, port-less Block of a `/0`, which Allowlist and Only
+/// trusted IPs end with.
+fn catch_all(rules: &[FirewallRule]) -> Option<&FirewallRule> {
+    rules.iter().find(|rule| {
+        rule.enabled
+            && rule.port.is_none()
+            && rule.action != FirewallAction::Allow
+            && rule.address.trim().ends_with("/0")
+    })
 }
 
 /// Where the lockout guard gets its SSH log.
@@ -458,6 +511,11 @@ pub fn check_lockout_protecting(
                 if !connected.contains(address) {
                     connected.push(address.clone());
                 }
+            }
+            if connected.is_empty() {
+                return Guard::NoLogins {
+                    catch_all: catch_all(rules).map(|rule| rule.address.clone()),
+                };
             }
             Guard::Ran(lockout_risks(rules, &connected))
         }
@@ -1119,6 +1177,8 @@ pub struct Prepared {
     pub built: BuiltFirewall,
     /// [`rules_signature`] of `built.rules`, for [`record`].
     pub signature: String,
+    /// Whether to run the lockout check at all: [`Db::get_ssh_lockout_check`].
+    pub lockout_check: bool,
 }
 
 /// Reads and renders: the database half of a run. Fails before anything
@@ -1131,6 +1191,7 @@ pub fn prepare(db: &Db, run: FirewallRun) -> Result<Prepared> {
         run,
         built,
         signature,
+        lockout_check: db.get_ssh_lockout_check()?,
     })
 }
 
@@ -1209,8 +1270,13 @@ pub fn execute(prepared: Prepared, ssh_log: SshLog<'_>) -> FirewallOutcome {
         run,
         built,
         signature,
+        lockout_check,
     } = prepared;
-    let guard = check_lockout_protecting(&built.rules, ssh_log, &run.protect);
+    let guard = if lockout_check {
+        check_lockout_protecting(&built.rules, ssh_log, &run.protect)
+    } else {
+        Guard::Off
+    };
     let previous = std::fs::read_to_string(&run.applied_path).ok();
     let change = rule_change(previous.as_deref(), &built.script);
 
@@ -1352,6 +1418,12 @@ impl FirewallOutcome {
             Guard::LogUnreadable => {
                 "no SSH log could be read, so the lockout check could not run".to_string()
             }
+            Guard::NoLogins { catch_all } => format!(
+                "no one has logged in over SSH in the last {NO_LOGINS_DAYS} days, so there is \
+                 no address to keep open, and {} would block whoever connects next",
+                catch_all.as_deref().unwrap_or("a catch-all rule")
+            ),
+            Guard::Off => "the lockout check is off".to_string(),
             Guard::Ran(risks) => format!(
                 "it would block {} connected SSH client(s): {}",
                 risks.len(),
@@ -2125,10 +2197,93 @@ mod tests {
     #[test]
     fn the_guard_reads_text_it_is_handed() {
         let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
-        assert!(check_lockout(&rules, SshLog::Text(Some(""))).passed());
+        assert_eq!(
+            check_lockout(&rules, SshLog::Text(Some(CONNECTED))),
+            Guard::Ran(vec![("4.5.6.7".to_string(), "4.5.6.0/24".to_string())])
+        );
         assert_eq!(
             check_lockout(&rules, SshLog::Text(None)),
             Guard::LogUnreadable
+        );
+    }
+
+    /// An empty log used to read as "lockout check passed: no connected
+    /// client would be blocked", which was true only because nobody was
+    /// checked. It still lets narrow blocks through, as nothing in them can
+    /// be shown to block anyone, but it says that nobody was checked.
+    #[test]
+    fn a_log_with_no_logins_is_not_reported_as_a_pass() {
+        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
+
+        let guard = check_lockout(&rules, SshLog::Text(Some("")));
+
+        assert_eq!(guard, Guard::NoLogins { catch_all: None });
+        assert!(guard.passed(), "{}", guard.describe());
+        assert!(
+            !guard.describe().contains("passed"),
+            "an unchecked apply must not read as a pass: {}",
+            guard.describe()
+        );
+    }
+
+    /// Allowlist and Only trusted IPs end in a `/0` Block. With no login
+    /// to keep open, that rule blocks whoever connects next, whoever it is.
+    #[test]
+    fn no_logins_and_a_rule_that_blocks_everyone_is_refused() {
+        let rules = vec![
+            rule("192.0.2.0/24", FirewallAction::Allow),
+            rule("0.0.0.0/0", FirewallAction::Block),
+        ];
+
+        let guard = check_lockout(&rules, SshLog::Text(Some("")));
+
+        assert_eq!(
+            guard,
+            Guard::NoLogins {
+                catch_all: Some("0.0.0.0/0".to_string())
+            }
+        );
+        assert!(!guard.passed(), "{}", guard.describe());
+    }
+
+    /// A login the database recorded is someone to check, even when the
+    /// log itself has rotated since.
+    #[test]
+    fn a_recorded_login_is_checked_when_the_log_has_none() {
+        let rules = vec![rule("0.0.0.0/0", FirewallAction::Block)];
+
+        let guard =
+            check_lockout_protecting(&rules, SshLog::Text(Some("")), &["192.0.2.9".to_string()]);
+
+        assert_eq!(
+            guard,
+            Guard::Ran(vec![("192.0.2.9".to_string(), "0.0.0.0/0".to_string())])
+        );
+    }
+
+    #[test]
+    fn a_turned_off_check_lets_the_apply_through_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run) = blocking_the_admin(dir.path());
+        db.set_ssh_lockout_check(false).unwrap();
+
+        let outcome =
+            render_and_apply(&db, run.apply(true), SshLog::Text(Some(CONNECTED))).unwrap();
+
+        assert_eq!(outcome.guard, Guard::Off);
+        assert_eq!(
+            outcome.apply,
+            ApplyStep::NotForReal,
+            "{}",
+            outcome.summary()
+        );
+        assert!(
+            outcome
+                .lines()
+                .iter()
+                .any(|line| line.contains("lockout check is off")),
+            "{:?}",
+            outcome.lines()
         );
     }
 
@@ -2634,6 +2789,13 @@ mod tests {
                 "log unreadable, forced",
                 None,
                 true,
+                WriteStep::Written,
+                ApplyStep::NotForReal,
+            ),
+            (
+                "nobody logged in",
+                Some(""),
+                false,
                 WriteStep::Written,
                 ApplyStep::NotForReal,
             ),

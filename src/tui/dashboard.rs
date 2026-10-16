@@ -181,6 +181,12 @@ enum ProtectionRow {
     /// switching one of the others on. The NGINX half of the same
     /// question lives on NGINX, beside the config it applies.
     AutoApplyFirewall,
+    /// Whether every apply is checked against the addresses that log in
+    /// over SSH (`Db::get_ssh_lockout_check`). Beside auto-apply because
+    /// it is the other half of the same question: what stands between a
+    /// rendered script and the kernel. Switching it off asks first — see
+    /// [`Popup::NoLogins`].
+    LockoutCheck,
 }
 
 impl ProtectionRow {
@@ -217,6 +223,17 @@ enum Popup {
         diff: std::sync::Arc<[String]>,
         show_diff: bool,
         scroll: usize,
+    },
+    /// "Do you log into this server over SSH?": keep the lock-out check on
+    /// (0), or turn it off (1). Asked before the apply preview when the
+    /// SSH log was read and no one has logged in over SSH, as the check
+    /// then has no one to protect, and asked by the
+    /// [`ProtectionRow::LockoutCheck`] row before switching it off.
+    /// `preview` is the apply this came from, which keeping the check
+    /// goes on to show; `None` from the row.
+    NoLogins {
+        preview: Option<std::sync::Arc<crate::preview::ApplyPreview>>,
+        selected: usize,
     },
     Category {
         category: Category,
@@ -311,6 +328,9 @@ pub struct Dashboard {
     /// `ProtectionRow::AutoApplyFirewall` row, the same way every other
     /// value this panel shows is loaded in `refresh`.
     auto_apply_firewall: bool,
+    /// `Db::get_ssh_lockout_check`, for the `ProtectionRow::LockoutCheck`
+    /// row.
+    ssh_lockout_check: bool,
     /// Whether this host serves humans only. Drives both the extra
     /// detector row and the greying of the three category rows.
     humans_only: bool,
@@ -364,6 +384,7 @@ impl Dashboard {
         self.reputation = db.list_reputation_sources()?;
         self.crawlers = ipranges::crawler_sources(db)?;
         self.auto_apply_firewall = db.get_auto_apply_firewall()?;
+        self.ssh_lockout_check = db.get_ssh_lockout_check()?;
         self.cron_status = crate::cron::status(db)?;
         self.script_state = crate::firewall::script_state(db)?;
         self.rule_count = crate::firewall::all_rules(db)?.len();
@@ -885,7 +906,10 @@ impl Dashboard {
             .filter(|detector| *detector != Detector::RobotsTxt || self.humans_only)
             .map(ProtectionRow::Detect)
             .chain((0..self.reputation.len()).map(ProtectionRow::Feed))
-            .chain(std::iter::once(ProtectionRow::AutoApplyFirewall))
+            .chain([
+                ProtectionRow::AutoApplyFirewall,
+                ProtectionRow::LockoutCheck,
+            ])
             .collect()
     }
 
@@ -898,6 +922,7 @@ impl Dashboard {
                 .map(|s| s.name.clone())
                 .unwrap_or_default(),
             ProtectionRow::AutoApplyFirewall => "Auto-apply the script".to_string(),
+            ProtectionRow::LockoutCheck => "SSH lock-out check".to_string(),
         }
     }
 
@@ -910,6 +935,7 @@ impl Dashboard {
                 .unwrap_or(false),
             ProtectionRow::Feed(i) => self.reputation.get(i).is_some_and(|s| s.enabled),
             ProtectionRow::AutoApplyFirewall => self.auto_apply_firewall,
+            ProtectionRow::LockoutCheck => self.ssh_lockout_check,
         }
     }
 
@@ -923,7 +949,9 @@ impl Dashboard {
             // Feeds have no TTL: their blocks are derived fresh at
             // render time from the stored ranges, so there's nothing to
             // expire.
-            ProtectionRow::Feed(_) | ProtectionRow::AutoApplyFirewall => 0,
+            ProtectionRow::Feed(_)
+            | ProtectionRow::AutoApplyFirewall
+            | ProtectionRow::LockoutCheck => 0,
         }
     }
 
@@ -941,7 +969,7 @@ impl Dashboard {
             },
             // No TTL and no count — the state is the whole story, and the
             // tag already carries it.
-            ProtectionRow::AutoApplyFirewall => String::new(),
+            ProtectionRow::AutoApplyFirewall | ProtectionRow::LockoutCheck => String::new(),
             _ if self.protection_enabled(row) => format!(" {}d", self.protection_ttl_days(row)),
             ProtectionRow::Detect(detector) if self.new_detectors.contains(&detector) => {
                 " new".to_string()
@@ -1021,6 +1049,15 @@ impl Dashboard {
                 selected,
                 theme,
             ),
+            Popup::NoLogins { preview, selected } => {
+                let catch_all = preview.as_ref().and_then(|preview| {
+                    match &preview.firewall.as_ref().ok()?.guard {
+                        crate::firewall::Guard::NoLogins { catch_all } => catch_all.clone(),
+                        _ => None,
+                    }
+                });
+                render_no_logins(frame, area, preview.is_some(), catch_all, selected, theme)
+            }
             Popup::Category { category, selected } => render_option_list(
                 frame,
                 area,
@@ -1142,6 +1179,7 @@ impl Dashboard {
                 Popup::GeoMode { .. } => self.handle_geo_mode_popup_key(key, db, message),
                 Popup::RenderFirewall { .. } => self.handle_render_firewall_popup_key(key),
                 Popup::ConfirmApply { .. } => self.handle_confirm_apply_popup_key(key, message),
+                Popup::NoLogins { .. } => self.handle_no_logins_popup_key(key, db, message),
             };
         }
 
@@ -1400,6 +1438,24 @@ impl Dashboard {
     ) -> Result<KeyOutcome> {
         if let ProtectionRow::Feed(i) = row {
             return self.commit_feed(db, i, selected == 1, message);
+        }
+        if row == ProtectionRow::LockoutCheck {
+            if selected == 0 {
+                // Off only once asked: see `Popup::NoLogins`.
+                self.popup = Some(Popup::NoLogins {
+                    preview: None,
+                    selected: 0,
+                });
+                return Ok(KeyOutcome::Consumed);
+            }
+            db.set_ssh_lockout_check(true)?;
+            self.ssh_lockout_check = true;
+            *message = Some(
+                "SSH lock-out check on \u{2014} every apply is checked against the addresses \
+                 that log in over SSH"
+                    .to_string(),
+            );
+            return Ok(KeyOutcome::Mutated);
         }
         if row == ProtectionRow::AutoApplyFirewall {
             let on = selected == 1;
@@ -1790,7 +1846,24 @@ impl Dashboard {
 
     /// Opens "Apply everything"'s confirmation with `preview` in it — `App`
     /// works the preview out off the event loop and hands it back here.
+    /// When the lock-out check found no one to check, it asks about that
+    /// first: see [`Popup::NoLogins`].
     pub fn show_apply_preview(&mut self, preview: &crate::preview::ApplyPreview) {
+        if preview
+            .firewall
+            .as_ref()
+            .is_ok_and(|outcome| matches!(outcome.guard, crate::firewall::Guard::NoLogins { .. }))
+        {
+            self.popup = Some(Popup::NoLogins {
+                preview: Some(std::sync::Arc::new(preview.clone())),
+                selected: 0,
+            });
+            return;
+        }
+        self.show_confirm_apply(preview);
+    }
+
+    fn show_confirm_apply(&mut self, preview: &crate::preview::ApplyPreview) {
         self.popup = Some(Popup::ConfirmApply {
             server: preview.server,
             lines: preview.lines().into(),
@@ -1798,6 +1871,62 @@ impl Dashboard {
             show_diff: false,
             scroll: 0,
         });
+    }
+
+    /// See [`Popup::NoLogins`]. Keeping the check goes on to the preview
+    /// it came from; turning it off previews again, so the verdict shown is
+    /// the one the apply will get.
+    fn handle_no_logins_popup_key(
+        &mut self,
+        key: KeyEvent,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(Popup::NoLogins { preview, selected }) = &mut self.popup else {
+            unreachable!("dispatched on this variant")
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                let applying = preview.is_some();
+                self.popup = None;
+                *message = Some(
+                    if applying {
+                        "Nothing applied."
+                    } else {
+                        "SSH lock-out check left on."
+                    }
+                    .to_string(),
+                );
+            }
+            KeyCode::Up | KeyCode::Char('k') => *selected = 0,
+            KeyCode::Down | KeyCode::Char('j') => *selected = 1,
+            KeyCode::Enter | KeyCode::Char(' ') if *selected == 0 => {
+                let preview = preview.take();
+                self.popup = None;
+                match preview {
+                    Some(preview) => self.show_confirm_apply(&preview),
+                    None => *message = Some("SSH lock-out check left on.".to_string()),
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let applying = preview.is_some();
+                self.popup = None;
+                db.set_ssh_lockout_check(false)?;
+                self.ssh_lockout_check = false;
+                *message = Some(
+                    "SSH lock-out check off \u{2014} addresses that log in over SSH are still let \
+                     through, and `stop-bots status` warns if anyone does"
+                        .to_string(),
+                );
+                return Ok(if applying {
+                    KeyOutcome::PreviewApplyEverything
+                } else {
+                    KeyOutcome::Mutated
+                });
+            }
+            _ => {}
+        }
+        Ok(KeyOutcome::Consumed)
     }
 
     #[cfg(test)]
@@ -2107,6 +2236,80 @@ fn policy_tag(policy: Policy) -> Span<'static> {
 /// someone edits the text inside one — and then the thing that gets cut
 /// off is a key hint or a validation message, i.e. the part that was
 /// there to be read.
+/// [`Popup::NoLogins`]: why it asks, then the two answers. `applying` when
+/// it stands in front of an apply's preview, rather than the Dashboard
+/// row; `catch_all` is the rule that would block whoever connects next.
+fn render_no_logins(
+    frame: &mut Frame,
+    area: Rect,
+    applying: bool,
+    catch_all: Option<String>,
+    selected: usize,
+    theme: Theme,
+) {
+    let days = crate::db::SSH_LOGIN_WINDOW_SECONDS / 86_400;
+    let mut text: Vec<Line> = Vec::new();
+    if applying {
+        text.push(
+            format!(
+                "No one has logged in over SSH in the last {days} days, so the lock-out check \
+                 has no address of yours to keep open."
+            )
+            .into(),
+        );
+        if let Some(rule) = catch_all {
+            text.push("".into());
+            text.push(
+                format!(
+                    "These rules end in {rule}, which blocks every address not allowed ahead of \
+                     it: whoever connects next over SSH is blocked, so the firewall half of this \
+                     apply is refused while the check is on. Trust your address on the Firewall \
+                     screen first."
+                )
+                .yellow()
+                .into(),
+            );
+        }
+    } else {
+        text.push(
+            "The lock-out check stops any apply that would block an address that logged in over \
+             SSH in the last week."
+                .into(),
+        );
+    }
+    text.push("".into());
+    text.push(
+        "If you never log in over SSH, because you use your provider's console, you can turn it \
+         off. Addresses that do log in are still let through."
+            .into(),
+    );
+    text.push("".into());
+    text.push("Do you log into this server over SSH?".bold().into());
+    let options = [
+        "Yes, keep the check on",
+        "No, I never log in over SSH: turn the check off",
+    ];
+    for (i, option) in options.into_iter().enumerate() {
+        let line = Line::from(format!("  {option}"));
+        text.push(if i == selected { line.reversed() } else { line });
+    }
+    text.push("".into());
+    text.push(Line::from("\u{2191}/\u{2193} choose  Enter confirm  Esc cancel").fg(theme.dim()));
+
+    let width = area.width.saturating_sub(4).min(76);
+    let inner = width.saturating_sub(2).max(1) as usize;
+    let height: usize = text
+        .iter()
+        .map(|line| line.width().div_ceil(inner).max(1))
+        .sum();
+    let popup_area = centered_rect(width, height as u16 + 2, area);
+    let paragraph = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .block(crate::tui::popup("No successful SSH logins", theme));
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(paragraph, popup_area);
+}
+
 /// "Apply everything"'s confirmation: the summary on top, wrapped, and the
 /// diff below it when asked for, drawn a screenful at a time from `scroll`
 /// — a first apply's firewall diff is tens of thousands of lines, and only
@@ -3235,6 +3438,145 @@ mod tests {
         );
     }
 
+    /// A preview whose lock-out check read an SSH log with no login in it.
+    fn preview_with_no_logins(db: &Db, dir: &std::path::Path) -> crate::preview::ApplyPreview {
+        let run = crate::firewall::FirewallRun::new(
+            crate::firewall::FirewallBackend::Nftables,
+            dir.join("firewall.nft"),
+        )
+        .apply(true)
+        .dry_run(true);
+        crate::preview::ApplyPreview {
+            server: crate::webserver::WebServer::Nginx,
+            nginx: Ok(Vec::new()),
+            firewall: crate::firewall::render_and_apply(
+                db,
+                run,
+                crate::firewall::SshLog::Text(Some("")),
+            )
+            .map_err(|err| format!("{err:#}")),
+        }
+    }
+
+    /// With no SSH login to check against, the apply asks whether anyone
+    /// logs in over SSH before it shows what it would change; keeping the
+    /// check goes on to that preview.
+    #[test]
+    fn an_apply_with_no_ssh_logins_asks_first_and_keeping_the_check_shows_the_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        let mut message = None;
+
+        dashboard.show_apply_preview(&preview_with_no_logins(&db, dir.path()));
+        assert!(
+            matches!(dashboard.popup, Some(Popup::NoLogins { .. })),
+            "{:?}",
+            dashboard.popup
+        );
+
+        let outcome = dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        assert!(dashboard.confirm_apply_is_open(), "{:?}", dashboard.popup);
+        assert!(db.get_ssh_lockout_check().unwrap(), "keeping it left it on");
+    }
+
+    /// Turning it off previews again, so the confirmation shows the
+    /// verdict the apply will get.
+    #[test]
+    fn answering_no_ssh_turns_the_check_off_and_previews_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        let mut message = None;
+        dashboard.show_apply_preview(&preview_with_no_logins(&db, dir.path()));
+
+        for code in [KeyCode::Down, KeyCode::Enter] {
+            let outcome = dashboard
+                .handle_key(KeyEvent::from(code), &db, &mut message)
+                .unwrap();
+            if code == KeyCode::Enter {
+                assert_eq!(outcome, KeyOutcome::PreviewApplyEverything);
+            }
+        }
+
+        assert!(!db.get_ssh_lockout_check().unwrap());
+        assert!(dashboard.popup.is_none(), "{:?}", dashboard.popup);
+    }
+
+    /// The question, both answers and the way out all fit the smallest
+    /// terminal the pty tests drive, with the catch-all warning in.
+    #[test]
+    fn the_no_logins_question_fits_with_its_answers() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_no_logins(
+                    frame,
+                    frame.area(),
+                    true,
+                    Some("0.0.0.0/0".to_string()),
+                    0,
+                    Theme::Dark,
+                )
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content: String = (0..buffer.area.height)
+            .map(|y| {
+                let row: String = (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                row + "\n"
+            })
+            .collect();
+        for needle in [
+            "No successful SSH logins",
+            "0.0.0.0/0",
+            "Do you log into this server over SSH?",
+            "Yes, keep the check on",
+            "No, I never log in over SSH",
+            "Esc cancel",
+        ] {
+            assert!(content.contains(needle), "{needle:?} missing:\n{content}");
+        }
+    }
+
+    /// The Dashboard row turns the check on at once, and off only once
+    /// asked.
+    #[test]
+    fn the_lockout_check_row_asks_before_switching_off() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        let mut message = None;
+
+        let outcome = dashboard
+            .commit_protection(&db, ProtectionRow::LockoutCheck, 0, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        assert!(
+            db.get_ssh_lockout_check().unwrap(),
+            "not off before the answer"
+        );
+        for code in [KeyCode::Down, KeyCode::Enter] {
+            dashboard
+                .handle_key(KeyEvent::from(code), &db, &mut message)
+                .unwrap();
+        }
+        assert!(!db.get_ssh_lockout_check().unwrap(), "{message:?}");
+
+        dashboard
+            .commit_protection(&db, ProtectionRow::LockoutCheck, 1, &mut message)
+            .unwrap();
+        assert!(db.get_ssh_lockout_check().unwrap(), "{message:?}");
+    }
+
     /// In the confirmation, Enter is the only key that applies; the others
     /// read, scroll or leave.
     #[test]
@@ -3898,9 +4240,9 @@ mod tests {
         let detectors = Detector::ALL.len() - 1;
         assert_eq!(
             rows.len(),
-            // ...plus the one `AutoApplyFirewall` row, which sits after
-            // the feeds and is not one.
-            detectors + ReputationSourceKind::ALL.len() + 1
+            // ...plus the `AutoApplyFirewall` and `LockoutCheck` rows,
+            // which sit after the feeds and are not ones.
+            detectors + ReputationSourceKind::ALL.len() + 2
         );
         assert!(rows[..detectors].iter().all(|r| r.is_detector()));
         assert!(rows[detectors..].iter().all(|r| !r.is_detector()));
@@ -4223,7 +4565,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         let rows = dashboard.protection_rows();
-        assert_eq!(rows.len(), 16, "if this changes, so does the panel height");
+        assert_eq!(rows.len(), 17, "if this changes, so does the panel height");
         for row in rows {
             let label = dashboard.protection_label(row);
             assert!(content.contains(&label), "{label:?} is not on screen");

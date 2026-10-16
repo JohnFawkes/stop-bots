@@ -2085,6 +2085,17 @@ impl Db {
         self.set_bool_setting(keys::CLOUD_PORT_80_OPEN, open)
     }
 
+    /// Whether every firewall apply is checked against the addresses that
+    /// log in over SSH (see `firewall::check_lockout`). On unless someone
+    /// said they never log in over SSH.
+    pub fn get_ssh_lockout_check(&self) -> Result<bool> {
+        self.get_bool_setting(keys::SSH_LOCKOUT_CHECK, true)
+    }
+
+    pub fn set_ssh_lockout_check(&self, on: bool) -> Result<()> {
+        self.set_bool_setting(keys::SSH_LOCKOUT_CHECK, on)
+    }
+
     pub fn get_serve_robots_txt(&self) -> Result<bool> {
         self.get_bool_setting(keys::SERVE_ROBOTS_TXT, false)
     }

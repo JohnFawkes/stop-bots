@@ -96,6 +96,7 @@ pub fn check_label(check: &Check) -> &'static str {
         "nginx-deployment" => "runtime",
         "firewall-reaches-containers" => "containers",
         "ssh-login-allowlist" => "ssh",
+        "ssh-lockout-check" => "lockout",
         "lets-encrypt-reachable" => "certs",
         "trusted" => "trusted",
         "skipped-entries" => "skipped",

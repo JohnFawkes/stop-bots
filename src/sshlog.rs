@@ -259,6 +259,13 @@ enum AuthKind {
     GaveUp,
 }
 
+/// The opening of the line sshd logs when a client reaches `MaxAuthTries`:
+/// `maximum authentication attempts exceeded for [invalid user ]<user> from
+/// <ip> port <n> ssh2 [preauth]`, at error level, so newer sshds put
+/// `error: ` in front. On a host that takes keys only, a scanner offering
+/// key after key leaves this and a disconnect, and no `Failed` line.
+const MAX_TRIES: &str = "maximum authentication attempts exceeded for ";
+
 /// The openings of [`AuthKind::GaveUp`]'s two forms.
 const GAVE_UP: [&str; 2] = [
     "Connection closed by authenticating user ",
@@ -312,6 +319,18 @@ fn parse_auth_line(line: &str) -> Option<AuthLine<'_>> {
             kind: AuthKind::GaveUp,
             user,
             ip: ip.parse().ok()?,
+        });
+    }
+    let max_tries = message
+        .strip_prefix("error: ")
+        .unwrap_or(message)
+        .strip_prefix(MAX_TRIES);
+    if let Some(rest) = max_tries {
+        let (user, ip) = split_address(rest)?;
+        return Some(AuthLine {
+            kind: AuthKind::Failed,
+            user: user.strip_prefix("invalid user ").unwrap_or(user),
+            ip,
         });
     }
     let (kind, rest) = if let Some(rest) = message.strip_prefix("Accepted ") {
@@ -397,7 +416,13 @@ fn split_port(text: &str, at: usize) -> Option<(&str, &str)> {
 /// of identical failures still counts (once, as it did before this parser
 /// read lines from their start).
 fn sshd_message(line: &str) -> Option<&str> {
-    const MARKERS: [&str; 3] = ["Accepted ", "Failed ", "Invalid user "];
+    const MARKERS: [&str; 5] = [
+        "Accepted ",
+        "Failed ",
+        "Invalid user ",
+        MAX_TRIES,
+        "error: maximum authentication attempts exceeded for ",
+    ];
     if MARKERS
         .iter()
         .chain(&GAVE_UP)
@@ -776,6 +801,33 @@ Jun 12 01:00:01 host sshd[100]: Received disconnect from 198.51.100.1 port 4444:
 Jun 12 01:00:02 host sshd[100]: Connection closed by authenticating user root 198.51.100.1 port 4444 [preauth]
 ";
         assert!(parse_accepted_ips(log).is_empty());
+    }
+
+    /// A key-only host: a scanner offering key after key leaves no
+    /// `Failed` line, only this one once it reaches `MaxAuthTries`.
+    #[test]
+    fn reaching_max_auth_tries_counts_as_a_failure() {
+        for (what, line) in [
+            (
+                "syslog",
+                "Jun 12 01:00:00 host sshd[100]: error: maximum authentication attempts exceeded for root from 198.51.100.1 port 4444 ssh2 [preauth]",
+            ),
+            (
+                "an invalid user",
+                "Jun 12 01:00:00 host sshd-session[100]: maximum authentication attempts exceeded for invalid user admin from 198.51.100.1 port 4444 ssh2 [preauth]",
+            ),
+            (
+                "journalctl -o cat",
+                "error: maximum authentication attempts exceeded for root from 198.51.100.1 port 4444 ssh2 [preauth]",
+            ),
+        ] {
+            assert_eq!(
+                failed_attempt_ips(line),
+                vec!["198.51.100.1".parse::<IpAddr>().unwrap()],
+                "{what}: {line}"
+            );
+            assert!(parse_accepted_ips(line).is_empty(), "{what} is not a login");
+        }
     }
 
     #[test]

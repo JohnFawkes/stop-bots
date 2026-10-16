@@ -934,7 +934,7 @@ impl Dashboard {
                 )
             })
             .warn(format!(
-                "It {}. Blocking Microsoft also blocks Bingbot.",
+                "It {}.",
                 hosting::warning()
             ))
             .para(

@@ -86,15 +86,10 @@ pub const HOSTING_PROVIDERS: &[HostingProvider] = &[
     provider(63949, "Akamai Linode"),
     // M247
     provider(9009, "M247"),
-    // MICROSOFT-CORP-MSN-AS-BLOCK
-    HostingProvider {
-        asn: 8075,
-        name: "Microsoft Azure",
-        note: Some(
-            "This is all of Microsoft, not only Azure: Bingbot crawls from it, and Outlook \
-             and Microsoft 365 send from it.",
-        ),
-    },
+    // Microsoft (AS8075) is left out on purpose: it is all of Microsoft,
+    // not only Azure, so Bingbot crawls from it and Outlook and Microsoft
+    // 365 send from it. `add-hosting-asn --asn 8075` adds it for someone
+    // who means that.
     // ORACLE-BMC-31898
     provider(31898, "Oracle Cloud"),
     // OVH

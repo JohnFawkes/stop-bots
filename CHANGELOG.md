@@ -15,7 +15,7 @@ back, put back the copy the upgrade kept, `/var/lib/stop-bots/db.sqlite3.bak-v7`
 ### Added
 
 - **Block whole hosting providers by AS number.** Hetzner, OVHcloud, Contabo,
-  Microsoft Azure, Akamai Linode, Vultr, Oracle Cloud, Alibaba Cloud, Tencent Cloud,
+  Akamai Linode, Vultr, Oracle Cloud, Alibaba Cloud, Tencent Cloud,
   Scaleway, Leaseweb, M247 and Hostinger are on a built-in list, and
   `add-hosting-asn --asn <n>` takes any other. Their ranges come from iptoasn.com's
   public-domain table, downloaded once for all of them (about 9 MB) by
@@ -27,8 +27,8 @@ back, put back the copy the upgrade kept, `/var/lib/stop-bots/db.sqlite3.bak-v7`
   Dashboard, one "Hosting providers" row under Automatic blocking opens the list to
   tick, `status` warns about a provider that is chosen but not downloaded yet, and
   the Firewall screen's detail view names the provider an address belongs to. Off
-  by default. Blocking Microsoft blocks all of Microsoft, Bingbot included, and says
-  so.
+  by default. Microsoft is not on the list: its network is also Bingbot's and
+  Microsoft 365's (`add-hosting-asn --asn 8075` adds it anyway).
 
 - **`status` says whether your sites serve their secrets.** The probe-paths detector
   blocks whoever asks for `/.env`; the new `exposed-files` check says whether they got

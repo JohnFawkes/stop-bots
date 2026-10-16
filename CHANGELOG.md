@@ -8,9 +8,23 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
-**Before upgrading:** the database gains a schema version (the hosting-provider
-tables), and 0.3.0 refuses the upgraded database rather than misreading it. To go
-back, put back the copy the upgrade kept, `/var/lib/stop-bots/db.sqlite3.bak-v7`.
+## [0.4.0] — 2026-10-16
+
+More ways to catch bots, and one that checks your own sites: a `status` check for secrets
+your sites serve, whole hosting providers blocked by network, three new detectors from the
+access log, a port-scan detector that covers the whole host, and probe paths for
+applications a host does not run.
+
+**Before upgrading:** the database gains a schema version (the hosting-provider tables), and
+0.3.0 refuses the upgraded database rather than misreading it. To go back, put back the copy
+the upgrade kept, `/var/lib/stop-bots/db.sqlite3.bak-v7`, then install the older release.
+
+**After upgrading:** everything here that blocks more arrives off on an existing install, and
+the Dashboard marks it new. Login brute force, probes for absent apps and repeat offenders
+(from 0.3.0) are low-risk to turn on: `stop-bots set-detector login-attempts --enabled true`,
+`stop-bots set-detector probe-paths --app-aware true` and
+`stop-bots set-repeat-offenders --enabled true`. Run `stop-bots status` once to see whether
+any of your sites serves a file it should not.
 
 ### Added
 
@@ -115,6 +129,13 @@ back, put back the copy the upgrade kept, `/var/lib/stop-bots/db.sqlite3.bak-v7`
     `/var/log/messages`, then the journal's kernel messages, from a stored cursor;
     `set-log-paths --kernel-log` names it. `status` warns when the detector is on and the
     kernel log cannot be read, or `ss` cannot be run.
+
+### Changed
+
+- **The Dashboard's Automatic blocking panel has the right-hand column to itself.** With a row
+  per detector, feed and setting it no longer fitted beside Scheduled tasks on a 100×32
+  terminal, so Scheduled tasks moved to the left column under Firewall script, and the two
+  columns are now equal.
 
 ## [0.3.0] — 2026-10-16
 
@@ -2530,7 +2551,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ivankovic/stop-bots/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ivankovic/stop-bots/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/ivankovic/stop-bots/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ivankovic/stop-bots/compare/v0.1.1...v0.2.0

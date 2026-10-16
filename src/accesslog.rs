@@ -134,7 +134,7 @@ fn parse_combined_line(line: &str) -> Option<ParsedLine> {
     let after_request = fields.next()?;
 
     let mut request_parts = request.split_whitespace();
-    request_parts.next()?; // HTTP method
+    let method = request_parts.next()?.to_string();
     let target = request_parts.next()?;
     // Strip any query string: `/foo?a=1` and `/foo?a=2` are the same path
     // as far as "is this a valid URL on this site" goes, and counting them
@@ -166,7 +166,9 @@ fn parse_combined_line(line: &str) -> Option<ParsedLine> {
     Some(ParsedLine {
         ip,
         status,
+        query: target.contains('?'),
         path,
+        method: Some(method),
         request: request.to_string(),
         referer,
         user_agent,
@@ -229,6 +231,14 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
     // Strip the query for the same reason as the combined parser: `/foo?a=1`
     // and `/foo?a=2` are one path as far as "is this a real URL here" goes.
     let path = target.split('?').next().unwrap_or(&target).to_string();
+    // `$request_method`, or the first word of a `$request` that has the
+    // whole triple. A format with neither cannot say, which is `None`.
+    let method = json_field(obj, "request_method").or_else(|| {
+        let request = json_field(obj, "request")?;
+        let mut words = request.split_whitespace();
+        let method = words.next()?;
+        words.next().is_some().then(|| method.to_string())
+    });
     // `$request` when the format has it; otherwise the target alone, which
     // is where nearly every payload is anyway.
     let request = json_field(obj, "request").unwrap_or_else(|| target.clone());
@@ -236,7 +246,9 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
     Some(ParsedLine {
         ip,
         status,
+        query: target.contains('?'),
         path,
+        method,
         request,
         referer: json_field(obj, "http_referer"),
         // An absent user agent is an empty one for every caller here, so
@@ -259,11 +271,12 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
 }
 
 /// Every key [`parse_json_line`] reads.
-const JSON_FIELDS: [&str; 11] = [
+const JSON_FIELDS: [&str; 12] = [
     "remote_addr",
     "status",
     "request_uri",
     "request",
+    "request_method",
     "uri",
     "http_referer",
     "http_user_agent",
@@ -329,6 +342,12 @@ struct ParsedLine {
     ip: IpAddr,
     status: u16,
     path: String,
+    /// Whether the target carried a query string, which [`Self::path`]
+    /// has dropped.
+    query: bool,
+    /// The HTTP method, as logged: `None` for a JSON format that logs
+    /// neither `$request_method` nor `$request`.
+    method: Option<String>,
     /// The request line as logged, method, query and protocol included —
     /// what [`injection_ips`] reads, since a payload is mostly in the
     /// query that [`ParsedLine::path`] drops, and sometimes in place of
@@ -379,6 +398,150 @@ impl ParsedLine {
         let hosts = self.host.iter().chain(&self.trailing).map(String::as_str);
         hosted.app_request(hosts, &self.path)
     }
+
+    /// Whether this is an attempt to sign in: a `POST` to one of
+    /// [`LOGIN_PATHS`], to [`LOGIN_PATHS_WITHOUT_QUERY`] with no query, or
+    /// to the sign-in page of the application behind its site (see
+    /// [`crate::services::Service::login_routes`]). Whatever it was
+    /// answered: a password that worked on the hundredth try was still
+    /// guessed.
+    fn is_login_attempt(&self, hosted: &Hosted) -> bool {
+        if !self
+            .method
+            .as_deref()
+            .is_some_and(|method| method.eq_ignore_ascii_case("POST"))
+        {
+            return false;
+        }
+        let path = format!("/{}", path_segments(&self.path).join("/"));
+        // A `.php` page is also found below the root: WordPress installed
+        // in `/blog/` signs in at `/blog/wp-login.php`.
+        let is = |paths: &[&str]| {
+            paths.iter().any(|p| {
+                path.eq_ignore_ascii_case(p)
+                    || (p.ends_with(".php")
+                        && path.len() > p.len()
+                        && path.as_bytes()[path.len() - p.len()..]
+                            .eq_ignore_ascii_case(p.as_bytes()))
+            })
+        };
+        is(&LOGIN_PATHS)
+            || (!self.query && is(&LOGIN_PATHS_WITHOUT_QUERY))
+            || hosted.app_login(
+                self.host.iter().chain(&self.trailing).map(String::as_str),
+                &self.path,
+            )
+    }
+}
+
+/// The pages a password is posted to, on whatever runs behind a site: a
+/// `POST` to one of them is a login attempt (see
+/// [`ParsedLine::is_login_attempt`]). Whole paths, compared ignoring case
+/// and a trailing `/`, never prefixes: what sits *below* a login page is
+/// often something an application's own clients call over and over, such
+/// as Nextcloud's `/login/v2/poll`. A `.php` page also counts below the
+/// root, where an application installed in a directory has it.
+///
+/// An application recognised behind a site adds its own (see
+/// [`crate::services::Service::login_routes`]).
+pub const LOGIN_PATHS: [&str; 14] = [
+    "/wp-login.php", // WordPress
+    // WordPress's XML-RPC, where `system.multicall` tries hundreds of
+    // passwords per request. Also what the WordPress app and Jetpack talk
+    // to, which is the risk `Detector::risk` names.
+    "/xmlrpc.php",
+    "/user/login",        // Drupal
+    "/users/sign_in",     // GitLab, Mastodon and other Rails apps
+    "/login",             // Ghost's admin API, Nextcloud, countless others
+    "/signin",            //
+    "/sign-in",           //
+    "/auth/login",        // Navidrome
+    "/admin/login",       //
+    "/api/login",         //
+    "/api/auth/login",    // Immich
+    "/api/auth/signin",   //
+    "/api/v1/auth/login", //
+    "/accounts/login",    // Django's default
+];
+
+/// Every address that kept up `per_minute` requests a minute in `log_text`
+/// over the `window_seconds` before its last dated line, or was refused
+/// [`crate::protection::REQUEST_RATE_REFUSED_MIN`] times by a rate limit
+/// in it, with how many: see [`crate::protection::request_rate_rule`].
+///
+/// Unlike the other whole-text forms this one reads the times: a rate is
+/// requests over time, and a count over a whole file is not one. The
+/// window ends where the log does, which for a live log is now. A line
+/// without a time counts for nothing.
+pub fn request_rate_ips(
+    log_text: &str,
+    per_minute: usize,
+    window_seconds: i64,
+    hosted: Hosted,
+) -> Vec<(String, String)> {
+    let detector = Detector::RequestRate;
+    let mut observer = Observer::new(Watch {
+        hosted,
+        ..Watch::only(detector)
+    });
+    let clock = Clock::Logged {
+        now: i64::MAX,
+        undated: None,
+    };
+    for line in log_text.lines() {
+        observer.line(line, clock);
+    }
+    let (evidence, _, _) = observer.finish();
+    let rows = evidence.rows_for(detector);
+    let Some(end) = rows.iter().map(|row| row.tally.last).max() else {
+        return Vec::new();
+    };
+    let rule = crate::protection::request_rate_rule(per_minute, window_seconds);
+    crate::evidence::decide(&rows, rule, Some(end - window_seconds))
+}
+
+/// Every address that fetched `/robots.txt` and then a page `robots`
+/// forbids to the user agent it asked with, with the first such page: see
+/// [`crate::robots`] for how a robots.txt is read. "Then" is by position
+/// in `log_text`.
+pub fn robots_violator_ips(
+    log_text: &str,
+    robots: &crate::robots::Robots,
+) -> Vec<(String, String)> {
+    convicted_in_text(
+        log_text,
+        Watch {
+            robots: Some(robots.clone()),
+            ..Watch::only(Detector::RobotsViolators)
+        },
+        Rule::AfterWarning,
+    )
+}
+
+/// Joomla's administrator sign-in, which posts to the same page as every
+/// other form in its back end. The sign-in posts to the bare page; the
+/// rest post with a query (`?option=com_content&...`), so a `POST` here
+/// counts only without one. An editor saving twenty articles an hour is
+/// not guessing passwords.
+pub const LOGIN_PATHS_WITHOUT_QUERY: [&str; 1] = ["/administrator/index.php"];
+
+/// Every address that sent at least `threshold` login attempts (see
+/// [`ParsedLine::is_login_attempt`]) in `log_text`, with the first login
+/// page it posted to. A count over the whole text given, like the SSH
+/// scanner's; the scheduled detector counts inside its window.
+pub fn login_attempt_ips(
+    log_text: &str,
+    threshold: usize,
+    hosted: Hosted,
+) -> Vec<(String, String)> {
+    convicted_in_text(
+        log_text,
+        Watch {
+            hosted,
+            ..Watch::only(Detector::LoginAttempts)
+        },
+        Rule::AtLeast(threshold),
+    )
 }
 
 /// Every IP with at least `threshold` *distinct* paths that returned 404
@@ -852,6 +1015,10 @@ pub struct Watch {
     pub probe_paths: Vec<String>,
     /// [`crate::protection::honeypot_path`].
     pub honeypot: String,
+    /// [`crate::protection::robots_rules`]: `None` when no robots.txt is
+    /// known, which leaves the robots.txt-violator detector nothing to
+    /// judge by.
+    pub robots: Option<crate::robots::Robots>,
     /// [`crate::scanblock::crawler_claims`].
     pub claims: Vec<CrawlerClaim>,
     /// The applications behind this server's sites, whose own clients'
@@ -871,6 +1038,7 @@ impl Watch {
             detectors: vec![(detector, None)],
             probe_paths: DEFAULT_PROBE_PATHS.iter().map(|p| p.to_string()).collect(),
             honeypot: crate::protection::HONEYPOT_PATH_DEFAULT.to_string(),
+            robots: None,
             claims: Vec::new(),
             hosted: Hosted::default(),
             app_probes: AppProbes::default(),
@@ -1033,7 +1201,12 @@ impl Observer {
             {
                 continue;
             }
-            if let Some(item) = self.observe(*detector, &line) {
+            if let Some(item) = self.observe(*detector, &line, at) {
+                if *detector == Detector::LoginAttempts {
+                    // Counted a line at a time, in buckets; the page posted
+                    // to rides along to name the reason (see `Rule::AtLeast`).
+                    self.evidence.add(*detector, line.ip, Item::bucket(at), at);
+                }
                 self.evidence.add(*detector, line.ip, item, at);
             }
         }
@@ -1042,7 +1215,7 @@ impl Observer {
 
     /// What `line` says for `detector`, if anything. The one place each
     /// access-log detector's idea of a suspicious line is written down.
-    fn observe(&mut self, detector: Detector, line: &ParsedLine) -> Option<Item> {
+    fn observe(&mut self, detector: Detector, line: &ParsedLine, at: i64) -> Option<Item> {
         match detector {
             // A distinct path that does not exist here.
             Detector::WebScanners => (line.status == 404).then(|| Item::seen(&line.path)),
@@ -1107,6 +1280,29 @@ impl Observer {
                     (line.path != "/").then(|| Item::seen(&line.path))
                 }
             }
+            Detector::LoginAttempts => line
+                .is_login_attempt(&self.watch.hosted)
+                .then(|| Item::seen(&line.path)),
+            // Every request counts; one NGINX's rate limit refused counts
+            // twice, as a request and as a refusal.
+            Detector::RequestRate => Some(if line.status == 429 {
+                Item::refused(at)
+            } else {
+                Item::bucket(at)
+            }),
+            // Fetching robots.txt is being told; a page it then forbids
+            // to the agent asking is defiance (see `Rule::AfterWarning`).
+            Detector::RobotsViolators => {
+                let robots = self.watch.robots.as_ref()?;
+                let path = format!("/{}", path_segments(&line.path).join("/"));
+                if path.eq_ignore_ascii_case("/robots.txt") {
+                    Some(Item::Warned)
+                } else {
+                    robots
+                        .disallows(&line.user_agent, &line.path)
+                        .map(|_| Item::seen(&line.path))
+                }
+            }
             // Not an access-log detector.
             Detector::SshScanners => None,
         }
@@ -1148,12 +1344,19 @@ fn allows_app_requests(detector: Detector) -> bool {
         Detector::WebScanners
         | Detector::AssetRatio
         | Detector::RotatingUserAgent
-        | Detector::RefererlessCrawl => true,
+        | Detector::RefererlessCrawl
+        // A sync client catching up on a thousand photos is busy, not
+        // flooding.
+        | Detector::RequestRate => true,
+        // A sign-in is an application's own client's request too (Jellyfin
+        // signs in under `/Users/`), and it is what this one counts.
         Detector::SpoofedCrawlers
         | Detector::ProbePaths
         | Detector::Injection
         | Detector::Honeypot
         | Detector::RobotsTxt
+        | Detector::LoginAttempts
+        | Detector::RobotsViolators
         | Detector::SshScanners => false,
     }
 }
@@ -2366,6 +2569,294 @@ mod tests {
 
     /// 2026-09-28T06:33:01Z.
     const SEP_28: i64 = 1_790_577_181;
+
+    // ---- login attempts ----
+
+    fn request_line(ip: &str, request: &str, status: u16) -> String {
+        format!(
+            "{ip} - - [10/Oct/2026:13:55:36 +0000] \"{request}\" {status} 0 \"-\" \"Mozilla/5.0\"\n"
+        )
+    }
+
+    fn is_login_attempt(line: &str, hosted: &Hosted) -> bool {
+        parse_line(line)
+            .expect("the line should parse")
+            .is_login_attempt(hosted)
+    }
+
+    #[test]
+    fn a_login_attempt_is_a_post_to_a_login_page() {
+        let cases = [
+            ("WordPress", "POST /wp-login.php HTTP/1.1", true),
+            ("XML-RPC", "POST /xmlrpc.php HTTP/1.1", true),
+            (
+                "WordPress in a directory",
+                "POST /blog/wp-login.php HTTP/1.1",
+                true,
+            ),
+            ("any case", "post /WP-Login.PHP HTTP/1.1", true),
+            ("a query", "POST /wp-login.php?redirect_to=x HTTP/1.1", true),
+            ("Drupal", "POST /user/login HTTP/1.1", true),
+            ("a trailing slash", "POST /login/ HTTP/1.1", true),
+            (
+                "Joomla's sign-in",
+                "POST /administrator/index.php HTTP/1.1",
+                true,
+            ),
+            (
+                "reading the login page",
+                "GET /wp-login.php HTTP/1.1",
+                false,
+            ),
+            (
+                "Joomla's back end saving an article",
+                "POST /administrator/index.php?option=com_content HTTP/1.1",
+                false,
+            ),
+            (
+                "Nextcloud's client polling",
+                "POST /login/v2/poll HTTP/1.1",
+                false,
+            ),
+            (
+                "a page that only ends in login",
+                "POST /blog/login HTTP/1.1",
+                false,
+            ),
+            ("a form elsewhere", "POST /contact HTTP/1.1", false),
+        ];
+        for (what, request, expected) in cases {
+            let line = request_line("203.0.113.9", request, 200);
+            assert_eq!(
+                is_login_attempt(&line, &Hosted::default()),
+                expected,
+                "{what}: {request}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_json_line_says_its_method_with_either_variable() {
+        let cases = [
+            (
+                "request_method",
+                r#"{"remote_addr":"203.0.113.9","status":"200","request_uri":"/wp-login.php","request_method":"POST"}"#,
+                true,
+            ),
+            (
+                "the request triple",
+                r#"{"remote_addr":"203.0.113.9","status":"200","request":"POST /wp-login.php HTTP/1.1"}"#,
+                true,
+            ),
+            (
+                "neither: cannot tell a POST from a GET",
+                r#"{"remote_addr":"203.0.113.9","status":"200","uri":"/wp-login.php"}"#,
+                false,
+            ),
+        ];
+        for (what, line, expected) in cases {
+            assert_eq!(
+                is_login_attempt(line, &Hosted::default()),
+                expected,
+                "{what}"
+            );
+        }
+    }
+
+    /// Jellyfin signs in under `/Users/`, one of its own data routes, and
+    /// that is a login like any other where Jellyfin runs.
+    #[test]
+    fn an_application_s_own_sign_in_counts_where_it_runs() {
+        let line = request_line(
+            "203.0.113.9",
+            "POST /Users/AuthenticateByName HTTP/1.1",
+            401,
+        );
+        let jellyfin = Hosted::new(vec![(
+            "media.example.com".to_string(),
+            Some(crate::services::Service::Jellyfin),
+        )]);
+        assert!(is_login_attempt(&line, &jellyfin), "where Jellyfin runs");
+        assert!(
+            !is_login_attempt(&line, &Hosted::default()),
+            "where it does not"
+        );
+    }
+
+    #[test]
+    fn login_attempt_ips_counts_posts_against_the_threshold() {
+        let posts =
+            |ip: &str, n: usize| request_line(ip, "POST /wp-login.php HTTP/1.1", 200).repeat(n);
+        let log = [
+            posts("203.0.113.9", 20),
+            posts("203.0.113.10", 19),
+            request_line("203.0.113.11", "GET /wp-login.php HTTP/1.1", 200).repeat(50),
+            posts("10.0.0.5", 50),
+        ]
+        .concat();
+        assert_eq!(
+            login_attempt_ips(&log, 20, Hosted::default()),
+            [("203.0.113.9".to_string(), "/wp-login.php".to_string())],
+            "only twenty POSTs from a public address"
+        );
+    }
+
+    /// A password that works on the twentieth try was still guessed.
+    #[test]
+    fn a_successful_login_does_not_excuse_the_attempts_before_it() {
+        let log = request_line("203.0.113.9", "POST /wp-login.php HTTP/1.1", 200).repeat(19)
+            + &request_line("203.0.113.9", "POST /wp-login.php HTTP/1.1", 302);
+        assert_eq!(login_attempt_ips(&log, 20, Hosted::default()).len(), 1);
+    }
+
+    // ---- request rate ----
+
+    /// `per_minute` requests a minute from `ip` for `minutes` minutes, the
+    /// last minute ending at `end`, each answered `status`, for `path`.
+    fn steady(
+        ip: &str,
+        path: &str,
+        status: u16,
+        per_minute: i64,
+        minutes: i64,
+        end: i64,
+    ) -> String {
+        let request = format!("GET {path} HTTP/1.1");
+        (0..minutes * per_minute)
+            .map(|i| {
+                let at = end - minutes * 60 + i * 60 / per_minute;
+                crate::testing::access_line_at(ip, &request, 200, "Mozilla/5.0", at)
+                    .replace(" 200 0 ", &format!(" {status} 0 "))
+                    + "\n"
+            })
+            .collect()
+    }
+
+    const END: i64 = 1_790_000_000;
+
+    #[test]
+    fn request_rate_ips_finds_a_rate_kept_up_over_the_window() {
+        // A threshold of 12 a minute rather than the default's 120, so the
+        // logs stay small. The reasons are matched by their ending: how
+        // many requests are counted depends on where the buckets fall.
+        let cases = [
+            ("15 a minute for the hour", 15, 60, 200, Some(" requests")),
+            ("11 a minute for the hour", 11, 60, 200, None),
+            ("15 a minute for ten minutes", 15, 10, 200, None),
+            (
+                "refused 150 times in a minute",
+                150,
+                1,
+                429,
+                Some("150 requests refused with 429"),
+            ),
+        ];
+        for (what, per_minute, minutes, status, expected) in cases {
+            let log = steady("203.0.113.9", "/", status, per_minute, minutes, END);
+            let found = request_rate_ips(&log, 12, 3600, Hosted::default());
+            let reason = found.first().map(|(_, reason)| reason.as_str());
+            match (expected, reason) {
+                (None, None) => {}
+                (Some(ending), Some(reason)) if reason.ends_with(ending) => {}
+                _ => panic!("{what}: expected {expected:?}, found {reason:?}"),
+            }
+        }
+    }
+
+    /// A sync client catching up on its owner's photos is busy on its
+    /// application's own routes, and that is not a flood.
+    #[test]
+    fn request_rate_ips_leaves_an_application_s_own_clients_alone() {
+        let log = steady(
+            "203.0.113.9",
+            "/remote.php/dav/files/a/b.jpg",
+            200,
+            20,
+            60,
+            END,
+        );
+        let nextcloud = Hosted::new(vec![(
+            "cloud.example.com".to_string(),
+            Some(crate::services::Service::Nextcloud),
+        )]);
+        assert!(request_rate_ips(&log, 12, 3600, nextcloud).is_empty());
+        assert_eq!(
+            request_rate_ips(&log, 12, 3600, Hosted::default()).len(),
+            1,
+            "where Nextcloud does not run, the same requests are a flood"
+        );
+    }
+
+    /// The window ends where the log does: an hour of flooding a day
+    /// before the last line is not a rate now.
+    #[test]
+    fn request_rate_ips_reads_the_window_back_from_the_last_line() {
+        let log = steady("203.0.113.9", "/", 200, 20, 60, END - 86_400)
+            + &steady("198.51.100.4", "/", 200, 1, 1, END);
+        assert!(request_rate_ips(&log, 12, 3600, Hosted::default()).is_empty());
+    }
+
+    // ---- robots.txt violators ----
+
+    const ROBOTS: &str = "User-agent: GPTBot\nDisallow: /\n\nUser-agent: *\nDisallow: /trap/\n";
+
+    fn visit(ip: &str, path: &str, user_agent: &str) -> String {
+        line(ip, path, 200, "-", user_agent)
+    }
+
+    #[test]
+    fn a_robots_violator_read_the_rules_and_then_broke_them() {
+        let robots = crate::robots::Robots::parse(ROBOTS);
+        let browser = "Mozilla/5.0 Firefox/131.0";
+        let gptbot = "Mozilla/5.0 (compatible; GPTBot/1.2)";
+        let cases = [
+            (
+                "the trap, after robots.txt",
+                [
+                    visit("203.0.113.9", "/robots.txt", browser),
+                    visit("203.0.113.9", "/trap/a", browser),
+                ],
+                Some("/trap/a"),
+            ),
+            (
+                "the trap, before robots.txt",
+                [
+                    visit("203.0.113.9", "/trap/a", browser),
+                    visit("203.0.113.9", "/robots.txt", browser),
+                ],
+                None,
+            ),
+            (
+                "a page only a named crawler may not fetch",
+                [
+                    visit("203.0.113.9", "/robots.txt", gptbot),
+                    visit("203.0.113.9", "/blog", gptbot),
+                ],
+                Some("/blog"),
+            ),
+            (
+                "the same page, for everyone else",
+                [
+                    visit("203.0.113.9", "/robots.txt", browser),
+                    visit("203.0.113.9", "/blog", browser),
+                ],
+                None,
+            ),
+            (
+                "someone else read robots.txt",
+                [
+                    visit("198.51.100.4", "/robots.txt", browser),
+                    visit("203.0.113.9", "/trap/a", browser),
+                ],
+                None,
+            ),
+        ];
+        for (what, lines, expected) in cases {
+            let found = robots_violator_ips(&lines.concat(), &robots);
+            let path = found.first().map(|(_, path)| path.as_str());
+            assert_eq!(path, expected, "{what}: {found:?}");
+        }
+    }
 
     #[test]
     fn a_combined_line_carries_its_time() {

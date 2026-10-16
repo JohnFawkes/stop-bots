@@ -180,6 +180,9 @@ pub fn detector_name(detector: Detector) -> &'static str {
         Detector::RotatingUserAgent => "rotating-ua",
         Detector::RefererlessCrawl => "refererless",
         Detector::RobotsTxt => "robots-txt",
+        Detector::LoginAttempts => "login-attempts",
+        Detector::RequestRate => "request-rate",
+        Detector::RobotsViolators => "robots-violators",
     }
 }
 

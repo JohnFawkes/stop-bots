@@ -166,6 +166,28 @@ fn every_release_s_database_opens_at_the_current_schema_version() {
     }
 }
 
+/// An upgrade starts no detector by itself: one added since a release is
+/// off on that release's database, and marked new, whatever it defaults
+/// to on a new one.
+#[test]
+fn every_release_s_database_has_the_detectors_added_since_off_and_new() {
+    for release in RELEASES {
+        let db = Db::open(UpgradedHost::of(release).db).unwrap();
+        let created_at = db.defaults_generation().unwrap();
+        for detector in Detector::ALL
+            .into_iter()
+            .filter(|d| d.spec().introduced_in > created_at)
+        {
+            let id = detector.id();
+            assert!(!detector.is_enabled(&db).unwrap(), "{release}: {id} is on");
+            assert!(
+                detector.is_new_here(&db).unwrap(),
+                "{release}: {id} not new"
+            );
+        }
+    }
+}
+
 /// Every setting `scripts/upgrade-fixture.sh` changed from its default
 /// reads back changed. A key renamed or a value re-spelled since would
 /// read as the default here instead.

@@ -415,6 +415,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- blocks.rs      <- Why a rule exists: its source, its evidence line, and unblocks
         |- trigger.rs     <- The log line behind a new block, when a whole log was read
         |- protection.rs  <- The detectors' on/off switches, their defaults, and why
+        |- robots.rs      <- Reading a robots.txt: which paths it forbids to which client
         |- ipranges/      <- Crawler, country and third-party IP-range fetching/storage
         |- ipdetail.rs    <- Everything already known about one address (Firewall detail view)
         |- uadetail.rs    <- The same for one user agent string

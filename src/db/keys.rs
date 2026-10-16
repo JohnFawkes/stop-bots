@@ -123,6 +123,8 @@ pub const DETECT_ROTATING_UA_MIN: &str = "detect_rotating_ua_min";
 pub const DETECT_REFERERLESS_MIN_PATHS: &str = "detect_refererless_min_paths";
 pub const DETECT_SSH_SCANNERS_MIN_ATTEMPTS: &str = "detect_ssh_scanners_min_attempts";
 pub const DETECT_WEB_SCANNERS_MIN_PATHS: &str = "detect_web_scanners_min_paths";
+pub const DETECT_LOGIN_ATTEMPTS_MIN: &str = "detect_login_attempts_min";
+pub const DETECT_REQUEST_RATE_PER_MINUTE: &str = "detect_request_rate_per_minute";
 
 // ---- downloads ----
 
@@ -176,6 +178,8 @@ pub const ALL: &[&str] = &[
     DETECT_REFERERLESS_MIN_PATHS,
     DETECT_SSH_SCANNERS_MIN_ATTEMPTS,
     DETECT_WEB_SCANNERS_MIN_PATHS,
+    DETECT_LOGIN_ATTEMPTS_MIN,
+    DETECT_REQUEST_RATE_PER_MINUTE,
     HEALTH_PROBE,
     HEALTH_PROBE_AT,
     REFRESH_LEASE,

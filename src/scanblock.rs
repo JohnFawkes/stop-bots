@@ -48,6 +48,9 @@ pub enum ScanKind {
     /// that doesn't act like a browser, by a different tell.
     NonBrowser,
     RobotsTxt,
+    LoginAttempt,
+    RequestRate,
+    RobotsViolator,
 }
 
 impl ScanKind {
@@ -63,6 +66,9 @@ impl ScanKind {
                 ScanKind::NonBrowser
             }
             Detector::RobotsTxt => ScanKind::RobotsTxt,
+            Detector::LoginAttempts => ScanKind::LoginAttempt,
+            Detector::RequestRate => ScanKind::RequestRate,
+            Detector::RobotsViolators => ScanKind::RobotsViolator,
         }
     }
 
@@ -77,6 +83,9 @@ impl ScanKind {
             ScanKind::Honeypot => "trapped IP",
             ScanKind::NonBrowser => "non-browser IP",
             ScanKind::RobotsTxt => "robots.txt fetcher",
+            ScanKind::LoginAttempt => "password-guessing IP",
+            ScanKind::RequestRate => "flooding IP",
+            ScanKind::RobotsViolator => "robots.txt violator",
         }
     }
 }
@@ -191,15 +200,19 @@ impl ScanBlockOutcome {
 /// What `detector` needs to see before it blocks.
 ///
 /// The threshold is the stored one (see `Detector::threshold`), the same
-/// for every scheduler; the CLI's one-off `run-detector ssh-scanners` and
-/// `run-detector web-scanners` take theirs from a flag instead. The SSH scanner
-/// counts failed-login lines; the other four that have a threshold count
-/// distinct things; the rest need one line.
+/// for every scheduler; the CLI's one-off `run-detector` takes its from a
+/// flag instead. The SSH scanner counts failed-login lines and the login
+/// brute-force detector login attempts; the others that have a threshold
+/// count distinct things; the rest need one line.
 pub fn rule(db: &Db, detector: crate::protection::Detector) -> Result<Rule> {
     use crate::protection::Detector as D;
     Ok(match (detector, detector.threshold(db)?) {
-        (D::SshScanners, Some(n)) => Rule::AtLeast(n),
+        (D::SshScanners | D::LoginAttempts, Some(n)) => Rule::AtLeast(n),
+        (D::RequestRate, Some(n)) => {
+            crate::protection::request_rate_rule(n, detector.window_seconds(db)?)
+        }
         (_, Some(n)) => Rule::Distinct(n),
+        (D::RobotsViolators, None) => Rule::AfterWarning,
         (_, None) => Rule::Once,
     })
 }
@@ -290,7 +303,13 @@ pub fn run_detector(
                 trigger,
             )
         }
-        D::WebScanners | D::AssetRatio | D::RotatingUserAgent | D::RefererlessCrawl => {
+        D::WebScanners
+        | D::AssetRatio
+        | D::RotatingUserAgent
+        | D::RefererlessCrawl
+        | D::LoginAttempts
+        | D::RequestRate
+        | D::RobotsViolators => {
             excluding_known_crawlers(db, detector, hinted(convicted), ttl_days, trigger)
         }
     }
@@ -649,10 +668,107 @@ pub fn block_refererless(
     )
 }
 
+/// Blocks addresses that posted to a login page at least `threshold` times
+/// (the stored one when `None`) in `log_text`: see
+/// [`accesslog::login_attempt_ips`]. A verified crawler is never blocked
+/// by it, though none has any business posting a password.
+pub fn block_login_attempts(
+    db: &Db,
+    ttl_days: i64,
+    log_text: &str,
+    threshold: Option<usize>,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    let threshold = match threshold {
+        Some(n) => n,
+        None => crate::protection::threshold(
+            db,
+            crate::protection::LOGIN_ATTEMPTS_MIN,
+            crate::protection::LOGIN_ATTEMPTS_MIN_DEFAULT,
+        )?,
+    };
+    let hosted = crate::logscan::hosted(db)?;
+    let candidates = accesslog::login_attempt_ips(log_text, threshold, hosted)
+        .into_iter()
+        .map(|(ip, path)| (ip, Some(path)))
+        .collect();
+    excluding_known_crawlers(
+        db,
+        Detector::LoginAttempts,
+        candidates,
+        ttl_days,
+        Trigger::log(log_text, dry_run),
+    )
+}
+
+/// Blocks addresses that kept up `threshold` requests a minute (the stored
+/// one when `None`) over the detector's window, or were refused too often
+/// by a rate limit, in `log_text`: see [`accesslog::request_rate_ips`].
+pub fn block_request_rate(
+    db: &Db,
+    ttl_days: i64,
+    log_text: &str,
+    threshold: Option<usize>,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    let detector = Detector::RequestRate;
+    let per_minute = match threshold {
+        Some(n) => n,
+        None => detector.threshold(db)?.unwrap_or_default(),
+    };
+    let hosted = crate::logscan::hosted(db)?;
+    let window = detector.window_seconds(db)?;
+    let candidates = accesslog::request_rate_ips(log_text, per_minute, window, hosted)
+        .into_iter()
+        .map(|(ip, count)| (ip, Some(count)))
+        .collect();
+    excluding_known_crawlers(
+        db,
+        detector,
+        candidates,
+        ttl_days,
+        Trigger::log(log_text, dry_run),
+    )
+}
+
+/// Blocks clients that fetched robots.txt and then a page it forbids them,
+/// in `log_text`: see [`accesslog::robots_violator_ips`]. Judged by the
+/// generated robots.txt (see [`crate::protection::robots_rules`]), so it
+/// finds nothing while that is not served.
+///
+/// A verified crawler is never blocked by it. The real Googlebot obeys
+/// robots.txt, so one caught here more likely means this reading of a
+/// rule differs from Google's than that Google ignored it, and a week
+/// without search traffic is too high a price for that. A forged one is
+/// the forged-crawler detector's to block.
+pub fn block_robots_violators(
+    db: &Db,
+    ttl_days: i64,
+    log_text: &str,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    let candidates = match crate::protection::robots_rules(db)? {
+        Some(robots) => accesslog::robots_violator_ips(log_text, &robots)
+            .into_iter()
+            .map(|(ip, path)| (ip, Some(path)))
+            .collect(),
+        None => Vec::new(),
+    };
+    excluding_known_crawlers(
+        db,
+        Detector::RobotsViolators,
+        candidates,
+        ttl_days,
+        Trigger::log(log_text, dry_run),
+    )
+}
+
 /// Blocks `candidates`, less any inside a known crawler's published ranges
 /// (see [`known_crawler_ranges`]).
 ///
-/// The web scanner and the three behavioural detectors go through here.
+/// The web scanner, the three behavioural detectors, the login
+/// brute-force detector, the request rate and the robots.txt violators go
+/// through here.
 /// The behavioural three need it most: all of them describe "doesn't behave
 /// like a browser", which is exactly true of Googlebot — it fetches no CSS,
 /// uses more than one user agent and never sends a referer — so without it
@@ -826,6 +942,16 @@ fn evidence_line(detector: Detector, item: Option<&str>, line: Option<&String>) 
         }
         (Detector::RefererlessCrawl, Some(path)) => {
             format!("deep pages and never a referer, the first {path}")
+        }
+        (Detector::LoginAttempts, Some(path)) => {
+            format!("login attempts over the threshold, inside the window, the first to {path}")
+        }
+        (Detector::LoginAttempts, None) => {
+            "login attempts over the threshold, inside the window".to_string()
+        }
+        (Detector::RequestRate, Some(count)) => format!("{count} inside the window"),
+        (Detector::RobotsViolators, Some(path)) => {
+            format!("fetched robots.txt, then {path}, which it forbids")
         }
         (_, None) => return None,
     })
@@ -2448,6 +2574,232 @@ mod tests {
 
         assert!(outcome.newly_blocked.is_empty(), "{outcome:?}");
         assert_eq!(outcome.skipped_unblocked, 1);
+    }
+
+    // ---- login brute force ----
+
+    /// `n` POSTs to `/wp-login.php` from `ip`, `every` seconds apart, the
+    /// last at `last`.
+    fn login_posts(ip: &str, n: i64, every: i64, last: i64) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                crate::testing::access_line_at(
+                    ip,
+                    "POST /wp-login.php HTTP/1.1",
+                    200,
+                    "Mozilla/5.0",
+                    last - i * every,
+                )
+            })
+            .collect()
+    }
+
+    /// From the log to the block, as the schedule runs it: twenty login
+    /// attempts inside the hour block the address, and the block names
+    /// the page.
+    #[test]
+    fn the_scheduled_login_detector_blocks_twenty_attempts_inside_its_hour() {
+        let db = Db::open_in_memory().unwrap();
+        let now = now_secs();
+        let lines = [
+            login_posts("203.0.113.5", 20, 60, now - 60),
+            login_posts("198.51.100.7", 19, 60, now - 60),
+        ]
+        .concat();
+        crate::testing::ingest_access_lines(&db, &lines, now);
+
+        let outcome = run_detector(&db, Detector::LoginAttempts, 1, now, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, ["203.0.113.5"], "{outcome:?}");
+        assert_eq!(
+            the_only_rule(&db).evidence.as_deref(),
+            Some(
+                "login attempts over the threshold, inside the window, the first to \
+                 /wp-login.php"
+            )
+        );
+    }
+
+    /// Twenty attempts spread over a day are a team logging in, not a
+    /// password being guessed.
+    #[test]
+    fn login_attempts_outside_the_hour_do_not_count() {
+        let db = Db::open_in_memory().unwrap();
+        let now = now_secs();
+        let lines = login_posts("203.0.113.5", 20, 3600, now - 60);
+        crate::testing::ingest_access_lines(&db, &lines, now);
+
+        let outcome = run_detector(&db, Detector::LoginAttempts, 1, now, false).unwrap();
+
+        assert_eq!(outcome.candidates, 0, "{outcome:?}");
+    }
+
+    #[test]
+    fn the_login_detector_never_blocks_a_trusted_address() {
+        let db = Db::open_in_memory().unwrap();
+        db.trust_address("203.0.113.5").unwrap();
+        let now = now_secs();
+        let lines = login_posts("203.0.113.5", 30, 60, now - 60);
+        crate::testing::ingest_access_lines(&db, &lines, now);
+
+        let outcome = run_detector(&db, Detector::LoginAttempts, 1, now, false).unwrap();
+
+        assert!(outcome.newly_blocked.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.skipped_trusted, 1);
+    }
+
+    // ---- request rate ----
+
+    /// `n` requests for `/` from `ip`, spread evenly over the hour before
+    /// `end`, each answered `status`.
+    fn hour_of_requests(ip: &str, n: i64, status: u16, end: i64) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                crate::testing::access_line_at(
+                    ip,
+                    "GET / HTTP/1.1",
+                    status,
+                    "Mozilla/5.0",
+                    end - 3600 + i * 3600 / n,
+                )
+            })
+            .collect()
+    }
+
+    /// From the log to the block, as the schedule runs it: a rate kept up
+    /// for the hour a fifth over the threshold (12 a minute here, so the
+    /// log stays small) blocks, whatever the clock, and one under it does
+    /// not; the block says how many requests it counted.
+    #[test]
+    fn the_scheduled_request_rate_blocks_a_rate_kept_up_for_the_hour() {
+        let db = Db::open_in_memory().unwrap();
+        Detector::RequestRate.set_enabled(&db, true).unwrap();
+        Detector::RequestRate.set_threshold(&db, 12).unwrap();
+        let now = now_secs();
+        let lines = [
+            hour_of_requests("203.0.113.5", 15 * 60, 200, now),
+            hour_of_requests("198.51.100.7", 11 * 60, 200, now),
+        ]
+        .concat();
+        crate::testing::ingest_access_lines(&db, &lines, now);
+
+        let outcome = run_detector(&db, Detector::RequestRate, 1, now, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, ["203.0.113.5"], "{outcome:?}");
+        let evidence = the_only_rule(&db).evidence.unwrap_or_default();
+        assert!(
+            evidence.ends_with("requests inside the window"),
+            "evidence was: {evidence}"
+        );
+    }
+
+    /// A client NGINX's rate limit keeps refusing is blocked however few
+    /// requests it makes in all.
+    #[test]
+    fn the_scheduled_request_rate_blocks_a_client_refused_a_hundred_times() {
+        let db = Db::open_in_memory().unwrap();
+        Detector::RequestRate.set_enabled(&db, true).unwrap();
+        let now = now_secs();
+        // Inside the last ten minutes, so every one is in a bucket that
+        // began inside the window.
+        let lines: Vec<String> = (0..100)
+            .map(|i| {
+                let at = now - 300 + i;
+                crate::testing::access_line_at("203.0.113.5", "GET / HTTP/1.1", 429, "Bot", at)
+            })
+            .collect();
+        crate::testing::ingest_access_lines(&db, &lines, now);
+
+        let outcome = run_detector(&db, Detector::RequestRate, 1, now, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, ["203.0.113.5"], "{outcome:?}");
+        assert_eq!(
+            the_only_rule(&db).evidence.as_deref(),
+            Some("100 requests refused with 429 inside the window")
+        );
+    }
+
+    #[test]
+    fn the_request_rate_never_blocks_a_verified_crawler() {
+        let db = Db::open_in_memory().unwrap();
+        Detector::RequestRate.set_enabled(&db, true).unwrap();
+        Detector::RequestRate.set_threshold(&db, 12).unwrap();
+        seed_googlebot_ranges(&db);
+        let now = now_secs();
+        let lines = hour_of_requests("66.249.66.1", 20 * 60, 200, now);
+        crate::testing::ingest_access_lines(&db, &lines, now);
+
+        let outcome = run_detector(&db, Detector::RequestRate, 1, now, false).unwrap();
+
+        assert!(outcome.newly_blocked.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.skipped_known_crawlers, 1);
+    }
+
+    // ---- robots.txt violators ----
+
+    /// `ip` as `user_agent` fetching robots.txt and then `path`, a minute
+    /// apart, the second a minute before `now`.
+    fn read_then_fetched(ip: &str, path: &str, user_agent: &str, now: i64) -> Vec<String> {
+        let get = |path: &str, at| {
+            let request = format!("GET {path} HTTP/1.1");
+            crate::testing::access_line_at(ip, &request, 200, user_agent, at)
+        };
+        vec![get("/robots.txt", now - 120), get(path, now - 60)]
+    }
+
+    /// A host serving the generated robots.txt, with the detector on.
+    fn serving_robots_txt() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.set_serve_robots_txt(true).unwrap();
+        Detector::RobotsViolators.set_enabled(&db, true).unwrap();
+        db
+    }
+
+    /// From the log to the block, as the schedule runs it: the generated
+    /// robots.txt forbids the trap path to everyone.
+    #[test]
+    fn the_scheduled_robots_detector_blocks_a_client_that_read_the_rules_and_ignored_them() {
+        let db = serving_robots_txt();
+        let now = now_secs();
+        let lines = read_then_fetched("203.0.113.5", "/stop-bots-trap/x", "Firefox", now);
+        crate::testing::ingest_access_lines(&db, &lines, now);
+
+        let outcome = run_detector(&db, Detector::RobotsViolators, 7, now, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, ["203.0.113.5"], "{outcome:?}");
+        assert_eq!(
+            the_only_rule(&db).evidence.as_deref(),
+            Some("fetched robots.txt, then /stop-bots-trap/x, which it forbids")
+        );
+    }
+
+    /// Without the generated robots.txt served there are no rules it
+    /// knows were read.
+    #[test]
+    fn the_robots_detector_does_nothing_while_robots_txt_is_not_served() {
+        let db = serving_robots_txt();
+        db.set_serve_robots_txt(false).unwrap();
+        let now = now_secs();
+        let lines = read_then_fetched("203.0.113.5", "/stop-bots-trap/x", "Firefox", now);
+        crate::testing::ingest_access_lines(&db, &lines, now);
+
+        let outcome = run_detector(&db, Detector::RobotsViolators, 7, now, false).unwrap();
+
+        assert_eq!(outcome.candidates, 0, "{outcome:?}");
+    }
+
+    #[test]
+    fn the_robots_detector_never_blocks_a_verified_crawler() {
+        let db = serving_robots_txt();
+        seed_googlebot_ranges(&db);
+        let now = now_secs();
+        let lines = read_then_fetched("66.249.66.1", "/stop-bots-trap/x", "Googlebot/2.1", now);
+        crate::testing::ingest_access_lines(&db, &lines, now);
+
+        let outcome = run_detector(&db, Detector::RobotsViolators, 7, now, false).unwrap();
+
+        assert!(outcome.newly_blocked.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.skipped_known_crawlers, 1);
     }
 
     // ---- an application's own clients ----

@@ -429,16 +429,18 @@ enum Command {
     ///
     /// ssh-scanners reads the SSH log; every other detector reads the web
     /// server's access log. spoofed-crawlers needs the crawler ranges
-    /// (`update-crawler-ranges`), and honeypot needs the trap path published
-    /// in the generated robots.txt (`set-robots-txt --enabled true`).
+    /// (`update-crawler-ranges`), and honeypot and robots-violators need the
+    /// generated robots.txt served (`set-robots-txt --enabled true`).
     RunDetector {
         /// Which detector, as `list-detectors` names it
         detector: DetectorArg,
         /// How much evidence from one address before it is blocked, for the
         /// detectors that count (ssh-scanners, web-scanners, asset-ratio,
-        /// rotating-ua, refererless). A count over the whole log given, not
-        /// a rate. Defaults to the stored threshold (`set-detector`). Must
-        /// be at least 1.
+        /// rotating-ua, refererless, login-attempts, request-rate). A count
+        /// over the whole log given, except for request-rate, which takes
+        /// requests a minute over its window, ending where the log ends.
+        /// Defaults to the stored threshold (`set-detector`). Must be at
+        /// least 1.
         #[arg(long, value_parser = min_threshold)]
         threshold: Option<usize>,
         #[arg(long, value_parser = ttl_days_arg, help = TTL_HELP)]
@@ -498,9 +500,10 @@ enum Command {
     /// blocks; it never removes the ones it already added, which expire on
     /// their own. Give no flags to print the detector's current settings.
     ///
-    /// Only the five detectors that count something take a threshold:
-    /// ssh-scanners, web-scanners, asset-ratio, rotating-ua and
-    /// refererless. For the others one matching request is conclusive.
+    /// Only the detectors that count something take a threshold:
+    /// ssh-scanners, web-scanners, asset-ratio, rotating-ua, refererless,
+    /// login-attempts and request-rate. For the others one matching request
+    /// is conclusive.
     ///
     /// robots-txt cannot be switched here: it runs exactly when "humans
     /// only" is on (`set-humans-only`).
@@ -514,13 +517,15 @@ enum Command {
         #[arg(long)]
         ttl_days: Option<i64>,
         /// How much evidence from one address before it is blocked: failed
-        /// logins, 404'd paths, pages without assets, user agents or
-        /// referer-less pages, depending on the detector. At least 2.
+        /// logins, 404'd paths, pages without assets, user agents,
+        /// referer-less pages, login attempts or, for request-rate, requests
+        /// a minute, depending on the detector. At least 2.
         #[arg(long)]
         threshold: Option<i64>,
         /// How far back evidence counts, in hours, from 1 to 720: a log
         /// line older than this is no reason to block. 24 unless changed,
-        /// and 1 for asset-ratio, rotating-ua and refererless.
+        /// and 1 for asset-ratio, rotating-ua, refererless, login-attempts
+        /// and request-rate.
         #[arg(long)]
         window_hours: Option<i64>,
         /// probe-paths only: also count /wp-login.php, /phpmyadmin and the
@@ -3400,6 +3405,9 @@ fn detector_line(db: &Db, detector: DetectorArg) -> Result<String> {
     if !d.is_operator_controlled() {
         label.push_str(" (follows set-humans-only)");
     }
+    if d.is_new_here(db)? {
+        label.push_str(" (new in this release: off until you turn it on)");
+    }
     Ok(format!(
         "{:<17} {:<4} {:>5}d {:>9} {:>5}h  {label}",
         detector.name(),
@@ -3424,6 +3432,7 @@ fn list_detectors(db_path: Option<PathBuf>, json: bool) -> Result<()> {
                 ttl_days: d.ttl_days(&db)?,
                 threshold: d.threshold(&db)?,
                 window_hours: d.window_hours(&db)?,
+                new_in_this_release: d.is_new_here(&db)?,
             });
         }
         return stop_bots::output::print(&stop_bots::output::Detectors {
@@ -3518,8 +3527,8 @@ fn set_detector(
     if threshold.is_some() && d.threshold_setting().is_none() {
         anyhow::bail!(
             "{name} has no threshold: one matching request is already conclusive (the ones \
-             that have one are ssh-scanners, web-scanners, asset-ratio, rotating-ua and \
-             refererless)"
+             that have one are {})",
+            counting_detectors()
         );
     }
 
@@ -4840,6 +4849,20 @@ fn capitalised(text: &str) -> String {
     }
 }
 
+/// The detectors that take a threshold, as the command line names them:
+/// "a, b and c".
+fn counting_detectors() -> String {
+    let names: Vec<&str> = DetectorArg::ALL
+        .into_iter()
+        .filter(|d| d.0.threshold_setting().is_some())
+        .map(DetectorArg::name)
+        .collect();
+    match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => names.join(""),
+    }
+}
+
 /// `run-detector`: one detector over a whole log, now. The five that had
 /// a verb of their own before keep their wording; the rest share one.
 fn run_detector(
@@ -4852,19 +4875,11 @@ fn run_detector(
     dry_run: bool,
 ) -> Result<()> {
     let name = stop_bots::blocks::detector_name(detector);
-    let counts = matches!(
-        detector,
-        Detector::SshScanners
-            | Detector::WebScanners
-            | Detector::AssetRatio
-            | Detector::RotatingUserAgent
-            | Detector::RefererlessCrawl
-    );
-    if threshold.is_some() && !counts {
+    if threshold.is_some() && detector.threshold_setting().is_none() {
         anyhow::bail!(
             "{name} has no threshold: one matching request is already conclusive (the ones \
-             that have one are ssh-scanners, web-scanners, asset-ratio, rotating-ua and \
-             refererless)"
+             that have one are {})",
+            counting_detectors()
         );
     }
     if detector == Detector::SshScanners && access_log.is_some() {
@@ -4885,7 +4900,10 @@ fn run_detector(
         | Detector::RobotsTxt
         | Detector::AssetRatio
         | Detector::RotatingUserAgent
-        | Detector::RefererlessCrawl => {
+        | Detector::RefererlessCrawl
+        | Detector::LoginAttempts
+        | Detector::RequestRate
+        | Detector::RobotsViolators => {
             let db = open_db(db_path)?;
             let ttl_days = match ttl_days {
                 Some(days) => days,
@@ -4901,6 +4919,15 @@ fn run_detector(
                 }
                 Detector::RotatingUserAgent => {
                     sb::block_rotating_ua(&db, ttl_days, &log_text, threshold, dry_run)?
+                }
+                Detector::LoginAttempts => {
+                    sb::block_login_attempts(&db, ttl_days, &log_text, threshold, dry_run)?
+                }
+                Detector::RequestRate => {
+                    sb::block_request_rate(&db, ttl_days, &log_text, threshold, dry_run)?
+                }
+                Detector::RobotsViolators => {
+                    sb::block_robots_violators(&db, ttl_days, &log_text, dry_run)?
                 }
                 _ => sb::block_refererless(&db, ttl_days, &log_text, threshold, dry_run)?,
             };

@@ -220,6 +220,46 @@ pub(crate) fn nginx_time(at: i64) -> String {
     )
 }
 
+/// One combined-format access-log line: `request` (the whole `GET /path
+/// HTTP/1.1` triple) from `ip` as `user_agent`, answered `status` at `at`.
+pub(crate) fn access_line_at(
+    ip: &str,
+    request: &str,
+    status: u16,
+    user_agent: &str,
+    at: i64,
+) -> String {
+    format!(
+        "{ip} - - [{}] \"{request}\" {status} 0 \"-\" \"{user_agent}\"",
+        nginx_time(at)
+    )
+}
+
+/// Reads `lines` as one scheduled pass does at `now` (for the detectors
+/// `db` has on, each inside its window) and stores what they show, for
+/// `scanblock::run_detector` to decide on.
+pub(crate) fn ingest_access_lines(db: &Db, lines: &[String], now: i64) {
+    let watch = crate::logscan::watch(db, now).unwrap();
+    let mut observer = crate::accesslog::Observer::new(watch);
+    for line in lines {
+        observer.line(line, crate::accesslog::Clock::Logged { now, undated: None });
+    }
+    let (evidence, _, _) = observer.finish();
+    let from = db.get_log_cursor("test").unwrap();
+    let to = format!("{}x", from.clone().unwrap_or_default());
+    assert!(db
+        .ingest(&crate::db::evidence::Ingested {
+            source: "test",
+            from: from.as_deref(),
+            to: Some(&to),
+            evidence: &evidence,
+            user_agents: &std::collections::HashMap::new(),
+            logins: &[],
+            now,
+        })
+        .unwrap());
+}
+
 /// `at` as `journalctl -o short-iso` and a high-precision rsyslog write it.
 pub(crate) fn iso_time(at: i64) -> String {
     let (y, mo, d, h, mi, s) = crate::logtime::civil(at);

@@ -69,8 +69,10 @@ pub const CURRENT_VERSION: u32 = 8;
 /// - **1**: everything that existed at 0.1.
 /// - **2**: longer blocks for repeat offenders
 ///   (`protection::REPEAT_ESCALATION_INTRODUCED_IN`).
-/// - **3**: probe paths that are probes only where their application is
-///   absent (`protection::APP_PROBE_PATHS_INTRODUCED_IN`).
+/// - **3**: the detectors added after 0.3
+///   (`protection::MORE_DETECTORS_INTRODUCED_IN`), and probe paths that are
+///   probes only where their application is absent
+///   (`protection::APP_PROBE_PATHS_INTRODUCED_IN`).
 pub const DEFAULTS_GENERATION: u32 = 3;
 
 /// One step from version `n - 1` to version `n`, where `n` is its position
@@ -1479,7 +1481,7 @@ mod tests {
 
     /// A 0.0.x database is defaults generation 1, the generation of every
     /// detector that existed then: nothing that ran before an upgrade
-    /// stops, nothing new starts, and nothing is marked new.
+    /// stops, and none of those is marked new.
     #[test]
     fn upgrading_changes_no_detector_s_default() {
         use crate::protection::Detector;
@@ -1489,6 +1491,7 @@ mod tests {
             // The fixtures switch web scanners and asset ratio by hand.
             for d in Detector::ALL.into_iter().filter(|d| {
                 d.is_operator_controlled()
+                    && d.spec().introduced_in == 1
                     && ![Detector::WebScanners, Detector::AssetRatio].contains(d)
             }) {
                 assert_eq!(
@@ -1498,6 +1501,23 @@ mod tests {
                     d.id()
                 );
                 assert!(!d.is_new_here(&db).unwrap(), "{release}: {}", d.id());
+            }
+        }
+    }
+
+    /// Nothing new starts on an upgrade: a detector added since is off,
+    /// and marked new, however its spec defaults on a new database.
+    #[test]
+    fn upgrading_leaves_every_later_detector_off_and_new() {
+        use crate::protection::Detector;
+        for (release, fixture) in [("0.0.1", DB_0_0_1), ("0.0.15", DB_0_0_15)] {
+            let db = upgraded(fixture);
+            for d in Detector::ALL
+                .into_iter()
+                .filter(|d| d.spec().introduced_in > 1)
+            {
+                assert!(!d.is_enabled(&db).unwrap(), "{release}: {} is on", d.id());
+                assert!(d.is_new_here(&db).unwrap(), "{release}: {} not new", d.id());
             }
         }
     }

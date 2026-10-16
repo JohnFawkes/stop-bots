@@ -265,6 +265,9 @@ pub struct DetectorRow {
     /// `null` for a detector that has none.
     pub threshold: Option<usize>,
     pub window_hours: i64,
+    /// Added since this database was created, and not switched on or off
+    /// since: off until someone turns it on.
+    pub new_in_this_release: bool,
 }
 
 #[derive(Debug, Serialize)]

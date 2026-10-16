@@ -44,9 +44,11 @@
 //!
 //! Each detector counts one of three things, which is what [`Rule`] says:
 //!
-//! - **lines** ([`Rule::AtLeast`]): the SSH scanner counts failed logins.
-//!   Kept as ten-minute buckets ([`Item::Bucket`]), so a window can slide
-//!   over them without keeping every line;
+//! - **lines** ([`Rule::AtLeast`]): the SSH scanner counts failed logins,
+//!   the login brute-force detector POSTs to a login page. Kept as
+//!   ten-minute buckets ([`Item::Bucket`]), so a window can slide over
+//!   them without keeping every line. Only buckets are counted; a seen
+//!   item beside them (the login page posted to) only names the reason;
 //! - **distinct things** ([`Rule::Distinct`]): paths that 404'd, pages,
 //!   user agents. Each is one [`Item::Seen`] with the last time it was
 //!   seen. Two of them also have a *clearing* observation ([`Item::Clear`]):
@@ -54,6 +56,15 @@
 //!   suspect for as long as that is inside the window;
 //! - **one line is enough** ([`Rule::Once`]): a probe path, a payload, the
 //!   honeypot.
+//!
+//! And two that are a little of each. One line after a warning
+//! ([`Rule::AfterWarning`]): the robots.txt-violator detector, where a
+//! request for a forbidden page counts only once the client has fetched
+//! the robots.txt that forbids it ([`Item::Warned`]). And one that counts
+//! lines two ways at once ([`Rule::Rate`]): the
+//! request-rate detector, which counts every request in buckets and the
+//! ones NGINX's own rate limit refused in buckets of their own
+//! ([`Item::Refused`]), and acts on either.
 //!
 //! [`decide`] is the whole decision, and the same function serves the
 //! evidence stored here and the evidence built in memory from a log given
@@ -85,6 +96,11 @@ pub enum Item {
     Clear,
     /// A line counted into the bucket starting at this time.
     Bucket(i64),
+    /// A line counted into the bucket starting at this time that was also
+    /// refused by a rate limit (a 429). Counted as a line too.
+    Refused(i64),
+    /// It was told the rules it is judged by: it fetched robots.txt.
+    Warned,
 }
 
 impl Item {
@@ -100,7 +116,12 @@ impl Item {
 
     /// The bucket `at` falls in.
     pub fn bucket(at: i64) -> Item {
-        Item::Bucket(at.div_euclid(BUCKET_SECONDS) * BUCKET_SECONDS)
+        Item::Bucket(bucket_start(at))
+    }
+
+    /// The refused-lines bucket `at` falls in.
+    pub fn refused(at: i64) -> Item {
+        Item::Refused(bucket_start(at))
     }
 
     /// How this is stored. A leading newline marks the two kinds a client
@@ -116,6 +137,8 @@ impl Item {
             Item::Seen(text) => crate::present::without_controls(text).into_owned(),
             Item::Clear => "\nclear".to_string(),
             Item::Bucket(start) => format!("\nbucket {start}"),
+            Item::Refused(start) => format!("\nrefused {start}"),
+            Item::Warned => "\nwarned".to_string(),
         }
     }
 
@@ -123,12 +146,16 @@ impl Item {
         if key == "\nclear" {
             return Item::Clear;
         }
-        match key
-            .strip_prefix("\nbucket ")
-            .and_then(|n| n.parse::<i64>().ok())
-        {
-            Some(start) => Item::Bucket(start),
-            None => Item::Seen(key.to_string()),
+        if key == "\nwarned" {
+            return Item::Warned;
+        }
+        let start = |prefix: &str| key.strip_prefix(prefix)?.parse::<i64>().ok();
+        if let Some(start) = start("\nbucket ") {
+            Item::Bucket(start)
+        } else if let Some(start) = start("\nrefused ") {
+            Item::Refused(start)
+        } else {
+            Item::Seen(key.to_string())
         }
     }
 }
@@ -156,6 +183,11 @@ impl Tally {
         self.first = self.first.min(other.first);
         self.last = self.last.max(other.last);
     }
+}
+
+/// The start of the bucket `at` falls in.
+fn bucket_start(at: i64) -> i64 {
+    at.div_euclid(BUCKET_SECONDS) * BUCKET_SECONDS
 }
 
 /// One stored or collected row: `address` saw `item`, `tally` times.
@@ -220,13 +252,19 @@ impl Evidence {
 /// What a detector needs to see before it acts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rule {
-    /// At least this many lines.
+    /// At least this many lines, counted from [`Item::Bucket`]s.
     AtLeast(usize),
     /// At least this many distinct items, and nothing that clears the
     /// address.
     Distinct(usize),
     /// One line.
     Once,
+    /// At least `lines` lines, or at least `refused` of them refused by a
+    /// rate limit, counted from [`Item::Bucket`]s and [`Item::Refused`]s.
+    Rate { lines: usize, refused: usize },
+    /// One line, seen at or after the first time the address was
+    /// [`Item::Warned`].
+    AfterWarning,
 }
 
 /// Every address `rows` convicts under `rule`, counting only what was seen
@@ -260,12 +298,12 @@ pub fn decide(rows: &[Row], rule: Rule, cutoff: Option<i64>) -> Vec<(String, Str
             Rule::AtLeast(threshold) => {
                 let mut lines = 0u64;
                 for row in &rows {
-                    let start = match row.item {
-                        Item::Bucket(start) => start,
-                        _ => row.tally.first,
-                    };
-                    if inside(start) {
-                        lines += row.tally.count;
+                    match row.item {
+                        Item::Bucket(start) if inside(start) => lines += row.tally.count,
+                        // What the lines were, for the report: the login
+                        // page a brute-forcer posted to.
+                        Item::Seen(_) if inside(row.tally.last) => note(&mut earliest, row),
+                        _ => {}
                     }
                 }
                 lines >= threshold as u64
@@ -282,6 +320,57 @@ pub fn decide(rows: &[Row], rule: Rule, cutoff: Option<i64>) -> Vec<(String, Str
                     }
                 }
                 !cleared && distinct >= threshold
+            }
+            Rule::Rate {
+                lines: most,
+                refused: most_refused,
+            } => {
+                let (mut lines, mut refused) = (0u64, 0u64);
+                for row in &rows {
+                    match row.item {
+                        Item::Bucket(start) if inside(start) => lines += row.tally.count,
+                        Item::Refused(start) if inside(start) => {
+                            lines += row.tally.count;
+                            refused += row.tally.count;
+                        }
+                        _ => {}
+                    }
+                }
+                // The count is the reason: there is no one line to name.
+                let reason = if lines >= most as u64 {
+                    Some(format!("{lines} requests"))
+                } else if refused >= most_refused as u64 {
+                    Some(format!("{refused} requests refused with 429"))
+                } else {
+                    None
+                };
+                match reason {
+                    Some(reason) => {
+                        convicted.push((address.to_string(), reason));
+                        continue;
+                    }
+                    None => false,
+                }
+            }
+            Rule::AfterWarning => {
+                let warned = rows
+                    .iter()
+                    .filter(|row| row.item == Item::Warned && inside(row.tally.last))
+                    .map(|row| row.tally.first)
+                    .min();
+                let mut any = false;
+                if let Some(warned) = warned {
+                    for row in &rows {
+                        if matches!(row.item, Item::Seen(_))
+                            && inside(row.tally.last)
+                            && row.tally.last >= warned
+                        {
+                            any = true;
+                            note(&mut earliest, row);
+                        }
+                    }
+                }
+                any
             }
             Rule::Once => {
                 let mut any = false;
@@ -336,6 +425,10 @@ mod tests {
             Item::seen("/wp-login.php"),
             Item::Clear,
             Item::bucket(1_790_577_181),
+            Item::refused(1_790_577_181),
+            Item::Warned,
+            Item::seen("\nwarned"),
+            Item::seen("\nrefused nonsense"),
             Item::seen(""),
             Item::seen("\nbucket nonsense"),
         ] {
@@ -374,6 +467,99 @@ mod tests {
             decide(&rows, Rule::AtLeast(20), Some(300)).is_empty(),
             "the first bucket began before the window, so only 10 count"
         );
+    }
+
+    /// A brute-forcer's buckets count its POSTs; the page it posted to
+    /// rides along to name the reason, and counts for nothing itself.
+    #[test]
+    fn a_line_count_is_named_by_its_seen_item_without_counting_it() {
+        let rows = [
+            row("203.0.113.5", Item::Bucket(600), 600, 700, 19),
+            row("203.0.113.5", Item::seen("/wp-login.php"), 600, 700, 19),
+        ];
+        assert!(
+            decide(&rows, Rule::AtLeast(20), None).is_empty(),
+            "19 lines, whatever the seen item's tally says"
+        );
+        assert_eq!(
+            decide(&rows, Rule::AtLeast(19), None),
+            [("203.0.113.5".to_string(), "/wp-login.php".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_rate_convicts_on_requests_or_on_refusals_and_says_which() {
+        let cases = [
+            ("enough requests", 60, 0, Some("60 requests")),
+            ("refusals count as requests", 30, 30, Some("60 requests")),
+            (
+                "enough refusals",
+                0,
+                10,
+                Some("10 requests refused with 429"),
+            ),
+            ("neither", 40, 9, None),
+        ];
+        for (what, served, refused, expected) in cases {
+            let rows = [
+                row("203.0.113.5", Item::Bucket(600), 600, 700, served),
+                row("203.0.113.5", Item::Refused(600), 600, 700, refused),
+            ];
+            let found = decide(
+                &rows,
+                Rule::Rate {
+                    lines: 60,
+                    refused: 10,
+                },
+                None,
+            );
+            let reason = found.first().map(|(_, reason)| reason.as_str());
+            assert_eq!(reason, expected, "{what}");
+        }
+    }
+
+    #[test]
+    fn a_rate_counts_only_buckets_that_began_inside_the_window() {
+        let rows = [
+            row("203.0.113.5", Item::Bucket(0), 10, 500, 50),
+            row("203.0.113.5", Item::Refused(0), 10, 500, 50),
+            row("203.0.113.5", Item::Bucket(600), 600, 700, 10),
+        ];
+        let rule = Rule::Rate {
+            lines: 20,
+            refused: 20,
+        };
+        assert_eq!(decide(&rows, rule, None).len(), 1, "110 in all");
+        assert!(decide(&rows, rule, Some(300)).is_empty(), "10 inside");
+    }
+
+    /// A forbidden page fetched before robots.txt was read may be a guess;
+    /// after it, it is defiance.
+    #[test]
+    fn a_line_after_a_warning_counts_and_one_before_it_does_not() {
+        let warned = |at| row("203.0.113.5", Item::Warned, at, at, 1);
+        let cases = [
+            (
+                "after",
+                vec![warned(100), seen("203.0.113.5", "/trap/", 200)],
+                true,
+            ),
+            (
+                "before",
+                vec![seen("203.0.113.5", "/trap/", 50), warned(100)],
+                false,
+            ),
+            (
+                "never warned",
+                vec![seen("203.0.113.5", "/trap/", 200)],
+                false,
+            ),
+            ("warned and nothing more", vec![warned(100)], false),
+        ];
+        for (what, rows, expected) in cases {
+            let found = decide(&rows, Rule::AfterWarning, None);
+            assert_eq!(!found.is_empty(), expected, "{what}: {found:?}");
+        }
     }
 
     #[test]

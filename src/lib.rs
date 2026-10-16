@@ -117,6 +117,8 @@ pub mod refresh;
 #[doc(hidden)]
 pub mod revert;
 #[doc(hidden)]
+pub mod robots;
+#[doc(hidden)]
 pub mod scanblock;
 #[doc(hidden)]
 pub mod services;

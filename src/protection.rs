@@ -125,6 +125,41 @@ pub const INJECTION_ENABLED_DEFAULT: bool = true;
 /// honeypot's thirty, which is the one signal that cannot be an accident.
 pub const INJECTION_TTL_DAYS_DEFAULT: i64 = 7;
 
+/// robots.txt violators default to **off**, for the reason the honeypot
+/// does: it judges by the robots.txt this project generates, and does
+/// nothing until that is served, so on by default it would be an enabled
+/// detector that cannot fire. And because a person can read robots.txt
+/// too, and then open what it forbids, out of curiosity.
+pub const ROBOTS_VIOLATORS_ENABLED_DEFAULT: bool = false;
+
+/// Seven days: shorter than the honeypot's thirty, since what a page
+/// forbids is read from a file here rather than being a path that exists
+/// for no other reason, and as long as an injection's, since a crawler
+/// that ignored the rules once will again.
+pub const ROBOTS_VIOLATORS_TTL_DAYS_DEFAULT: i64 = 7;
+
+/// The robots.txt the robots.txt-violator detector judges by: the one this
+/// project generates, when it is served, and otherwise none.
+///
+/// **Only the generated one**, because it is the only one whose rules are
+/// known to be what clients were sent. Every site gets it, from the same
+/// `location = /robots.txt` (or Apache rewrite), so it does not matter
+/// that the combined log format does not say which site a request was
+/// for. A `robots.txt` in a site's document root can be shadowed by a
+/// `location`, served by the application behind a proxy instead, or
+/// differ from one site to the next; reading it would judge clients by
+/// rules they may never have seen. Fetching each site's over localhost
+/// would know what is served, but it is a network request from a detector
+/// that runs every minute, through TLS and virtual hosts, and no test
+/// here may touch the network.
+pub fn robots_rules(db: &Db) -> Result<Option<crate::robots::Robots>> {
+    if !db.get_serve_robots_txt()? {
+        return Ok(None);
+    }
+    let body = crate::webserver::robots_txt_body(db)?;
+    Ok(Some(crate::robots::Robots::parse(&body)))
+}
+
 /// Every extra probe path configured on top of the built-in list: the
 /// `PROBE_PATHS_EXTRA` setting split on newlines, with blank lines and
 /// `#` comments dropped so an admin can annotate the list.
@@ -307,6 +342,9 @@ pub enum Detector {
     RefererlessCrawl,
     /// Only ever on under "humans only" — see [`Detector::is_enabled`].
     RobotsTxt,
+    LoginAttempts,
+    RequestRate,
+    RobotsViolators,
 }
 
 /// The static facts about a detector: how it's stored, what it's called,
@@ -337,7 +375,7 @@ pub struct DetectorSpec {
 }
 
 impl Detector {
-    pub const ALL: [Detector; 10] = [
+    pub const ALL: [Detector; 13] = [
         Detector::SshScanners,
         Detector::WebScanners,
         Detector::SpoofedCrawlers,
@@ -348,6 +386,9 @@ impl Detector {
         Detector::RotatingUserAgent,
         Detector::RefererlessCrawl,
         Detector::RobotsTxt,
+        Detector::LoginAttempts,
+        Detector::RequestRate,
+        Detector::RobotsViolators,
     ];
 
     pub fn spec(self) -> DetectorSpec {
@@ -461,6 +502,38 @@ impl Detector {
                 uses_ssh_log: false,
                 introduced_in: 1,
             },
+            // Detectors from here on arrived after 0.3: off on a database
+            // an earlier release created, whatever `enabled_default` says.
+            Detector::LoginAttempts => DetectorSpec {
+                id: "block_login_attempts",
+                label: "Login brute force",
+                job_label: "Block login brute force",
+                enabled_default: LOGIN_ATTEMPTS_ENABLED_DEFAULT,
+                ttl_days_default: LOGIN_ATTEMPTS_TTL_DAYS_DEFAULT,
+                window_hours_default: LOGIN_ATTEMPTS_WINDOW_HOURS,
+                uses_ssh_log: false,
+                introduced_in: MORE_DETECTORS_INTRODUCED_IN,
+            },
+            Detector::RequestRate => DetectorSpec {
+                id: "block_request_rate",
+                label: "Request rate",
+                job_label: "Block high request rates",
+                enabled_default: REQUEST_RATE_ENABLED_DEFAULT,
+                ttl_days_default: REQUEST_RATE_TTL_DAYS_DEFAULT,
+                window_hours_default: REQUEST_RATE_WINDOW_HOURS,
+                uses_ssh_log: false,
+                introduced_in: MORE_DETECTORS_INTRODUCED_IN,
+            },
+            Detector::RobotsViolators => DetectorSpec {
+                id: "block_robots_violators",
+                label: "robots.txt violators",
+                job_label: "Block robots.txt violators",
+                enabled_default: ROBOTS_VIOLATORS_ENABLED_DEFAULT,
+                ttl_days_default: ROBOTS_VIOLATORS_TTL_DAYS_DEFAULT,
+                window_hours_default: EVIDENCE_WINDOW_HOURS,
+                uses_ssh_log: false,
+                introduced_in: MORE_DETECTORS_INTRODUCED_IN,
+            },
         }
     }
 
@@ -517,6 +590,25 @@ impl Detector {
                 "Under Humans only: blocks a client that fetches robots.txt. People do not ask \
                  for it; crawlers do."
             }
+            Detector::LoginAttempts => {
+                "Blocks an address that sends many login attempts in a short time: POST \
+                 requests to a login page such as /wp-login.php, /xmlrpc.php or /user/login. \
+                 That is password guessing, and a login that succeeds in the end does not \
+                 excuse it."
+            }
+            Detector::RequestRate => {
+                "Blocks an address that keeps up more requests a minute than its threshold \
+                 for the whole window, or that NGINX's own rate limit has refused (429) a \
+                 hundred times in it. Rate limiting in the web server slows a client down; \
+                 this shuts it out. On Apache, which has no rate limiting here, it is the only \
+                 defence against a flood."
+            }
+            Detector::RobotsViolators => {
+                "Blocks a client that fetched robots.txt and then a page it forbids to that \
+                 client: a crawler that read the rules and ignored them. The honeypot's trap \
+                 path is one such page; a bot that robots.txt shuts out altogether asking for \
+                 anything at all is another."
+            }
         }
     }
 
@@ -546,6 +638,26 @@ impl Detector {
             Detector::SpoofedCrawlers => Some(
                 "Needs the crawler ranges downloaded; until they are, it cannot tell a real \
                  Googlebot from a forged one and blocks neither.",
+            ),
+            Detector::LoginAttempts => Some(
+                "Can catch an office or school behind one shared address whose people all log \
+                 in within the hour, and a program that posts to /xmlrpc.php often, such as \
+                 the WordPress app or Jetpack. Twenty attempts an hour is far more than one \
+                 person makes. It never blocks a trusted address, one that logged in over SSH, \
+                 or a verified search engine.",
+            ),
+            Detector::RequestRate => Some(
+                "Can catch many people behind one shared address, such as an office, a school \
+                 or a mobile carrier, and a proxy or monitoring service that fetches a lot. \
+                 Off by default for that reason, with a high threshold. What an application \
+                 recognised behind a site fetches on its own data routes does not count, and \
+                 it never blocks a trusted address or a verified search engine.",
+            ),
+            Detector::RobotsViolators => Some(
+                "Does nothing until the site serves the generated robots.txt (a setting on the \
+                 web server's screen), the only one it knows the rules of. A person who reads \
+                 robots.txt and then opens a page it forbids by hand is blocked too. It never \
+                 blocks a verified search engine.",
             ),
             _ => None,
         }
@@ -655,7 +767,7 @@ impl Detector {
     }
 
     /// The `settings` key and default of this detector's threshold, for the
-    /// five that count something. `None` for the ones where a single
+    /// ones that count something. `None` for the ones where a single
     /// request is conclusive, which have nothing to tune.
     ///
     /// The three behavioural keys predate this and keep their names; the
@@ -671,11 +783,16 @@ impl Detector {
             Detector::RefererlessCrawl => {
                 Some((REFERERLESS_MIN_PATHS, REFERERLESS_MIN_PATHS_DEFAULT))
             }
+            Detector::LoginAttempts => Some((LOGIN_ATTEMPTS_MIN, LOGIN_ATTEMPTS_MIN_DEFAULT)),
+            Detector::RequestRate => {
+                Some((REQUEST_RATE_PER_MINUTE, REQUEST_RATE_PER_MINUTE_DEFAULT))
+            }
             Detector::SpoofedCrawlers
             | Detector::ProbePaths
             | Detector::Injection
             | Detector::Honeypot
-            | Detector::RobotsTxt => None,
+            | Detector::RobotsTxt
+            | Detector::RobotsViolators => None,
         }
     }
 
@@ -938,6 +1055,82 @@ pub const ROTATING_UA_MIN_DEFAULT: i64 = 20;
 /// fetched with no `Referer`.
 pub const REFERERLESS_MIN_PATHS: &str = keys::DETECT_REFERERLESS_MIN_PATHS;
 pub const REFERERLESS_MIN_PATHS_DEFAULT: i64 = 25;
+
+/// The defaults generation the detectors added after 0.3 arrived in (see
+/// `db::schema::DEFAULTS_GENERATION`): on a database an earlier release
+/// created they are off, and marked new, until the operator chooses.
+pub const MORE_DETECTORS_INTRODUCED_IN: u32 = 3;
+
+/// Login brute force defaults to **on**: the evidence is twenty login
+/// attempts from one address inside an hour, which no one person makes,
+/// and every exemption a detector has applies (trusted addresses, recent
+/// SSH logins, verified crawlers). Only on a database created at
+/// [`MORE_DETECTORS_INTRODUCED_IN`] or later, by [`enabled_by_default`].
+pub const LOGIN_ATTEMPTS_ENABLED_DEFAULT: bool = true;
+
+/// One day, like the web scanner's: the false positive it can have is an
+/// office behind one address, which should not wait long for its block to
+/// end. A brute-forcer that comes back is blocked again, for longer each
+/// time if repeat offenders are (see [`escalated_ttl_days`]).
+pub const LOGIN_ATTEMPTS_TTL_DAYS_DEFAULT: i64 = 1;
+
+/// An hour: the shortest window there is. A password-guesser makes its
+/// attempts in minutes; twenty spread over a day could be a team, each
+/// logging in once.
+pub const LOGIN_ATTEMPTS_WINDOW_HOURS: i64 = 1;
+
+/// Threshold for the login brute-force detector: POST requests to a login
+/// page from one address inside the window. Twenty, as for SSH: a person
+/// who mistypes a password a few times, or logs in and out and in again,
+/// stays far below it, and a password-guesser passes it in a minute.
+pub const LOGIN_ATTEMPTS_MIN: &str = keys::DETECT_LOGIN_ATTEMPTS_MIN;
+pub const LOGIN_ATTEMPTS_MIN_DEFAULT: i64 = 20;
+
+/// Request rate defaults to **off**. One address is not one person: an
+/// office, a school or a carrier's NAT puts hundreds behind it, and their
+/// requests add up to whatever a threshold says. Only the operator knows
+/// how busy their own visitors are.
+pub const REQUEST_RATE_ENABLED_DEFAULT: bool = false;
+
+/// One day, like the other detectors that can catch a crowd behind one
+/// address.
+pub const REQUEST_RATE_TTL_DAYS_DEFAULT: i64 = 1;
+
+/// An hour: long enough that a page with a hundred images, or a burst of
+/// reloads, averages out, and short enough that a flood is answered while
+/// it lasts.
+pub const REQUEST_RATE_WINDOW_HOURS: i64 = 1;
+
+/// Threshold for the request-rate detector: requests a minute from one
+/// address, kept up for the window. 120 by default, two a second for an
+/// hour: a person reading, even pages heavy with images, averages far less
+/// over an hour, and what keeps it up is a scraper or a flood.
+pub const REQUEST_RATE_PER_MINUTE: &str = keys::DETECT_REQUEST_RATE_PER_MINUTE;
+pub const REQUEST_RATE_PER_MINUTE_DEFAULT: i64 = 120;
+
+/// Requests NGINX's own rate limit refused (answered 429) inside the
+/// window that block an address whatever its average. A hundred: a page
+/// load that bursts past the limit is refused a handful of times; a client
+/// that keeps coming back after a hundred refusals is not listening.
+pub const REQUEST_RATE_REFUSED_MIN: usize = 100;
+
+/// What the request-rate detector acts on, for `per_minute` requests a
+/// minute over a window of `window_seconds`.
+///
+/// The rate is asked of the whole window, so a client under the threshold
+/// is never caught. The requests counted are those in buckets that began
+/// inside the window (see [`crate::evidence::decide`]), which can fall up
+/// to a bucket short of it, so a client that keeps up exactly the
+/// threshold may not be caught either: with an hour's window and
+/// ten-minute buckets, one that keeps up a fifth more always is. Short of,
+/// never over, as every count here errs.
+pub fn request_rate_rule(per_minute: usize, window_seconds: i64) -> crate::evidence::Rule {
+    let minutes = (window_seconds / 60).max(1) as usize;
+    crate::evidence::Rule::Rate {
+        lines: per_minute.saturating_mul(minutes),
+        refused: REQUEST_RATE_REFUSED_MIN,
+    }
+}
 
 #[cfg(test)]
 mod tests {

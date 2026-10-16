@@ -234,7 +234,7 @@ pub fn plan(db: &Db, jobs: &[CronJob], flags: &Flags) -> Result<Plan> {
 
 /// What every access-log detector that is on is looking for, and from
 /// when.
-fn watch(db: &Db, now: i64) -> Result<Watch> {
+pub fn watch(db: &Db, now: i64) -> Result<Watch> {
     let mut detectors = Vec::new();
     for detector in Detector::ALL {
         if !detector.spec().uses_ssh_log && detector.is_enabled(db)? {
@@ -246,10 +246,20 @@ fn watch(db: &Db, now: i64) -> Result<Watch> {
     } else {
         crate::webapps::AppProbes::default()
     };
+    // Built from the whole bot list, so only when something reads it.
+    let robots = if detectors
+        .iter()
+        .any(|(d, _)| *d == Detector::RobotsViolators)
+    {
+        crate::protection::robots_rules(db)?
+    } else {
+        None
+    };
     Ok(Watch {
         detectors,
         probe_paths: crate::protection::probe_paths(db)?,
         honeypot: crate::protection::honeypot_path(db)?,
+        robots,
         claims: crate::scanblock::crawler_claims(db)?,
         hosted: hosted(db)?,
         app_probes,

@@ -79,6 +79,29 @@ impl SourceKind {
         }
     }
 
+    /// What the list is, for the TUI's `?`.
+    pub fn about(self) -> &'static str {
+        match self {
+            SourceKind::WellKnownBots => {
+                "Arcjet's Well-Known Bots: a catalogue of named bots and crawlers, tagged by what \
+                 they do, such as search engine or AI crawler."
+            }
+            SourceKind::AiRobotsTxt => {
+                "ai.robots.txt: the crawlers that collect pages for AI models, kept up to date \
+                 by a community project. Every bot here is in the AI category."
+            }
+            SourceKind::NginxBadBots => {
+                "The NGINX Ultimate Bad Bot Blocker's list: scrapers, spam bots and \
+                 vulnerability scanners. Its bots are in the scanner category."
+            }
+            SourceKind::StopBotsExtras => {
+                "stop-bots' own list, built into the program: bots seen on a real server that \
+                 none of the other lists carried. It needs no download, so a new install is \
+                 covered before it has fetched anything."
+            }
+        }
+    }
+
     /// Looks up a `SourceKind` by its stable `id()` (the same string stored
     /// in the `sources` table) — e.g. what `App`'s `UpdateSource` outcome
     /// carries back from a Bot settings confirmation, or the CLI's

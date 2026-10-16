@@ -136,6 +136,39 @@ impl ReputationSourceKind {
         )
     }
 
+    /// What the list holds, for the TUI's `?`.
+    pub fn about(self) -> &'static str {
+        match self {
+            ReputationSourceKind::FireholLevel1 => {
+                "A conservative list of addresses that are attacking right now, or should \
+                 never send traffic at all (unallocated and hijacked ranges), combined from \
+                 several abuse lists by the FireHOL project. Meant to be safe to block \
+                 outright."
+            }
+            ReputationSourceKind::TorExits => {
+                "Every address the Tor network currently exits from. Blocks attacks routed \
+                 through Tor, and also every person who uses Tor for privacy."
+            }
+            ReputationSourceKind::BlocklistDe => {
+                "Addresses reported in the last 48 hours for attacks on SSH, mail, web and \
+                 other services, by servers that run fail2ban and report to blocklist.de."
+            }
+            ReputationSourceKind::Aws => {
+                "Every address Amazon Web Services owns. Much bot traffic comes from cloud \
+                 servers, but so do VPNs, company networks and API clients."
+            }
+            ReputationSourceKind::GoogleCloud => {
+                "Every address Google Cloud rents to its customers (not Googlebot, which has \
+                 its own ranges). Much bot traffic comes from cloud servers, but so do VPNs \
+                 and API clients."
+            }
+            ReputationSourceKind::DigitalOcean => {
+                "Every address DigitalOcean owns. Much bot traffic comes from cheap cloud \
+                 servers, but so do VPNs and API clients."
+            }
+        }
+    }
+
     /// A one-line caution shown next to the more dangerous feeds, or
     /// `None` for the abuse lists.
     pub fn warning(self) -> Option<&'static str> {

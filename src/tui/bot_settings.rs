@@ -442,6 +442,94 @@ impl BotSettings {
     }
 }
 
+impl BotSettings {
+    /// What the row under the cursor is, for `?`.
+    pub fn explain(&self) -> crate::tui::explain::Explanation {
+        use crate::tui::explain::Explanation;
+        match self.focus {
+            Focus::Sources => {
+                let Some(source) = self
+                    .sources_state
+                    .selected()
+                    .and_then(|i| self.sources.get(i))
+                else {
+                    return Explanation::new("Bot list sources").para(
+                        "The lists of known bots this host blocks by user agent. Update one \
+                         to download it.",
+                    );
+                };
+                Explanation::new(source.name.clone())
+                    .para(
+                        crate::botlist::SourceKind::from_id(&source.id)
+                            .map(|kind| kind.about())
+                            .unwrap_or_default(),
+                    )
+                    .now(format!(
+                        "{} bots, {}.",
+                        source.bot_count,
+                        humanize_age(source.last_fetched_at)
+                    ))
+                    .para(
+                        "The bots from every list are merged: a bot is in a category if any \
+                         list says so. Whether a category is blocked is set on the Dashboard. \
+                         Enter downloads this list again; every list is updated weekly by the \
+                         schedule.",
+                    )
+            }
+            Focus::Search => {
+                let bots = self.filtered_bots();
+                let Some(bot) = self.results_state.selected().and_then(|i| bots.get(i)) else {
+                    return Explanation::new("Bot search").para(
+                        "Type part of a bot's name to find it, then Enter to allow or block it \
+                         on every site, whatever its category says.",
+                    );
+                };
+                let categories: Vec<&str> = [
+                    (bot.is_search_engine, "search engine"),
+                    (bot.is_ai, "AI crawler"),
+                    (bot.is_scanner, "scanner"),
+                ]
+                .into_iter()
+                .filter_map(|(is, name)| is.then_some(name))
+                .collect();
+                let effective = effective_policy(
+                    bot,
+                    self.ai_default,
+                    self.search_default,
+                    self.scanner_default,
+                );
+                let verdict = match effective {
+                    Policy::Allowed => "allowed",
+                    Policy::Blocked => "blocked",
+                };
+                let why = match bot.status {
+                    BotStatus::Default if categories.is_empty() => {
+                        "in no category, so no category default blocks it".to_string()
+                    }
+                    BotStatus::Default => format!(
+                        "by its categories' defaults on the Dashboard ({})",
+                        categories.join(", ")
+                    ),
+                    BotStatus::Allowed | BotStatus::Blocked => {
+                        "by an override set here, whatever its categories say".to_string()
+                    }
+                };
+                Explanation::new(bot.name.clone())
+                    .para(format!(
+                        "Matched by its user agent, ignoring case: {}",
+                        bot.user_agent_pattern
+                    ))
+                    .now(format!("{verdict}, {why}."))
+                    .para(
+                        "Enter sets an override for every site: allowed, blocked, or back to \
+                         its categories. A single site can override it again, on the web \
+                         server's screen.",
+                    )
+            }
+        }
+    }
+}
+
 fn source_line(source: &Source, name_width: usize) -> Line<'static> {
     Line::from(vec![
         Span::from(format!("{:<name_width$}  ", source.name)).bold(),

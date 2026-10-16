@@ -438,6 +438,37 @@ impl RequestRule {
         }
     }
 
+    /// What the rule turns away and why that catches bots, for the TUI's
+    /// `?`.
+    pub fn about(self) -> &'static str {
+        match self {
+            RequestRule::Http1x => {
+                "Turns away requests over HTTP/1.0 and 1.1 on HTTPS. Every current browser \
+                 speaks HTTP/2 there; much bot tooling still does not."
+            }
+            RequestRule::NoAccept => {
+                "Turns away requests with no Accept header. Every browser sends one; a fair \
+                 amount of tooling sends nothing."
+            }
+            RequestRule::NoAcceptLanguage => {
+                "Turns away requests with no Accept-Language header. Browsers send it; most \
+                 scripts do not. Weaker than No Accept header, as some privacy setups strip it."
+            }
+            RequestRule::NoUserAgent => {
+                "Turns away requests with an empty or missing user agent, which the bot lists \
+                 cannot catch: they match only agents that name themselves."
+            }
+            RequestRule::IpLiteralHost => {
+                "Turns away requests addressed to the server's IP address rather than the \
+                 site's name. Scanners sweep address ranges; visitors arrive by name."
+            }
+            RequestRule::OldTls => {
+                "Turns away connections over TLS 1.0 and 1.1, which are formally deprecated \
+                 and offered by no current browser."
+            }
+        }
+    }
+
     /// A one-line note on what this turns away besides bots, shown next to
     /// the toggle. Every one of these has collateral; saying so at the
     /// point of the decision is the whole point.

@@ -435,6 +435,132 @@ impl Nginx {
         self.focus = Focus::Sites;
     }
 
+    /// What the row under the cursor is, for `?`.
+    pub fn explain(&self) -> crate::tui::explain::Explanation {
+        use crate::tui::explain::Explanation;
+        if let Some(detail) = &self.detail {
+            return detail.explain();
+        }
+        let server = self.server.label();
+        let apply = format!(
+            "A change here reaches the sites when you apply them (a or A here), which tests \
+             the config and reloads {server}."
+        );
+        match self.focus {
+            Focus::Settings => {
+                let Some(setting) = self
+                    .settings_state
+                    .selected()
+                    .and_then(|i| NginxSetting::ALL.get(i).copied())
+                else {
+                    return Explanation::new(format!("{server} settings"));
+                };
+                let explanation = match setting {
+                    NginxSetting::Response => Explanation::new("Response for blocked requests")
+                        .para(
+                            "What a blocked request gets back. A 403 says no; the others \
+                             trade that clarity for wasting a bot's time or saying less.",
+                        )
+                        .now(format!(
+                            "{}: {}",
+                            self.block_response.label(),
+                            self.block_response.rationale()
+                        )),
+                    NginxSetting::RobotsTxt => Explanation::new("robots.txt")
+                        .para(
+                            "Serves a generated /robots.txt on every site that asks every bot \
+                             you block to stay away: the polite request, before the block. It \
+                             also publishes the Honeypot detector's trap path.",
+                        )
+                        .now(if self.serve_robots_txt {
+                            "generated, replacing each site's own robots.txt."
+                        } else {
+                            "off: each site's own robots.txt, if any, is left alone."
+                        })
+                        .warn(
+                            "It replaces a robots.txt a site already serves. Leave it off if \
+                             yours says something you need.",
+                        ),
+                    NginxSetting::RateLimit => {
+                        let explanation = Explanation::new("Rate limit")
+                            .para(format!(
+                                "Limits how many requests one address can make per second; \
+                                 past the burst, {server} turns it away with a 429. Slows down \
+                                 scrapers that fetch too fast."
+                            ))
+                            .now(if self.server.without_rate_limiting().is_some() {
+                                format!("not available on {server}.")
+                            } else if self.rate_limit_enabled {
+                                format!(
+                                    "{} requests a second, bursts of {}.",
+                                    self.rate_limit_rps, self.rate_limit_burst
+                                )
+                            } else {
+                                "off.".to_string()
+                            });
+                        explanation.warn(
+                            "Many people behind one address (an office, a school, a mobile \
+                             network) count as one client. Start with the highest rate.",
+                        )
+                    }
+                    NginxSetting::AutoApply => Explanation::new("Auto-apply")
+                        .para(format!(
+                            "Whether the schedule applies config changes to every site and \
+                             reloads {server} on its own, at most once an hour, after the \
+                             config test passes."
+                        ))
+                        .now(if self.auto_apply {
+                            "on: changes reach the sites within the hour."
+                        } else {
+                            "off: changes wait for a or A."
+                        }),
+                };
+                explanation.para(apply).para("Enter changes it.")
+            }
+            Focus::Sites => {
+                let Some((site, status)) = self
+                    .list_state
+                    .selected()
+                    .and_then(|i| self.sites.get(i).zip(self.statuses.get(i)))
+                else {
+                    return Explanation::new("Sites").para(format!(
+                        "The sites found in {server}'s config. r scans for them."
+                    ));
+                };
+                let now = if !self.statuses_current {
+                    "being checked.".to_string()
+                } else {
+                    match status {
+                        SiteApplyStatus::UpToDate => {
+                            "UP TO DATE: its config carries the blocks as they are set now."
+                                .to_string()
+                        }
+                        SiteApplyStatus::Stale => "STALE: a setting changed since it was \
+                                                    last applied; a applies it."
+                            .to_string(),
+                        SiteApplyStatus::NotFound => format!(
+                            "NOT FOUND: {} no longer has a server block for this name, or \
+                             cannot be read. r scans again.",
+                            site.config_path
+                        ),
+                    }
+                };
+                Explanation::new(site.server_name.clone())
+                    .para(format!(
+                        "A site {server} serves, from {}. stop-bots writes its blocks into \
+                         this site's config, between BEGIN and END stop-bots markers, and \
+                         touches nothing else in the file.",
+                        site.config_path
+                    ))
+                    .now(now)
+                    .para(
+                        "Enter opens its own settings: categories, request rules, paths and \
+                         bots that differ from the rest. a applies this site, A every site.",
+                    )
+            }
+        }
+    }
+
     /// The footer's key hints for the focused panel.
     pub fn hints(&self) -> crate::tui::Hints {
         if let Some(detail) = self.detail.as_ref().filter(|_| self.popup.is_none()) {

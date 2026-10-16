@@ -16,6 +16,12 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ### Added
 
+- **`?` explains what is under the cursor.** On every screen, `?` opens what the
+  selected row is, what it is set to now, what it can block by mistake and when a change
+  reaches the host, with the keys for that panel beside it. This covers every detector,
+  feed, country, category, crawler range, bot, request rule, site, trusted entry and
+  block. `?` again opens the full key reference, which is what `?` alone used to do.
+
 - **A question when no one has logged in over SSH.** The TUI's "Apply everything" asks
   "Do you log into this server over SSH?" before its preview when the SSH log holds no
   login from the last week. Answering no turns the lock-out check off, which is also a

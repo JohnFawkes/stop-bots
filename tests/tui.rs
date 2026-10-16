@@ -436,6 +436,30 @@ fn startup_enters_the_alternate_screen_and_clears_it_before_drawing() {
         .expect("process should exit after q on the Dashboard");
 }
 
+/// `?` explains the row under the cursor, with its keys beside it, and
+/// `?` again opens the key reference.
+#[test]
+fn question_mark_explains_the_selected_row_and_then_lists_every_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = spawn_tui(&tmp.path().join("db.sqlite3"));
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "?");
+    // The first Dashboard row is Humans only; its explanation opens with
+    // what it does, and the key column ends with the keys for anywhere.
+    session.exp_string("Serves").unwrap();
+    session.exp_string("anywhere").unwrap();
+
+    send_key(&mut session, "?");
+    session.exp_string("Navigation").unwrap();
+
+    send_escape(&mut session);
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+}
+
 /// The SSH panel is filled from a background read now, so it arrives a
 /// moment after the screen does. Nothing else in the suite watches that
 /// panel through a real terminal, which makes this the one place a broken
@@ -1139,9 +1163,12 @@ fn help_screen_opens_and_returns_to_the_previous_screen() {
     send_key(&mut session, "n");
     session.exp_string("Sites").unwrap();
 
+    // `?` explains the site list first; `?` again is the key reference.
+    send_key(&mut session, "?");
+    session.exp_string("scans").unwrap();
     send_key(&mut session, "?");
     session.exp_string("Navigation").unwrap();
-    session.exp_string("light/dark").unwrap();
+    session.exp_string("explain").unwrap();
 
     // Esc on Help goes back to NGINX, not the Dashboard.
     send_key(&mut session, "\x1b");

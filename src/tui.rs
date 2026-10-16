@@ -23,6 +23,7 @@
 pub mod blocks;
 pub mod bot_settings;
 pub mod dashboard;
+pub mod explain;
 pub mod firewall;
 pub mod help;
 pub mod nginx;
@@ -468,6 +469,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if let Some(palette) = &app.palette {
         palette.render(frame, body, app.theme);
     }
+    if let Some(explain) = &app.explain {
+        explain.render(frame, body, app.theme);
+    }
 
     render_footer(app, frame, footer);
 }
@@ -579,21 +583,18 @@ fn status_line(app: &App) -> Line<'static> {
 /// the site list only while the site list has focus.
 fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     let theme = app.theme;
-    let (panel, hints) = match (&app.palette, app.screen) {
+    let overlay = app.palette.is_some() || app.explain.is_some();
+    let (panel, hints) = match (&app.palette, &app.explain) {
         (Some(palette), _) => palette.hints(),
-        (None, Screen::Dashboard) => app.dashboard.hints(),
-        (None, Screen::BotSettings) => app.bot_settings.hints(),
-        (None, Screen::Firewall) => app.firewall.hints(),
-        (None, Screen::Nginx) => app.nginx.hints(),
-        (None, Screen::Blocks) => app.blocks.hints(),
-        (None, Screen::Help) => ("Help", vec![("Esc", "back")]),
+        (None, Some(explain)) => explain.hints(),
+        (None, None) => app.hints(),
     };
     let mut spans: Vec<Span> = vec![panel.fg(theme.accent()).bold(), "  ".into()];
     // The last thing that happened, on whatever screen is open, until the
     // next key press brings the hints back. It used to reach only the
     // Dashboard, so the outcome of a fetch started from Bot settings, or
     // of an apply on NGINX, was on a screen nobody was looking at.
-    if let (Some(message), true, None) = (&app.message, app.message_in_footer, &app.palette) {
+    if let (Some(message), true, false) = (&app.message, app.message_in_footer, overlay) {
         spans.push(
             message
                 .lines()
@@ -605,11 +606,11 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
         return;
     }
-    let globals: &[(&str, &str)] = match (&app.palette, app.screen) {
-        (Some(_), _) | (None, Screen::Help) => &[],
+    let globals: &[(&str, &str)] = match (overlay, app.screen) {
+        (true, _) | (false, Screen::Help) => &[],
         _ => &[
             (":", "commands"),
-            ("?", "help"),
+            ("?", "explain"),
             ("t", "theme"),
             ("q", "quit"),
         ],

@@ -135,6 +135,9 @@ pub struct App {
     db_last_logged: Option<String>,
     /// The command palette, while it is open. See [`crate::tui::palette`].
     pub palette: Option<tui::palette::Palette>,
+    /// What the row under the cursor is, while `?` has it open. See
+    /// [`crate::tui::explain`].
+    pub explain: Option<tui::explain::Explain>,
     pub db: Db,
     /// Shown above the status strip when the database is not the system
     /// one: see [`crate::db::location_notice`]. Set by `main.rs`, which is
@@ -324,6 +327,31 @@ pub fn firewall_message(outcome: &crate::firewall::FirewallOutcome) -> String {
 }
 
 impl App {
+    /// The active screen's footer hints: the focused panel's name and its
+    /// keys. Shared by the footer and by `?`, so the two list the same keys.
+    pub fn hints(&self) -> tui::Hints {
+        match self.screen {
+            Screen::Dashboard => self.dashboard.hints(),
+            Screen::BotSettings => self.bot_settings.hints(),
+            Screen::Firewall => self.firewall.hints(),
+            Screen::Nginx => self.nginx.hints(),
+            Screen::Blocks => self.blocks.hints(),
+            Screen::Help => ("Help", vec![("Esc", "back")]),
+        }
+    }
+
+    /// What the row under the cursor on the active screen is, for `?`.
+    fn explanation(&self) -> tui::explain::Explanation {
+        match self.screen {
+            Screen::Dashboard => self.dashboard.explain(),
+            Screen::BotSettings => self.bot_settings.explain(),
+            Screen::Firewall => self.firewall.explain(),
+            Screen::Nginx => self.nginx.explain(),
+            Screen::Blocks => self.blocks.explain(),
+            Screen::Help => tui::explain::Explanation::new("Help"),
+        }
+    }
+
     /// Constructs a new [`App`], loading initial state from `db`. `root` is
     /// the NGINX config root NGINX scans when the user triggers a
     /// rescan from the TUI. `reload_nginx_for_real` gates whether a successful Site
@@ -348,6 +376,7 @@ impl App {
             log: Vec::new(),
             db_last_logged: None,
             palette: None,
+            explain: None,
             db,
             db_notice: None,
             dashboard: tui::dashboard::Dashboard::default(),
@@ -1772,6 +1801,19 @@ impl App {
             return Ok(());
         }
 
+        if let Some(explain) = &mut self.explain {
+            match explain.handle_key(key.code) {
+                tui::explain::ExplainKey::Stay => {}
+                tui::explain::ExplainKey::Close => self.explain = None,
+                tui::explain::ExplainKey::AllKeys => {
+                    self.explain = None;
+                    self.before_help = self.screen;
+                    self.screen = Screen::Help;
+                }
+            }
+            return Ok(());
+        }
+
         if self.screen == Screen::Help {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | '?')) {
                 self.screen = self.before_help;
@@ -1878,9 +1920,10 @@ impl App {
             // `t` is the documented theme key; `c` stays as the alias it
             // used to be, for hands that learned it.
             KeyCode::Char('t' | 'c') => self.theme = self.theme.toggle(),
+            // What the row under the cursor is; `?` again, from there,
+            // is the full key reference.
             KeyCode::Char('?') => {
-                self.before_help = self.screen;
-                self.screen = Screen::Help;
+                self.explain = Some(tui::explain::Explain::new(self.explanation(), self.hints()));
             }
             KeyCode::Char(':') => self.palette = Some(tui::palette::Palette::new(self.commands())),
             // Digits, as every tabbed terminal tool has them and as the tab
@@ -2147,7 +2190,7 @@ mod tests {
         app.handle_key_press(KeyEvent::from(KeyCode::Down)).unwrap();
         let after = footer(&mut app);
         assert!(
-            !after.contains("Stored 4") && after.contains("help"),
+            !after.contains("Stored 4") && after.contains("explain"),
             "the hints did not come back: {after}"
         );
         assert_eq!(
@@ -2346,6 +2389,50 @@ mod tests {
             ),
             "the lease was not given back"
         );
+    }
+
+    /// `?` explains the row under the cursor; `?` from there opens the
+    /// full key reference, and Esc from the explanation goes back to the
+    /// screen it was opened on.
+    #[tokio::test]
+    async fn question_mark_explains_then_lists_every_key() {
+        let mut app = test_app();
+        let press = |app: &mut App, code| app.handle_key_event(KeyEvent::from(code)).unwrap();
+
+        press(&mut app, KeyCode::Char('?'));
+        let title = app
+            .explain
+            .as_ref()
+            .map(|explain| explain.explanation().title.clone());
+        assert_eq!(
+            title.as_deref(),
+            Some("Humans only"),
+            "the Dashboard's first row"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(app.explain.is_none());
+        assert_eq!(app.screen, Screen::Dashboard, "Esc closed it, and only it");
+
+        press(&mut app, KeyCode::Char('?'));
+        press(&mut app, KeyCode::Char('?'));
+        assert!(app.explain.is_none());
+        assert_eq!(app.screen, Screen::Help);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, Screen::Dashboard);
+    }
+
+    /// Every screen has something to say on `?`, even with nothing on it.
+    #[tokio::test]
+    async fn every_screen_explains_something_when_empty() {
+        let mut app = test_app();
+        for screen in Screen::TABS {
+            app.screen = screen;
+            let explanation = app.explanation();
+            assert!(
+                !explanation.title.is_empty() && !explanation.body.is_empty(),
+                "{screen:?} explained nothing: {explanation:?}"
+            );
+        }
     }
 
     /// Types `text` into the open palette and presses Enter.

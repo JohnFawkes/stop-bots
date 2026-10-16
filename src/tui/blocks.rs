@@ -109,6 +109,55 @@ impl Blocks {
         self.offset + self.state.selected().unwrap_or(0)
     }
 
+    /// What the row under the cursor is, for `?`.
+    pub fn explain(&self) -> crate::tui::explain::Explanation {
+        use crate::tui::explain::Explanation;
+        let Some(rule) = self.selected_rule() else {
+            return Explanation::new("Blocks").para(
+                "Every firewall rule stop-bots stores, and why each exists: the detectors' \
+                 blocks with the log line behind them, and blocks added by hand. Countries, \
+                 feeds and crawler ranges are not listed here; they are settings on the \
+                 Dashboard.",
+            );
+        };
+        let now = blocks::now();
+        let action = match rule.action {
+            crate::db::FirewallAction::Allow => "Allows",
+            _ => "Blocks",
+        };
+        let port = rule
+            .port
+            .map(|port| format!(" on port {port}"))
+            .unwrap_or_else(|| " on every port".to_string());
+        let until = match rule.expires_at {
+            Some(at) if at <= now => "It has expired, and goes at the next render.".to_string(),
+            Some(at) => format!(
+                "It lifts by itself in {}.",
+                crate::dynamic::format_until(at)
+            ),
+            None => "It stays until it is removed.".to_string(),
+        };
+        let why = match (&rule.evidence, rule.source) {
+            (Some(evidence), _) => format!("The log line behind it: {evidence}"),
+            (None, None) => "Added before 0.1, which did not record why.".to_string(),
+            (None, Some(_)) => "No log line: it was added by hand.".to_string(),
+        };
+        Explanation::new(rule.address.clone())
+            .para(format!(
+                "{action} {}{port}, in the firewall. Added by {}.",
+                rule.address,
+                blocks::source_label(rule.source)
+            ))
+            .now(until)
+            .para(why)
+            .para(
+                "Enter or Delete removes it; a detector that added it leaves the address \
+                 alone for a while after. U removes every rule from the source shown (f picks \
+                 the source). T on the Firewall screen trusts an address for good.",
+            )
+            .takes_effect(false)
+    }
+
     fn selected_rule(&self) -> Option<&FirewallRule> {
         self.page.get(self.state.selected()?)
     }

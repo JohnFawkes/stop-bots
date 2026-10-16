@@ -65,7 +65,7 @@ const LINES: [&str; MAX_LINES] = [
     "  Enter, /           open a site's category, request-rule and bot overrides; / searches bots",
     "",
     "Global",
-    "  q Esc / t / ?      quit, go back or close a popup / light/dark theme / toggle this help screen",
+    "  q Esc / t / ?      quit or back / theme / explain the selected row; ? again opens this screen",
 ];
 
 /// Draws the reference. "NGINX" in [`LINES`] is the sites screen and the
@@ -112,7 +112,7 @@ mod tests {
                 .collect();
 
             assert!(
-                content.contains("toggle this help screen"),
+                content.contains("? again opens this screen"),
                 "the last help line was cut off:\n{content}"
             );
             // Every mention is the server the host runs, as its tab is.

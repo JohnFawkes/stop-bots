@@ -139,7 +139,6 @@ pub const MIGRATIONS: &[Migration] = &[
         summary: "offences, how many times a detector has blocked each address",
         apply: v7_offences,
     },
-
 ];
 
 /// Where the copy of a database at `version` is kept before it is

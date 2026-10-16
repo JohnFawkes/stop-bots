@@ -56,6 +56,12 @@
 //! same guard as every other apply (see `firewall::FirewallRun`), which
 //! refuses when the anti-lockout check could not read an SSH log: "the
 //! check could not run" is not "the check passed".
+//!
+//! **No confirm-or-revert here.** An apply someone is watching arms a
+//! revert and asks "keep these firewall rules?" (see `crate::revert`);
+//! a job has nobody to ask, and a revert would undo every unattended
+//! apply a minute later. It does refuse to apply while an interactive
+//! apply is still waiting for its answer.
 
 use crate::db::Db;
 use crate::protection::Detector;

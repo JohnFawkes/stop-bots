@@ -2883,6 +2883,125 @@ fn the_iptables_backend_loads_ipv6_rules_into_ip6tables() {
     );
 }
 
+/// **An interactive apply nobody keeps is undone by systemd**, after the
+/// session that made it is gone. The rules are applied from a terminal,
+/// which arms a `systemd-run` timer before they load; the CLI is then
+/// killed mid-countdown, as a dropped SSH session would kill it. The
+/// timer, which belongs to PID 1 and not to the session, loads the
+/// previous script again, and the boot script is never replaced.
+#[test]
+fn an_apply_nobody_keeps_is_reverted_by_systemd_after_the_session_dies() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-revert");
+    let applied = "/etc/stop-bots/firewall.nft";
+    let loaded = || host.sh("nft list table inet stop_bots 2>/dev/null || true");
+
+    // The rules to go back to, applied with no terminal: nothing armed.
+    host.stop_bots("add-firewall-rule --address 203.0.113.1 --action block");
+    host.stop_bots("render-firewall --apply --force");
+    let kept = host.sh(&format!("cat {applied}"));
+    assert!(
+        loaded().contains("203.0.113.1"),
+        "the first apply did not load"
+    );
+
+    // The new rules, from a terminal (`script` gives the CLI one), with
+    // input that never answers.
+    host.stop_bots("add-firewall-rule --address 203.0.113.2 --action block");
+    host.sh(&format!(
+        "(sleep 600 | setsid script -qfc 'stop-bots render-firewall --apply --force \
+         --confirm-timeout 5 --db {HOST_DB}' /tmp/apply.log >/dev/null 2>&1 &)"
+    ));
+    let mut new_rules = String::new();
+    for _ in 0..100 {
+        new_rules = loaded();
+        if new_rules.contains("203.0.113.2") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        new_rules.contains("203.0.113.2"),
+        "the interactive apply never loaded:\n{}",
+        host.sh("cat /tmp/apply.log || true")
+    );
+    let timers = host.sh("systemctl list-timers --all --no-legend 'stop-bots-revert-*' || true");
+    assert!(
+        timers.contains("stop-bots-revert-"),
+        "no revert timer is armed under systemd:\n{timers}"
+    );
+
+    // The session dies without answering.
+    host.sh("pkill -9 -x stop-bots; pkill -9 -x script; true");
+    // Dead before its own countdown ends, so whatever reverts is the timer.
+    assert_eq!(
+        host.sh("pgrep -x stop-bots || true").trim(),
+        "",
+        "the CLI outlived the kill, so the test cannot tell its revert from the timer's"
+    );
+
+    let mut after = String::new();
+    for _ in 0..200 {
+        after = loaded();
+        if !after.contains("203.0.113.2") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        !after.contains("203.0.113.2") && after.contains("203.0.113.1"),
+        "the timer did not put the previous rules back:\n{after}\n{}",
+        host.sh("journalctl --no-pager -n 30 -u 'stop-bots-revert-*' || true")
+    );
+    assert_eq!(
+        host.sh(&format!("cat {applied}")),
+        kept,
+        "the boot script was replaced by rules nobody kept"
+    );
+}
+
+/// **An apply that is kept stays**, under real systemd: answering yes
+/// disarms the timer, so nothing reverts once the countdown has passed,
+/// and the kept rules become the boot script.
+#[test]
+fn an_apply_that_is_kept_outlives_its_countdown() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-keep");
+    let loaded = || host.sh("nft list table inet stop_bots 2>/dev/null || true");
+    host.stop_bots("add-firewall-rule --address 203.0.113.1 --action block");
+    host.stop_bots("render-firewall --apply --force");
+    host.stop_bots("add-firewall-rule --address 203.0.113.2 --action block");
+
+    // Answers yes a second in, then keeps the terminal open past the
+    // countdown.
+    host.sh(&format!(
+        "(sleep 1; echo y; sleep 600) | setsid script -qfc 'stop-bots render-firewall --apply \
+         --force --confirm-timeout 3 --db {HOST_DB}' /tmp/apply.log >/dev/null 2>&1 &"
+    ));
+    std::thread::sleep(std::time::Duration::from_secs(6));
+
+    let after = loaded();
+    assert!(
+        after.contains("203.0.113.2"),
+        "the kept rules were reverted:\n{after}\n{}",
+        host.sh("cat /tmp/apply.log || true")
+    );
+    assert!(
+        host.sh("cat /etc/stop-bots/firewall.nft")
+            .contains("203.0.113.2"),
+        "the kept rules are not the boot script"
+    );
+    let timers = host.sh("systemctl list-timers --all --no-legend 'stop-bots-revert-*' || true");
+    assert!(
+        !timers.contains("stop-bots-revert-"),
+        "a revert timer is still armed after keeping:\n{timers}"
+    );
+}
+
 /// The reason for the restore. The old script flushed the chain and then
 /// ran one process per rule under `set -e`, so a failure part way through
 /// left the chain half filled until the next apply. A restore is checked

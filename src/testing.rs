@@ -266,3 +266,34 @@ pub(crate) fn journalctl_calls(dir: &std::path::Path) -> Vec<String> {
         .map(String::from)
         .collect()
 }
+
+/// A fake program `name` in `dir` that appends `<name> <args>` to
+/// `dir/calls` (read with [`fake_calls`]) and then runs `body`.
+pub(crate) fn logging_fake(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    write_script(
+        &path,
+        &format!("echo \"{name} $*\" >> \"$(dirname \"$0\")/calls\"\n{body}"),
+    );
+    path
+}
+
+/// Every call the fakes in `dir` received, one a line.
+pub(crate) fn fake_calls(dir: &std::path::Path) -> Vec<String> {
+    journalctl_calls(dir)
+}
+
+/// [`crate::revert::Tools`] that are all [`logging_fake`]s in `dir`,
+/// succeeding: `systemd-run`, `systemctl`, the `stop-bots` the timer would
+/// run, `nft`, `sh`, `iptables` and `ip6tables`.
+pub(crate) fn fake_revert_tools(dir: &std::path::Path) -> crate::revert::Tools {
+    let fake = |name: &str| logging_fake(dir, name, "exit 0");
+    crate::revert::Tools {
+        systemd_run: fake("systemd-run"),
+        systemctl: fake("systemctl"),
+        exe: fake("stop-bots"),
+        nft: fake("nft"),
+        sh: fake("sh"),
+        iptables: vec![fake("iptables"), fake("ip6tables")],
+    }
+}

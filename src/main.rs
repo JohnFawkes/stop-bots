@@ -85,6 +85,16 @@ the stable contract from 1.0: fields may be added, never renamed or removed";
 /// Help text shared by every detector subcommand's `--dry-run`.
 const DRY_RUN_HELP: &str = "Show what would be blocked without storing anything";
 
+/// Help text shared by every apply's `--no-confirm`.
+const NO_CONFIRM_HELP: &str = "Apply without asking to keep the new firewall rules. On a \
+terminal, an apply otherwise arms a revert first and asks \"Keep these firewall rules?\"; \
+no answer within --confirm-timeout puts the previous rules back. Without a terminal on stdin \
+(cron, scripts) nothing is asked and nothing is armed, flag or not";
+
+/// Help text shared by every `--confirm-timeout`.
+const CONFIRM_TIMEOUT_HELP: &str =
+    "Seconds to answer \"Keep these firewall rules?\" before the previous rules are put back";
+
 /// Help text shared by every detector subcommand's `--ttl-days`.
 const TTL_HELP: &str = "How many days a block lasts. Defaults to this detector's stored TTL \
 (`set-detector`)";
@@ -344,6 +354,39 @@ enum Command {
         /// aren't at their usual path
         #[arg(long)]
         ssh_log: Option<PathBuf>,
+        #[arg(long, help = NO_CONFIRM_HELP)]
+        no_confirm: bool,
+        #[arg(long, value_name = "SECS", default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..), help = CONFIRM_TIMEOUT_HELP)]
+        confirm_timeout: u64,
+    },
+    /// Put back the firewall rules from before the last apply.
+    ///
+    /// While an apply is waiting to be kept ("Keep these firewall rules?"),
+    /// this reverts it now: the applied script, which an unconfirmed apply
+    /// leaves alone, is loaded again — or, if there was none, the
+    /// stop-bots nft table or iptables chains are deleted. The timer an
+    /// interactive apply arms runs exactly this when nobody answers.
+    ///
+    /// With nothing waiting, it goes back to /etc/stop-bots/firewall.prev.nft
+    /// (or .prev.sh), the applied script the last apply replaced, and swaps
+    /// the two, so running it again goes forward again.
+    RevertFirewall {
+        /// The backend, for going back to the previous script. Defaults to
+        /// the stored one; a waiting apply knows its own.
+        #[arg(long)]
+        backend: Option<FirewallBackend>,
+        /// The applied script. Defaults to /etc/stop-bots/firewall.nft, or
+        /// firewall.sh for iptables
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Only revert the apply armed with this token (what the timer
+        /// passes), and do nothing if it was kept
+        #[arg(long, hide = true)]
+        token: Option<String>,
+        /// Wait this many seconds first: the timer, where there is no
+        /// systemd to run it
+        #[arg(long, hide = true, requires = "token")]
+        after: Option<u64>,
     },
     /// Choose which firewall this host generates scripts for.
     ///
@@ -918,6 +961,10 @@ enum Command {
     /// not be read" as a pass, which is reasonable while a person is
     /// reading the result; unattended it is not, so this refuses. If the
     /// cron reports that, point `--ssh-log` at a readable log.
+    ///
+    /// An automatic apply is not asked about afterwards, as one from the
+    /// TUI or a terminal is ("Keep these firewall rules?"): there is
+    /// nobody to answer, so nothing is armed to revert it.
     SetAutoApplyFirewall {
         /// Whether the internal cron runs the firewall script
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
@@ -1227,6 +1274,10 @@ enum Command {
         /// would change, the firewall script included
         #[arg(long, requires = "dry_run")]
         diff: bool,
+        #[arg(long, help = NO_CONFIRM_HELP)]
+        no_confirm: bool,
+        #[arg(long, value_name = "SECS", default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..), help = CONFIRM_TIMEOUT_HELP)]
+        confirm_timeout: u64,
     },
     /// Keep this host protected with nobody at a terminal.
     ///
@@ -1347,6 +1398,8 @@ enum Command {
         /// `journalctl` on every refresh of the Firewall screen
         #[arg(long)]
         ssh_log: Option<PathBuf>,
+        #[arg(long, value_name = "SECS", default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..), help = CONFIRM_TIMEOUT_HELP)]
+        confirm_timeout: u64,
     },
 }
 
@@ -1572,12 +1625,16 @@ async fn run() -> Result<()> {
     match cli.command {
         // No flags to pass, so the stored root is the only way this form
         // can be right on a host whose config is not in /etc/nginx.
-        None => run_tui(db, None, false, None).await,
+        None => run_tui(db, None, false, None, stop_bots::revert::DEFAULT_TIMEOUT).await,
         Some(Command::Tui {
             root,
             no_reload,
             ssh_log,
-        }) => run_tui(db, root, no_reload, ssh_log).await,
+            confirm_timeout,
+        }) => {
+            let timeout = std::time::Duration::from_secs(confirm_timeout);
+            run_tui(db, root, no_reload, ssh_log, timeout).await
+        }
         Some(Command::Install {
             target,
             dry_run,
@@ -1618,6 +1675,8 @@ async fn run() -> Result<()> {
             verbose,
             dry_run,
             diff,
+            no_confirm,
+            confirm_timeout,
         }) => {
             let request = BatchRequest {
                 root,
@@ -1628,6 +1687,7 @@ async fn run() -> Result<()> {
                 access_log,
                 force,
                 no_fetch,
+                confirm: confirm_with(apply && !dry_run, no_confirm, confirm_timeout),
             };
             if dry_run {
                 preview_batch(db, request, diff || verbose)
@@ -1669,6 +1729,8 @@ async fn run() -> Result<()> {
             apply,
             force,
             ssh_log,
+            no_confirm,
+            confirm_timeout,
         }) => render_firewall(
             db,
             RenderRequest {
@@ -1677,8 +1739,15 @@ async fn run() -> Result<()> {
                 apply,
                 force,
                 ssh_log,
+                confirm: confirm_with(apply, no_confirm, confirm_timeout),
             },
         ),
+        Some(Command::RevertFirewall {
+            backend,
+            out,
+            token,
+            after,
+        }) => revert_firewall(db, backend, out, token, after),
         Some(Command::SetFirewallBackend { backend }) => set_firewall_backend(db, backend),
         Some(Command::BlockSshScanners {
             threshold,
@@ -1959,6 +2028,7 @@ async fn run_tui(
     root: Option<PathBuf>,
     no_reload: bool,
     ssh_log: Option<PathBuf>,
+    confirm_timeout: std::time::Duration,
 ) -> Result<()> {
     let defaulted = db_path.is_none();
     let db = open_db(db_path)?;
@@ -1967,6 +2037,7 @@ async fn run_tui(
     let notice = stop_bots::db::location_notice(db.path().as_deref(), defaulted);
     let mut app = stop_bots::app::App::new(db, root, !no_reload, ssh_log)?;
     app.db_notice = notice;
+    app.confirm_timeout = confirm_timeout;
     let terminal = ratatui::init();
     // Not `?`: bailing here would skip the `restore` below and leave the
     // terminal in raw mode.
@@ -2046,11 +2117,15 @@ fn run_status(
         report.checks.iter().collect()
     };
 
-    if quiet && shown.is_empty() {
+    let notes = revert_notes(&db)?;
+    if quiet && shown.is_empty() && notes.is_empty() {
         return Ok(());
     }
 
     say!("{}", report.headline());
+    for note in notes {
+        say!("{note}");
+    }
     if let Some(at) = taken_at {
         say!("(from a probe taken {})", stop_bots::present::ago(at));
     }
@@ -2079,6 +2154,31 @@ fn exit_status(report: &stop_bots::health::Report) -> Result<()> {
     Ok(())
 }
 
+/// What `status` says about confirm-or-revert: an apply waiting to be
+/// kept, and a revert in the last day.
+fn revert_notes(db: &Db) -> Result<Vec<String>> {
+    let backend = stop_bots::firewall::stored_backend(db)?;
+    let applied = stop_bots::firewall::default_output_path(backend);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let mut notes = Vec::new();
+    if let Some(pending) = stop_bots::revert::waiting(&applied, now) {
+        notes.push(format!(
+            "A firewall apply is waiting to be kept: the previous rules come back in {} s \
+             unless it is (`stop-bots revert-firewall` puts them back now).",
+            pending.seconds_left(now)
+        ));
+    }
+    if let Some((at, message)) = stop_bots::revert::last_reverted(&applied) {
+        if now - at < 86_400 {
+            notes.push(format!("{message}, {}.", stop_bots::present::ago(at)));
+        }
+    }
+    Ok(notes)
+}
+
 /// `batch`'s arguments as the command line gives them, before the two
 /// that depend on the database have been resolved.
 ///
@@ -2095,6 +2195,17 @@ struct BatchRequest {
     access_log: Option<PathBuf>,
     force: bool,
     no_fetch: bool,
+    /// Confirm-or-revert's timeout, when the firewall apply asks.
+    confirm: Option<std::time::Duration>,
+}
+
+/// The timeout to confirm an apply in, when this run asks at all: an
+/// apply, with a terminal on stdin to answer from, and no `--no-confirm`.
+/// Everything else — cron above all — applies as it always did.
+fn confirm_with(apply: bool, no_confirm: bool, secs: u64) -> Option<std::time::Duration> {
+    use std::io::IsTerminal;
+    (apply && !no_confirm && std::io::stdin().is_terminal())
+        .then(|| std::time::Duration::from_secs(secs))
 }
 
 async fn run_batch(db_path: Option<PathBuf>, request: BatchRequest, verbose: bool) -> Result<()> {
@@ -2115,6 +2226,7 @@ async fn run_batch(db_path: Option<PathBuf>, request: BatchRequest, verbose: boo
         access_log: request.access_log,
         force: request.force,
         no_fetch: request.no_fetch,
+        confirm: request.confirm,
         host,
     };
 
@@ -4202,6 +4314,7 @@ fn render_firewall(db_path: Option<PathBuf>, request: RenderRequest) -> Result<(
     let mut run = stop_bots::firewall::FirewallRun::new(backend, applied)
         .apply(request.apply)
         .force(request.force)
+        .confirm(request.confirm)
         .protect(stop_bots::sshlog::session_client());
     if let (Some(out), false) = (&request.out, request.apply) {
         run = run.rendered_at(out);
@@ -4242,6 +4355,12 @@ fn render_firewall(db_path: Option<PathBuf>, request: RenderRequest) -> Result<(
         (WriteStep::Written, ApplyStep::Refused) => {
             anyhow::bail!("{}. --force overrides this.", outcome.summary())
         }
+        (WriteStep::Written, ApplyStep::AwaitingConfirmation(pending)) => {
+            say!("{}.", capitalised(&outcome.summary()));
+            let timeout = std::time::Duration::from_secs(pending.timeout_secs().max(1) as u64);
+            let answer = stop_bots::revert::ask_on_terminal(timeout);
+            settle_on_terminal(&db, &outcome, pending, answer)?;
+        }
         _ if outcome.succeeded() => say!("{}", capitalised(&outcome.summary())),
         _ => anyhow::bail!("{}", outcome.summary()),
     }
@@ -4255,6 +4374,69 @@ struct RenderRequest {
     apply: bool,
     force: bool,
     ssh_log: Option<PathBuf>,
+    confirm: Option<std::time::Duration>,
+}
+
+/// Keeps or reverts an apply as the operator answered, says which, and
+/// records a kept one as applied. A revert is an error: what was asked
+/// for did not stay.
+fn settle_on_terminal(
+    db: &Db,
+    outcome: &stop_bots::firewall::FirewallOutcome,
+    pending: &stop_bots::revert::Pending,
+    answer: stop_bots::revert::Answer,
+) -> Result<()> {
+    use stop_bots::revert::Settled;
+    let tools = stop_bots::revert::Tools::host();
+    match stop_bots::revert::settle(&tools, pending, &outcome.script, answer)? {
+        Settled::Kept(message) => {
+            db.set_firewall_applied_signature(&outcome.signature)?;
+            say!("{message}.");
+            Ok(())
+        }
+        Settled::Reverted(message) => anyhow::bail!("{message}."),
+        Settled::Nothing(message) => {
+            say!("{message}.");
+            Ok(())
+        }
+    }
+}
+
+/// `revert-firewall`: by hand, or as the timer an unconfirmed apply armed
+/// (`--token`, and `--after` where there is no systemd to wait for it).
+fn revert_firewall(
+    db_path: Option<PathBuf>,
+    backend: Option<FirewallBackend>,
+    out: Option<PathBuf>,
+    token: Option<String>,
+    after: Option<u64>,
+) -> Result<()> {
+    use stop_bots::revert::{Settled, Why};
+    if let Some(secs) = after {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+    }
+    // The timer passes both; it must not need the database, which a
+    // revert at the wrong moment could find locked or mid-upgrade.
+    let (backend, applied) = match (backend, out.clone()) {
+        (Some(backend), Some(out)) => (backend.into(), out),
+        (backend, out) => firewall_target(&open_db(db_path.clone())?, backend, out)?,
+    };
+    let why = if token.is_some() {
+        Why::NoAnswer
+    } else {
+        Why::Manual
+    };
+    let tools = stop_bots::revert::Tools::host();
+    let settled = stop_bots::revert::revert(&tools, &applied, backend, token.as_deref(), why)?;
+    // Going back by hand loads rules the database did not apply, so it no
+    // longer says the current ones are.
+    if token.is_none() && matches!(settled, Settled::Reverted(_)) {
+        if let Ok(db) = open_db(db_path) {
+            let _ = db.set_firewall_applied_signature("");
+        }
+    }
+    say!("{}.", settled.message());
+    Ok(())
 }
 
 /// `text` with its first letter upper-cased: the shared summaries are
@@ -5237,6 +5419,7 @@ mod tests {
                 apply: false,
                 force: false,
                 ssh_log: None,
+                confirm: None,
             },
         );
         assert!(result.is_err());

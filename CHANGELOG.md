@@ -35,6 +35,20 @@ older release; settings changed since the upgrade are lost.
   check, as `status` does. Without the flag the output is unchanged. The field names
   become part of the stable contract at 1.0: fields may be added, never renamed or
   removed in a minor (`RELEASING.md`).
+- **Confirm-or-revert for firewall applies someone is watching.** The TUI's "Apply
+  everything" and render popup, and `render-firewall --apply` and `batch --apply` run from
+  a terminal, now arm a revert before running the new script and then ask "Keep these
+  firewall rules?" with a countdown (60 s; `--confirm-timeout` changes it). Enter or `y`
+  keeps them; `n`, Esc or no answer puts the previous rules back — or, if there were
+  none, removes the stop-bots table or chains. The revert runs from a transient
+  `systemd-run` timer, or a detached process where there is no systemd, so it still
+  happens if the TUI, the CLI or the SSH session dies. Until kept, the applied script
+  the boot unit loads is left as it was. `--no-confirm` skips the question; without a
+  terminal on stdin (cron, scripts) and for auto-apply nothing is asked or armed, as
+  before. `status` mentions an apply waiting to be kept and a recent revert.
+- **The applied script an apply replaces is kept** as `firewall.prev.nft` (or
+  `.prev.sh`), and the new `stop-bots revert-firewall` goes back to it (running it again
+  goes forward). While an apply waits to be kept, it reverts that apply now.
 
 - **A question when no one has logged in over SSH.** The TUI's "Apply everything" asks
   "Do you log into this server over SSH?" before its preview when the SSH log holds no

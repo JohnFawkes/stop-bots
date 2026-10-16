@@ -120,6 +120,11 @@ pub enum AppEvent {
     FirewallRendered {
         outcome: Box<crate::firewall::FirewallOutcome>,
     },
+    /// An apply waiting to be kept has been kept or reverted (see
+    /// `App::start_firewall_settle`), or could not be.
+    FirewallSettled {
+        result: Result<crate::revert::Settled, String>,
+    },
     /// What "Apply everything" would change has been worked out (see
     /// `App::start_apply_preview`), for the Dashboard to ask about.
     ApplyPreviewed {

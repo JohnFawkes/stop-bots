@@ -241,6 +241,15 @@ pub enum Stream {
     Stderr,
 }
 
+/// Flushes stdout, for a [`say_inline!`](crate::say_inline) that asks a
+/// question: stdout is line-buffered, and the answer is typed on the same
+/// line. Writes nothing of its own, so nothing here needs making safe.
+#[allow(clippy::disallowed_methods)]
+pub fn flush_stdout() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
 /// What [`say!`](crate::say), [`say_err!`](crate::say_err) and
 /// [`say_inline!`](crate::say_inline) expand to: the formatted message,
 /// through [`terminal_safe_text`], to `stream`. A write that fails panics,

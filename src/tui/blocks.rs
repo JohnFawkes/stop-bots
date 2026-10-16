@@ -72,6 +72,9 @@ pub struct Blocks {
     not_listed: (usize, usize),
     /// The last thing this screen told the operator.
     notice: Option<String>,
+    /// Repeat offenders and their counts (`Db::repeat_offences`), for
+    /// the "3rd offence" a detector's block of one shows under Why.
+    offences: std::collections::HashMap<String, u32>,
 }
 
 impl Blocks {
@@ -100,6 +103,7 @@ impl Blocks {
         let selected = selected.min(self.total.saturating_sub(1));
         self.offset = selected / PAGE * PAGE;
         self.page = db.blocks_page(&self.query, self.offset, PAGE)?;
+        self.offences = db.repeat_offences(blocks::now())?;
         self.state
             .select((!self.page.is_empty()).then_some(selected - self.offset));
         Ok(())
@@ -405,10 +409,13 @@ impl Blocks {
                 Line::from(vec![
                     rule.address.clone().bold(),
                     format!(
-                        " — {}{}",
+                        " — {}{}{}",
                         blocks::source_label(rule.source),
                         rule.created_at
                             .map(|t| format!(", added {} ago", blocks::format_age(t, now)))
+                            .unwrap_or_default(),
+                        blocks::offence_note(rule, &self.offences)
+                            .map(|note| format!(", {note}"))
                             .unwrap_or_default()
                     )
                     .into(),
@@ -598,6 +605,22 @@ mod tests {
         ] {
             assert!(drawn.contains(needle), "{needle:?} missing from:\n{drawn}");
         }
+    }
+
+    #[test]
+    fn a_repeat_offender_s_block_says_which_offence_it_is() {
+        let db = Db::open_in_memory().unwrap();
+        add(&db, "203.0.113.5", PROBES, None);
+        let now = blocks::now();
+        db.record_offence("203.0.113.5", Detector::ProbePaths, 3, now, now + 86_400)
+            .unwrap();
+
+        let drawn = drawn(&mut screen(&db));
+
+        assert!(
+            drawn.contains("3rd offence"),
+            "no offence count in:\n{drawn}"
+        );
     }
 
     #[test]

@@ -125,8 +125,23 @@ pub struct ScanBlockOutcome {
     /// Addresses actually newly blocked — or, if `dry_run`, that would
     /// have been.
     pub newly_blocked: Vec<String>,
+    /// Of `newly_blocked`, the ones blocked before, and blocked for longer
+    /// this time (see `protection::escalated_ttl_days`). Empty when
+    /// escalation is off.
+    pub repeat_offenders: Vec<RepeatOffender>,
+    /// The detector's own TTL: what every block in `newly_blocked` lasts
+    /// that is not in `repeat_offenders`.
     pub ttl_days: i64,
     pub dry_run: bool,
+}
+
+/// An address blocked again, and how long for this time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepeatOffender {
+    pub address: String,
+    /// Which offence this is: 2 for the second block.
+    pub offence: u32,
+    pub ttl_days: i64,
 }
 
 impl ScanBlockOutcome {
@@ -165,7 +180,11 @@ impl ScanBlockOutcome {
         } else {
             "blocked"
         };
-        format!("{verb} {} IP(s)", self.newly_blocked.len())
+        let longer = match self.repeat_offenders.len() {
+            0 => String::new(),
+            n => format!(", {n} for longer as repeat offender(s)"),
+        };
+        format!("{verb} {} IP(s){longer}", self.newly_blocked.len())
     }
 }
 
@@ -918,8 +937,9 @@ fn add_block_rules_now(
     // cannot overflow in either direction.
     let max = crate::protection::MAX_TTL_DAYS;
     let ttl_days = ttl_days.clamp(-max, max);
-    let ttl_seconds = ttl_days * 24 * 60 * 60;
+    let escalate = crate::protection::repeat_escalation(db)?;
     let mut newly_blocked = Vec::new();
+    let mut repeat_offenders = Vec::new();
     let mut already_covered = 0;
     let mut skipped_ssh_logins = 0;
     let mut skipped_trusted = 0;
@@ -980,12 +1000,31 @@ fn add_block_rules_now(
             }
             continue;
         }
+        // Counted from what is on record, whether or not escalation is
+        // on, so that switching it on later has a history to go by. The
+        // trusted and recently logged-in addresses above never get here,
+        // so they never gain an offence.
+        let now = now_secs();
+        let offence = db.offences_before(&ip, now)?.saturating_add(1);
+        let days = if escalate {
+            crate::protection::escalated_ttl_days(ttl_days, offence).clamp(-max, max)
+        } else {
+            ttl_days
+        };
+        if days != ttl_days {
+            repeat_offenders.push(RepeatOffender {
+                address: ip.clone(),
+                offence,
+                ttl_days: days,
+            });
+        }
         if !dry_run {
             // The first address it answers for that has something to say.
             let evidence = answered.iter().find_map(|address| {
                 let item = items.get(*address).cloned().flatten();
                 evidence_line(detector, item.as_deref(), lines.get(*address))
             });
+            let ttl_seconds = days * 24 * 60 * 60;
             db.add_firewall_rule_with_ttl(
                 &NewFirewallRule {
                     address: ip.clone(),
@@ -996,6 +1035,7 @@ fn add_block_rules_now(
                 },
                 ttl_seconds,
             )?;
+            db.record_offence(&ip, detector, offence, now, now + ttl_seconds)?;
             // The evidence has been acted on. Kept, it would block the
             // address again the minute this block expires, from the same
             // lines -- the bug that made a one-day block last until
@@ -1019,6 +1059,7 @@ fn add_block_rules_now(
         skipped_trusted,
         skipped_unblocked,
         newly_blocked,
+        repeat_offenders,
         ttl_days,
         dry_run,
     })
@@ -1233,6 +1274,7 @@ mod tests {
             skipped_trusted: 0,
             skipped_unblocked: 0,
             newly_blocked: vec![],
+            repeat_offenders: vec![],
             ttl_days: 5,
             dry_run: false,
         };
@@ -1251,6 +1293,21 @@ mod tests {
             ..none
         };
         assert_eq!(blocked.summary(), "blocked 1 IP(s)");
+
+        let again = ScanBlockOutcome {
+            candidates: 2,
+            newly_blocked: vec!["1.2.3.4".to_string(), "1.2.3.5".to_string()],
+            repeat_offenders: vec![RepeatOffender {
+                address: "1.2.3.5".to_string(),
+                offence: 2,
+                ttl_days: 10,
+            }],
+            ..blocked
+        };
+        assert_eq!(
+            again.summary(),
+            "blocked 2 IP(s), 1 for longer as repeat offender(s)"
+        );
     }
 
     // ---- spoofed crawler blocking ----
@@ -1439,6 +1496,7 @@ mod tests {
             skipped_trusted: 0,
             skipped_unblocked: 0,
             newly_blocked: vec![],
+            repeat_offenders: vec![],
             ttl_days: 1,
             dry_run: false,
         };
@@ -2382,5 +2440,134 @@ mod tests {
         let outcome = block_web_scanners(&db, 7, 1, &phone_catching_up(), false).unwrap();
 
         assert_eq!(outcome.newly_blocked, ["203.0.113.5"]);
+    }
+
+    // ---- repeat offenders ----
+
+    /// How long `address`'s live block was made for, in days.
+    fn days_blocked(db: &Db, address: &str) -> i64 {
+        let rules = db.list_firewall_rules().unwrap();
+        let rule = rules
+            .iter()
+            .find(|r| r.address == address)
+            .unwrap_or_else(|| panic!("{address} is not blocked; rules: {rules:?}"));
+        let seconds = rule.expires_at.unwrap() - rule.created_at.unwrap();
+        (seconds + 43_200) / 86_400
+    }
+
+    /// Blocks `address` for probing and lets that block lapse, `times`
+    /// times over, each time from the same log line.
+    fn probe_and_lapse(db: &Db, address: &str, times: usize) {
+        let log = probe_line(address, "/.env");
+        for _ in 0..times {
+            block_probe_paths(db, 5, &log, false).unwrap();
+            let id = db.list_firewall_rules().unwrap()[0].id;
+            db.let_firewall_rule_lapse(id);
+        }
+    }
+
+    #[test]
+    fn a_second_block_after_the_first_expired_is_twice_as_long() {
+        let db = Db::open_in_memory().unwrap();
+        probe_and_lapse(&db, "203.0.113.9", 1);
+
+        let outcome =
+            block_probe_paths(&db, 5, &probe_line("203.0.113.9", "/.env"), false).unwrap();
+
+        assert_eq!(days_blocked(&db, "203.0.113.9"), 10);
+        assert_eq!(
+            outcome.repeat_offenders,
+            [RepeatOffender {
+                address: "203.0.113.9".to_string(),
+                offence: 2,
+                ttl_days: 10
+            }]
+        );
+    }
+
+    #[test]
+    fn the_fourth_block_and_after_are_eight_times_as_long() {
+        let db = Db::open_in_memory().unwrap();
+        probe_and_lapse(&db, "203.0.113.9", 4);
+
+        block_probe_paths(&db, 5, &probe_line("203.0.113.9", "/.env"), false).unwrap();
+
+        assert_eq!(days_blocked(&db, "203.0.113.9"), 40, "the fifth block");
+    }
+
+    /// Finding an address already blocked is not a new offence: a
+    /// scanner that carries on while blocked has not been caught twice.
+    #[test]
+    fn finding_an_address_still_blocked_is_not_an_offence() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("203.0.113.9", "/.env");
+        block_probe_paths(&db, 5, &log, false).unwrap();
+        block_probe_paths(&db, 5, &log, false).unwrap();
+
+        assert_eq!(db.offences_before("203.0.113.9", now_secs()).unwrap(), 1);
+    }
+
+    #[test]
+    fn with_escalation_off_a_repeat_offender_gets_the_detector_s_ttl() {
+        let db = Db::open_in_memory().unwrap();
+        crate::protection::set_repeat_escalation(&db, false).unwrap();
+        probe_and_lapse(&db, "203.0.113.9", 1);
+
+        let outcome =
+            block_probe_paths(&db, 5, &probe_line("203.0.113.9", "/.env"), false).unwrap();
+
+        assert_eq!(days_blocked(&db, "203.0.113.9"), 5);
+        assert!(outcome.repeat_offenders.is_empty(), "{outcome:?}");
+        assert_eq!(
+            db.offences_before("203.0.113.9", now_secs()).unwrap(),
+            2,
+            "still counted, so switching escalation on has a history"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_says_how_long_but_records_no_offence() {
+        let db = Db::open_in_memory().unwrap();
+        probe_and_lapse(&db, "203.0.113.9", 1);
+
+        let outcome = block_probe_paths(&db, 5, &probe_line("203.0.113.9", "/.env"), true).unwrap();
+
+        assert_eq!(outcome.repeat_offenders[0].ttl_days, 10, "{outcome:?}");
+        assert_eq!(db.offences_before("203.0.113.9", now_secs()).unwrap(), 1);
+    }
+
+    /// The two exemptions are checked before an offence is counted, so a
+    /// trusted address or one logged in from never builds up a record.
+    #[test]
+    fn a_trusted_or_logged_in_address_gains_no_offence() {
+        let db = Db::open_in_memory().unwrap();
+        db.trust_address("203.0.113.9").unwrap();
+        db.record_ssh_login_ips(&["203.0.113.10".to_string()])
+            .unwrap();
+        let log = probe_line("203.0.113.9", "/.env") + &probe_line("203.0.113.10", "/.env");
+
+        block_probe_paths(&db, 5, &log, false).unwrap();
+
+        for address in ["203.0.113.9", "203.0.113.10"] {
+            assert_eq!(
+                db.offences_before(address, now_secs()).unwrap(),
+                0,
+                "{address}"
+            );
+        }
+    }
+
+    /// An operator's unblock says the block was a mistake; the next one
+    /// starts from the detector's own TTL again.
+    #[test]
+    fn unblocking_by_hand_forgets_the_offences() {
+        let db = Db::open_in_memory().unwrap();
+        probe_and_lapse(&db, "203.0.113.9", 2);
+        block_probe_paths(&db, 5, &probe_line("203.0.113.9", "/.env"), false).unwrap();
+        let id = db.list_firewall_rules().unwrap()[0].id;
+
+        db.remove_firewall_rule(id).unwrap();
+
+        assert_eq!(db.offences_before("203.0.113.9", now_secs()).unwrap(), 0);
     }
 }

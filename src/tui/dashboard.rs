@@ -172,6 +172,11 @@ enum ProtectionRow {
     /// `Dashboard::reputation` (which is ordered by id, as
     /// `Db::list_reputation_sources` returns it).
     Feed(usize),
+    /// Whether a detector blocks an address it blocked before for longer
+    /// (`protection::repeat_escalation`). Beside the detectors, because it
+    /// changes how long each of their blocks lasts; a plain Off/On, since
+    /// the lengths are fixed (`protection::escalated_ttl_days`).
+    RepeatOffenders,
     /// Whether the daily render also *runs* the script it writes
     /// (`Db::get_auto_apply_firewall`).
     ///
@@ -341,6 +346,12 @@ pub struct Dashboard {
     /// nobody has switched yet: off, and marked "new" so the operator
     /// learns they exist. See `Detector::is_new_here`.
     new_detectors: std::collections::HashSet<Detector>,
+    /// `protection::repeat_escalation`, for the
+    /// `ProtectionRow::RepeatOffenders` row.
+    repeat_offenders: bool,
+    /// Whether that row is new here, as a new detector's is
+    /// (`protection::repeat_escalation_is_new_here`).
+    repeat_offenders_new: bool,
     /// Every third-party CIDR feed, ordered by id — the order
     /// `ProtectionRow::Feed`'s index refers to.
     reputation: Vec<crate::db::ReputationSource>,
@@ -401,6 +412,8 @@ impl Dashboard {
             .into_iter()
             .filter_map(|d| d.is_new_here(db).map(|new| new.then_some(d)).transpose())
             .collect::<Result<_>>()?;
+        self.repeat_offenders = crate::protection::repeat_escalation(db)?;
+        self.repeat_offenders_new = crate::protection::repeat_escalation_is_new_here(db)?;
         self.reputation = db.list_reputation_sources()?;
         self.crawlers = ipranges::crawler_sources(db)?;
         self.auto_apply_firewall = db.get_auto_apply_firewall()?;
@@ -1231,6 +1244,7 @@ impl Dashboard {
             // height it was for every host that does not use the mode.
             .filter(|detector| *detector != Detector::RobotsTxt || self.humans_only)
             .map(ProtectionRow::Detect)
+            .chain([ProtectionRow::RepeatOffenders])
             .chain((0..self.reputation.len()).map(ProtectionRow::Feed))
             .chain([
                 ProtectionRow::AutoApplyFirewall,
@@ -1247,6 +1261,7 @@ impl Dashboard {
                 .get(i)
                 .map(|s| s.name.clone())
                 .unwrap_or_default(),
+            ProtectionRow::RepeatOffenders => "Repeat offenders".to_string(),
             ProtectionRow::AutoApplyFirewall => "Auto-apply the script".to_string(),
             ProtectionRow::LockoutCheck => "SSH lock-out check".to_string(),
         }
@@ -1260,8 +1275,19 @@ impl Dashboard {
                 .map(|(enabled, _)| *enabled)
                 .unwrap_or(false),
             ProtectionRow::Feed(i) => self.reputation.get(i).is_some_and(|s| s.enabled),
+            ProtectionRow::RepeatOffenders => self.repeat_offenders,
             ProtectionRow::AutoApplyFirewall => self.auto_apply_firewall,
             ProtectionRow::LockoutCheck => self.ssh_lockout_check,
+        }
+    }
+
+    /// Whether `row` arrived after this database was created and nobody
+    /// has switched it: the rows that show a yellow "new".
+    fn protection_is_new(&self, row: ProtectionRow) -> bool {
+        match row {
+            ProtectionRow::Detect(detector) => self.new_detectors.contains(&detector),
+            ProtectionRow::RepeatOffenders => self.repeat_offenders_new,
+            _ => false,
         }
     }
 
@@ -1276,6 +1302,7 @@ impl Dashboard {
             // render time from the stored ranges, so there's nothing to
             // expire.
             ProtectionRow::Feed(_)
+            | ProtectionRow::RepeatOffenders
             | ProtectionRow::AutoApplyFirewall
             | ProtectionRow::LockoutCheck => 0,
         }
@@ -1296,10 +1323,14 @@ impl Dashboard {
             // No TTL and no count — the state is the whole story, and the
             // tag already carries it.
             ProtectionRow::AutoApplyFirewall | ProtectionRow::LockoutCheck => String::new(),
-            _ if self.protection_enabled(row) => format!(" {}d", self.protection_ttl_days(row)),
-            ProtectionRow::Detect(detector) if self.new_detectors.contains(&detector) => {
-                " new".to_string()
+            _ if self.protection_is_new(row) => " new".to_string(),
+            // How much longer, at most: the whole rule is in the message
+            // switching it on leaves.
+            ProtectionRow::RepeatOffenders if self.repeat_offenders => {
+                format!(" up to {}x", crate::protection::ESCALATION_MAX_MULTIPLIER)
             }
+            ProtectionRow::RepeatOffenders => String::new(),
+            _ if self.protection_enabled(row) => format!(" {}d", self.protection_ttl_days(row)),
             _ => String::new(),
         }
     }
@@ -1326,11 +1357,10 @@ impl Dashboard {
             tag,
             // "new" is the one detail worth catching the eye: something an
             // upgrade added and left off, which nobody has looked at yet.
-            match row {
-                ProtectionRow::Detect(detector) if self.new_detectors.contains(&detector) => {
-                    Span::from(self.protection_detail(row)).yellow()
-                }
-                _ => Span::from(self.protection_detail(row)),
+            if self.protection_is_new(row) {
+                Span::from(self.protection_detail(row)).yellow()
+            } else {
+                Span::from(self.protection_detail(row))
             },
         ])
     }
@@ -1798,6 +1828,23 @@ impl Dashboard {
                 return Ok(KeyOutcome::Consumed);
             }
             return self.commit_auto_apply_firewall(db, on, message);
+        }
+        if row == ProtectionRow::RepeatOffenders {
+            let on = selected == 1;
+            crate::protection::set_repeat_escalation(db, on)?;
+            self.repeat_offenders = on;
+            self.repeat_offenders_new = false;
+            *message = Some(if on {
+                format!(
+                    "Repeat offenders on \u{2014} {}",
+                    crate::protection::repeat_escalation_summary()
+                )
+            } else {
+                "Repeat offenders off \u{2014} an address blocked again gets its detector's \
+                 TTL, however often it comes back"
+                    .to_string()
+            });
+            return Ok(KeyOutcome::Mutated);
         }
         let ProtectionRow::Detect(detector) = row else {
             unreachable!("feeds are committed by commit_feed")
@@ -4768,6 +4815,58 @@ mod tests {
         assert!(!Detector::SpoofedCrawlers.is_enabled(&db).unwrap());
     }
 
+    fn select_repeat_offenders(dashboard: &mut Dashboard) {
+        let index = dashboard
+            .protection_rows()
+            .iter()
+            .position(|row| *row == ProtectionRow::RepeatOffenders)
+            .expect("the repeat offenders row should exist");
+        dashboard.protection_state.select(Some(index));
+    }
+
+    /// On a database from before it, the row is off and says "new", the
+    /// way a new detector's does, until the operator chooses.
+    #[test]
+    fn repeat_offenders_is_new_on_an_older_database_until_switched() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_int_setting(crate::db::keys::DEFAULTS_GENERATION, 1)
+            .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        let row = ProtectionRow::RepeatOffenders;
+        assert!(!dashboard.protection_enabled(row), "on after an upgrade");
+        assert_eq!(dashboard.protection_detail(row), " new");
+
+        focus_protection(&mut dashboard, &db);
+        select_repeat_offenders(&mut dashboard);
+        let outcome = press(&mut dashboard, &db, KeyCode::Char(' '));
+
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert!(crate::protection::repeat_escalation(&db).unwrap());
+        assert_eq!(dashboard.protection_detail(row), " up to 8x");
+    }
+
+    #[test]
+    fn turning_repeat_offenders_off_persists_it() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        focus_protection(&mut dashboard, &db);
+        select_repeat_offenders(&mut dashboard);
+
+        let mut message = None;
+        dashboard
+            .commit_protection(&db, ProtectionRow::RepeatOffenders, 0, &mut message)
+            .unwrap();
+
+        assert!(!crate::protection::repeat_escalation(&db).unwrap());
+        let message = message.unwrap_or_default();
+        assert!(
+            message.starts_with("Repeat offenders off"),
+            "message: {message}"
+        );
+    }
+
     #[test]
     fn choosing_an_on_option_stores_both_the_toggle_and_its_ttl() {
         let db = Db::open_in_memory().unwrap();
@@ -4953,10 +5052,12 @@ mod tests {
         let detectors = Detector::ALL.len() - 1;
         assert_eq!(
             rows.len(),
-            // ...plus the `AutoApplyFirewall` and `LockoutCheck` rows,
-            // which sit after the feeds and are not ones.
-            detectors + ReputationSourceKind::ALL.len() + 2
+            // ...plus `RepeatOffenders`, between the detectors and the
+            // feeds, and the `AutoApplyFirewall` and `LockoutCheck` rows,
+            // which sit after the feeds. None of the three is a detector.
+            detectors + ReputationSourceKind::ALL.len() + 3
         );
+        assert_eq!(rows[detectors], ProtectionRow::RepeatOffenders);
         assert!(rows[..detectors].iter().all(|r| r.is_detector()));
         assert!(rows[detectors..].iter().all(|r| !r.is_detector()));
     }
@@ -5278,7 +5379,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         let rows = dashboard.protection_rows();
-        assert_eq!(rows.len(), 17, "if this changes, so does the panel height");
+        assert_eq!(rows.len(), 18, "if this changes, so does the panel height");
         for row in rows {
             let label = dashboard.protection_label(row);
             assert!(content.contains(&label), "{label:?} is not on screen");

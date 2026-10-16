@@ -48,7 +48,7 @@ use super::{keys, Category, GeoMode, Policy};
 /// Always equal to `MIGRATIONS.len()`; a test holds the two together, so
 /// adding a migration without bumping this (or the reverse) fails the
 /// build's tests rather than a user's upgrade.
-pub const CURRENT_VERSION: u32 = 6;
+pub const CURRENT_VERSION: u32 = 7;
 
 /// The generation of defaults this binary creates a database with.
 ///
@@ -65,7 +65,11 @@ pub const CURRENT_VERSION: u32 = 6;
 /// detector that is on by default, and mark it `introduced_in` the new
 /// number. It is separate from [`CURRENT_VERSION`]: a new default needs no
 /// schema change, and a schema change brings no new default.
-pub const DEFAULTS_GENERATION: u32 = 1;
+///
+/// - **1**: everything that existed at 0.1.
+/// - **2**: longer blocks for repeat offenders
+///   (`protection::REPEAT_ESCALATION_INTRODUCED_IN`).
+pub const DEFAULTS_GENERATION: u32 = 2;
 
 /// One step from version `n - 1` to version `n`, where `n` is its position
 /// in [`MIGRATIONS`] counting from one.
@@ -130,6 +134,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         summary: "remembered_browsers, the console's login-throttle exemption",
         apply: v6_remembered_browsers,
+    },
+    Migration {
+        summary: "offences, how many times a detector has blocked each address",
+        apply: v7_offences,
     },
 ];
 
@@ -831,6 +839,29 @@ fn v6_remembered_browsers(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// Version 7: how many times the detectors have blocked each address,
+/// for the longer blocks repeat offenders get (see
+/// `protection::escalated_ttl_days`).
+///
+/// One row per address as it is blocked (a /64 or an escalated /24 is
+/// its own row), whichever detector blocked it: an address that probes
+/// for `/.env` today and brute-forces SSH next week is the same repeat
+/// offender. `source` is the detector behind the latest offence,
+/// `blocked_until` when that block was due to end, which is what the
+/// quiet period that forgets an address is counted from. Starts empty:
+/// no release before this one kept a history to fill it from.
+fn v7_offences(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE offences (
+             address TEXT PRIMARY KEY,
+             source TEXT NOT NULL,
+             count INTEGER NOT NULL,
+             last_offence_at INTEGER NOT NULL,
+             blocked_until INTEGER NOT NULL
+         );",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1461,6 +1492,57 @@ mod tests {
                 .get_text_setting(keys::DEFAULTS_GENERATION)
                 .unwrap(),
             None
+        );
+    }
+
+    /// Escalation arrived in generation 2: an upgraded database has it
+    /// off, and marked new, until the operator chooses.
+    #[test]
+    fn upgrading_leaves_repeat_escalation_off_and_new() {
+        use crate::protection::{repeat_escalation, repeat_escalation_is_new_here};
+        for (release, fixture) in [("0.0.1", DB_0_0_1), ("0.0.15", DB_0_0_15)] {
+            let db = upgraded(fixture);
+            assert!(!repeat_escalation(&db).unwrap(), "{release}: on");
+            assert!(
+                repeat_escalation_is_new_here(&db).unwrap(),
+                "{release}: not marked new"
+            );
+        }
+    }
+
+    /// A version 6 database, the last before offences were kept, gains
+    /// the table empty, keeps its rules, and keeps the generation it was
+    /// created at.
+    #[test]
+    fn a_version_6_database_gains_an_empty_offences_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        for step in &MIGRATIONS[..6] {
+            (step.apply)(&conn).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, '1')",
+            params![keys::DEFAULTS_GENERATION],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO firewall_rules (address, action, enabled, created_at, expires_at, source)
+             VALUES ('198.51.100.9', 'block', 1, 1, 4102444800, 'block_probe_paths')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn, None).unwrap();
+        let db = Db { conn };
+
+        assert_eq!(version_of(&db), CURRENT_VERSION);
+        assert_eq!(db.defaults_generation().unwrap(), 1, "the generation moved");
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules.len(), 1, "rules: {rules:?}");
+        assert_eq!(
+            db.offences_before("198.51.100.9", 0).unwrap(),
+            0,
+            "an offence appeared from nowhere"
         );
     }
 

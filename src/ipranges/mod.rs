@@ -27,6 +27,7 @@
 //! instead of dispatching to per-source modules the way `botlist::SourceKind`
 //! does.
 
+pub mod hosting;
 pub mod reputation;
 
 use crate::db::{Category, Db, IpRangeSource};

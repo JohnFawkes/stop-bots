@@ -50,6 +50,12 @@ use crate::db::{Db, ReputationSource};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// The caution beside everything that blocks a provider's whole network:
+/// the cloud feeds here, and the hosting providers chosen by ASN
+/// (`super::hosting`).
+pub const INFRASTRUCTURE_WARNING: &str =
+    "blocks every visitor hosted there, not just bots — including VPNs and API clients";
+
 /// One built-in third-party feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReputationSourceKind {
@@ -172,9 +178,8 @@ impl ReputationSourceKind {
     /// A one-line caution shown next to the more dangerous feeds, or
     /// `None` for the abuse lists.
     pub fn warning(self) -> Option<&'static str> {
-        self.blocks_infrastructure().then_some(
-            "blocks every visitor hosted there, not just bots — including VPNs and API clients",
-        )
+        self.blocks_infrastructure()
+            .then_some(INFRASTRUCTURE_WARNING)
     }
 
     pub fn from_id(id: &str) -> Option<ReputationSourceKind> {

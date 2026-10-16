@@ -48,7 +48,7 @@ use super::{keys, Category, GeoMode, Policy};
 /// Always equal to `MIGRATIONS.len()`; a test holds the two together, so
 /// adding a migration without bumping this (or the reverse) fails the
 /// build's tests rather than a user's upgrade.
-pub const CURRENT_VERSION: u32 = 7;
+pub const CURRENT_VERSION: u32 = 8;
 
 /// The generation of defaults this binary creates a database with.
 ///
@@ -138,6 +138,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         summary: "offences, how many times a detector has blocked each address",
         apply: v7_offences,
+    },
+    Migration {
+        summary: "hosting_asns and hosting_asn_ranges, hosting providers blocked by AS number",
+        apply: v8_hosting_asns,
     },
 ];
 
@@ -858,6 +862,26 @@ fn v7_offences(conn: &Connection) -> rusqlite::Result<()> {
              count INTEGER NOT NULL,
              last_offence_at INTEGER NOT NULL,
              blocked_until INTEGER NOT NULL
+         );",
+    )
+}
+
+/// The hosting providers blocked by AS number (`ipranges::hosting`): a
+/// row in `hosting_asns` is a selected ASN, and `hosting_asn_ranges` holds
+/// the ranges of selected ASNs only, never the whole table they came from.
+fn v8_hosting_asns(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE hosting_asns (
+             asn INTEGER PRIMARY KEY,
+             description TEXT,
+             added_at INTEGER NOT NULL,
+             last_fetched_at INTEGER,
+             range_count INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE hosting_asn_ranges (
+             asn INTEGER NOT NULL REFERENCES hosting_asns(asn),
+             cidr TEXT NOT NULL,
+             PRIMARY KEY (asn, cidr)
          );",
     )
 }
@@ -1758,6 +1782,29 @@ mod tests {
         assert_eq!(version_of(&db), CURRENT_VERSION);
         assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
         assert_eq!(db.recent_ssh_login_ips().unwrap(), ["198.51.100.9"]);
+    }
+
+    /// A version-7 database (0.3.0's) gains the hosting-provider tables
+    /// with nothing selected, and keeps what it had.
+    #[test]
+    fn a_version_7_database_upgrades_with_no_hosting_provider_selected() {
+        let conn = Connection::open_in_memory().unwrap();
+        for step in &MIGRATIONS[..7] {
+            (step.apply)(&conn).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        conn.execute_batch(
+            "INSERT INTO firewall_rules (address, action, enabled, created_at, source)
+                 VALUES ('203.0.113.7', 'block', 1, 5, 'cli');",
+        )
+        .unwrap();
+
+        migrate(&conn, None).unwrap();
+
+        let db = Db { conn };
+        assert_eq!(version_of(&db), CURRENT_VERSION);
+        assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
+        assert!(db.list_hosting_asns().unwrap().is_empty());
     }
 
     /// A version-5 database keeps its settings, including ones no release

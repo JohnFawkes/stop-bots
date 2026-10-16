@@ -339,6 +339,19 @@ pub struct ReputationSource {
     pub range_count: i64,
 }
 
+/// A hosting provider's network selected for blocking, by AS number (see
+/// `ipranges::hosting`). Being a row is being selected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostingAsn {
+    pub asn: u32,
+    /// What the iptoasn table calls the network, from the last fetch;
+    /// `None` until one.
+    pub description: Option<String>,
+    pub added_at: i64,
+    pub last_fetched_at: Option<i64>,
+    pub range_count: i64,
+}
+
 /// A bot-list data source that bots can be fetched from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Source {
@@ -3529,7 +3542,8 @@ impl Db {
     /// means there is never a stale derived row to reconcile, and an
     /// admin's own rules are never at risk of being deleted by a refresh.
     ///
-    /// **A cloud provider's ranges leave port 80 open**, in Blocklist mode.
+    /// **A cloud provider's ranges leave port 80 open**, in Blocklist mode,
+    /// and so do the hosting providers selected by ASN.
     /// Let's Encrypt validates an http-01 challenge from several places at
     /// once, and every place but the first is an AWS region: with the AWS
     /// feed on, the first validator got its 200 and the others timed out,
@@ -3552,13 +3566,20 @@ impl Db {
             .into_iter()
             .map(|address| (address, None, FirewallAction::Block))
             .collect();
-        let (cloud, abuse): (Vec<_>, Vec<_>) = self
+        let (mut cloud, abuse): (Vec<_>, Vec<_>) = self
             .enabled_reputation_ranges_by_source_id()?
             .into_iter()
             .partition(|(source_id, _)| {
                 crate::ipranges::reputation::ReputationSourceKind::from_id(source_id)
                     .is_some_and(|kind| kind.blocks_infrastructure())
             });
+        // A hosting provider chosen by ASN is the same kind of block as a
+        // cloud feed, so it takes the same path, port 80 and all.
+        cloud.extend(
+            self.hosting_asn_ranges()?
+                .into_iter()
+                .map(|(asn, cidr)| (format!("AS{asn}"), cidr)),
+        );
         entries.extend(
             abuse
                 .into_iter()
@@ -3705,6 +3726,115 @@ impl Db {
         let rows = stmt.query_map([], |row| row.get(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("failed to list enabled reputation ranges")
+    }
+
+    // ---- hosting providers by ASN ----
+
+    /// Selects `asn` for blocking. Returns whether it was newly selected;
+    /// selecting one twice changes nothing, its ranges included.
+    pub fn add_hosting_asn(&self, asn: u32) -> Result<bool> {
+        crate::ipranges::hosting::check_asn(asn)?;
+        let added = self.conn.execute(
+            "INSERT OR IGNORE INTO hosting_asns (asn, added_at) VALUES (?1, ?2)",
+            params![asn, now()],
+        )?;
+        Ok(added > 0)
+    }
+
+    /// Stops blocking `asn` and forgets its ranges: only a selected ASN's
+    /// ranges are kept. Returns whether it was selected.
+    pub fn remove_hosting_asn(&self, asn: u32) -> Result<bool> {
+        self.batch(|| {
+            self.conn.execute(
+                "DELETE FROM hosting_asn_ranges WHERE asn = ?1",
+                params![asn],
+            )?;
+            let removed = self
+                .conn
+                .execute("DELETE FROM hosting_asns WHERE asn = ?1", params![asn])?;
+            Ok(removed > 0)
+        })
+    }
+
+    /// Every selected ASN, by number.
+    pub fn list_hosting_asns(&self) -> Result<Vec<HostingAsn>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT asn, description, added_at, last_fetched_at, range_count
+             FROM hosting_asns ORDER BY asn",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(HostingAsn {
+                asn: row.get(0)?,
+                description: row.get(1)?,
+                added_at: row.get(2)?,
+                last_fetched_at: row.get(3)?,
+                range_count: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list the hosting ASNs")
+    }
+
+    /// Replaces every range stored for `asn`, which must be selected, with
+    /// the usable ones of `cidrs`, under the same checks as a feed's (see
+    /// [`Self::replace_reputation_ranges`]), and records `description`.
+    pub fn replace_hosting_asn_ranges(
+        &self,
+        asn: u32,
+        description: &str,
+        cidrs: &[String],
+    ) -> Result<usize> {
+        let label = format!("AS{asn}");
+        self.batch(|| {
+            let selected: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM hosting_asns WHERE asn = ?1",
+                params![asn],
+                |row| row.get(0),
+            )?;
+            if selected == 0 {
+                anyhow::bail!("{label} is not selected, so its ranges are not kept");
+            }
+            reject_an_oversized_fetch(&label, cidrs)?;
+            reject_an_overbroad_fetch(&label, cidrs, FEED_MAX_V4_SHARE)?;
+            reject_a_wholly_unusable_fetch(&label, cidrs)?;
+            self.reject_an_empty_fetch_over_stored(
+                "hosting_asn_ranges",
+                "asn",
+                &asn.to_string(),
+                cidrs,
+            )?;
+            self.conn.execute(
+                "DELETE FROM hosting_asn_ranges WHERE asn = ?1",
+                params![asn],
+            )?;
+            let mut insert = self.conn.prepare_cached(
+                "INSERT OR IGNORE INTO hosting_asn_ranges (asn, cidr) VALUES (?1, ?2)",
+            )?;
+            for cidr in usable_addresses(cidrs) {
+                insert.execute(params![asn, cidr])?;
+            }
+            let count: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM hosting_asn_ranges WHERE asn = ?1",
+                params![asn],
+                |row| row.get(0),
+            )?;
+            self.conn.execute(
+                "UPDATE hosting_asns SET description = ?1, last_fetched_at = ?2, range_count = ?3
+                 WHERE asn = ?4",
+                params![description, now(), count, asn],
+            )?;
+            Ok(count as usize)
+        })
+    }
+
+    /// Every stored range of every selected ASN, as `(asn, cidr)`.
+    pub fn hosting_asn_ranges(&self) -> Result<Vec<(u32, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT asn, cidr FROM hosting_asn_ranges ORDER BY asn, cidr")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list the hosting ASNs' ranges")
     }
 
     /// Computes the user-agent regex alternatives for every bot that should
@@ -6233,6 +6363,85 @@ mod tests {
             Some(FirewallAction::Block),
             "{entries:?}"
         );
+    }
+
+    /// A database with `asn` selected and holding `cidrs`.
+    fn with_hosting_asn(asn: u32, cidrs: &[&str]) -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.add_hosting_asn(asn).unwrap();
+        let cidrs: Vec<String> = cidrs.iter().map(|c| c.to_string()).collect();
+        db.replace_hosting_asn_ranges(asn, "HETZNER-AS", &cidrs)
+            .unwrap();
+        db
+    }
+
+    /// A hosting provider is a cloud provider by another name: blocked,
+    /// with port 80 left open for Let's Encrypt like the cloud feeds.
+    #[test]
+    fn a_hosting_asn_is_blocked_like_a_cloud_feed_port_80_and_all() {
+        let db = with_hosting_asn(24940, &["5.9.0.0/16", "2a01:4f8::/32"]);
+        let entries = db.derived_firewall_entries().unwrap();
+
+        let cases = [
+            ("port 80", "5.9.1.1", 80, Some(FirewallAction::Allow)),
+            ("port 443", "5.9.1.1", 443, Some(FirewallAction::Block)),
+            (
+                "IPv6, port 443",
+                "2a01:4f8::1",
+                443,
+                Some(FirewallAction::Block),
+            ),
+            ("outside its ranges", "5.10.1.1", 443, None),
+        ];
+        for (what, ip, port, expected) in cases {
+            assert_eq!(verdict(&entries, ip, port), expected, "{what}: {entries:?}");
+        }
+
+        db.set_cloud_port_80_open(false).unwrap();
+        let entries = db.derived_firewall_entries().unwrap();
+        assert_eq!(
+            verdict(&entries, "5.9.1.1", 80),
+            Some(FirewallAction::Block),
+            "with port 80 closed: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_hosting_asn_selection_persists_and_removing_it_forgets_its_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        {
+            let db = Db::open(&path).unwrap();
+            assert!(db.add_hosting_asn(24940).unwrap());
+            assert!(!db.add_hosting_asn(24940).unwrap(), "added twice");
+            db.replace_hosting_asn_ranges(24940, "HETZNER-AS", &["5.9.0.0/16".to_string()])
+                .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let selected = db.list_hosting_asns().unwrap();
+        assert_eq!(selected.len(), 1, "{selected:?}");
+        assert_eq!(selected[0].asn, 24940);
+        assert_eq!(selected[0].range_count, 1);
+        assert_eq!(selected[0].description.as_deref(), Some("HETZNER-AS"));
+
+        assert!(db.remove_hosting_asn(24940).unwrap());
+        assert!(db.list_hosting_asns().unwrap().is_empty());
+        assert!(
+            db.hosting_asn_ranges().unwrap().is_empty(),
+            "a removed ASN's ranges stayed behind"
+        );
+    }
+
+    /// Only a selected ASN's ranges are ever kept.
+    #[test]
+    fn ranges_for_an_unselected_asn_are_refused() {
+        let db = Db::open_in_memory().unwrap();
+        let err = db
+            .replace_hosting_asn_ranges(24940, "HETZNER-AS", &["5.9.0.0/16".to_string()])
+            .unwrap_err();
+        assert!(err.to_string().contains("not selected"), "was: {err:#}");
+        assert!(db.hosting_asn_ranges().unwrap().is_empty());
     }
 
     /// An Allow ahead of the catch-all would open port 80 to every cloud

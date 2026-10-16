@@ -74,6 +74,13 @@ pub enum AppEvent {
         source_id: String,
         result: Result<Vec<String>, String>,
     },
+    /// The ASN table, downloaded for hosting providers the Dashboard just
+    /// chose (see `App::start_hosting_asn_fetch`): only the lines of
+    /// `asns`, stored back on the main thread, or why the download failed.
+    HostingAsnsFetched {
+        asns: Vec<u32>,
+        result: Result<String, String>,
+    },
     /// One crawler's ranges, downloaded from the Dashboard (see
     /// `App::start_crawler_ranges_refresh`): the raw body, stored back on
     /// the main thread, or why the download failed.

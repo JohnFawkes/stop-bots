@@ -26,7 +26,8 @@
 //! attacker-supplied text that reads as authoritative. None of that is
 //! here. What is here is a join over feeds this host already downloads for
 //! other reasons: six reputation lists (`reputation_ranges` — Tor exits,
-//! FireHOL, blocklist.de, and three cloud providers), three crawler
+//! FireHOL, blocklist.de, and three cloud providers), the hosting
+//! providers blocked by AS number (`hosting_asn_ranges`), three crawler
 //! sources (`ip_ranges` — Googlebot, Bingbot, GPTBot), and whichever
 //! countries have been fetched (`country_ip_ranges`). That answers "is
 //! this a hosting provider, a Tor exit, a known-bad address, or a crawler
@@ -128,10 +129,12 @@ impl IpDetail {
         }
 
         let country_ranges = db.country_ranges_by_code()?;
+        let mut reputation = hits(&db.enabled_reputation_ranges_by_source_name()?, ip);
+        reputation.extend(hosting_hits(db, ip)?);
         Ok(Self {
             address: address.to_string(),
             kind: AddressKind::Public,
-            reputation: hits(&db.enabled_reputation_ranges_by_source_name()?, ip),
+            reputation,
             crawlers: hits(&db.ip_ranges_by_source_name()?, ip),
             country: country_ranges
                 .iter()
@@ -185,6 +188,28 @@ fn hits(ranges: &[(String, String)], ip: std::net::IpAddr) -> Vec<RangeHit> {
         }
     }
     out
+}
+
+/// The selected hosting providers (`ipranges::hosting`) whose ranges hold
+/// `ip`, named as the Dashboard names them.
+fn hosting_hits(db: &Db, ip: std::net::IpAddr) -> Result<Vec<RangeHit>> {
+    let names: std::collections::HashMap<u32, Option<String>> = db
+        .list_hosting_asns()?
+        .into_iter()
+        .map(|asn| (asn.asn, asn.description))
+        .collect();
+    Ok(db
+        .hosting_asn_ranges()?
+        .into_iter()
+        .filter(|(_, cidr)| ipranges::cidr_contains(cidr, ip))
+        .map(|(asn, range)| RangeHit {
+            source: format!(
+                "AS{asn} {}",
+                ipranges::hosting::display_name(asn, names.get(&asn).and_then(Option::as_deref))
+            ),
+            range,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -363,5 +388,25 @@ mod tests {
 
         assert_eq!(found.len(), 1, "found: {found:?}");
         assert_eq!(found[0].range, "10.50.7.0/24");
+    }
+
+    /// A blocked hosting provider says what an address is as plainly as a
+    /// cloud feed does.
+    #[test]
+    fn an_address_in_a_selected_hosting_asn_names_the_provider() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_hosting_asn(24940).unwrap();
+        db.replace_hosting_asn_ranges(24940, "HETZNER-AS", &["5.9.0.0/16".to_string()])
+            .unwrap();
+
+        let detail = load(&db, "5.9.1.2");
+
+        assert_eq!(
+            detail.reputation,
+            [RangeHit {
+                source: "AS24940 Hetzner".to_string(),
+                range: "5.9.0.0/16".to_string(),
+            }]
+        );
     }
 }

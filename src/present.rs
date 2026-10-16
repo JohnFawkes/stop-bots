@@ -100,6 +100,7 @@ pub fn check_label(check: &Check) -> &'static str {
         "lets-encrypt-reachable" => "certs",
         "exposed-files" => "exposed",
         "trusted" => "trusted",
+        "hosting-asns" => "hosting",
         "skipped-entries" => "skipped",
         _ => check.title,
     }

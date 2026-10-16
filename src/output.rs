@@ -280,6 +280,33 @@ pub struct ReputationSourceRow {
     pub warning: Option<&'static str>,
 }
 
+/// `list-hosting-asns --json`.
+#[derive(Debug, Serialize)]
+pub struct HostingAsns {
+    pub asns: Vec<HostingAsnRow>,
+    /// What blocking any of them blocks besides bots.
+    pub warning: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HostingAsnRow {
+    /// The AS number, as `add-hosting-asn --asn` takes it.
+    pub asn: u32,
+    /// The built-in list's name for it, else the table's, else `AS<n>`.
+    pub name: String,
+    /// What iptoasn.com's table calls the network, from the last
+    /// download; `null` before one.
+    pub description: Option<String>,
+    /// Whether it is on the built-in list.
+    pub curated: bool,
+    pub blocked: bool,
+    /// `null` when its ranges have never been downloaded.
+    pub last_fetched_at: Option<i64>,
+    pub range_count: i64,
+    /// What blocking it takes with it beyond the general warning.
+    pub note: Option<&'static str>,
+}
+
 /// `list-selected-countries --json`.
 #[derive(Debug, Serialize)]
 pub struct SelectedCountries {

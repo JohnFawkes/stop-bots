@@ -172,6 +172,11 @@ enum ProtectionRow {
     /// `Dashboard::reputation` (which is ordered by id, as
     /// `Db::list_reputation_sources` returns it).
     Feed(usize),
+    /// The hosting providers blocked by AS number (`ipranges::hosting`):
+    /// one row for the whole list, whose Enter opens
+    /// [`Popup::HostingProviders`] to choose them, rather than a row per
+    /// provider in a panel that has no room for sixteen more.
+    HostingProviders,
     /// Whether a detector blocks an address it blocked before for longer
     /// (`protection::repeat_escalation`). Beside the detectors, because it
     /// changes how long each of their blocks lasts; a plain Off/On, since
@@ -279,6 +284,15 @@ enum Popup {
         feed: usize,
         selected: usize,
     },
+    /// Which hosting providers to block: every one on the built-in list,
+    /// and any other AS number already blocked. Space ticks the row under
+    /// `cursor` in `chosen`; Enter blocks what is ticked and stops blocking
+    /// what is not, in one go, so one download fetches every newly ticked
+    /// provider; Esc changes nothing.
+    HostingProviders {
+        cursor: usize,
+        chosen: std::collections::BTreeSet<u32>,
+    },
     /// Firewall rendering: select backend (0 = nftables, 1 = iptables),
     /// enter the output path, and optionally toggle `apply_after_write`
     /// (Space) so confirming with Enter also actually enforces the script
@@ -355,6 +369,9 @@ pub struct Dashboard {
     /// Every third-party CIDR feed, ordered by id — the order
     /// `ProtectionRow::Feed`'s index refers to.
     reputation: Vec<crate::db::ReputationSource>,
+    /// The hosting providers blocked by AS number, for the
+    /// `ProtectionRow::HostingProviders` row and its popup.
+    hosting_asns: Vec<crate::db::HostingAsn>,
     /// `Db::get_auto_apply_firewall`, mirrored here for the
     /// `ProtectionRow::AutoApplyFirewall` row, the same way every other
     /// value this panel shows is loaded in `refresh`.
@@ -415,6 +432,7 @@ impl Dashboard {
         self.repeat_offenders = crate::protection::repeat_escalation(db)?;
         self.repeat_offenders_new = crate::protection::repeat_escalation_is_new_here(db)?;
         self.reputation = db.list_reputation_sources()?;
+        self.hosting_asns = db.list_hosting_asns()?;
         self.crawlers = ipranges::crawler_sources(db)?;
         self.auto_apply_firewall = db.get_auto_apply_firewall()?;
         self.ssh_lockout_check = db.get_ssh_lockout_check()?;
@@ -497,6 +515,17 @@ impl Dashboard {
 
     /// The footer's key hints for the focused panel.
     pub fn hints(&self) -> crate::tui::Hints {
+        if matches!(self.popup, Some(Popup::HostingProviders { .. })) {
+            return (
+                "Popup",
+                vec![
+                    ("\u{2191}\u{2193}", "move"),
+                    ("Space", "tick"),
+                    ("Enter", "save"),
+                    ("Esc", "cancel"),
+                ],
+            );
+        }
         if self.popup.is_some() {
             return (
                 "Popup",
@@ -814,6 +843,7 @@ impl Dashboard {
                     .para("Space switches it. It is downloaded again every week.")
                     .takes_effect(self.auto_apply_firewall)
             }
+            ProtectionRow::HostingProviders => self.explain_hosting_providers(label),
             ProtectionRow::RepeatOffenders => {
                 use crate::protection::{
                     ESCALATION_MAX_DAYS, ESCALATION_MAX_MULTIPLIER, OFFENCE_MEMORY_DAYS,
@@ -874,6 +904,46 @@ impl Dashboard {
                      anyone logs in over SSH while it is off.",
                 ),
         }
+    }
+
+    fn explain_hosting_providers(&self, label: String) -> Explanation {
+        use ipranges::hosting;
+        let unfetched: Vec<String> = self
+            .hosting_asns
+            .iter()
+            .filter(|asn| asn.last_fetched_at.is_none())
+            .map(|asn| hosting::label(asn.asn, asn.description.as_deref()))
+            .collect();
+        let names: Vec<String> = self
+            .hosting_asns
+            .iter()
+            .map(|asn| hosting::label(asn.asn, asn.description.as_deref()))
+            .collect();
+        let ranges: i64 = self.hosting_asns.iter().map(|asn| asn.range_count).sum();
+        Explanation::new(label)
+            .para(hosting::about())
+            .now(if names.is_empty() {
+                "none blocked.".to_string()
+            } else if unfetched.is_empty() {
+                format!("blocking {}, {ranges} ranges.", names.join(", "))
+            } else {
+                format!(
+                    "blocking {}; not downloaded yet, so not blocked: {}.",
+                    names.join(", "),
+                    unfetched.join(", ")
+                )
+            })
+            .warn(format!("It {}.", hosting::warning()))
+            .para(
+                "Port 80 stays open to these ranges, as to the cloud feeds, unless you chose \
+                 otherwise when turning AWS on, so Let's Encrypt can still renew.",
+            )
+            .para(
+                "Enter or Space opens the list: Space ticks a provider, Enter saves and \
+                 downloads what is new. AWS, Google Cloud and DigitalOcean are feeds of \
+                 their own, above. Downloaded again every week.",
+            )
+            .takes_effect(self.auto_apply_firewall)
     }
 
     pub fn render(
@@ -1274,6 +1344,7 @@ impl Dashboard {
             .chain([ProtectionRow::RepeatOffenders])
             .chain((0..self.reputation.len()).map(ProtectionRow::Feed))
             .chain([
+                ProtectionRow::HostingProviders,
                 ProtectionRow::AutoApplyFirewall,
                 ProtectionRow::LockoutCheck,
             ])
@@ -1289,6 +1360,7 @@ impl Dashboard {
                 .map(|s| s.name.clone())
                 .unwrap_or_default(),
             ProtectionRow::RepeatOffenders => "Repeat offenders".to_string(),
+            ProtectionRow::HostingProviders => "Hosting providers".to_string(),
             ProtectionRow::AutoApplyFirewall => "Auto-apply the script".to_string(),
             ProtectionRow::LockoutCheck => "SSH lock-out check".to_string(),
         }
@@ -1303,6 +1375,7 @@ impl Dashboard {
                 .unwrap_or(false),
             ProtectionRow::Feed(i) => self.reputation.get(i).is_some_and(|s| s.enabled),
             ProtectionRow::RepeatOffenders => self.repeat_offenders,
+            ProtectionRow::HostingProviders => !self.hosting_asns.is_empty(),
             ProtectionRow::AutoApplyFirewall => self.auto_apply_firewall,
             ProtectionRow::LockoutCheck => self.ssh_lockout_check,
         }
@@ -1329,6 +1402,7 @@ impl Dashboard {
             // render time from the stored ranges, so there's nothing to
             // expire.
             ProtectionRow::Feed(_)
+            | ProtectionRow::HostingProviders
             | ProtectionRow::RepeatOffenders
             | ProtectionRow::AutoApplyFirewall
             | ProtectionRow::LockoutCheck => 0,
@@ -1347,6 +1421,19 @@ impl Dashboard {
                 Some(s) => format!(" {}", s.range_count),
                 None => String::new(),
             },
+            // How many, which is what the row cannot show by name; and,
+            // as for a feed, whether any is doing nothing for want of a
+            // download.
+            ProtectionRow::HostingProviders if self.hosting_asns.is_empty() => String::new(),
+            ProtectionRow::HostingProviders
+                if self
+                    .hosting_asns
+                    .iter()
+                    .any(|asn| asn.last_fetched_at.is_none()) =>
+            {
+                " not fetched".to_string()
+            }
+            ProtectionRow::HostingProviders => format!(" {} blocked", self.hosting_asns.len()),
             // No TTL and no count — the state is the whole story, and the
             // tag already carries it.
             ProtectionRow::AutoApplyFirewall | ProtectionRow::LockoutCheck => String::new(),
@@ -1421,6 +1508,9 @@ impl Dashboard {
                 selected,
                 theme,
             ),
+            Popup::HostingProviders { cursor, chosen } => {
+                self.render_hosting_providers(frame, area, cursor, &chosen, theme);
+            }
             Popup::CloudPort80 { selected, .. } => render_option_list(
                 frame,
                 area,
@@ -1563,6 +1653,9 @@ impl Dashboard {
                 Popup::AddCountry { .. } => self.handle_add_country_popup_key(key, db, message),
                 Popup::Protection { .. } => self.handle_protection_popup_key(key, db, message),
                 Popup::CloudPort80 { .. } => self.handle_cloud_port_80_popup_key(key, db, message),
+                Popup::HostingProviders { .. } => {
+                    self.handle_hosting_providers_popup_key(key, db, message)
+                }
                 Popup::GeoMode { .. } => self.handle_geo_mode_popup_key(key, db, message),
                 Popup::RenderFirewall { .. } => self.handle_render_firewall_popup_key(key),
                 Popup::ConfirmApply { .. } => self.handle_confirm_apply_popup_key(key, message),
@@ -1766,6 +1859,11 @@ impl Dashboard {
         else {
             return Ok(KeyOutcome::Consumed);
         };
+        // A list, not a switch: there is no one thing to flip.
+        if row == ProtectionRow::HostingProviders {
+            self.open_hosting_providers_popup();
+            return Ok(KeyOutcome::Consumed);
+        }
         let selected = if self.protection_enabled(row) {
             0
         } else if !row.is_detector() {
@@ -1796,6 +1894,10 @@ impl Dashboard {
         else {
             return;
         };
+        if row == ProtectionRow::HostingProviders {
+            self.open_hosting_providers_popup();
+            return;
+        }
         let selected = if !self.protection_enabled(row) {
             0
         } else if !row.is_detector() {
@@ -1874,7 +1976,7 @@ impl Dashboard {
             return Ok(KeyOutcome::Mutated);
         }
         let ProtectionRow::Detect(detector) = row else {
-            unreachable!("feeds are committed by commit_feed")
+            unreachable!("feeds are committed by commit_feed, hosting providers by their popup")
         };
         let label = self.protection_label(row);
         if selected == 0 {
@@ -1963,6 +2065,189 @@ impl Dashboard {
             source.name, source.range_count
         ));
         Ok(KeyOutcome::Mutated)
+    }
+
+    /// The AS numbers [`Popup::HostingProviders`] lists, in order: the
+    /// built-in list, then any other one blocked, by number.
+    fn hosting_choices(&self) -> Vec<u32> {
+        ipranges::hosting::HOSTING_PROVIDERS
+            .iter()
+            .map(|p| p.asn)
+            .chain(
+                self.hosting_asns
+                    .iter()
+                    .map(|asn| asn.asn)
+                    .filter(|asn| ipranges::hosting::curated(*asn).is_none()),
+            )
+            .collect()
+    }
+
+    fn open_hosting_providers_popup(&mut self) {
+        self.popup = Some(Popup::HostingProviders {
+            cursor: 0,
+            chosen: self.hosting_asns.iter().map(|asn| asn.asn).collect(),
+        });
+    }
+
+    fn handle_hosting_providers_popup_key(
+        &mut self,
+        key: KeyEvent,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let last = self.hosting_choices().len().saturating_sub(1);
+        let choices = self.hosting_choices();
+        let Some(Popup::HostingProviders { cursor, chosen }) = &mut self.popup else {
+            unreachable!("dispatched on this variant")
+        };
+        match key.code {
+            KeyCode::Esc => self.popup = None,
+            KeyCode::Up | KeyCode::Char('k') => *cursor = cursor.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => *cursor = (*cursor + 1).min(last),
+            KeyCode::Char(' ') => {
+                if let Some(asn) = choices.get(*cursor) {
+                    if !chosen.remove(asn) {
+                        chosen.insert(*asn);
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let Some(Popup::HostingProviders { chosen, .. }) = self.popup.take() else {
+                    unreachable!("checked above")
+                };
+                return self.commit_hosting_providers(db, &chosen, message);
+            }
+            _ => {}
+        }
+        Ok(KeyOutcome::Consumed)
+    }
+
+    /// Blocks every provider in `chosen` and stops blocking every other
+    /// one. A provider whose ranges were never downloaded is fetched, all
+    /// of them in one download (`KeyOutcome::FetchHostingAsns`); with
+    /// nothing to fetch the change is already complete.
+    fn commit_hosting_providers(
+        &mut self,
+        db: &Db,
+        chosen: &std::collections::BTreeSet<u32>,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        use ipranges::hosting;
+        let before: std::collections::BTreeSet<u32> =
+            self.hosting_asns.iter().map(|asn| asn.asn).collect();
+        if *chosen == before {
+            return Ok(KeyOutcome::Consumed);
+        }
+        let name = |asn: &u32| hosting::display_name(*asn, None);
+        let added: Vec<u32> = chosen.difference(&before).copied().collect();
+        let removed: Vec<u32> = before.difference(chosen).copied().collect();
+        for asn in &removed {
+            db.remove_hosting_asn(*asn)?;
+        }
+        for asn in &added {
+            db.add_hosting_asn(*asn)?;
+        }
+
+        let mut parts = Vec::new();
+        if !added.is_empty() {
+            let names: Vec<String> = added.iter().map(name).collect();
+            parts.push(format!("Blocking {}", names.join(", ")));
+        }
+        if !removed.is_empty() {
+            let names: Vec<String> = removed.iter().map(name).collect();
+            parts.push(format!("no longer blocking {}", names.join(", ")));
+        }
+        let mut text = parts.join("; ");
+        if let Some(first) = text.get(..1) {
+            text = first.to_uppercase() + &text[1..];
+        }
+        // Everything chosen that has no ranges yet: the ones just added,
+        // and any added before whose download never happened.
+        let fetch: Vec<u32> = chosen
+            .iter()
+            .copied()
+            .filter(|asn| {
+                !self
+                    .hosting_asns
+                    .iter()
+                    .any(|stored| stored.asn == *asn && stored.last_fetched_at.is_some())
+            })
+            .collect();
+        let warning = if added.is_empty() {
+            String::new()
+        } else {
+            format!(" \u{2014} {}", hosting::warning())
+        };
+        if fetch.is_empty() {
+            *message = Some(format!("{text} \u{2014} apply (a) to enforce it{warning}"));
+            return Ok(KeyOutcome::Mutated);
+        }
+        *message = Some(format!("{text}, fetching\u{2026}{warning}"));
+        Ok(KeyOutcome::FetchHostingAsns(fetch))
+    }
+
+    fn render_hosting_providers(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        cursor: usize,
+        chosen: &std::collections::BTreeSet<u32>,
+        theme: Theme,
+    ) {
+        use ipranges::hosting;
+        let title = "Hosting providers to block";
+        let choices = self.hosting_choices();
+        let mut lines: Vec<Line<'static>> = choices
+            .iter()
+            .enumerate()
+            .map(|(i, asn)| {
+                let stored = self.hosting_asns.iter().find(|a| a.asn == *asn);
+                let name =
+                    hosting::display_name(*asn, stored.and_then(|a| a.description.as_deref()));
+                let ranges = match stored {
+                    Some(a) if a.last_fetched_at.is_some() => format!("{} range(s)", a.range_count),
+                    Some(_) => "not fetched".to_string(),
+                    None => String::new(),
+                };
+                let tick = if chosen.contains(asn) { "[x]" } else { "[ ]" };
+                let line = Line::from(format!(
+                    "{tick} {:<9} {:<18} {ranges}",
+                    format!("AS{asn}"),
+                    crate::present::terminal_safe(&name)
+                ));
+                if i == cursor {
+                    line.reversed()
+                } else {
+                    line
+                }
+            })
+            .collect();
+        // As wide as the list, not the warning below it, which wraps.
+        let width = widest_line(&lines).max(title.chars().count() as u16 + 4);
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!("Each {}.", hosting::warning())).yellow());
+        if let Some(note) = choices
+            .get(cursor)
+            .and_then(|asn| hosting::curated(*asn))
+            .and_then(|p| p.note)
+        {
+            lines.push(Line::from(note).yellow());
+        }
+        lines.push(Line::from("Space tick  Enter save  Esc cancel").dim());
+
+        // Tall enough for the caution lines once wrapped to that width.
+        let inner = width.saturating_add(2).max(1);
+        let height: u16 = lines
+            .iter()
+            .map(|line| (line.width() as u16).div_ceil(inner).max(1))
+            .sum();
+        // One spare row: word wrapping can need one more than the division.
+        let popup_area = centered_rect(width + 4, height + 3, area);
+        let paragraph = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(crate::tui::popup(title, theme));
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(paragraph, popup_area);
     }
 
     /// One category default: Allowed (0) or Blocked (1).
@@ -5080,9 +5365,10 @@ mod tests {
         assert_eq!(
             rows.len(),
             // ...plus `RepeatOffenders`, between the detectors and the
-            // feeds, and the `AutoApplyFirewall` and `LockoutCheck` rows,
-            // which sit after the feeds. None of the three is a detector.
-            detectors + ReputationSourceKind::ALL.len() + 3
+            // feeds, and the `HostingProviders`, `AutoApplyFirewall` and
+            // `LockoutCheck` rows, which sit after the feeds. None of the
+            // four is a detector.
+            detectors + ReputationSourceKind::ALL.len() + 4
         );
         assert_eq!(rows[detectors], ProtectionRow::RepeatOffenders);
         assert!(rows[..detectors].iter().all(|r| r.is_detector()));
@@ -5292,6 +5578,172 @@ mod tests {
         assert!(message.contains("not just bots"), "message was: {message}");
     }
 
+    // ---- hosting providers by ASN ----
+
+    fn on_the_hosting_row(db: &Db) -> Dashboard {
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(db).unwrap();
+        focus_protection(&mut dashboard, db);
+        let target = dashboard
+            .protection_rows()
+            .iter()
+            .position(|row| *row == ProtectionRow::HostingProviders)
+            .expect("the hosting providers row");
+        dashboard.protection_state.select(Some(target));
+        dashboard
+    }
+
+    /// Moves the popup's cursor onto `asn` by keypress.
+    fn move_to(dashboard: &mut Dashboard, db: &Db, asn: u32) {
+        let at = dashboard
+            .hosting_choices()
+            .iter()
+            .position(|a| *a == asn)
+            .expect("listed");
+        for _ in 0..at {
+            press(dashboard, db, KeyCode::Down);
+        }
+    }
+
+    /// Ticking a provider and saving blocks it, warns, and asks `App` for
+    /// one download of everything chosen that has no ranges yet.
+    #[test]
+    fn ticking_a_provider_and_saving_blocks_it_and_asks_for_its_ranges() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = on_the_hosting_row(&db);
+
+        press(&mut dashboard, &db, KeyCode::Enter);
+        assert!(matches!(
+            dashboard.popup,
+            Some(Popup::HostingProviders { .. })
+        ));
+        move_to(&mut dashboard, &db, 24940);
+        press(&mut dashboard, &db, KeyCode::Char(' '));
+        let mut message = None;
+        let outcome = dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::FetchHostingAsns(vec![24940]));
+        assert!(dashboard.popup.is_none());
+        let selected: Vec<u32> = db
+            .list_hosting_asns()
+            .unwrap()
+            .iter()
+            .map(|a| a.asn)
+            .collect();
+        assert_eq!(selected, [24940]);
+        let message = message.unwrap_or_default();
+        assert!(
+            message.contains("Blocking Hetzner") && message.contains("not just bots"),
+            "message was: {message}"
+        );
+    }
+
+    #[test]
+    fn escape_leaves_the_hosting_providers_as_they_were() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = on_the_hosting_row(&db);
+
+        press(&mut dashboard, &db, KeyCode::Char(' '));
+        press(&mut dashboard, &db, KeyCode::Char(' '));
+        let outcome = press(&mut dashboard, &db, KeyCode::Esc);
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        assert!(dashboard.popup.is_none());
+        assert!(db.list_hosting_asns().unwrap().is_empty());
+    }
+
+    /// Unticking one whose ranges are stored needs no download, and its
+    /// ranges go with it.
+    #[test]
+    fn unticking_a_blocked_provider_unblocks_it_without_a_download() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_hosting_asn(16276).unwrap();
+        db.replace_hosting_asn_ranges(16276, "OVH", &["51.68.0.0/23".to_string()])
+            .unwrap();
+        let mut dashboard = on_the_hosting_row(&db);
+
+        press(&mut dashboard, &db, KeyCode::Char(' '));
+        move_to(&mut dashboard, &db, 16276);
+        press(&mut dashboard, &db, KeyCode::Char(' '));
+        let outcome = press(&mut dashboard, &db, KeyCode::Enter);
+
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert!(db.list_hosting_asns().unwrap().is_empty());
+        assert!(db.hosting_asn_ranges().unwrap().is_empty());
+    }
+
+    /// The row counts what is blocked, and the popup lists the built-in
+    /// providers with what each holds.
+    #[test]
+    fn the_row_counts_the_blocked_providers_and_the_popup_lists_them() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_hosting_asn(16276).unwrap();
+        db.replace_hosting_asn_ranges(16276, "OVH", &["51.68.0.0/23".to_string()])
+            .unwrap();
+        let mut dashboard = on_the_hosting_row(&db);
+        assert_eq!(
+            dashboard.protection_detail(ProtectionRow::HostingProviders),
+            " 1 blocked"
+        );
+
+        press(&mut dashboard, &db, KeyCode::Enter);
+        let mut terminal = test_terminal();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &[],
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "[x] AS16276",
+            "OVHcloud",
+            "1 range(s)",
+            "[ ] AS24940",
+            "Hetzner",
+        ] {
+            assert!(screen.contains(expected), "{expected:?} not in:\n{screen}");
+        }
+    }
+
+    #[test]
+    fn a_chosen_provider_with_no_ranges_yet_says_not_fetched() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_hosting_asn(24940).unwrap();
+        let dashboard = on_the_hosting_row(&db);
+
+        assert_eq!(
+            dashboard.protection_detail(ProtectionRow::HostingProviders),
+            " not fetched"
+        );
+        let explained = dashboard
+            .explain()
+            .body
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            explained.contains("not downloaded yet"),
+            "explained as:\n{explained}"
+        );
+    }
+
     /// A dashboard on the Automatic blocking panel, with the AWS feed
     /// fetched, off, and selected.
     fn on_the_aws_row(db: &Db) -> Dashboard {
@@ -5406,7 +5858,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         let rows = dashboard.protection_rows();
-        assert_eq!(rows.len(), 18, "if this changes, so does the panel height");
+        assert_eq!(rows.len(), 19, "if this changes, so does the panel height");
         for row in rows {
             let label = dashboard.protection_label(row);
             assert!(content.contains(&label), "{label:?} is not on screen");

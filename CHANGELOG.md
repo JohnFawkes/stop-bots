@@ -8,7 +8,27 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+**Before upgrading:** the database gains a schema version (the hosting-provider
+tables), and 0.3.0 refuses the upgraded database rather than misreading it. To go
+back, put back the copy the upgrade kept, `/var/lib/stop-bots/db.sqlite3.bak-v7`.
+
 ### Added
+
+- **Block whole hosting providers by AS number.** Hetzner, OVHcloud, Contabo,
+  Akamai Linode, Vultr, Oracle Cloud, Alibaba Cloud, Tencent Cloud,
+  Scaleway, Leaseweb, M247 and Hostinger are on a built-in list, and
+  `add-hosting-asn --asn <n>` takes any other. Their ranges come from iptoasn.com's
+  public-domain table, downloaded once for all of them (about 9 MB) by
+  `update-hosting-asns` (`--source <file>` reads a local copy, gzipped or plain), and
+  again every week with the other lists; only the chosen networks' ranges are kept.
+  They are blocked like the AWS, Google Cloud and DigitalOcean feeds, with the same
+  warning and the same port 80 left open for Let's Encrypt (`set-cloud-port-80`).
+  `remove-hosting-asn` and `list-hosting-asns [--json]` complete the set. On the
+  Dashboard, one "Hosting providers" row under Automatic blocking opens the list to
+  tick, `status` warns about a provider that is chosen but not downloaded yet, and
+  the Firewall screen's detail view names the provider an address belongs to. Off
+  by default. Microsoft is not on the list: its network is also Bingbot's and
+  Microsoft 365's (`add-hosting-asn --asn 8075` adds it anyway).
 
 - **`status` says whether your sites serve their secrets.** The probe-paths detector
   blocks whoever asks for `/.env`; the new `exposed-files` check says whether they got

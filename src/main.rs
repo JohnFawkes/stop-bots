@@ -703,6 +703,52 @@ enum Command {
         #[arg(long, help = JSON_HELP)]
         json: bool,
     },
+    /// Block a hosting provider's whole network, by its AS number.
+    ///
+    /// Every range the network announces is blocked in the next script
+    /// `render-firewall` writes, like a cloud-provider feed: every visitor
+    /// hosted there is turned away, not just bots — VPN endpoints, company
+    /// networks and API clients included — and port 80 stays open for
+    /// Let's Encrypt unless `set-cloud-port-80` closes it.
+    ///
+    /// `list-hosting-asns` names the providers on the built-in list, but any
+    /// AS number is accepted. Nothing is downloaded by this: run
+    /// `update-hosting-asns` for the ranges.
+    AddHostingAsn {
+        /// The AS number, e.g. 24940 or AS24940 (Hetzner)
+        #[arg(long, value_parser = stop_bots::ipranges::hosting::parse_asn)]
+        asn: u32,
+    },
+    /// Stop blocking a hosting provider's network, and forget its ranges
+    RemoveHostingAsn {
+        /// The AS number, as `list-hosting-asns` shows it
+        #[arg(long, value_parser = stop_bots::ipranges::hosting::parse_asn)]
+        asn: u32,
+    },
+    /// List the hosting providers that can be blocked by AS number.
+    ///
+    /// Every provider on the built-in list and every other AS number
+    /// selected, with whether it is blocked and how many ranges it holds.
+    ListHostingAsns {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
+    /// Download the blocked hosting providers' ranges: every one, or one.
+    ///
+    /// Downloads iptoasn.com's public table of which network announces which
+    /// range (about 9 MB) once, and keeps the ranges of every AS number
+    /// selected with `add-hosting-asn`. The rest of the table is not kept.
+    UpdateHostingAsns {
+        /// Only this AS number, which must be selected. Every selected one
+        /// without it
+        #[arg(long, value_parser = stop_bots::ipranges::hosting::parse_asn)]
+        asn: Option<u32>,
+        /// Read the table from a local file instead of downloading it: an
+        /// ip2asn TSV, gzipped or plain. For a host with no outbound access
+        /// — and what makes this path testable offline
+        #[arg(long)]
+        source: Option<PathBuf>,
+    },
     /// Set whether a category of bots is allowed or blocked.
     ///
     /// Without --site this is the host-wide default for the category:
@@ -905,14 +951,16 @@ enum Command {
     ///
     /// Let's Encrypt fetches an http-01 challenge from several places, and
     /// all but one are in AWS. With this on, which it is by default, the
-    /// AWS, Google Cloud and DigitalOcean feeds block every port but TCP 80,
+    /// AWS, Google Cloud and DigitalOcean feeds and the hosting providers
+    /// blocked by AS number (`add-hosting-asn`) block every port but TCP 80,
     /// so certbot's `nginx`, `apache`, `webroot` and `standalone` plugins
     /// keep renewing. Turn it off on a host that renews over DNS, or has no
     /// certificate, to block those ranges on port 80 as well. Allowlist geo
     /// mode never opens the port.
     #[command(name = "set-cloud-port-80")]
     SetCloudPort80 {
-        /// Whether the cloud-provider feeds leave port 80 open
+        /// Whether the cloud-provider feeds and hosting providers leave port
+        /// 80 open
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
@@ -1820,6 +1868,12 @@ async fn run() -> Result<()> {
         Some(Command::AddCountry { country }) => set_country_selected(db, country, true),
         Some(Command::RemoveCountry { country }) => set_country_selected(db, country, false),
         Some(Command::ListSelectedCountries { json }) => list_selected_countries(db, json),
+        Some(Command::AddHostingAsn { asn }) => add_hosting_asn(db, asn),
+        Some(Command::RemoveHostingAsn { asn }) => remove_hosting_asn(db, asn),
+        Some(Command::ListHostingAsns { json }) => list_hosting_asns(db, json),
+        Some(Command::UpdateHostingAsns { asn, source }) => {
+            update_hosting_asns(db, asn, source).await
+        }
         Some(Command::SetCategory {
             category,
             policy,
@@ -3279,10 +3333,12 @@ fn set_ssh_lockout_check(db_path: Option<PathBuf>, enabled: bool) -> Result<()> 
 /// `set-cloud-port-80` and by `set-reputation-source` turning AWS on.
 fn cloud_port_80_line(open: bool) -> &'static str {
     if open {
-        "The cloud-provider feeds leave port 80 open, so Let's Encrypt can renew \
-         certificates over HTTP (`set-cloud-port-80 --enabled false` closes it)."
+        "The cloud-provider feeds and hosting providers leave port 80 open, so Let's \
+         Encrypt can renew certificates over HTTP (`set-cloud-port-80 --enabled false` \
+         closes it)."
     } else {
-        "The cloud-provider feeds block port 80 too. Let's Encrypt validates from AWS, so \
+        "The cloud-provider feeds and hosting providers block port 80 too. Let's Encrypt \
+         validates from AWS, so \
          with the AWS feed on, certificates renewed over HTTP stop renewing \
          (`set-cloud-port-80 --enabled true` opens it)."
     }
@@ -4326,6 +4382,184 @@ fn list_selected_countries(db_path: Option<PathBuf>, json: bool) -> Result<()> {
         say!("{}", terminal_safe(&country));
     }
     Ok(())
+}
+
+fn add_hosting_asn(db_path: Option<PathBuf>, asn: u32) -> Result<()> {
+    use stop_bots::ipranges::hosting;
+
+    let db = open_db(db_path)?;
+    let added = db.add_hosting_asn(asn)?;
+    let stored = db.list_hosting_asns()?.into_iter().find(|a| a.asn == asn);
+    let description = stored.as_ref().and_then(|a| a.description.clone());
+    let label = terminal_safe(&hosting::label(asn, description.as_deref())).into_owned();
+    if !added {
+        say!("{label} is already blocked.");
+        return Ok(());
+    }
+    say!("{label} is now blocked.");
+    say!("Warning: {}.", hosting::warning());
+    if let Some(note) = hosting::curated(asn).and_then(|p| p.note) {
+        say!("{note}");
+    }
+    say!("{}", cloud_port_80_line(db.get_cloud_port_80_open()?));
+    if stored.is_none_or(|a| a.last_fetched_at.is_none()) {
+        say!(
+            "No ranges stored yet — run `stop-bots update-hosting-asns` first, or this does \
+             nothing."
+        );
+    }
+    say!("Run render-firewall, then apply the script, to enforce it.");
+    Ok(())
+}
+
+fn remove_hosting_asn(db_path: Option<PathBuf>, asn: u32) -> Result<()> {
+    use stop_bots::ipranges::hosting;
+
+    let db = open_db(db_path)?;
+    let description = db
+        .list_hosting_asns()?
+        .into_iter()
+        .find(|a| a.asn == asn)
+        .and_then(|a| a.description);
+    let label = terminal_safe(&hosting::label(asn, description.as_deref())).into_owned();
+    if !db.remove_hosting_asn(asn)? {
+        say!("{label} was not blocked.");
+        return Ok(());
+    }
+    say!("{label} is no longer blocked, and its ranges are forgotten.");
+    say!("Run render-firewall, then apply the script, to enforce it.");
+    Ok(())
+}
+
+/// Every provider on the built-in list, in its order, then every other
+/// selected AS number, by number: what `list-hosting-asns` shows.
+fn hosting_asn_rows(db: &Db) -> Result<Vec<stop_bots::output::HostingAsnRow>> {
+    use stop_bots::ipranges::hosting::{self, HOSTING_PROVIDERS};
+
+    let selected = db.list_hosting_asns()?;
+    let row = |asn: u32| {
+        let stored = selected.iter().find(|a| a.asn == asn);
+        let description = stored.and_then(|a| a.description.clone());
+        stop_bots::output::HostingAsnRow {
+            asn,
+            name: hosting::display_name(asn, description.as_deref()),
+            curated: hosting::curated(asn).is_some(),
+            blocked: stored.is_some(),
+            last_fetched_at: stored.and_then(|a| a.last_fetched_at),
+            range_count: stored.map_or(0, |a| a.range_count),
+            note: hosting::curated(asn).and_then(|p| p.note),
+            description,
+        }
+    };
+    Ok(HOSTING_PROVIDERS
+        .iter()
+        .map(|p| p.asn)
+        .chain(
+            selected
+                .iter()
+                .map(|a| a.asn)
+                .filter(|asn| hosting::curated(*asn).is_none()),
+        )
+        .map(row)
+        .collect())
+}
+
+fn list_hosting_asns(db_path: Option<PathBuf>, json: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    let asns = hosting_asn_rows(&db)?;
+    if json {
+        return stop_bots::output::print(&stop_bots::output::HostingAsns {
+            asns,
+            warning: stop_bots::ipranges::hosting::warning(),
+        });
+    }
+    for row in &asns {
+        let state = if row.blocked { "ON " } else { "OFF" };
+        let ranges = match (row.blocked, row.last_fetched_at) {
+            (false, _) => String::new(),
+            (true, None) => "not fetched".to_string(),
+            (true, Some(_)) => format!("{} range(s)", row.range_count),
+        };
+        say!(
+            "[{state}] {:<9} {:<22} {ranges}",
+            format!("AS{}", row.asn),
+            terminal_safe(&row.name)
+        );
+    }
+    say!("Blocking one {}.", stop_bots::ipranges::hosting::warning());
+    for row in asns.iter().filter(|row| row.note.is_some()) {
+        say!("AS{}: {}", row.asn, row.note.unwrap_or_default());
+    }
+    Ok(())
+}
+
+async fn update_hosting_asns(
+    db_path: Option<PathBuf>,
+    asn: Option<u32>,
+    source: Option<PathBuf>,
+) -> Result<()> {
+    use stop_bots::ipranges::hosting;
+
+    let db = open_db(db_path)?;
+    let selected: Vec<u32> = db.list_hosting_asns()?.into_iter().map(|a| a.asn).collect();
+    let asns = match asn {
+        Some(asn) if !selected.contains(&asn) => anyhow::bail!(
+            "AS{asn} is not blocked, so its ranges would not be kept — \
+             `stop-bots add-hosting-asn --asn {asn}` first"
+        ),
+        Some(asn) => vec![asn],
+        None => selected,
+    };
+    if asns.is_empty() {
+        say!(
+            "No hosting provider is blocked, so there is nothing to update \
+             (`add-hosting-asn`; `list-hosting-asns` names them)."
+        );
+        return Ok(());
+    }
+    let lines = match &source {
+        Some(path) => {
+            let raw = std::fs::read(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            hosting::select_lines(&raw, &asns)?
+        }
+        None => hosting::fetch(&asns)
+            .await
+            .with_context(|| format!("failed to update from {}", hosting::SOURCE_NAME))?,
+    };
+    let stored = hosting::store(&db, &asns, &lines)?;
+    let names: std::collections::HashMap<u32, Option<String>> = db
+        .list_hosting_asns()?
+        .into_iter()
+        .map(|a| (a.asn, a.description))
+        .collect();
+    let label = |asn: u32| {
+        terminal_safe(&hosting::label(
+            asn,
+            names.get(&asn).and_then(Option::as_deref),
+        ))
+        .into_owned()
+    };
+    for (asn, count) in &stored.stored {
+        say!("Stored {count} range(s) for {}", label(*asn));
+    }
+    let mut failed: Vec<String> = stored
+        .missing
+        .iter()
+        .map(|asn| {
+            format!(
+                "{}: not in the table — no network announces it; check the number",
+                label(*asn)
+            )
+        })
+        .collect();
+    failed.extend(
+        stored
+            .refused
+            .iter()
+            .map(|(asn, why)| format!("{}: {why}", label(*asn))),
+    );
+    each_or_fail(failed)
 }
 
 /// What `render-firewall` says on stderr about the lockout guard, before

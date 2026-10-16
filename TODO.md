@@ -51,12 +51,6 @@ path.** Everything is either offline log analysis that writes a database row, or
 text generated into a config file. That is what decides which of these are cheap
 and which are not.
 
-* **ASN / datacenter ranges.** Partly addressed — AWS, Google Cloud and
-  DigitalOcean ship as named provider feeds. A generic "datacenter ranges" list
-  is deferred because there is no single feed: Azure sits behind a download-page
-  indirection, and Hetzner/OVH need ASN→CIDR resolution with no source for it. A
-  list under that name covering a third of them is worse than no list, because
-  this is the one category that blocks *legitimate* traffic when it fires.
 * **JS / proof-of-work challenge** (Anubis style) and **TLS/HTTP2
   fingerprinting** (JA3/JA4, header-order anomalies). Both need a component in
   the request path. The honest answer is "not without a new architecture", not

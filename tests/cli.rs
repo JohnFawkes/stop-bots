@@ -5310,3 +5310,527 @@ fn on_an_upgraded_database_repeat_offenders_is_off_until_turned_on() {
         "the third offence, counted while it was off"
     );
 }
+
+// ---- `--json` on `status` and every `list-*` ----
+//
+// The field names are part of the command-line contract, so the shape of
+// the two a monitoring script is likeliest to read is pinned in a golden,
+// and every other command is checked for the values it should carry.
+
+impl Fixture {
+    /// Runs `args --json`, asserting success, and parses what it printed.
+    fn json(&self, args: &[&str]) -> serde_json::Value {
+        let args = [args, &["--json"]].concat();
+        let output = self.cmd(&args).output().unwrap();
+        let command = args.join(" ");
+        assert!(
+            output.status.success(),
+            "`{command}` failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        parse_json(&command, &output.stdout)
+    }
+
+    /// The database, opened in-process, for setup the CLI would take a
+    /// run per row to do.
+    fn db(&self) -> stop_bots::db::Db {
+        stop_bots::db::Db::open(&self.db).unwrap()
+    }
+}
+
+/// `stdout` as the one JSON document it should be, failing with what was
+/// printed when it is not.
+fn parse_json(command: &str, stdout: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(stdout);
+    serde_json::from_str(&text).unwrap_or_else(|err| {
+        panic!("`{command}` did not print one JSON document ({err}):\n{text}")
+    })
+}
+
+/// Runs `args --json` and returns what it printed, as printed: a golden
+/// pins the order of the fields too, which a parsed value would sort.
+fn json_text(fx: &Fixture, args: &[&str]) -> String {
+    let args = [args, &["--json"]].concat();
+    let output = fx.cmd(&args).output().unwrap();
+    assert!(
+        output.status.success(),
+        "`{}` failed:\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    parse_json(&args.join(" "), text.as_bytes());
+    text
+}
+
+/// Compares the printed `json` with `tests/golden/<name>`, after replacing
+/// the times, which change from run to run: every `*_at` field holding an
+/// integer, as a Unix time should, becomes `"{UNIX_SECONDS}"`. Anything
+/// else that varies the caller replaces first. `UPDATE_GOLDENS=1 cargo
+/// test` rewrites the golden, as it does the library's.
+fn assert_json_golden(name: &str, json: &str) {
+    let actual: String = json
+        .split_inclusive('\n')
+        .map(|line| {
+            let Some((key, value)) = line.split_once("_at\": ") else {
+                return line.to_string();
+            };
+            let digits = value.trim_end_matches(['\n', ',']);
+            if digits.parse::<i64>().is_ok() {
+                format!("{key}_at\": \"{{UNIX_SECONDS}}\"{}", &value[digits.len()..])
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(name);
+    if std::env::var_os("UPDATE_GOLDENS").is_some() {
+        fs::write(&path, &actual).unwrap();
+        return;
+    }
+    let expected = fs::read_to_string(&path).unwrap_or_else(|_| {
+        panic!("missing golden file tests/golden/{name} — generate it with UPDATE_GOLDENS=1 cargo test, then review and commit it")
+    });
+    assert_eq!(
+        actual, expected,
+        "the JSON no longer matches tests/golden/{name}. A renamed or removed field breaks \
+         scripts; an added one is fine — regenerate with UPDATE_GOLDENS=1 cargo test."
+    );
+}
+
+/// One rule of each kind a script would meet: by hand with a port, an
+/// allow, and a detector's, which expires and carries its evidence.
+#[test]
+fn list_firewall_rules_json_matches_the_golden() {
+    use stop_bots::blocks::RuleSource;
+    use stop_bots::db::{FirewallAction, NewFirewallRule};
+    let fx = Fixture::new();
+    let db = fx.db();
+    let rule = |address: &str, port, action, source, evidence: Option<&str>| NewFirewallRule {
+        address: address.to_string(),
+        port,
+        action,
+        source,
+        evidence: evidence.map(str::to_string),
+    };
+    db.add_firewall_rule(&rule(
+        "10.0.0.1",
+        Some(22),
+        FirewallAction::Block,
+        RuleSource::Cli,
+        None,
+    ))
+    .unwrap();
+    db.add_firewall_rule(&rule(
+        "2001:db8::/64",
+        None,
+        FirewallAction::Allow,
+        RuleSource::Tui,
+        None,
+    ))
+    .unwrap();
+    db.add_firewall_rule_with_ttl(
+        &rule(
+            "198.51.100.7",
+            None,
+            FirewallAction::Block,
+            RuleSource::Detector(stop_bots::protection::Detector::ProbePaths),
+            Some("GET /.env HTTP/1.1"),
+        ),
+        86_400,
+    )
+    .unwrap();
+    drop(db);
+
+    assert_json_golden(
+        "list-firewall-rules.json",
+        &json_text(&fx, &["list-firewall-rules"]),
+    );
+}
+
+/// What a monitoring script reads: every check with its level, and the
+/// counts. From a stored probe, so the host running the tests does not
+/// decide what it says.
+#[test]
+fn status_json_matches_the_golden() {
+    let fx = Fixture::new();
+    stop_bots::health::store_probe(&fx.db(), &stop_bots::health::Probe::default()).unwrap();
+
+    let json = json_text(&fx, &["status", "--cached"]);
+
+    // The database's size moves with every schema change.
+    let status = parse_json("status", json.as_bytes());
+    let size = status["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "database-size")
+        .unwrap_or_else(|| panic!("no database-size check:\n{json}"));
+    let size = format!("\"detail\": {}", size["detail"]);
+    assert_json_golden(
+        "status.json",
+        &json.replace(&size, "\"detail\": \"{SIZE}\""),
+    );
+}
+
+/// `--json` changes what is printed, not what the exit status means: a
+/// critical check still fails the run, with the reason on stderr, after a
+/// whole document on stdout.
+#[test]
+fn status_json_still_exits_1_when_a_check_is_critical() {
+    let fx = Fixture::new();
+    fx.run(&["add-firewall-rule", "--address", "10.0.0.1"]);
+    let probe = stop_bots::health::Probe {
+        live_rules: Some(0),
+        ..Default::default()
+    };
+    stop_bots::health::store_probe(&fx.db(), &probe).unwrap();
+
+    let output = fx.cmd(&["status", "--cached", "--json"]).output().unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("not protected"),
+        "the reason should be on stderr:\n{stderr}"
+    );
+    let status = parse_json("status --cached --json", &output.stdout);
+    assert_eq!(status["summary"]["worst"], "critical", "{status:#}");
+    let enforced = status["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "firewall-enforced")
+        .unwrap_or_else(|| panic!("no firewall-enforced check:\n{status:#}"));
+    assert_eq!(enforced["level"], "critical", "{enforced:#}");
+    assert!(enforced["fix"].is_string(), "{enforced:#}");
+}
+
+/// An empty list is an empty array, not the sentence the text prints.
+#[test]
+fn list_firewall_rules_json_with_no_rules_is_an_empty_list() {
+    let fx = Fixture::new();
+
+    assert_eq!(
+        fx.json(&["list-firewall-rules"]),
+        serde_json::json!({ "rules": [] })
+    );
+}
+
+/// A failure is still an error on stderr with a non-zero exit, and puts
+/// nothing on stdout for a script to half-parse.
+#[test]
+fn a_json_command_that_fails_prints_nothing_on_stdout() {
+    let fx = Fixture::new();
+
+    let output = fx
+        .cmd(&["list-categories", "--site", "nope.example", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("Error: "), "stderr:\n{stderr}");
+}
+
+#[test]
+fn list_probe_paths_json_separates_built_in_from_extra() {
+    let fx = Fixture::new();
+    fx.run(&["set-probe-paths", "--paths", "/secret-admin"]);
+
+    let paths = fx.json(&["list-probe-paths"]);
+
+    assert_eq!(
+        paths["extra"],
+        serde_json::json!(["/secret-admin"]),
+        "{paths:#}"
+    );
+    assert_eq!(
+        paths["built_in"].as_array().map(Vec::len),
+        Some(stop_bots::accesslog::DEFAULT_PROBE_PATHS.len()),
+        "{paths:#}"
+    );
+}
+
+#[test]
+fn list_detectors_json_carries_each_detector_s_settings() {
+    let fx = Fixture::new();
+    fx.run(&[
+        "set-detector",
+        "web-scanners",
+        "--enabled",
+        "false",
+        "--threshold",
+        "7",
+    ]);
+
+    let listed = fx.json(&["list-detectors"]);
+
+    let detector = |name: &str| {
+        listed["detectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == name)
+            .unwrap_or_else(|| panic!("no {name}:\n{listed:#}"))
+            .clone()
+    };
+    let web = detector("web-scanners");
+    for (field, expected) in [
+        ("enabled", serde_json::json!(false)),
+        ("threshold", serde_json::json!(7)),
+        ("follows_humans_only", serde_json::json!(false)),
+    ] {
+        assert_eq!(web[field], expected, "web-scanners {field}:\n{web:#}");
+    }
+    let robots = detector("robots-txt");
+    assert_eq!(robots["follows_humans_only"], true, "{robots:#}");
+    assert_eq!(robots["threshold"], serde_json::Value::Null, "{robots:#}");
+    assert_eq!(listed["subnet_escalation"]["enabled"], false, "{listed:#}");
+    // A database this release created starts with repeat offenders on.
+    let repeat = &listed["repeat_offenders"];
+    assert_eq!(repeat["enabled"], true, "{repeat:#}");
+    assert_eq!(repeat["new_in_this_release"], false, "{repeat:#}");
+    assert_eq!(repeat["max_days"], 90, "{repeat:#}");
+}
+
+#[test]
+fn list_access_stats_json_lists_each_user_agent_s_hits() {
+    let fx = Fixture::new();
+    let hits = [("Mozilla/5.0".to_string(), 3)].into_iter().collect();
+    fx.db()
+        .record_user_agent_hits(&hits, 1_700_000_000)
+        .unwrap();
+
+    let stats = fx.json(&["list-access-stats"]);
+
+    assert_eq!(
+        stats,
+        serde_json::json!({ "user_agents": [
+            { "user_agent": "Mozilla/5.0", "hit_count": 3, "last_seen_at": 1_700_000_000 }
+        ] })
+    );
+}
+
+#[test]
+fn list_reputation_sources_json_says_which_are_on_and_what_they_cost() {
+    let fx = Fixture::new();
+    fx.run(&[
+        "set-reputation-source",
+        "--source-id",
+        "aws",
+        "--enabled",
+        "true",
+    ]);
+
+    let listed = fx.json(&["list-reputation-sources"]);
+
+    let source = |id: &str| {
+        listed["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap_or_else(|| panic!("no {id}:\n{listed:#}"))
+            .clone()
+    };
+    let aws = source("aws");
+    assert_eq!(aws["enabled"], true, "{aws:#}");
+    assert_eq!(aws["last_fetched_at"], serde_json::Value::Null, "{aws:#}");
+    assert!(aws["warning"].is_string(), "a cloud feed warns:\n{aws:#}");
+    let firehol = source("firehol-level1");
+    assert_eq!(firehol["enabled"], false, "{firehol:#}");
+    assert_eq!(firehol["warning"], serde_json::Value::Null, "{firehol:#}");
+}
+
+#[test]
+fn list_selected_countries_json_names_the_mode_and_the_countries() {
+    let fx = Fixture::new();
+    fx.run(&[
+        "update-country-ranges",
+        "--country",
+        "nl",
+        "--source",
+        "tests/fixtures/ipranges/country-sample.zone",
+    ]);
+    fx.run(&["add-country", "--country", "nl"]);
+
+    assert_eq!(
+        fx.json(&["list-selected-countries"]),
+        serde_json::json!({ "geo_mode": "blocklist", "countries": ["nl"] })
+    );
+}
+
+#[test]
+fn list_categories_json_shows_a_site_s_overrides_next_to_the_host_wide_policy() {
+    let fx = Fixture::new();
+    fx.seed_bots();
+    fx.write_site("example.com");
+    fx.scan_sites();
+    fx.run(&[
+        "set-category",
+        "--category",
+        "search",
+        "--policy",
+        "blocked",
+    ]);
+    fx.run(&[
+        "set-category",
+        "--category",
+        "ai",
+        "--policy",
+        "allowed",
+        "--site",
+        "example.com",
+    ]);
+    fx.run(&[
+        "set-bot",
+        "--bot",
+        "google-crawler",
+        "--policy",
+        "allowed",
+        "--site",
+        "example.com",
+    ]);
+
+    let listed = fx.json(&["list-categories", "--site", "example.com"]);
+
+    assert_eq!(
+        listed["categories"][1],
+        serde_json::json!({ "category": "search", "policy": "blocked" }),
+        "{listed:#}"
+    );
+    assert_eq!(
+        listed["site"],
+        serde_json::json!({
+            "server_name": "example.com",
+            "categories": [
+                { "category": "scanner", "policy": null },
+                { "category": "search", "policy": null },
+                { "category": "ai", "policy": "allowed" },
+            ],
+            "bot_overrides": [{ "bot": "google-crawler", "policy": "allowed" }],
+        }),
+        "{listed:#}"
+    );
+}
+
+#[test]
+fn list_bots_json_spells_status_as_set_bot_takes_it() {
+    let fx = Fixture::new();
+    fx.seed_bots();
+    fx.run(&["set-bot", "--bot", "ai-search-bot", "--policy", "allowed"]);
+
+    let listed = fx.json(&["list-bots", "--search", "search-bot"]);
+
+    let bots = listed["bots"].as_array().unwrap();
+    let bot = bots
+        .iter()
+        .find(|b| b["slug"] == "ai-search-bot")
+        .unwrap_or_else(|| panic!("no ai-search-bot:\n{listed:#}"));
+    assert_eq!(bot["status"], "allowed", "{bot:#}");
+    assert!(
+        bot["categories"].as_array().is_some_and(|c| !c.is_empty()),
+        "{bot:#}"
+    );
+    assert!(
+        bots.iter().all(|b| b["slug"] != "google-crawler"),
+        "--search still filters:\n{listed:#}"
+    );
+}
+
+#[test]
+fn list_turned_away_json_counts_refused_and_served_per_user_agent() {
+    let fx = Fixture::new();
+    let log = fx.nginx_root.join("access.log");
+    fs::write(
+        &log,
+        [
+            access_line("203.0.113.5", "/", 444, "okhttp/4.9"),
+            access_line("203.0.113.5", "/", 444, "okhttp/4.9"),
+            access_line("203.0.113.5", "/", 200, "okhttp/4.9"),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    fx.db()
+        .set_block_response(stop_bots::db::BlockResponse::Close)
+        .unwrap();
+
+    assert_eq!(
+        fx.json(&["list-turned-away", "--access-log", log.to_str().unwrap()]),
+        serde_json::json!({
+            "block_status": 444,
+            "user_agents": [{ "user_agent": "okhttp/4.9", "refused": 2, "served": 1 }],
+        })
+    );
+}
+
+#[test]
+fn list_trusted_json_keeps_addresses_and_user_agents_apart() {
+    let fx = Fixture::new();
+    fx.run(&["trust", "--address", "203.0.113.7"]);
+    fx.run(&["trust", "--user-agent", "UptimeRobot"]);
+
+    assert_eq!(
+        fx.json(&["list-trusted"]),
+        serde_json::json!({ "addresses": ["203.0.113.7"], "user_agents": ["UptimeRobot"] })
+    );
+}
+
+/// The `--json` twin of the walk above: the same database and log, every
+/// command that takes `--json`. What a value carries reaches the terminal
+/// as a JSON escape, and a parser reads back exactly what was stored.
+#[test]
+fn every_json_command_prints_hostile_rows_terminal_safe_and_intact() {
+    let fx = Fixture::hostile();
+    stop_bots::health::store_probe(&fx.db(), &stop_bots::health::Probe::default()).unwrap();
+    let help = fx.cmd(&["--help"]).output().unwrap();
+    let help = String::from_utf8(help.stdout).unwrap();
+    let mut commands: Vec<Vec<&str>> = help
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|word| word.starts_with("list-"))
+        .map(|word| vec![word, "--json"])
+        .collect();
+    assert!(
+        commands.len() >= 10,
+        "the walk found too few commands, so --help changed shape: {commands:?}"
+    );
+    commands.push(vec!["status", "--cached", "--json"]);
+
+    // All at once, as in the walk above.
+    let outputs: Vec<_> = std::thread::scope(|scope| {
+        let runs: Vec<_> = commands
+            .iter()
+            .map(|args| {
+                let fx = &fx;
+                scope.spawn(move || (args.join(" "), fx.cmd(args).output().unwrap()))
+            })
+            .collect();
+        runs.into_iter().map(|run| run.join().unwrap()).collect()
+    });
+    for (command, output) in &outputs {
+        assert_output_terminal_safe(command, output);
+        parse_json(command, &output.stdout);
+    }
+
+    let (_, rules) = outputs
+        .iter()
+        .find(|(command, _)| command.starts_with("list-firewall-rules"))
+        .unwrap();
+    let rules = parse_json("list-firewall-rules --json", &rules.stdout);
+    let mut addresses: Vec<String> = rules["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rule| rule["address"].as_str().unwrap().to_string())
+        .collect();
+    addresses.sort();
+    let mut planted: Vec<String> = hostile_values().collect();
+    planted.sort();
+    assert_eq!(addresses, planted, "the addresses did not survive intact");
+}

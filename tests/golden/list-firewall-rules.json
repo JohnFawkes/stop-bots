@@ -1,0 +1,37 @@
+{
+  "rules": [
+    {
+      "id": 3,
+      "action": "block",
+      "address": "198.51.100.7",
+      "port": null,
+      "enabled": true,
+      "source": "probe-paths",
+      "created_at": "{UNIX_SECONDS}",
+      "expires_at": "{UNIX_SECONDS}",
+      "evidence": "GET /.env HTTP/1.1"
+    },
+    {
+      "id": 2,
+      "action": "allow",
+      "address": "2001:db8::/64",
+      "port": null,
+      "enabled": true,
+      "source": "tui",
+      "created_at": "{UNIX_SECONDS}",
+      "expires_at": null,
+      "evidence": null
+    },
+    {
+      "id": 1,
+      "action": "block",
+      "address": "10.0.0.1",
+      "port": 22,
+      "enabled": true,
+      "source": "cli",
+      "created_at": "{UNIX_SECONDS}",
+      "expires_at": null,
+      "evidence": null
+    }
+  ]
+}

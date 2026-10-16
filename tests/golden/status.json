@@ -1,0 +1,99 @@
+{
+  "checked_at": "{UNIX_SECONDS}",
+  "probed_at": "{UNIX_SECONDS}",
+  "cached": true,
+  "summary": {
+    "worst": "warn",
+    "total": 12,
+    "ok": 3,
+    "unknown": 7,
+    "warn": 2,
+    "critical": 0
+  },
+  "checks": [
+    {
+      "id": "firewall-enforced",
+      "title": "Firewall rules are in the kernel",
+      "level": "unknown",
+      "detail": "could not read the live ruleset — needs root",
+      "fix": null
+    },
+    {
+      "id": "firewall-persists",
+      "title": "Rules survive a reboot",
+      "level": "unknown",
+      "detail": "could not tell whether anything re-applies the rules at boot",
+      "fix": null
+    },
+    {
+      "id": "script-fresh",
+      "title": "Applied rules match the configuration",
+      "level": "ok",
+      "detail": "no rules to apply yet",
+      "fix": null
+    },
+    {
+      "id": "nginx-applied",
+      "title": "NGINX blocks are applied",
+      "level": "warn",
+      "detail": "no sites scanned yet",
+      "fix": "run `stop-bots scan-sites`"
+    },
+    {
+      "id": "generated-files-reachable",
+      "title": "Generated files are where NGINX reads them",
+      "level": "unknown",
+      "detail": "could not tell whether /etc/nginx/conf.d exists",
+      "fix": null
+    },
+    {
+      "id": "schedule",
+      "title": "Schedule",
+      "level": "warn",
+      "detail": "nothing runs the detectors and list updates unattended (the schedule has never run)",
+      "fix": "stop-bots install cron"
+    },
+    {
+      "id": "disk-room",
+      "title": "Room for the database",
+      "level": "unknown",
+      "detail": "could not read free space for the database",
+      "fix": null
+    },
+    {
+      "id": "database-size",
+      "title": "Database size",
+      "level": "ok",
+      "detail": "{SIZE}",
+      "fix": null
+    },
+    {
+      "id": "log-sources",
+      "title": "Detector log sources",
+      "level": "unknown",
+      "detail": "could not check the log sources",
+      "fix": null
+    },
+    {
+      "id": "access-log-format",
+      "title": "Access log format is readable",
+      "level": "unknown",
+      "detail": "no access log to read",
+      "fix": null
+    },
+    {
+      "id": "access-log-clients",
+      "title": "Access log records real clients",
+      "level": "unknown",
+      "detail": "no access log to read",
+      "fix": null
+    },
+    {
+      "id": "ssh-login-allowlist",
+      "title": "Addresses kept un-blockable",
+      "level": "ok",
+      "detail": "no successful SSH login recorded in the last 7 days",
+      "fix": null
+    }
+  ]
+}

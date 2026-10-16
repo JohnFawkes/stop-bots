@@ -320,6 +320,9 @@ machine can check.
   `Option<bool>` when it is one of several optional settings.
 - **A presence flag is for how this run behaves**: `--force`, `--dry-run`, `--no-fetch`,
   `--remove`. Never for a stored value.
+- **`status` and every `list-*` take `--json`**, which prints one JSON object built from
+  the output structs in `src/output.rs`, never from a database type. A new `list-*` takes
+  it too; a test at the bottom of `src/main.rs` checks.
 - **`--db` is global** and falls back to `STOP_BOTS_DB`. Don't add a `db` field to a
   subcommand; clap refuses a subcommand argument that shadows a global one.
 - **Help text is for someone typing commands.** Name other verbs as they are typed

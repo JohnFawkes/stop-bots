@@ -159,6 +159,15 @@ impl WebServer {
         }
     }
 
+    /// Every named block under `root` and the addresses it listens on, one
+    /// entry per block: a site's port-80 and port-443 blocks are two.
+    pub fn site_listens(self, root: &Path) -> Result<Vec<SiteListens>> {
+        match self {
+            WebServer::Nginx => nginx::site_listens(root),
+            WebServer::Apache => apache::site_listens(root),
+        }
+    }
+
     /// What applying `site_configs` (and `default_config` for every block
     /// they do not name) to every block in `content` makes of it.
     ///
@@ -367,6 +376,52 @@ impl WebServer {
 pub struct DiscoveredSite {
     pub server_name: String,
     pub config_path: PathBuf,
+}
+
+/// One address a site is served on, as its config declares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Listen {
+    /// `None` for every address (`listen 80`, `*:80`, `_default_:443`)
+    /// and for one given by host name.
+    pub address: Option<std::net::IpAddr>,
+    pub port: u16,
+    pub tls: bool,
+}
+
+impl Listen {
+    /// The address and port in `text`, the way both servers write one:
+    /// `80`, `*:80`, `127.0.0.1:8080`, `[::]:443`, `example.com:80`, or
+    /// an address with no port, which is 80. `None` for a Unix socket or
+    /// a port that is not a number.
+    pub fn parse_address(text: &str) -> Option<(Option<std::net::IpAddr>, u16)> {
+        if text.starts_with("unix:") {
+            return None;
+        }
+        if let Some(v6) = text.strip_prefix('[') {
+            let (address, rest) = v6.split_once(']')?;
+            let port = match rest.strip_prefix(':') {
+                Some(port) => port.parse().ok()?,
+                None => 80,
+            };
+            return Some((address.parse().ok(), port));
+        }
+        if text.bytes().all(|b| b.is_ascii_digit()) {
+            return Some((None, text.parse().ok()?));
+        }
+        match text.rsplit_once(':') {
+            Some((host, port)) => Some((host.parse().ok(), port.parse().ok()?)),
+            None => Some((text.parse().ok(), 80)),
+        }
+    }
+}
+
+/// A site by its name, with every address one of its blocks listens on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SiteListens {
+    pub server_name: String,
+    /// Empty for a block with no `listen` (or an Apache host with no
+    /// address), which is served on port 80.
+    pub listens: Vec<Listen>,
 }
 
 /// An optional per-site rule that decides a request is unwanted from its
@@ -2227,6 +2282,27 @@ pub fn reload_with(server: WebServer, commands: &ServerCommands) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_listen_address_is_read_the_way_both_servers_write_it() {
+        let cases = [
+            ("80", Some((None, 80))),
+            ("*:8080", Some((None, 8080))),
+            ("_default_:443", Some((None, 443))),
+            ("127.0.0.1", Some((Some("127.0.0.1"), 80))),
+            ("127.0.0.1:8080", Some((Some("127.0.0.1"), 8080))),
+            ("[::]:443", Some((Some("::"), 443))),
+            ("[::1]", Some((Some("::1"), 80))),
+            ("localhost:8080", Some((None, 8080))),
+            ("unix:/run/site.sock", None),
+            ("*:http", None),
+        ];
+        for (text, expected) in cases {
+            let expected = expected
+                .map(|(ip, port): (Option<&str>, u16)| (ip.map(|ip| ip.parse().unwrap()), port));
+            assert_eq!(Listen::parse_address(text), expected, "{text}");
+        }
+    }
 
     // ---- split_command ----
 

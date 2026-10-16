@@ -1563,6 +1563,38 @@ fn probing_for_dotenv_gets_a_real_client_blocked_end_to_end() {
     );
 }
 
+/// The other side of the detector above: not who asked for `/.env`, but
+/// whether a real NGINX handed it out. `status` names the file, and stops
+/// once NGINX is told to deny dotfiles the way the check's fix says.
+#[test]
+fn status_names_an_env_file_nginx_really_serves() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-exposed");
+    server.sh("printf 'DB_PASSWORD=hunter2\\n' > /var/www/test/.env");
+
+    let (_, out, err) = server.run("stop-bots status --db /tmp/db.sqlite3");
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains("[CRITICAL] No secrets served")
+            && said.contains("http://test.example:8080/.env"),
+        "status does not name the served file:\n{said}"
+    );
+
+    server.sh(
+        "sed -i '/server_name/a location ~ /\\\\.(?!well-known) { deny all; }' \
+         /etc/nginx/sites-enabled/test-site.conf && nginx -t && nginx -s reload && sleep 1",
+    );
+    let (_, out, err) = server.run("stop-bots status --db /tmp/db.sqlite3");
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains("[OK] No secrets served"),
+        "the denied file is still reported:\n{said}\nsite:\n{}",
+        server.sh("cat /etc/nginx/sites-enabled/test-site.conf")
+    );
+}
+
 // ---- is this host actually protected? ----
 
 /// **The check the whole `health` module exists for**, against a host

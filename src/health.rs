@@ -264,6 +264,11 @@ pub struct Probe {
     /// host without one.
     #[serde(default)]
     pub http_renewals: Option<usize>,
+    /// What this host's own sites served when asked for `/.env` and the
+    /// like over loopback ([`crate::exposure`]). `None` when there were no
+    /// sites to ask, or in a probe from before this was carried.
+    #[serde(default)]
+    pub exposed_files: Option<crate::exposure::Survey>,
 }
 
 /// How much of the access log a probe reads: its last 32 MB. Every
@@ -427,6 +432,7 @@ pub fn probe(
             )
         }),
         http_renewals: http_renewals(Path::new(CERTBOT_RENEWAL_DIR)),
+        exposed_files: exposed_files_survey(server, &config_root, block_status),
         firewall_covers_forward: live.as_ref().map(|state| state.covers_forward),
         container_shares_host_network: container.as_ref().map(|name| {
             run_allowing_failure(
@@ -436,6 +442,25 @@ pub fn probe(
             .is_some_and(|mode| mode.trim() == "host")
         }),
     }
+}
+
+/// Asks every site under `root` for the files [`crate::exposure`] lists.
+/// `None`, and nothing asked, when there are no sites or no root.
+fn exposed_files_survey(
+    server: crate::webserver::WebServer,
+    root: &Path,
+    block_status: u16,
+) -> Option<crate::exposure::Survey> {
+    let sites = server.site_listens(root).ok()?;
+    let targets = crate::exposure::targets(&sites);
+    if targets.is_empty() {
+        return None;
+    }
+    Some(crate::exposure::survey(
+        &targets,
+        block_status,
+        crate::exposure::Limits::default(),
+    ))
 }
 
 /// Where certbot keeps one `.conf` per certificate it renews.
@@ -877,6 +902,9 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
         checks.push(check);
     }
     if let Some(check) = lets_encrypt_reachable(&rules, probe) {
+        checks.push(check);
+    }
+    if let Some(check) = exposed_files(probe) {
         checks.push(check);
     }
     if let Some(check) = trusted_by_hand(db, probe.web_server)? {
@@ -1893,6 +1921,96 @@ fn lets_encrypt_reachable(rules: &[FirewallRule], probe: &Probe) -> Option<Check
     })
 }
 
+/// How many served files a line names before it says how many more.
+const EXPOSED_FILES_SHOWN: usize = 5;
+
+/// Whether this host's sites hand out the files scanners ask for.
+///
+/// The probe-paths detector blocks whoever asks for `/.env`; this says
+/// whether the answer they got was the file. Critical when a credential,
+/// a repository or a dump is served, a warning for what only describes
+/// the server. Absent on a host with no sites to ask.
+fn exposed_files(probe: &Probe) -> Option<Check> {
+    let survey = probe.exposed_files.as_ref()?;
+    let check = |level, detail, fix| Check {
+        id: "exposed-files",
+        title: "No secrets served",
+        level,
+        detail,
+        fix,
+    };
+    let paths = crate::exposure::PATHS.len();
+    if !survey.leaks.is_empty() {
+        let secret = survey
+            .leaks
+            .iter()
+            .any(|leak| crate::exposure::is_secret(&leak.path));
+        let named: Vec<&str> = survey
+            .leaks
+            .iter()
+            .take(EXPOSED_FILES_SHOWN)
+            .map(|leak| leak.url.as_str())
+            .collect();
+        let more = survey.leaks.len().saturating_sub(EXPOSED_FILES_SHOWN);
+        let more = if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        };
+        let fix = match (secret, probe.web_server) {
+            (true, webserver::WebServer::Nginx) => {
+                "deny dotfiles in each `server` block, `location ~ /\\.(?!well-known) { deny all; }`, move dumps and backups out of the web root, and change every secret that was served"
+            }
+            (true, webserver::WebServer::Apache) => {
+                "deny dotfiles, `<LocationMatch \"/\\.(?!well-known)\"> Require all denied </LocationMatch>`, move dumps and backups out of the document root, and change every secret that was served"
+            }
+            (false, _) => "delete them from the web root: they describe the server to whoever asks",
+        };
+        return Some(check(
+            if secret { Level::Critical } else { Level::Warn },
+            format!(
+                "{} file(s) served that should not be: {}{more}",
+                survey.leaks.len(),
+                named.join(", ")
+            ),
+            Some(fix.to_string()),
+        ));
+    }
+    let unanswered = if survey.unanswered.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; not checked: {}",
+            survey
+                .unanswered
+                .iter()
+                .take(EXPOSED_FILES_SHOWN)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    Some(if survey.answered == 0 {
+        check(
+            Level::Unknown,
+            format!(
+                "none of {} site address(es) could be asked over loopback{unanswered}",
+                survey.addresses
+            ),
+            None,
+        )
+    } else {
+        check(
+            Level::Ok,
+            format!(
+                "{} site address(es) asked over loopback for {paths} sensitive paths, and none served one{unanswered}",
+                survey.answered
+            ),
+            None,
+        )
+    })
+}
+
 /// What an operator has trusted by hand, listed — for the reason
 /// [`ssh_login_allowlist`] lists its addresses, and more so: those expire
 /// on their own after a week, and these never do.
@@ -2277,6 +2395,7 @@ mod tests {
             config_root: None,
             apache_rewrite_enabled: None,
             http_renewals: Some(0),
+            exposed_files: None,
         }
     }
 
@@ -2333,6 +2452,84 @@ mod tests {
             check.detail.contains("18.216.118.75 (by 0.0.0.0/0)"),
             "{}",
             check.detail
+        );
+    }
+
+    /// A probe whose survey of the sites found `leaks` (paths on
+    /// `a.example`), with one site address answering.
+    fn serving(leaks: &[&str]) -> Probe {
+        Probe {
+            exposed_files: Some(crate::exposure::Survey {
+                addresses: 1,
+                answered: 1,
+                leaks: leaks
+                    .iter()
+                    .map(|path| crate::exposure::Leak {
+                        site: "a.example".to_string(),
+                        path: path.to_string(),
+                        url: format!("https://a.example{path}"),
+                    })
+                    .collect(),
+                unanswered: Vec::new(),
+            }),
+            ..healthy()
+        }
+    }
+
+    #[test]
+    fn a_served_env_file_is_critical_and_named() {
+        let report = assess(&db(), &serving(&["/.env"])).unwrap();
+        let check = check(&report, "exposed-files");
+        assert_eq!(check.level, Level::Critical, "{check:?}");
+        assert!(
+            check.detail.contains("https://a.example/.env"),
+            "{}",
+            check.detail
+        );
+        let fix = check.fix.as_deref().unwrap_or_default();
+        assert!(fix.contains("location ~ /\\.(?!well-known)"), "{fix}");
+    }
+
+    #[test]
+    fn a_served_phpinfo_page_alone_is_a_warning() {
+        let report = assess(&db(), &serving(&["/phpinfo.php"])).unwrap();
+        assert_eq!(check(&report, "exposed-files").level, Level::Warn);
+    }
+
+    #[test]
+    fn sites_that_serve_none_of_the_files_pass() {
+        let report = assess(&db(), &serving(&[])).unwrap();
+        assert_eq!(check(&report, "exposed-files").level, Level::Ok);
+    }
+
+    /// Not looking is not the same as fine.
+    #[test]
+    fn sites_that_could_not_be_asked_are_unknown_not_clean() {
+        let probe = Probe {
+            exposed_files: Some(crate::exposure::Survey {
+                addresses: 1,
+                unanswered: vec!["https://a.example (could not connect)".to_string()],
+                ..Default::default()
+            }),
+            ..healthy()
+        };
+        let report = assess(&db(), &probe).unwrap();
+        let check = check(&report, "exposed-files");
+        assert_eq!(check.level, Level::Unknown, "{check:?}");
+        assert!(
+            check.detail.contains("could not connect"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_sites_gets_no_exposed_files_line() {
+        let report = assess(&db(), &healthy()).unwrap();
+        assert!(
+            report.checks.iter().all(|c| c.id != "exposed-files"),
+            "{:?}",
+            report.checks
         );
     }
 

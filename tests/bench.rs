@@ -53,42 +53,50 @@ struct Budget {
     peak_mb: f64,
 }
 
-/// The budgets, about 3x the measured time and 1.5x the measured memory,
-/// rounded up.
+/// The budgets: about 3x the slower measured time and 1.5x the larger
+/// measured peak, rounded up, with a floor of a few seconds where the
+/// step is so quick that scheduling noise is most of it.
 ///
-/// Measured on 2026-10-16 with a 1000 MB log, on a 20-thread x86_64 Linux
-/// desktop (NVMe, release build, warm page cache), and then on GitHub's
-/// `ubuntu-latest` runner (see the `bench` job in ci.yml):
+/// Measured on 2026-10-16 with a 1000 MB log, release build, on a busy
+/// 20-thread x86_64 desktop (NVMe, warm page cache; the spread is three
+/// runs) and on GitHub's `ubuntu-latest` (the `bench` job in ci.yml, one
+/// run). The runner took about the same for the first scan and twice as
+/// long for the second, whose time is mostly SQLite reading the stored
+/// evidence rather than the log.
 ///
-/// | step                | local          | ubuntu-latest  |
-/// |---------------------|----------------|----------------|
-/// | scan 1 GB log       | MEASURE        | MEASURE        |
-/// | scan 10 MB appended | MEASURE        | MEASURE        |
-/// | store 100k ranges   | MEASURE        | MEASURE        |
-/// | render 100k ranges  | MEASURE        | MEASURE        |
+/// | step                  | local          | ubuntu-latest  | budget        |
+/// |-----------------------|----------------|----------------|---------------|
+/// | first scan of the log | 34-63s, 172 MB | 64s, 173 MB    | 200s, 260 MB  |
+/// | scan 10 MB appended   | 7.6-8.6s, 49 MB| 17s, 52 MB     | 50s, 80 MB    |
+/// | store 100k ranges     | 0.2s, 13 MB    | 0.2s, 14 MB    | 3s, 24 MB     |
+/// | render 100k ranges    | 0.2s, 66 MB    | 0.3s, 70 MB    | 3s, 105 MB    |
 ///
-/// The scan's memory budget matters beyond regression: the README says a
-/// 1 GB VPS is enough, and this is the step that runs on one every minute.
+/// The second scan's time budget is also what catches the whole log being
+/// re-read: that would cost it the first scan's minute on top. The first
+/// scan's memory budget matters beyond regression: the README says a 1 GB
+/// VPS is enough, and this is what a first pass over a large log takes on
+/// one. It is the evidence the pass collects, which grows with what it
+/// reads, up to the gigabyte one pass reads at most.
 const BUDGETS: [Budget; 4] = [
     Budget {
         step: SCAN,
-        seconds: 180.0,
+        seconds: 200.0,
         peak_mb: 260.0,
     },
     Budget {
         step: SCAN_APPENDED,
-        seconds: 30.0,
-        peak_mb: 75.0,
+        seconds: 50.0,
+        peak_mb: 80.0,
     },
     Budget {
         step: STORE_RANGES,
-        seconds: 5.0,
-        peak_mb: 20.0,
+        seconds: 3.0,
+        peak_mb: 24.0,
     },
     Budget {
         step: RENDER,
-        seconds: 5.0,
-        peak_mb: 100.0,
+        seconds: 3.0,
+        peak_mb: 105.0,
     },
 ];
 

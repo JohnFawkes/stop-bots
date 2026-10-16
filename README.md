@@ -331,8 +331,14 @@ plus the request-shape rules you switch on. In the firewall, nftables keeps the 
 sets, so a lookup stays cheap however many there are. The iptables backend writes one rule per
 address, which grows linearly with the list; for large lists (whole countries, the reputation
 feeds) prefer nftables. In both, established connections are accepted before any rule is
-checked. None of this has been benchmarked here, so measure it on your own traffic if it
-matters.
+checked. That per-request cost has not been benchmarked here, so measure it on your own
+traffic if it matters.
+
+What stop-bots itself costs is measured, by a benchmark that runs in CI (`make bench`)
+and fails it if a budget is exceeded. On GitHub's runners, the first read of a 1 GB access
+log takes about a minute and peaks under 200 MB of memory. After that, each pass reads only
+what was added: 10 MB more takes about 15 seconds and under 80 MB. Rendering a firewall
+of 100,000 address ranges takes under a second and about 70 MB.
 
 ### Does the AGPL mean my sites have to be AGPL?
 

@@ -37,7 +37,7 @@ use stop_bots::protection::Detector;
 mod common;
 use common::stop_bots_bin;
 
-const RELEASES: [&str; 5] = ["0.1.0", "0.1.1", "0.2.0", "0.2.1", "0.3.0"];
+const RELEASES: [&str; 6] = ["0.1.0", "0.1.1", "0.2.0", "0.2.1", "0.3.0", "0.4.0"];
 
 const BEGIN: &str = "# BEGIN stop-bots";
 const END: &str = "# END stop-bots";
@@ -306,11 +306,12 @@ fn every_setting_a_release_changed_reads_back_the_same() {
 }
 
 /// Probes for absent apps make the probe-paths detector block more, so no
-/// upgrade switches them on: off on every release's database, and marked
-/// new until the operator chooses.
+/// upgrade switches them on: off on the database of every release before
+/// the one that brought them (0.4.0), and marked new until the operator
+/// chooses. A database 0.4.0 or later created has them as it started.
 #[test]
-fn no_release_s_database_gains_probes_for_absent_apps() {
-    for release in RELEASES {
+fn no_earlier_release_s_database_gains_probes_for_absent_apps() {
+    for release in RELEASES.into_iter().filter(|r| older_than(r, "0.4.0")) {
         let host = UpgradedHost::of(release);
         let listed: serde_json::Value =
             serde_json::from_str(&host.run(&["list-probe-paths", "--json"])).unwrap();
@@ -320,6 +321,24 @@ fn no_release_s_database_gains_probes_for_absent_apps() {
             conditional["new_in_this_release"], true,
             "{release}: {conditional:#}"
         );
+    }
+}
+
+/// Whether `release` comes before `other`, comparing `major.minor.patch`.
+fn older_than(release: &str, other: &str) -> bool {
+    let parse = |v: &str| -> Vec<u32> { v.split('.').map(|n| n.parse().unwrap()).collect() };
+    parse(release) < parse(other)
+}
+
+#[test]
+fn older_than_compares_versions_numerically() {
+    for (a, b, older) in [
+        ("0.3.0", "0.4.0", true),
+        ("0.4.0", "0.4.0", false),
+        ("0.10.0", "0.4.0", false),
+        ("0.2.1", "0.10.0", true),
+    ] {
+        assert_eq!(older_than(a, b), older, "{a} < {b}");
     }
 }
 

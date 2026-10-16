@@ -572,6 +572,9 @@ impl App {
             }) => {
                 self.finish_country_select(country_code, result)?;
             }
+            Event::App(AppEvent::HostingAsnsFetched { asns, result }) => {
+                self.finish_hosting_asn_fetch(&asns, result)?;
+            }
             Event::App(AppEvent::ReputationFetchFinished { source_id, result }) => {
                 self.finish_reputation_fetch(source_id, result)?;
             }
@@ -804,6 +807,50 @@ impl App {
         }
         self.refresh()?;
         Ok(())
+    }
+
+    /// Starts one download of the ASN table for hosting providers the
+    /// Dashboard just chose but has no ranges for. Only the download and
+    /// the unpacking run off-thread, and only the chosen ASNs' lines come
+    /// back; storing them is [`Self::finish_hosting_asn_fetch`]'s, on the
+    /// main thread, as for every other feed.
+    fn start_hosting_asn_fetch(&mut self, asns: Vec<u32>) {
+        let sender = self.events.sender();
+        tokio::spawn(async move {
+            let result = ipranges::hosting::fetch(&asns)
+                .await
+                .map_err(|err| format!("{err:#}"));
+            let _ = sender.send(Event::App(AppEvent::HostingAsnsFetched { asns, result }));
+        });
+    }
+
+    /// Stores what [`Self::start_hosting_asn_fetch`] downloaded. A failure
+    /// leaves the providers chosen with nothing in them, which blocks
+    /// nothing, and says so; the weekly update tries again, as `status`
+    /// reminds.
+    fn finish_hosting_asn_fetch(
+        &mut self,
+        asns: &[u32],
+        result: Result<String, String>,
+    ) -> Result<()> {
+        self.message = Some(
+            match result.and_then(|lines| {
+                ipranges::hosting::store(&self.db, asns, &lines).map_err(|err| format!("{err:#}"))
+            }) {
+                Ok(stored) if stored.stored.is_empty() => {
+                    format!(
+                        "Hosting providers: nothing stored \u{2014} {}",
+                        stored.summary()
+                    )
+                }
+                Ok(stored) => format!(
+                    "Hosting providers: {} \u{2014} apply (a) to enforce them",
+                    stored.summary()
+                ),
+                Err(err) => format!("Hosting providers: download failed: {err}"),
+            },
+        );
+        self.refresh()
     }
 
     /// Stores the fetched CIDRs (on success) and adds the country to the
@@ -1959,6 +2006,12 @@ impl App {
                 self.start_reputation_fetch(source_id);
                 return Ok(());
             }
+            KeyOutcome::FetchHostingAsns(asns) => {
+                // The selection itself changed before the download.
+                self.refresh()?;
+                self.start_hosting_asn_fetch(asns);
+                return Ok(());
+            }
             KeyOutcome::RenderFirewall {
                 backend,
                 out_path,
@@ -2748,6 +2801,40 @@ mod tests {
         let message = app.message.as_deref().unwrap_or_default();
         assert!(
             message.contains("Failed to fetch"),
+            "message was: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_hosting_asn_download_stores_the_chosen_ranges() {
+        let mut app = test_app();
+        app.db.add_hosting_asn(24940).unwrap();
+        let lines = "5.9.0.0\t5.9.255.255\t24940\tDE\tHETZNER-AS\n".to_string();
+
+        app.finish_hosting_asn_fetch(&[24940], Ok(lines)).unwrap();
+
+        assert_eq!(
+            app.db.hosting_asn_ranges().unwrap(),
+            [(24940, "5.9.0.0/16".to_string())]
+        );
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(message.contains("1 range(s)"), "message was: {message}");
+    }
+
+    /// A failed download leaves the provider chosen and says why; the
+    /// weekly update and `status` pick it up from there.
+    #[tokio::test]
+    async fn a_failed_hosting_asn_download_says_so_and_keeps_the_choice() {
+        let mut app = test_app();
+        app.db.add_hosting_asn(24940).unwrap();
+
+        app.finish_hosting_asn_fetch(&[24940], Err("timed out".to_string()))
+            .unwrap();
+
+        assert_eq!(app.db.list_hosting_asns().unwrap().len(), 1);
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(
+            message.contains("download failed: timed out"),
             "message was: {message}"
         );
     }

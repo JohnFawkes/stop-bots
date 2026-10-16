@@ -910,6 +910,9 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     if let Some(check) = trusted_by_hand(db, probe.web_server)? {
         checks.push(check);
     }
+    if let Some(check) = hosting_asns_not_fetched(db)? {
+        checks.push(check);
+    }
     if let Some(check) = skipped_entries(db, probe.web_server)? {
         checks.push(check);
     }
@@ -2052,6 +2055,41 @@ fn trusted_by_hand(db: &Db, server: webserver::WebServer) -> Result<Option<Check
     }))
 }
 
+/// The hosting providers selected for blocking whose ranges were never
+/// downloaded, and so block nothing yet. A warning: the operator chose to
+/// block them and believes they are blocked. Absent when there is none.
+fn hosting_asns_not_fetched(db: &Db) -> Result<Option<Check>> {
+    let waiting: Vec<String> = db
+        .list_hosting_asns()?
+        .into_iter()
+        .filter(|asn| asn.last_fetched_at.is_none())
+        .map(|asn| {
+            format!(
+                "AS{} ({})",
+                asn.asn,
+                crate::ipranges::hosting::display_name(asn.asn, asn.description.as_deref())
+            )
+        })
+        .collect();
+    if waiting.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Check {
+        id: "hosting-asns",
+        title: "Hosting providers",
+        level: Level::Warn,
+        detail: format!(
+            "{} selected but not fetched, so not blocked yet: {}",
+            waiting.len(),
+            waiting.join(", ")
+        ),
+        fix: Some(
+            "`stop-bots update-hosting-asns`, or u on the Dashboard, downloads their ranges"
+                .to_string(),
+        ),
+    }))
+}
+
 /// Stored blocks, exemptions and trusted agents that the web server's
 /// config leaves out, because they would not mean what they say there (see
 /// `nginx::skipped_entries`, whose checks Apache's render shares).
@@ -2415,6 +2453,26 @@ mod tests {
             http_renewals: Some(2),
             ..healthy()
         }
+    }
+
+    #[test]
+    fn a_hosting_asn_that_was_never_fetched_is_named_until_it_is() {
+        let db = db();
+        db.add_hosting_asn(24940).unwrap();
+
+        let report = assess(&db, &healthy()).unwrap();
+        let line = check(&report, "hosting-asns");
+        assert_eq!(line.level, Level::Warn, "{line:?}");
+        assert!(line.detail.contains("AS24940 (Hetzner)"), "{line:?}");
+
+        db.replace_hosting_asn_ranges(24940, "HETZNER-AS", &["5.9.0.0/16".to_string()])
+            .unwrap();
+        let report = assess(&db, &healthy()).unwrap();
+        assert!(
+            report.checks.iter().all(|c| c.id != "hosting-asns"),
+            "still reported once fetched: {:?}",
+            report.checks
+        );
     }
 
     #[test]

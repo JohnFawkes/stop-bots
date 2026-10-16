@@ -157,6 +157,11 @@ sha2 = "0.11.0"
 # in the tree through tokio; this makes it direct.
 libc = "0.2"
 
+# Unpacking iptoasn.com's gzipped ASN tables, the source of the hosting
+# providers' ranges. Pure Rust (miniz_oxide), and already in the lock file
+# through the screenshot renderer, so it adds no new code to review.
+flate2 = "1"
+
 # Man pages and shell completions, from the same clap definition as
 # `--help`, written by the hidden `generate-docs` verb for the `.deb`.
 # Normal rather than dev or build dependencies: a build script cannot see

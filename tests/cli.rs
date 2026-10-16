@@ -759,6 +759,157 @@ fn an_unknown_reputation_source_is_rejected_with_the_known_ids() {
         .stderr(predicate::str::contains("firehol-level1"));
 }
 
+/// The checked-in ip2asn sample, gzipped as iptoasn.com serves it, in
+/// `dir`.
+fn gzipped_ip2asn_sample(dir: &Path) -> std::path::PathBuf {
+    use std::io::Write as _;
+    let sample = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ipranges/ip2asn-sample.tsv"),
+    )
+    .unwrap();
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&sample).unwrap();
+    let path = dir.join("ip2asn-combined.tsv.gz");
+    fs::write(&path, gz.finish().unwrap()).unwrap();
+    path
+}
+
+/// Blocking a hosting provider end to end, offline: select it, read its
+/// ranges from a local copy of the table, and find them in the script,
+/// with port 80 left open as for the cloud feeds.
+#[test]
+fn a_hosting_asn_reaches_the_firewall_script_with_port_80_open() {
+    let fx = Fixture::new();
+    let table = gzipped_ip2asn_sample(fx._tmp.path());
+    let out = fx._tmp.path().join("firewall.nft");
+
+    fx.run(&["add-hosting-asn", "--asn", "AS24940"])
+        .stdout(predicate::str::contains("AS24940 (Hetzner) is now blocked"))
+        .stdout(predicate::str::contains("not just bots"))
+        .stdout(predicate::str::contains("No ranges stored yet"));
+    fx.run(&["update-hosting-asns", "--source", table.to_str().unwrap()])
+        .stdout(predicate::str::contains(
+            "Stored 3 range(s) for AS24940 (Hetzner)",
+        ));
+    fx.run(&[
+        "render-firewall",
+        "--backend",
+        "nftables",
+        "--out",
+        out.to_str().unwrap(),
+        "--ssh-log",
+        "/nonexistent/auth.log",
+    ]);
+
+    let script = fs::read_to_string(&out).unwrap();
+    for range in ["5.9.0.0/16", "78.46.0.0/15", "2a01:4f8::/32"] {
+        let listed = script
+            .lines()
+            .filter(|line| line.trim().trim_end_matches(',') == range)
+            .count();
+        assert_eq!(
+            listed, 2,
+            "{range} should be in the port-80 accept set and the block set:
+{script}"
+        );
+        let (_, first) = nft_rule_for(&script, range).unwrap();
+        assert!(
+            first.contains("tcp dport 80 accept"),
+            "{range} should meet the port-80 accept first, met {first:?}"
+        );
+    }
+    assert!(
+        !script.contains("51.68.0.0"),
+        "OVH is in the table but not selected:\n{script}"
+    );
+}
+
+/// Only selected ASNs' ranges are kept, so naming one that is not is an
+/// error that says how to select it; one the table lacks is a failure
+/// that names it.
+#[test]
+fn update_hosting_asns_refuses_an_unselected_asn_and_names_a_missing_one() {
+    let fx = Fixture::new();
+    let table = "tests/fixtures/ipranges/ip2asn-sample.tsv";
+
+    fx.cmd(&["update-hosting-asns", "--asn", "16276", "--source", table])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("add-hosting-asn --asn 16276"));
+
+    fx.run(&["add-hosting-asn", "--asn", "64999"]);
+    fx.cmd(&["update-hosting-asns", "--source", table])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("AS64999: not in the table"));
+}
+
+#[test]
+fn removing_a_hosting_asn_takes_its_ranges_out_of_the_list() {
+    let fx = Fixture::new();
+    let table = "tests/fixtures/ipranges/ip2asn-sample.tsv";
+    fx.run(&["add-hosting-asn", "--asn", "16276"]);
+    fx.run(&["update-hosting-asns", "--source", table]);
+
+    fx.run(&["remove-hosting-asn", "--asn", "16276"])
+        .stdout(predicate::str::contains("no longer blocked"));
+
+    let ovh = fx.json(&["list-hosting-asns"])["asns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["asn"] == 16276)
+        .cloned()
+        .unwrap();
+    assert_eq!(ovh["blocked"], false, "{ovh:#}");
+    assert_eq!(ovh["range_count"], 0, "{ovh:#}");
+}
+
+/// `status` names a provider that is blocked in name only.
+#[test]
+fn status_names_a_hosting_asn_that_was_never_fetched() {
+    let fx = Fixture::new();
+    stop_bots::health::store_probe(&fx.db(), &stop_bots::health::Probe::default()).unwrap();
+    fx.run(&["add-hosting-asn", "--asn", "24940"]);
+
+    let status = fx.json(&["status", "--cached"]);
+
+    let check = status["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == "hosting-asns")
+        .unwrap_or_else(|| panic!("no hosting-asns check:\n{status:#}"))
+        .clone();
+    assert_eq!(check["level"], "warn", "{check:#}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .unwrap()
+            .contains("AS24940 (Hetzner)"),
+        "{check:#}"
+    );
+}
+
+/// What a script reads: every built-in provider and every other one
+/// selected, with what each holds.
+#[test]
+fn list_hosting_asns_json_matches_the_golden() {
+    let fx = Fixture::new();
+    let table = "tests/fixtures/ipranges/ip2asn-sample.tsv";
+    fx.run(&["add-hosting-asn", "--asn", "24940"]);
+    fx.run(&["add-hosting-asn", "--asn", "64999"]);
+    // 64999 is not in the table, which fails the run after storing 24940.
+    fx.cmd(&["update-hosting-asns", "--source", table])
+        .assert()
+        .failure();
+
+    assert_json_golden(
+        "list-hosting-asns.json",
+        &json_text(&fx, &["list-hosting-asns"]),
+    );
+}
+
 /// What the detectors will make allowances for is said when the site is
 /// found, before it matters.
 #[test]

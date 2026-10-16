@@ -48,6 +48,8 @@ pub enum Source {
     Reputation(ReputationSourceKind),
     /// A selected country's IPdeny zone file, by two-letter code.
     Country(String),
+    /// The iptoasn table, once, for every selected hosting ASN at once.
+    HostingAsns(Vec<u32>),
 }
 
 impl Source {
@@ -59,6 +61,7 @@ impl Source {
             Source::CrawlerRanges(kind) => format!("crawler ranges {}", kind.id()),
             Source::Reputation(kind) => format!("feed {}", kind.id()),
             Source::Country(code) => format!("country {code}"),
+            Source::HostingAsns(_) => "hosting providers".to_string(),
         }
     }
 }
@@ -66,7 +69,9 @@ impl Source {
 /// Everything an "update everything" would fetch, in a deterministic order.
 ///
 /// Bot lists, then crawler ranges, then the *enabled* reputation feeds,
-/// then the *selected* countries. The last two are read from the database
+/// then the *selected* countries, then the iptoasn table if any hosting
+/// ASN is selected (one download for all of them). The last three are
+/// read from the database
 /// rather than enumerated: a feed nobody turned on and a country nobody
 /// chose are not things this host uses, and fetching them would be six
 /// pointless requests and a table full of ranges no rule references.
@@ -102,6 +107,16 @@ pub fn plan(db: &Db) -> Result<Vec<Source>> {
         plan.push(Source::Country(code));
     }
 
+    let asns: Vec<u32> = db
+        .list_hosting_asns()
+        .context("could not read which hosting ASNs are selected")?
+        .into_iter()
+        .map(|asn| asn.asn)
+        .collect();
+    if !asns.is_empty() {
+        plan.push(Source::HostingAsns(asns));
+    }
+
     Ok(plan)
 }
 
@@ -112,6 +127,9 @@ pub async fn fetch(source: &Source) -> Result<String> {
         Source::CrawlerRanges(kind) => kind.fetch().await,
         Source::Reputation(kind) => kind.fetch().await,
         Source::Country(code) => ipranges::fetch_country(code).await,
+        // Only the selected ASNs' lines of the table come back, so what
+        // crosses to `store` is kilobytes, not the 46 MB table.
+        Source::HostingAsns(asns) => ipranges::hosting::fetch(asns).await,
     }
 }
 
@@ -137,6 +155,15 @@ pub fn store(db: &Db, source: &Source, raw: &str) -> Result<String> {
         Source::Country(code) => {
             let count = ipranges::store_country(db, code, raw)?;
             Ok(ranges_summary(count, &ipranges::parse_zone_file(raw)))
+        }
+        Source::HostingAsns(asns) => {
+            let stored = ipranges::hosting::store(db, asns, raw)?;
+            // Nothing stored and something asked for is a failure, so the
+            // run reports it; a partial store is reported in the summary.
+            if stored.stored.is_empty() && !stored.is_complete() {
+                anyhow::bail!("{}", stored.summary());
+            }
+            Ok(stored.summary())
         }
     }
 }
@@ -615,6 +642,43 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{err:#}").contains("parse"), "was: {err:#}");
+    }
+
+    /// One download for every selected hosting ASN, and none at all when
+    /// nothing is selected.
+    #[test]
+    fn the_plan_fetches_the_asn_table_once_and_only_when_an_asn_is_selected() {
+        let db = Db::open_in_memory().unwrap();
+        let tables = |db: &Db| -> Vec<Source> {
+            plan(db)
+                .unwrap()
+                .into_iter()
+                .filter(|s| matches!(s, Source::HostingAsns(_)))
+                .collect()
+        };
+        assert!(tables(&db).is_empty(), "planned with nothing selected");
+
+        db.add_hosting_asn(24940).unwrap();
+        db.add_hosting_asn(16276).unwrap();
+
+        assert_eq!(tables(&db), [Source::HostingAsns(vec![16276, 24940])]);
+    }
+
+    #[test]
+    fn store_lands_hosting_asn_ranges_and_refuses_when_none_landed() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_hosting_asn(24940).unwrap();
+        let sample = include_str!("../tests/fixtures/ipranges/ip2asn-sample.tsv");
+
+        let summary = store(&db, &Source::HostingAsns(vec![24940]), sample).unwrap();
+        assert_eq!(summary, "1 hosting ASN(s), 3 range(s)");
+
+        db.add_hosting_asn(64999).unwrap();
+        let err = store(&db, &Source::HostingAsns(vec![64999]), sample).unwrap_err();
+        assert!(
+            err.to_string().contains("not in the table: AS64999"),
+            "was: {err:#}"
+        );
     }
 
     #[test]

@@ -323,6 +323,10 @@ pub enum KeyOutcome {
     /// offline. Enabling an already-fetched feed returns `Mutated`
     /// instead, since nothing needs downloading.
     FetchReputationSource(String),
+    /// The Dashboard chose hosting providers to block, these AS numbers
+    /// among them with no ranges yet. `App` downloads the ASN table once
+    /// for all of them and stores their ranges (`App::start_hosting_asn_fetch`).
+    FetchHostingAsns(Vec<u32>),
     /// The Dashboard's firewall render action was triggered. Carries the
     /// selected backend and output path for `App` to call the render
     /// function (see `App::start_firewall_render`). `apply` is the render popup's

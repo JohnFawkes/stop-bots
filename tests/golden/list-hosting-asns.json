@@ -1,0 +1,175 @@
+{
+  "asns": [
+    {
+      "asn": 45102,
+      "name": "Alibaba Cloud",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
+      "asn": 51167,
+      "name": "Contabo",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
+      "asn": 40021,
+      "name": "Contabo US",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
+      "asn": 24940,
+      "name": "Hetzner",
+      "description": "HETZNER-AS",
+      "curated": true,
+      "blocked": true,
+      "last_fetched_at": "{UNIX_SECONDS}",
+      "range_count": 3,
+      "note": null
+    },
+    {
+      "asn": 213230,
+      "name": "Hetzner Cloud",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
+      "asn": 47583,
+      "name": "Hostinger",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
+      "asn": 60781,
+      "name": "Leaseweb NL",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
+      "asn": 28753,
+      "name": "Leaseweb DE",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
+      "asn": 63949,
+      "name": "Akamai Linode",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
+      "asn": 9009,
+      "name": "M247",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
+      "asn": 8075,
+      "name": "Microsoft Azure",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": "This is all of Microsoft, not only Azure: Bingbot crawls from it, and Outlook and Microsoft 365 send from it."
+    },
+    {
+      "asn": 31898,
+      "name": "Oracle Cloud",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
+      "asn": 16276,
+      "name": "OVHcloud",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
+      "asn": 12876,
+      "name": "Scaleway",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
+      "asn": 132203,
+      "name": "Tencent Cloud",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
+      "asn": 20473,
+      "name": "Vultr",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
+      "asn": 64999,
+      "name": "AS64999",
+      "description": null,
+      "curated": false,
+      "blocked": true,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    }
+  ],
+  "warning": "blocks every visitor hosted there, not just bots — including VPNs and API clients"
+}

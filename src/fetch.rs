@@ -86,6 +86,12 @@ pub async fn text(url: &str, what: &str) -> Result<String> {
     capped_text(client()?, url, what, MAX_BODY_BYTES).await
 }
 
+/// Fetches `url` as raw bytes, with the same limits as [`text`]: for a
+/// compressed download, which is not text until it has been unpacked.
+pub async fn bytes(url: &str, what: &str) -> Result<Vec<u8>> {
+    capped_bytes(client()?, url, what, MAX_BODY_BYTES).await
+}
+
 /// [`text`] with the limit as a parameter, so the refusal paths can be
 /// tested against a few bytes rather than by actually serving 32MB.
 async fn capped_text(
@@ -94,6 +100,17 @@ async fn capped_text(
     what: &str,
     max_bytes: usize,
 ) -> Result<String> {
+    let body = capped_bytes(client, url, what, max_bytes).await?;
+    String::from_utf8(body).with_context(|| format!("{what} response was not valid UTF-8"))
+}
+
+/// [`bytes`] with the limit as a parameter, for the same reason.
+async fn capped_bytes(
+    client: &reqwest::Client,
+    url: &str,
+    what: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
     let response = client
         .get(url)
         .send()
@@ -124,8 +141,7 @@ async fn capped_text(
         }
         body.extend_from_slice(&chunk);
     }
-
-    String::from_utf8(body).with_context(|| format!("{what} response was not valid UTF-8"))
+    Ok(body)
 }
 
 #[cfg(test)]

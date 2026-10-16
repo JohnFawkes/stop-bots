@@ -141,7 +141,8 @@ rules it applies stay inside the container, and `exit` deletes it.
 ## Run it
 
 `sudo stop-bots` starts the TUI. It needs root, because it rewrites your web server's config and
-loads firewall rules. `?` shows every key on every screen.
+loads firewall rules. `?` explains whatever is under the cursor, and `?` again shows every key on
+every screen.
 
 Run every command with `sudo`. Without root, stop-bots cannot open
 `/var/lib/stop-bots/db.sqlite3` and falls back to a database of your own (it prints which),

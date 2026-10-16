@@ -113,6 +113,7 @@ use crate::db::{Category, Db, GeoMode, Policy, Source};
 use crate::ipranges;
 use crate::present::category_label;
 use crate::protection::Detector;
+use crate::tui::explain::Explanation;
 use crate::tui::{centered_rect, KeyOutcome, Theme};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -527,6 +528,312 @@ impl Dashboard {
             ),
         };
         (name, own.into_iter().chain(host).collect())
+    }
+
+    /// What the row under the cursor is, for `?`.
+    pub fn explain(&self) -> Explanation {
+        match self.focus {
+            Focus::Categories => match self.list_state.selected().unwrap_or(0) {
+                0 => self.explain_humans_only(),
+                i if i <= CATEGORIES.len() => self.explain_category(CATEGORIES[i - 1]),
+                _ => Explanation::new("Old browsers")
+                    .para(
+                        "Blocks the user agents of browsers too old for anyone to still run: \
+                         Internet Explorer 9 and older, Firefox before 10, Chrome before 40, \
+                         old Opera, feature phones. Scanners send these strings to look like \
+                         people, and no bot list can carry them, as none is a bot's name.",
+                    )
+                    .now(if self.old_browsers {
+                        "blocked."
+                    } else {
+                        "allowed."
+                    })
+                    .warn(
+                        "A few are still a person somewhere: Opera Mini, for one, still \
+                         sends Opera/9.80. Off by default for that reason.",
+                    )
+                    .para("Enter switches it. It applies to every site, in the web server.")
+                    .takes_effect(false),
+            },
+            Focus::Countries => match self.countries_state.selected().unwrap_or(0) {
+                0 => self.explain_geo_mode(),
+                i => match self.selected_countries.get(i - 1) {
+                    Some(country) => self.explain_country(country),
+                    None => self.explain_geo_mode(),
+                },
+            },
+            Focus::Crawlers => match self
+                .crawlers_state
+                .selected()
+                .and_then(|i| self.crawlers.get(i))
+            {
+                Some(source) => self.explain_crawler(source),
+                None => Explanation::new("Crawler IP ranges"),
+            },
+            Focus::Protection => match self
+                .protection_state
+                .selected()
+                .and_then(|i| self.protection_rows().get(i).copied())
+            {
+                Some(row) => self.explain_protection(row),
+                None => Explanation::new("Automatic blocking"),
+            },
+        }
+    }
+
+    fn explain_humans_only(&self) -> Explanation {
+        Explanation::new("Humans only")
+            .para(
+                "Serves people and nothing else. Every bot on the bot lists is blocked, \
+                 whatever its category, so the three categories below are forced to Blocked. \
+                 Any address that fetches /robots.txt, which people never do, is blocked \
+                 for a day.",
+            )
+            .now(if self.humans_only { "on." } else { "off." })
+            .warn(
+                "Search engines are blocked too, so the site drops out of search results. So \
+                 are uptime monitors and link previews that call themselves bots: trust one by \
+                 its user agent on the Firewall screen to let it in.",
+            )
+            .para(
+                "Let's Encrypt is the one bot still allowed, so certificates keep renewing. \
+                 Turning this off brings back the categories as they were.",
+            )
+            .takes_effect(false)
+    }
+
+    fn explain_category(&self, category: Category) -> Explanation {
+        let (about, firewall) = match category {
+            Category::Scanner => (
+                "Bots that look for weaknesses: vulnerability and port scanners, and security \
+                 and SEO crawlers that probe sites they were not asked to.",
+                None,
+            ),
+            Category::Search => (
+                "Search engine crawlers: Googlebot, Bingbot and the rest. Blocking them takes \
+                 the site out of their search results.",
+                Some("Googlebot and Bingbot"),
+            ),
+            Category::Ai => (
+                "Crawlers that collect pages for AI models, such as GPTBot and CCBot. Blocking \
+                 them keeps the site's text out of their training data and answers.",
+                Some("GPTBot"),
+            ),
+        };
+        let policy = match self.category_default(category) {
+            Policy::Allowed => "allowed",
+            Policy::Blocked => "blocked",
+        };
+        let mut explanation = Explanation::new(category_label(category))
+            .para(about)
+            .now(if self.humans_only {
+                format!("{policy}, forced by Humans only, which must be off to change it.")
+            } else {
+                format!("{policy}.")
+            })
+            .para(
+                "A blocked bot is matched by its user agent in the web server, and gets the \
+                 block response set on the web server's screen. A site can override this, on \
+                 that screen.",
+            );
+        if let Some(crawlers) = firewall {
+            explanation = explanation.para(format!(
+                "While blocked, the addresses {crawlers} publish (Crawler IP ranges, below) \
+                 are blocked in the firewall as well, so a crawler that changes its user agent \
+                 is still kept out."
+            ));
+        }
+        explanation.takes_effect(self.auto_apply_firewall)
+    }
+
+    fn explain_geo_mode(&self) -> Explanation {
+        let list = if self.selected_countries.is_empty() {
+            "No country is on the list.".to_string()
+        } else {
+            format!(
+                "On the list: {}.",
+                self.selected_countries.join(" ").to_uppercase()
+            )
+        };
+        let explanation = match self.geo_choice() {
+            GEO_BLOCKLIST => Explanation::new("Geo: Blocklist")
+                .para(
+                    "Blocks every address in the countries on this list, in the firewall, on \
+                     every port. Everyone else gets in.",
+                )
+                .now(list),
+            GEO_ALLOWLIST => Explanation::new("Geo: Allowlist")
+                .para(
+                    "Lets in only the countries on this list, and blocks every other address \
+                     in the firewall, on every port. Trusted addresses, SSH logins from the \
+                     last week and private networks still get in.",
+                )
+                .now(list)
+                .warn(
+                    "Keep the country you connect from on the list, and an address you \
+                     connect from trusted (Firewall screen), or the next apply can lock you out.",
+                ),
+            _ => Explanation::new("Geo: Only trusted IPs")
+                .para(
+                    "Blocks every address in the firewall, on every port, except trusted \
+                     addresses (Firewall screen), SSH logins from the last week and private \
+                     networks. For a server only a few known people use.",
+                )
+                .now(format!("{} trusted address(es).", self.trusted_addresses))
+                .warn(
+                    "Trust every address you connect from before you apply. One that changes \
+                     (home broadband, a phone) is locked out once its last SSH login is a \
+                     week old.",
+                ),
+        };
+        explanation
+            .para(
+                "Enter adds a country by its two-letter code, and downloads its address \
+                 ranges. m changes the mode; Delete removes the selected country.",
+            )
+            .takes_effect(self.auto_apply_firewall)
+    }
+
+    fn explain_country(&self, country: &str) -> Explanation {
+        let code = country.to_uppercase();
+        let ranges = match self.range_count(country) {
+            Some(count) => format!("{count} address ranges downloaded."),
+            None => "its ranges are not downloaded yet, so it blocks nothing.".to_string(),
+        };
+        let effect = match self.geo_mode {
+            GeoMode::Blocklist => format!("Every address in {code} is blocked in the firewall."),
+            GeoMode::Allowlist => {
+                format!("{code} is one of the countries allowed in; every other one is blocked.")
+            }
+        };
+        Explanation::new(format!("Country {code}"))
+            .para(effect)
+            .now(ranges)
+            .para("Delete or Backspace removes it from the list; m changes what the list means.")
+            .takes_effect(self.auto_apply_firewall)
+    }
+
+    fn explain_crawler(&self, source: &crate::ipranges::CrawlerSource) -> Explanation {
+        let category = source.kind.category();
+        let policy = match self.category_default(category) {
+            Policy::Allowed => "allowed, so these addresses are not blocked",
+            Policy::Blocked => "blocked, so these addresses are blocked in the firewall",
+        };
+        Explanation::new(source.kind.name())
+            .para(format!(
+                "The addresses {} crawls from, as its owner publishes them. They do two \
+                 things: while its category ({}) is blocked, they are blocked in the \
+                 firewall, so the crawler cannot get past by changing its user agent; and \
+                 the Forged crawler detector uses them to tell the real crawler from a client \
+                 only calling itself that.",
+                source.short_name(),
+                category_label(category)
+            ))
+            .now(match source.last_fetched_at {
+                Some(at) => format!(
+                    "{} ranges, downloaded {}; {} is {policy}.",
+                    source.range_count,
+                    crate::present::ago(at),
+                    category_label(category)
+                ),
+                None => format!(
+                    "not downloaded yet; {} is {policy}.",
+                    category_label(category)
+                ),
+            })
+            .para(
+                "Enter downloads them again. The lists are also updated every week by the \
+                 schedule.",
+            )
+            .takes_effect(self.auto_apply_firewall)
+    }
+
+    fn explain_protection(&self, row: ProtectionRow) -> Explanation {
+        let label = self.protection_label(row);
+        match row {
+            ProtectionRow::Detect(detector) => Explanation::new(label)
+                .para(detector.about())
+                .now(if self.protection_enabled(row) {
+                    format!(
+                        "on, blocking each address it catches for {} day(s).",
+                        self.protection_ttl_days(row)
+                    )
+                } else if self.new_detectors.contains(&detector) {
+                    "off. New since this database was created, so it has not been switched \
+                     on for you."
+                        .to_string()
+                } else {
+                    "off.".to_string()
+                })
+                .warn_if(detector.risk())
+                .para(
+                    "It reads the log every minute while the TUI is open, or from cron. Each \
+                     block records the log line behind it, on the Blocks screen. Space \
+                     switches it; Enter also sets for how long it blocks.",
+                )
+                .takes_effect(self.auto_apply_firewall),
+            ProtectionRow::Feed(i) => {
+                let Some(source) = self.reputation.get(i) else {
+                    return Explanation::new(label);
+                };
+                let kind = ipranges::reputation::ReputationSourceKind::from_id(&source.id);
+                let mut explanation = Explanation::new(label)
+                    .para(kind.map(|k| k.about()).unwrap_or_default())
+                    .now(match (source.enabled, source.last_fetched_at) {
+                        (false, _) => "off.".to_string(),
+                        (true, None) => {
+                            "on, but not downloaded yet, so it blocks nothing.".to_string()
+                        }
+                        (true, Some(at)) => format!(
+                            "on, {} ranges, downloaded {}.",
+                            source.range_count,
+                            crate::present::ago(at)
+                        ),
+                    })
+                    .warn_if(kind.and_then(|k| k.warning()));
+                if kind.is_some_and(|k| k.blocks_infrastructure()) {
+                    explanation = explanation.para(
+                        "Port 80 stays open to these ranges unless you chose otherwise when \
+                         turning AWS on, because Let's Encrypt checks certificates from AWS.",
+                    );
+                }
+                explanation
+                    .para("Space switches it. It is downloaded again every week.")
+                    .takes_effect(self.auto_apply_firewall)
+            }
+            ProtectionRow::AutoApplyFirewall => Explanation::new(label)
+                .para(
+                    "Whether the scheduled render also runs the firewall script it writes. \
+                     The render runs within five minutes of any change to the rules and at \
+                     least once a day, while the TUI is open or from cron.",
+                )
+                .now(if self.auto_apply_firewall {
+                    "on: new blocks reach the firewall within minutes, with no preview."
+                } else {
+                    "off: the script is written, and runs when you apply (a)."
+                })
+                .para(
+                    "Every apply still goes through the SSH lock-out check, and is refused \
+                     when the SSH log cannot be read.",
+                ),
+            ProtectionRow::LockoutCheck => Explanation::new(label)
+                .para(
+                    "Before any firewall apply, checks the new rules against every address \
+                     that logged in over SSH in the last week, and the SSH session this runs \
+                     in, and refuses an apply that would block one.",
+                )
+                .now(if self.ssh_lockout_check {
+                    "on."
+                } else {
+                    "off: applies are not checked. Addresses that log in over SSH are still \
+                     let through ahead of every block."
+                })
+                .para(
+                    "Turn it off only on a server you never log into over SSH, such as one \
+                     you reach through your provider's console. stop-bots status warns if \
+                     anyone logs in over SSH while it is off.",
+                ),
+        }
     }
 
     pub fn render(
@@ -3789,6 +4096,59 @@ mod tests {
                 .unwrap(),
             KeyOutcome::PreviewApplyEverything
         );
+    }
+
+    /// Every row of every Dashboard list has its own explanation: titled
+    /// after the row, with text, and a warning where the row can block
+    /// people.
+    #[test]
+    fn every_dashboard_row_explains_itself() {
+        let db = Db::open_in_memory().unwrap();
+        register_all_reputation_sources(&db).unwrap();
+        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        db.set_country_selected("nl", true).unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let mut seen = std::collections::HashSet::new();
+        dashboard.focus = Focus::Categories;
+        for i in 0..POLICY_ROWS {
+            dashboard.list_state.select(Some(i));
+            seen.insert(dashboard.explain().title);
+        }
+        dashboard.focus = Focus::Countries;
+        for i in 0..=dashboard.selected_countries.len() {
+            dashboard.countries_state.select(Some(i));
+            seen.insert(dashboard.explain().title);
+        }
+        dashboard.focus = Focus::Crawlers;
+        for i in 0..dashboard.crawlers.len() {
+            dashboard.crawlers_state.select(Some(i));
+            seen.insert(dashboard.explain().title);
+        }
+        dashboard.focus = Focus::Protection;
+        for (i, row) in dashboard.protection_rows().into_iter().enumerate() {
+            dashboard.protection_state.select(Some(i));
+            let explanation = dashboard.explain();
+            assert_eq!(explanation.title, dashboard.protection_label(row));
+            assert!(explanation.body.len() > 2, "{explanation:?}");
+            let warns = explanation
+                .body
+                .iter()
+                .any(|line| line.to_string().starts_with('\u{26a0}'));
+            if let ProtectionRow::Detect(detector) = row {
+                assert_eq!(warns, detector.risk().is_some(), "{row:?}");
+            }
+            seen.insert(explanation.title);
+        }
+
+        let rows = POLICY_ROWS
+            + 1
+            + dashboard.selected_countries.len()
+            + dashboard.crawlers.len()
+            + dashboard.protection_rows().len();
+        assert_eq!(seen.len(), rows, "two rows share an explanation: {seen:?}");
     }
 
     /// A preview whose lock-out check read an SSH log with no login in it.

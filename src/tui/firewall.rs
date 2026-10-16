@@ -304,6 +304,92 @@ impl Firewall {
         KeyOutcome::Consumed
     }
 
+    /// What the row under the cursor is, for `?`.
+    pub fn explain(&self) -> crate::tui::explain::Explanation {
+        use crate::tui::explain::Explanation;
+        match self.focus {
+            Focus::Ssh => match self
+                .ssh_state
+                .selected()
+                .and_then(|i| self.visible_ssh_rows().get(i).copied())
+            {
+                Some(row) => Explanation::new(row.address.clone())
+                    .para(format!(
+                        "{} failed SSH login(s) from this address in the last week of the SSH \
+                         log: someone guessing passwords, or a person who mistyped one.",
+                        row.count
+                    ))
+                    .now(status_meaning(row.status, "address"))
+                    .para(
+                        "Enter blocks it for good, or lifts its block; T trusts it, so nothing \
+                         ever blocks it; i shows which lists and country it is in.",
+                    )
+                    .takes_effect(false),
+                None => Explanation::new("Failed SSH logins").para(
+                    "Addresses that failed to log in over SSH in the last week, most attempts \
+                     first. The SSH scanners detector, on the Dashboard, blocks the busiest on \
+                     its own.",
+                ),
+            },
+            Focus::UserAgents => match self
+                .ua_state
+                .selected()
+                .and_then(|i| self.visible_ua_rows().get(i).copied())
+            {
+                Some(row) => Explanation::new("User agent")
+                    .para(format!(
+                        "{} request(s) the web server answered carried this user agent, the \
+                         name a client gives for itself: {}",
+                        row.count, row.user_agent
+                    ))
+                    .now(status_meaning(row.status, "user agent"))
+                    .para(
+                        "Enter blocks it on every site, or lifts the block; T trusts it, so \
+                         the web server never blocks it; i shows which bot list matches it.",
+                    )
+                    .takes_effect(false),
+                None => Explanation::new("Top user agents").para(
+                    "The user agents behind the requests the web server answered, most first. \
+                     A client chooses its own, so it says who a client claims to be, not who \
+                     it is.",
+                ),
+            },
+            Focus::Trusted => match self.selected_trusted() {
+                Some(crate::dynamic::TrustedEntry::Address(address)) => {
+                    Explanation::new(address.clone())
+                        .para(
+                            "A trusted address is never blocked: it is let through ahead of \
+                             every firewall rule, by a detector, a list, a country or by hand, \
+                             the web server never blocks it, and the detectors skip it.",
+                        )
+                        .para("Enter stops trusting it.")
+                        .takes_effect(false)
+                }
+                Some(crate::dynamic::TrustedEntry::UserAgent(agent)) => {
+                    Explanation::new(agent.clone())
+                        .para(
+                            "A trusted user agent is never blocked by the web server: any \
+                             client whose user agent contains this, ignoring case, gets past \
+                             every bot block and rate limit.",
+                        )
+                        .warn(
+                            "Only the web server's blocks: any client can send this user \
+                             agent, so the detectors and the firewall still judge it by its \
+                             address. Trust the address for that.",
+                        )
+                        .para("Enter stops trusting it.")
+                        .takes_effect(false)
+                }
+                None => Explanation::new("Trust an address or user agent").para(
+                    "Enter types one in: an address (203.0.113.7), a range \
+                         (198.51.100.0/24) or part of a user agent (UptimeRobot). Trust the \
+                         addresses you connect from before you use Allowlist or Only trusted \
+                         IPs.",
+                ),
+            },
+        }
+    }
+
     /// The footer's key hints for the focused panel.
     pub fn hints(&self) -> crate::tui::Hints {
         if self.detail.is_some() {
@@ -1179,6 +1265,38 @@ fn panel_title(name: &str, total: usize, filter: &str) -> String {
 /// show" — and on this screen the second is the *good* outcome, so it is
 /// worth saying out loud. NGINX already does this for its own
 /// empty list; this is the same idea.
+/// What a row's tag means, in a sentence: `what` is "address" or "user
+/// agent".
+fn status_meaning(status: RowStatus, what: &str) -> String {
+    let place = if what == "address" {
+        "in the firewall"
+    } else {
+        "by the web server"
+    };
+    match status {
+        RowStatus::Pending => format!("NOT BLOCKED: nothing blocks this {what}."),
+        RowStatus::Blocked { until, by } => {
+            let how_long = match until {
+                Some(at) => format!(" for {}", crate::dynamic::format_until(at)),
+                None => ", for good".to_string(),
+            };
+            let who = match by {
+                Some(detector) => format!(" by the {} detector", detector.spec().label),
+                None => " by hand".to_string(),
+            };
+            format!("BLOCKED {place}{how_long},{who}. The Blocks screen says why.")
+        }
+        RowStatus::Blocklist => format!(
+            "BLOCKLIST: blocked {place} by a downloaded list, not by hand, so it is not one to \
+             lift here."
+        ),
+        RowStatus::Unknown => "UNKNOWN: it calls itself a bot, but no bot list here knows it, \
+                               so nothing blocks it. Enter blocks it by name."
+            .to_string(),
+        RowStatus::Trusted => format!("TRUSTED: never blocked, whatever else matches this {what}."),
+    }
+}
+
 fn empty_or(items: Vec<ListItem<'static>>, message: &str) -> Vec<ListItem<'static>> {
     if items.is_empty() {
         vec![ListItem::new(Line::from(message.to_string()).dim())]

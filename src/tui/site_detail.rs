@@ -462,6 +462,127 @@ impl SiteDetail {
         (name, own.into_iter().chain(apply).chain(common).collect())
     }
 
+    /// What the row under the cursor is, for `?`.
+    pub fn explain(&self) -> crate::tui::explain::Explanation {
+        use crate::tui::explain::Explanation;
+        let site = &self.site.server_name;
+        let apply = "A change here reaches the site when you apply it (a, or A for every site).";
+        let explanation = match self.focus {
+            Focus::Categories => {
+                let category = self
+                    .categories_state
+                    .selected()
+                    .and_then(|i| CATEGORIES.get(i).copied())
+                    .unwrap_or(Category::Scanner);
+                let verdict = |policy: Policy| match policy {
+                    Policy::Allowed => "allowed",
+                    Policy::Blocked => "blocked",
+                };
+                Explanation::new(format!("{} on {site}", category_label(category)))
+                    .para(
+                        "Whether this category of bots is blocked on this site. It follows \
+                         the Dashboard's setting for every site unless overridden here.",
+                    )
+                    .now(match self.category_overrides[category_index(category)] {
+                        Some(policy) => format!(
+                            "{} on this site, overriding the Dashboard ({}).",
+                            verdict(policy),
+                            verdict(self.global_default(category))
+                        ),
+                        None => format!(
+                            "{}, as set on the Dashboard.",
+                            verdict(self.global_default(category))
+                        ),
+                    })
+                    .para("Enter overrides it, or sets it back to the Dashboard's.")
+            }
+            Focus::Options => {
+                let rule = self
+                    .options_state
+                    .selected()
+                    .and_then(|i| RequestRule::ALL.get(i).copied())
+                    .unwrap_or(RequestRule::Http1x);
+                Explanation::new(rule.label())
+                    .para(rule.about())
+                    .now(if self.request_rules.contains(&rule) {
+                        "on: requests like this are turned away."
+                    } else {
+                        "off."
+                    })
+                    .warn(format!("Not only bots: {}.", rule.caveat()))
+                    .para(
+                        "Each rule is its own switch, off by default, so that if something of \
+                         yours stops working you can tell which one did it. Enter switches it.",
+                    )
+            }
+            Focus::Exemptions => match self
+                .exemptions_state
+                .selected()
+                .and_then(|i| i.checked_sub(1))
+                .and_then(|i| self.exemptions.get(i))
+            {
+                Some(exemption) => Explanation::new(exemption.path.clone())
+                    .para(match &exemption.user_agent {
+                        None => format!(
+                            "Requests for paths starting with {} are never blocked on this \
+                             site, by bot lists or request rules.",
+                            exemption.path
+                        ),
+                        Some(agent) => format!(
+                            "Requests for paths starting with {} from a client whose user \
+                             agent contains {agent} are never blocked on this site. Everyone \
+                             else is judged as usual.",
+                            exemption.path
+                        ),
+                    })
+                    .para("Enter removes it."),
+                None => Explanation::new("Exempt a path").para(
+                    "Enter adds a path where this site's blocks do not apply: a webhook, a \
+                     feed, an app's API that a bot list catches. Type /path to exempt every \
+                     client, or /path agent to exempt only clients whose user agent contains \
+                     agent.",
+                ),
+            },
+            Focus::Search => {
+                let bots = self.filtered_bots();
+                match self.results_state.selected().and_then(|i| bots.get(i)) {
+                    Some(bot) => {
+                        let site_override = self.site_bot_override(bot.id);
+                        let effective = effective_bot_policy(
+                            bot,
+                            site_override,
+                            self.effective_category(Category::Ai),
+                            self.effective_category(Category::Search),
+                            self.effective_category(Category::Scanner),
+                        );
+                        let verdict = match effective {
+                            Policy::Allowed => "allowed",
+                            Policy::Blocked => "blocked",
+                        };
+                        let why = if site_override.is_some() {
+                            "by an override for this site"
+                        } else if bot.status != BotStatus::Default {
+                            "by an override for every site, on Bot settings"
+                        } else {
+                            "by its categories, as set for this site"
+                        };
+                        Explanation::new(format!("{} on {site}", bot.name))
+                            .now(format!("{verdict} {why}."))
+                            .para(
+                                "A site override wins over everything else for this site. \
+                                 Enter sets one, or takes it away.",
+                            )
+                    }
+                    None => Explanation::new("Bot overrides").para(
+                        "/ searches the bots by name; Enter on one allows or blocks it on this \
+                         site alone.",
+                    ),
+                }
+            }
+        };
+        explanation.para(apply)
+    }
+
     fn bot_line(&self, bot: &Bot) -> Line<'static> {
         let site_override = self.site_bot_override(bot.id);
         let effective = effective_bot_policy(

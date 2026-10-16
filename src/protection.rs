@@ -414,6 +414,87 @@ impl Detector {
         self.spec().id
     }
 
+    /// What this detector blocks, in a sentence or two, for someone who
+    /// has not read the code: the TUI's `?` shows it.
+    pub fn about(self) -> &'static str {
+        match self {
+            Detector::SshScanners => {
+                "Blocks an address after many failed SSH logins: the password-guessing that \
+                 every server on the internet gets. An address that ever logged in \
+                 successfully is never blocked."
+            }
+            Detector::WebScanners => {
+                "Blocks an address that asks for many different pages that do not exist \
+                 (404s): a scanner walking a list of known-vulnerable paths."
+            }
+            Detector::SpoofedCrawlers => {
+                "Blocks a client that calls itself Googlebot, Bingbot or GPTBot from an address \
+                 that crawler does not use. The real crawlers publish their addresses, and \
+                 the Crawler IP ranges panel downloads them."
+            }
+            Detector::ProbePaths => {
+                "Blocks an address on a single request for a file no visitor asks for, such as \
+                 /.env or /.git/config: someone looking for leaked passwords and keys."
+            }
+            Detector::Injection => {
+                "Blocks an address on a single request carrying a known exploit, such as \
+                 Shellshock or Log4Shell, in its path or headers."
+            }
+            Detector::Honeypot => {
+                "Blocks a client that visits a trap path that only robots.txt mentions, as a \
+                 path crawlers must not visit. People never see it; a bot that reads \
+                 robots.txt for places to look does."
+            }
+            Detector::AssetRatio => {
+                "Blocks an address that fetches many pages and never a stylesheet, script or \
+                 image: a browser loads those, a scraper does not."
+            }
+            Detector::RotatingUserAgent => {
+                "Blocks an address that sends many different user agents in a short time: a \
+                 bot changing disguises to get past user-agent blocks."
+            }
+            Detector::RefererlessCrawl => {
+                "Blocks an address that requests many deep pages and never sends a Referer, \
+                 which a person clicking links does."
+            }
+            Detector::RobotsTxt => {
+                "Under Humans only: blocks a client that fetches robots.txt. People do not ask \
+                 for it; crawlers do."
+            }
+        }
+    }
+
+    /// Who this detector might block by mistake, when that is a real
+    /// risk; `None` when what it looks for is an attack and nothing else.
+    pub fn risk(self) -> Option<&'static str> {
+        match self {
+            Detector::AssetRatio => Some(
+                "Can catch real people: a reader with images off, a text browser, or a feed \
+                 reader. Off by default for that reason. It never blocks a verified search \
+                 engine.",
+            ),
+            Detector::RotatingUserAgent => Some(
+                "Can catch real people: an office or school behind one shared address, where \
+                 many browsers look like one client. Off by default for that reason. It never \
+                 blocks a verified search engine.",
+            ),
+            Detector::RefererlessCrawl => Some(
+                "Can catch real people: privacy tools and some browsers send no Referer at \
+                 all. Off by default for that reason. It never blocks a verified search \
+                 engine.",
+            ),
+            Detector::Honeypot => Some(
+                "Does nothing until the site serves the generated robots.txt (a setting on the \
+                 web server's screen), which is where the trap path is published.",
+            ),
+            Detector::SpoofedCrawlers => Some(
+                "Needs the crawler ranges downloaded; until they are, it cannot tell a real \
+                 Googlebot from a forged one and blocks neither.",
+            ),
+            _ => None,
+        }
+    }
+
     pub fn from_id(id: &str) -> Option<Detector> {
         Detector::ALL.into_iter().find(|d| d.id() == id)
     }

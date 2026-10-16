@@ -71,7 +71,7 @@ falling back to a per-user location if that is not writable";
 
 /// Help text shared by every `--root` flag.
 const ROOT_HELP: &str = "The web server's config root. Defaults to the one stored by \
-`set-web-server --root` (or `set-nginx-commands --root`), else /etc/nginx, or /etc/apache2 for Apache";
+`set-web-server --root`, else /etc/nginx, or /etc/apache2 for Apache";
 
 /// Help text shared by every detector subcommand's `--access-log`.
 const ACCESS_LOG_HELP: &str = "Read this access log instead of the stored one \
@@ -144,8 +144,10 @@ struct Cli {
 //   true|false`, so both directions can be said. A presence flag is only
 //   for how *this run* behaves (`--force`, `--dry-run`, `--no-fetch`).
 // - A stored setting is changed by a `set-*` verb. Flags on a verb that
-//   runs something (`web`, `batch`, `render-firewall`, the `block-*`
-//   detectors) apply to that run and are never written back.
+//   runs something (`batch`, `render-firewall`, `run-detector`) apply to
+//   that run and are never written back.
+// - A list of things has `add-*`, `remove-*` and `list-*` verbs, and an
+//   `update-*` verb downloads every source of its kind unless one is named.
 // - Help text names commands the way a user types them (`apply-blocks`),
 //   never the Rust variant (`ApplyBlocks`) or a table or module name.
 #[derive(Subcommand)]
@@ -156,15 +158,16 @@ enum Command {
         #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
     },
-    /// Download and store the latest known-bot list from one source
+    /// Download and store the known-bot lists: every source, or one.
     #[command(alias = "update")]
     UpdateBotLists {
-        /// Which bot-list source to update: well-known-bots, ai-robots-txt
-        /// or nginx-bad-bots
-        #[arg(long, default_value = "well-known-bots")]
-        source_id: String,
-        /// Read the bot list from a local file instead of downloading it
-        /// (parsed as --source-id's format)
+        /// Only this source: well-known-bots, ai-robots-txt, nginx-bad-bots
+        /// or stop-bots-extras. Every one without it
+        #[arg(long)]
+        source_id: Option<String>,
+        /// Read the bot list from a local file instead of downloading it,
+        /// parsed as --source-id's format (well-known-bots' when none is
+        /// given, as before every source was updated by default)
         #[arg(long)]
         source: Option<PathBuf>,
     },
@@ -213,8 +216,9 @@ enum Command {
     /// the address for that.
     ///
     /// Takes effect after `render-firewall` (addresses) and `apply-blocks`
-    /// (both), like every other change here.
-    Trust {
+    /// (both), like every other change here. `remove-trusted` takes it
+    /// back; `list-trusted` lists them.
+    AddTrusted {
         /// An IP address or CIDR range, e.g. 203.0.113.7 or 198.51.100.0/24
         #[arg(
             long,
@@ -225,9 +229,19 @@ enum Command {
         /// Part of a user agent, e.g. UptimeRobot
         #[arg(long)]
         user_agent: Option<String>,
-        /// Stop trusting it instead
+    },
+    /// Stop trusting an address or a user agent added with `add-trusted`
+    RemoveTrusted {
+        /// The address or CIDR range, as `list-trusted` shows it
+        #[arg(
+            long,
+            required_unless_present = "user_agent",
+            conflicts_with = "user_agent"
+        )]
+        address: Option<String>,
+        /// The user agent, as `list-trusted` shows it
         #[arg(long)]
-        remove: bool,
+        user_agent: Option<String>,
     },
     /// List the user agents this host's blocking policy is turning away.
     ///
@@ -243,7 +257,7 @@ enum Command {
     /// carrying `okhttp` -- were blocked on a real host for days before
     /// anyone noticed.
     ///
-    /// Allow one with `stop-bots trust --user-agent`.
+    /// Allow one with `stop-bots add-trusted --user-agent`.
     ListTurnedAway {
         #[arg(long, help = ACCESS_LOG_HELP)]
         access_log: Option<PathBuf>,
@@ -274,7 +288,7 @@ enum Command {
     /// Removing a detector's block also keeps that detector from adding
     /// it straight back from the same log lines: it leaves the address
     /// alone for as long as the block was meant to last. Trust the
-    /// address (`trust --address`) to exempt it for good.
+    /// address (`add-trusted --address`) to exempt it for good.
     #[command(group(clap::ArgGroup::new("which").required(true).args(["id", "source"])))]
     RemoveFirewallRule {
         /// The rule's id, as `list-firewall-rules` shows it
@@ -398,117 +412,41 @@ enum Command {
         #[arg(long)]
         backend: FirewallBackend,
     },
-    /// Block addresses with many failed SSH logins.
+    /// Run one detector over a log now, and block what it finds.
     ///
-    /// Scans the SSH log for addresses with many failed logins — the
-    /// signature of a brute-force bot, not a person — and stores a
-    /// temporary block for each. Never blocks an address that also has a
-    /// successful login in the same log, or a loopback or private one.
+    /// Reads the whole log given (or the one stored with `set-log-paths`,
+    /// or the usual place), runs the detector over it with its stored
+    /// settings unless overridden here, and stores a block for each address
+    /// it convicts. The schedule (`tick`, the TUI) runs the same detectors
+    /// on its own, over each detector's window; this is for a log you want
+    /// judged once, by hand.
     ///
     /// A stored block has no effect until the firewall script is applied
     /// (`render-firewall --apply`, `batch --apply`, or "Apply everything"),
-    /// so this is safe to run unattended. Once applied, a block lasts its
-    /// TTL: on nftables the kernel removes it when it runs out, with no
-    /// re-apply; on iptables it stays loaded until the script is applied
-    /// again. Either way the database drops it the next time the rules are
-    /// read.
+    /// so this is safe to run unattended. Addresses that logged in over SSH,
+    /// trusted ones, private ones, and those inside a verified crawler's
+    /// published ranges are never blocked.
     ///
-    /// The internal cron runs the same detector with the stored settings;
-    /// change those with `set-detector ssh-scanners`.
-    #[command(alias = "block-scanners")]
-    BlockSshScanners {
-        /// Failed-login lines from one address before it counts as a
-        /// scanner rather than someone who mistyped a password. A count
-        /// over the whole log given, not a rate; the internal cron counts
-        /// only inside the detector's window. Defaults to the stored
-        /// threshold (`set-detector ssh-scanners --threshold`), which is 20
-        /// unless changed. Must be at least 1.
+    /// ssh-scanners reads the SSH log; every other detector reads the web
+    /// server's access log. spoofed-crawlers needs the crawler ranges
+    /// (`update-crawler-ranges`), and honeypot needs the trap path published
+    /// in the generated robots.txt (`set-robots-txt --enabled true`).
+    RunDetector {
+        /// Which detector, as `list-detectors` names it
+        detector: DetectorArg,
+        /// How much evidence from one address before it is blocked, for the
+        /// detectors that count (ssh-scanners, web-scanners, asset-ratio,
+        /// rotating-ua, refererless). A count over the whole log given, not
+        /// a rate. Defaults to the stored threshold (`set-detector`). Must
+        /// be at least 1.
         #[arg(long, value_parser = min_threshold)]
         threshold: Option<usize>,
         #[arg(long, value_parser = ttl_days_arg, help = TTL_HELP)]
         ttl_days: Option<i64>,
-        /// Check this SSH log file instead of auto-detecting one
-        #[arg(long)]
+        /// Read this SSH log file instead of auto-detecting one
+        /// (ssh-scanners only)
+        #[arg(long, conflicts_with = "access_log")]
         ssh_log: Option<PathBuf>,
-        #[arg(long, help = DRY_RUN_HELP)]
-        dry_run: bool,
-    },
-    /// Block addresses that asked for many nonexistent URLs.
-    ///
-    /// Scans the web server's access log for addresses that requested many
-    /// distinct URLs answered 404 — the signature of a vulnerability
-    /// scanner, not a person clicking a dead link — and stores a temporary
-    /// block for each. Unlike `block-ssh-scanners`, a successful response
-    /// elsewhere in the log does not exempt an address: a scanner's own
-    /// reconnaissance almost always includes one. Addresses inside a
-    /// verified crawler's published ranges (Googlebot, Bingbot, GPTBot)
-    /// are never blocked.
-    ///
-    /// Same caveats as `block-ssh-scanners`: nothing is enforced until the
-    /// firewall script is rendered and applied.
-    BlockWebScanners {
-        /// Distinct 404'd paths from one address before it counts as a
-        /// scanner (not total hits, and not a rate). Defaults to the stored
-        /// threshold (`set-detector web-scanners --threshold`), which is 7
-        /// unless changed. Must be at least 1.
-        #[arg(long, value_parser = min_threshold)]
-        threshold: Option<usize>,
-        #[arg(long, value_parser = ttl_days_arg, help = TTL_HELP)]
-        ttl_days: Option<i64>,
-        #[arg(long, help = ACCESS_LOG_HELP)]
-        access_log: Option<PathBuf>,
-        #[arg(long, help = DRY_RUN_HELP)]
-        dry_run: bool,
-    },
-    /// Block addresses faking a Googlebot, Bingbot or GPTBot user agent.
-    ///
-    /// Scans the web server's access log for addresses that claim, in their user
-    /// agent, to be Googlebot, Bingbot or GPTBot while connecting from an
-    /// address that crawler's operator does not publish — the cheapest and
-    /// most common bot disguise there is — and stores a temporary block for
-    /// each.
-    ///
-    /// This is the offline stand-in for forward-confirmed reverse DNS: the
-    /// operators' published address lists answer the same "is this really
-    /// Google?" question against a log after the fact. There is no
-    /// --threshold: one forged request is already conclusive.
-    ///
-    /// Inert until `update-ip-ranges` has fetched at least one crawler's
-    /// ranges: with none stored, every real crawler request would look
-    /// forged, so that crawler is skipped. Same caveats as
-    /// `block-ssh-scanners`.
-    BlockSpoofedCrawlers {
-        /// How many days a block lasts. Defaults to this detector's stored
-        /// TTL (`set-detector`), which is one day unless changed: if a
-        /// crawler operator publishes a new range faster than the daily
-        /// range refresh picks it up, this bounds how long a real crawler
-        /// address stays blocked.
-        #[arg(long, value_parser = ttl_days_arg)]
-        ttl_days: Option<i64>,
-        #[arg(long, help = ACCESS_LOG_HELP)]
-        access_log: Option<PathBuf>,
-        #[arg(long, help = DRY_RUN_HELP)]
-        dry_run: bool,
-    },
-    /// Block addresses that asked for /.env, /.git/config and friends.
-    ///
-    /// Scans the web server's access log for addresses that requested a path
-    /// nothing legitimate asks for — `/.env`, `/.git/config`,
-    /// `/wp-config.php`, `/vendor/phpunit/...` and similar — and stores a
-    /// temporary block for each.
-    ///
-    /// No --threshold: one request to any of these is already conclusive.
-    /// The built-in list leaves out commonly probed paths that are also
-    /// legitimate somewhere — `/wp-login.php`, `/wp-admin/`,
-    /// `/xmlrpc.php`, `/phpmyadmin` — since instantly blocking a site's own
-    /// administrator would be far worse than missing a scanner that
-    /// `block-web-scanners` catches anyway. Add paths of your own with
-    /// `set-probe-paths`.
-    ///
-    /// Same caveats as `block-ssh-scanners`.
-    BlockProbePaths {
-        #[arg(long, value_parser = ttl_days_arg, help = TTL_HELP)]
-        ttl_days: Option<i64>,
         #[arg(long, help = ACCESS_LOG_HELP)]
         access_log: Option<PathBuf>,
         #[arg(long, help = DRY_RUN_HELP)]
@@ -516,7 +454,7 @@ enum Command {
     },
     /// Set the extra probe paths, on top of the built-in list.
     ///
-    /// Replaces the extra paths `block-probe-paths` checks. The built-in
+    /// Replaces the extra paths the probe-paths detector checks. The built-in
     /// list is never removable — switch the detector off instead. One path
     /// per line; blank lines and `#` comments are ignored. Each is looked
     /// for anywhere in the request path, so every entry must start with
@@ -531,30 +469,6 @@ enum Command {
     ListProbePaths {
         #[arg(long, help = JSON_HELP)]
         json: bool,
-    },
-    /// Block anything that fetched the honeypot trap path.
-    ///
-    /// Scans the web server's access log for anything that fetched the honeypot
-    /// trap path and stores a temporary block for each.
-    ///
-    /// The trap path is published as `Disallow:` in the robots.txt this
-    /// tool generates and is otherwise unreferenced, so fetching it means
-    /// the client either read robots.txt and ignored it, or guessed a path
-    /// that exists for no other reason. That makes this the strongest
-    /// signal here — hence the longest default TTL — and, unlike a
-    /// behavioural threshold, one with essentially no way to trip by
-    /// accident.
-    ///
-    /// Does nothing until the path is actually published: turn on
-    /// robots.txt generation (`set-robots-txt --enabled true`) and apply,
-    /// or add the Disallow line yourself.
-    BlockHoneypot {
-        #[arg(long, value_parser = ttl_days_arg, help = TTL_HELP)]
-        ttl_days: Option<i64>,
-        #[arg(long, help = ACCESS_LOG_HELP)]
-        access_log: Option<PathBuf>,
-        #[arg(long, help = DRY_RUN_HELP)]
-        dry_run: bool,
     },
     /// Set the honeypot trap path.
     ///
@@ -675,37 +589,40 @@ enum Command {
         #[arg(long)]
         force_compact: bool,
     },
-    /// Download one crawler's published IP ranges.
+    /// Download the crawlers' published IP ranges: every crawler, or one.
     ///
-    /// Downloads and stores the current CIDR list for one published crawler
-    /// IP-range source: Googlebot, Bingbot or GPTBot.
-    UpdateIpRanges {
-        /// Which source to update: googlebot, bingbot or gptbot
+    /// Downloads and stores the current CIDR lists Googlebot, Bingbot and
+    /// GPTBot publish. A blocked category blocks its crawler's ranges in
+    /// the firewall, and the spoofed-crawlers detector checks claims
+    /// against them.
+    UpdateCrawlerRanges {
+        /// Only this crawler: googlebot, bingbot or gptbot. Every one
+        /// without it
         #[arg(long)]
-        source_id: String,
+        source_id: Option<String>,
         /// Read the list from a local file instead of downloading it
         /// (parsed as this source's format). For a host with no outbound
         /// access — and what makes this path testable offline
-        #[arg(long)]
+        #[arg(long, requires = "source_id")]
         source: Option<PathBuf>,
     },
-    /// Download one third-party CIDR feed (does not switch it on).
+    /// Download third-party CIDR feeds: every one switched on, or one.
     ///
-    /// Downloads and stores one third-party CIDR feed: a reputation list
-    /// (firehol-level1, tor-exits, blocklist-de) or a cloud provider's
-    /// published address space (aws, google-cloud, digitalocean). Fetching
-    /// does *not* switch the feed on — see `set-reputation-source` — so
-    /// refreshing a feed you deliberately disabled never silently re-enables
-    /// it.
-    UpdateReputationSource {
-        /// Which feed: firehol-level1, tor-exits, blocklist-de, aws,
-        /// google-cloud or digitalocean
+    /// Downloads and stores a reputation list (firehol-level1, tor-exits,
+    /// blocklist-de) or a cloud provider's published address space (aws,
+    /// google-cloud, digitalocean). Without --source-id, every feed that is
+    /// switched on. Fetching does *not* switch a feed on — see
+    /// `set-reputation-source` — so refreshing a feed you deliberately
+    /// disabled never silently re-enables it.
+    UpdateReputationSources {
+        /// Only this feed: firehol-level1, tor-exits, blocklist-de, aws,
+        /// google-cloud or digitalocean. Every feed switched on without it
         #[arg(long)]
-        source_id: String,
+        source_id: Option<String>,
         /// Read the list from a local file instead of downloading it
         /// (parsed as this source's format). For a host with no outbound
         /// access — and what makes this path testable offline
-        #[arg(long)]
+        #[arg(long, requires = "source_id")]
         source: Option<PathBuf>,
     },
     /// Switch a third-party CIDR feed on or off.
@@ -739,18 +656,19 @@ enum Command {
         #[arg(long, help = JSON_HELP)]
         json: bool,
     },
-    /// Download one country's IP ranges (does not select it).
+    /// Download country IP ranges: every selected country, or one.
     ///
-    /// Downloads and stores IPdeny's current aggregated CIDR list for one
-    /// country. It does not select it — see `add-country`.
+    /// Downloads and stores IPdeny's current aggregated CIDR lists. One
+    /// named with --country is not selected by this — see `add-country`.
     UpdateCountryRanges {
-        /// Two-letter country code, e.g. "us" or "nl"
+        /// Only this country, by its two-letter code, e.g. "us" or "nl".
+        /// Every selected country without it
         #[arg(long)]
-        country: String,
+        country: Option<String>,
         /// Read the list from a local file instead of downloading it
         /// (parsed as this source's format). For a host with no outbound
         /// access — and what makes this path testable offline
-        #[arg(long)]
+        #[arg(long, requires = "country")]
         source: Option<PathBuf>,
     },
     /// Set the geo mode: blocklist or allowlist.
@@ -891,7 +809,8 @@ enum Command {
     ///
     /// Adds a request-path prefix that a site's blocking rules don't apply
     /// to. Run `apply-blocks` afterwards to write it into the site config.
-    ExemptPath {
+    /// `remove-exempt-path` takes it back.
+    AddExemptPath {
         /// The site's server_name, as `scan-sites` discovered it
         #[arg(long)]
         site: String,
@@ -904,9 +823,21 @@ enum Command {
         /// out of the exempt prefix.
         #[arg(long)]
         user_agent: Option<String>,
-        /// Remove the exemption instead of adding it
+    },
+    /// Remove a path exemption added with `add-exempt-path`.
+    ///
+    /// Give the same --site, --path and --user-agent it was added with. Run
+    /// `apply-blocks` afterwards to write the change into the site config.
+    RemoveExemptPath {
+        /// The site's server_name, as `scan-sites` discovered it
         #[arg(long)]
-        remove: bool,
+        site: String,
+        /// The path prefix. Must start with `/`.
+        #[arg(long)]
+        path: String,
+        /// The user agent it was limited to, if it was
+        #[arg(long)]
+        user_agent: Option<String>,
     },
     /// Turn generation of a robots.txt on or off.
     ///
@@ -1064,8 +995,8 @@ enum Command {
     },
     /// Remember where this host's logs actually are.
     ///
-    /// The companion to `set-web-server` and `set-nginx-commands`, for the
-    /// other half of a containerised web server. A container that
+    /// The companion to `set-web-server`, for the other half of a
+    /// containerised web server. A container that
     /// bind-mounts its log directory writes the access log somewhere that
     /// is not /var/log/nginx/access.log (or /var/log/apache2/access.log) on
     /// the host, and `--access-log` on a
@@ -1105,6 +1036,7 @@ enum Command {
     /// that genuinely contains a space.
     ///
     /// Pass no flag to print the commands currently in effect.
+    #[command(hide = true)]
     SetNginxCommands {
         /// The config check. Must exit non-zero on a bad config.
         #[arg(long)]
@@ -1133,9 +1065,8 @@ enum Command {
     /// apache2`. Stored in the host settings, so every command and the TUI
     /// follow it.
     ///
-    /// Takes the chosen server's own commands and config root as
-    /// `set-nginx-commands` does NGINX's, for a server that is not where a
-    /// stock install puts it. On RHEL and its relatives, whose Apache
+    /// Also takes the server's own commands and config root, for a server
+    /// that is not where a stock install puts it. On RHEL and its relatives, whose Apache
     /// reads conf.d and logs to /var/log/httpd:
     ///
     ///   set-web-server apache --root /etc/httpd --test "apachectl configtest" --reload "systemctl reload httpd"
@@ -1602,8 +1533,103 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+/// Spellings of the command line that still work but are on their way
+/// out: the old verb (and, for a few, a flag that used to change what it
+/// did), and what it is now. Each is rewritten to the new spelling before
+/// parsing, with a warning on stderr, so the old one cannot drift from the
+/// new one. They go in 2.0.0 (see "Versioning" in `RELEASING.md`).
+///
+/// `(old verb, flag that selects this row or "", new verb, words inserted
+/// after it)`.
+const DEPRECATED: &[(&str, &str, &str, &[&str])] = &[
+    ("block-ssh-scanners", "", "run-detector", &["ssh-scanners"]),
+    ("block-scanners", "", "run-detector", &["ssh-scanners"]),
+    ("block-web-scanners", "", "run-detector", &["web-scanners"]),
+    (
+        "block-spoofed-crawlers",
+        "",
+        "run-detector",
+        &["spoofed-crawlers"],
+    ),
+    ("block-probe-paths", "", "run-detector", &["probe-paths"]),
+    ("block-honeypot", "", "run-detector", &["honeypot"]),
+    ("trust", "--remove", "remove-trusted", &[]),
+    ("trust", "", "add-trusted", &[]),
+    ("exempt-path", "--remove", "remove-exempt-path", &[]),
+    ("exempt-path", "", "add-exempt-path", &[]),
+    ("update-ip-ranges", "", "update-crawler-ranges", &[]),
+    (
+        "update-reputation-source",
+        "",
+        "update-reputation-sources",
+        &[],
+    ),
+];
+
+/// `args` with a deprecated spelling (see [`DEPRECATED`]) rewritten to the
+/// current one, and the warning to print, if there was one.
+fn undeprecate(mut args: Vec<std::ffi::OsString>) -> (Vec<std::ffi::OsString>, Option<String>) {
+    // The verb is the first word that is neither a flag nor the value of
+    // the one global flag that takes a value.
+    let mut at = None;
+    let mut i = 1;
+    while i < args.len() {
+        let arg = args[i].to_string_lossy();
+        if arg == "--db" {
+            i += 2;
+            continue;
+        }
+        if !arg.starts_with('-') {
+            at = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let Some(at) = at else {
+        return (args, None);
+    };
+    let verb = args[at].to_string_lossy().into_owned();
+    let row = DEPRECATED.iter().find(|(old, flag, _, _)| {
+        *old == verb && (flag.is_empty() || args[at + 1..].iter().any(|a| a == *flag))
+    });
+    let Some((old, flag, new, insert)) = row else {
+        return (args, None);
+    };
+    if !flag.is_empty() {
+        args.retain(|a| a != *flag);
+    }
+    let replacement: Vec<std::ffi::OsString> = std::iter::once(new.into())
+        .chain(insert.iter().map(Into::into))
+        .collect();
+    args.splice(at..=at, replacement);
+    let was = if flag.is_empty() {
+        (*old).to_string()
+    } else {
+        format!("{old} {flag}")
+    };
+    let now = std::iter::once(*new)
+        .chain(insert.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (args, Some(deprecation(&was, &now)))
+}
+
+/// The one line a deprecated spelling prints.
+fn deprecation(was: &str, now: &str) -> String {
+    format!("warning: `{was}` is deprecated, use `{now}`; it will be removed in 2.0.0")
+}
+
+/// Prints [`deprecation`] for a spelling that is still its own command.
+fn deprecated(was: &str, now: &str) {
+    say_err!("{}", deprecation(was, now));
+}
+
 async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let (args, warning) = undeprecate(std::env::args_os().collect());
+    if let Some(warning) = warning {
+        say_err!("{warning}");
+    }
+    let cli = Cli::parse_from(args);
     // A one-shot command's output is often piped into something that stops
     // reading early (`| head`). Rust ignores SIGPIPE, so the next write is
     // an error, and `say!` (`println!` underneath) turns that into a panic.
@@ -1749,35 +1775,18 @@ async fn run() -> Result<()> {
             after,
         }) => revert_firewall(db, backend, out, token, after),
         Some(Command::SetFirewallBackend { backend }) => set_firewall_backend(db, backend),
-        Some(Command::BlockSshScanners {
+        Some(Command::RunDetector {
+            detector,
             threshold,
             ttl_days,
             ssh_log,
-            dry_run,
-        }) => block_scanners(db, threshold, ttl_days, ssh_log, dry_run),
-        Some(Command::BlockWebScanners {
-            threshold,
-            ttl_days,
             access_log,
             dry_run,
-        }) => block_web_scanners(db, threshold, ttl_days, access_log, dry_run),
-        Some(Command::BlockSpoofedCrawlers {
-            ttl_days,
-            access_log,
-            dry_run,
-        }) => block_spoofed_crawlers(db, ttl_days, access_log, dry_run),
-        Some(Command::BlockProbePaths {
-            ttl_days,
-            access_log,
-            dry_run,
-        }) => block_probe_paths(db, ttl_days, access_log, dry_run),
+        }) => run_detector(
+            db, detector.0, threshold, ttl_days, ssh_log, access_log, dry_run,
+        ),
         Some(Command::SetProbePaths { paths }) => set_probe_paths(db, paths),
         Some(Command::ListProbePaths { json }) => list_probe_paths(db, json),
-        Some(Command::BlockHoneypot {
-            ttl_days,
-            access_log,
-            dry_run,
-        }) => block_honeypot(db, ttl_days, access_log, dry_run),
         Some(Command::SetHoneypotPath { path }) => set_honeypot_path(db, path),
         Some(Command::ListDetectors { json }) => list_detectors(db, json),
         Some(Command::SetDetector {
@@ -1794,11 +1803,11 @@ async fn run() -> Result<()> {
         Some(Command::RecordAccessStats { access_log }) => record_access_stats(db, access_log),
         Some(Command::ListAccessStats { json }) => list_access_stats(db, json),
         Some(Command::Maintain { force_compact }) => maintain(db, force_compact),
-        Some(Command::UpdateIpRanges { source_id, source }) => {
-            update_ip_ranges(db, source_id, source).await
+        Some(Command::UpdateCrawlerRanges { source_id, source }) => {
+            update_crawler_ranges(db, source_id, source).await
         }
-        Some(Command::UpdateReputationSource { source_id, source }) => {
-            update_reputation_source(db, source_id, source).await
+        Some(Command::UpdateReputationSources { source_id, source }) => {
+            update_reputation_sources(db, source_id, source).await
         }
         Some(Command::SetReputationSource { source_id, enabled }) => {
             set_reputation_source(db, source_id, enabled)
@@ -1828,7 +1837,10 @@ async fn run() -> Result<()> {
             reload,
             root,
             reset,
-        }) => set_nginx_commands(db, test, reload, root, reset),
+        }) => {
+            deprecated("set-nginx-commands", "set-web-server nginx");
+            set_nginx_commands(db, test, reload, root, reset)
+        }
         Some(Command::SetWebServer {
             server,
             test,
@@ -1856,17 +1868,24 @@ async fn run() -> Result<()> {
             rule,
             enabled,
         }) => set_site_rule(db, site, rule, enabled),
-        Some(Command::ExemptPath {
+        Some(Command::AddExemptPath {
             site,
             path,
             user_agent,
-            remove,
-        }) => exempt_path(db, site, path, user_agent, remove),
-        Some(Command::Trust {
+        }) => exempt_path(db, site, path, user_agent, false),
+        Some(Command::RemoveExemptPath {
+            site,
+            path,
+            user_agent,
+        }) => exempt_path(db, site, path, user_agent, true),
+        Some(Command::AddTrusted {
             address,
             user_agent,
-            remove,
-        }) => trust(db, address, user_agent, remove),
+        }) => trust(db, address, user_agent, false),
+        Some(Command::RemoveTrusted {
+            address,
+            user_agent,
+        }) => trust(db, address, user_agent, true),
         Some(Command::ListTurnedAway { access_log, json }) => {
             list_turned_away(db, access_log, json)
         }
@@ -2276,21 +2295,49 @@ fn scan_sites(root: Option<&Path>, db_path: Option<PathBuf>) -> Result<()> {
 
 async fn update_bot_lists(
     db_path: Option<PathBuf>,
-    source_id: String,
+    source_id: Option<String>,
     source: Option<PathBuf>,
 ) -> Result<()> {
     let db = open_db(db_path)?;
-    let kind = botlist::SourceKind::from_id(&source_id)
-        .with_context(|| format!("unknown bot-list source id: {source_id}"))?;
-    let (count, skipped) = match source {
-        Some(path) => botlist::store_raw(&db, kind, &std::fs::read_to_string(&path)?)?,
-        None => botlist::update(&db, kind).await?,
+    let kinds = match (source_id, &source) {
+        (Some(id), _) => vec![botlist::SourceKind::from_id(&id)
+            .with_context(|| format!("unknown bot-list source id: {id}"))?],
+        (None, Some(_)) => vec![botlist::SourceKind::WellKnownBots],
+        (None, None) => botlist::SourceKind::ALL.to_vec(),
     };
-    say!("Stored {count} bot(s) from {}", kind.name());
-    if let Some(note) = botlist::left_out_note(skipped) {
-        say!("It {note}.");
+    let mut failed = Vec::new();
+    for kind in kinds {
+        let stored = match &source {
+            Some(path) => std::fs::read_to_string(path)
+                .map_err(anyhow::Error::from)
+                .and_then(|raw| botlist::store_raw(&db, kind, &raw)),
+            None => botlist::update(&db, kind).await,
+        };
+        match stored {
+            Ok((count, skipped)) => {
+                say!("Stored {count} bot(s) from {}", kind.name());
+                if let Some(note) = botlist::left_out_note(skipped) {
+                    say!("It {note}.");
+                }
+            }
+            Err(err) => failed.push(format!("{}: {err:#}", kind.name())),
+        }
     }
-    Ok(())
+    each_or_fail(failed)
+}
+
+/// The end of an "every source, or one" update: fine if every one was
+/// stored, and otherwise an error naming each that was not, after the rest
+/// were. One feed that is down must not stop the others being refreshed.
+fn each_or_fail(failed: Vec<String>) -> Result<()> {
+    if failed.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} could not be updated:\n{}",
+        failed.len(),
+        failed.join("\n")
+    )
 }
 
 /// `apply-blocks --dry-run`: the files an apply would change, and with
@@ -2599,34 +2646,63 @@ fn set_firewall_backend(db_path: Option<PathBuf>, backend: FirewallBackend) -> R
     Ok(())
 }
 
-async fn update_ip_ranges(
+async fn update_crawler_ranges(
     db_path: Option<PathBuf>,
-    source_id: String,
+    source_id: Option<String>,
     source: Option<PathBuf>,
 ) -> Result<()> {
     let db = open_db(db_path)?;
-    let kind = ipranges::IpRangeSourceKind::from_id(&source_id)
-        .with_context(|| format!("unknown ip-range source id: {source_id}"))?;
-    let count = match source {
-        Some(path) => ipranges::store(&db, kind, &kind.parse(&read_source_file(&path)?)?)?,
-        None => ipranges::update(&db, kind).await?,
+    let kinds = match source_id {
+        Some(id) => vec![ipranges::IpRangeSourceKind::from_id(&id)
+            .with_context(|| format!("unknown crawler source id: {id}"))?],
+        None => ipranges::IpRangeSourceKind::ALL.to_vec(),
     };
-    say!("Stored {count} CIDR range(s) from {}", kind.name());
-    Ok(())
+    let mut failed = Vec::new();
+    for kind in kinds {
+        let stored = match &source {
+            Some(path) => read_source_file(path)
+                .and_then(|raw| kind.parse(&raw))
+                .and_then(|ranges| ipranges::store(&db, kind, &ranges)),
+            None => ipranges::update(&db, kind).await,
+        };
+        match stored {
+            Ok(count) => say!("Stored {count} CIDR range(s) from {}", kind.name()),
+            Err(err) => failed.push(format!("{}: {err:#}", kind.name())),
+        }
+    }
+    each_or_fail(failed)
 }
 
 async fn update_country_ranges(
     db_path: Option<PathBuf>,
-    country: String,
+    country: Option<String>,
     source: Option<PathBuf>,
 ) -> Result<()> {
     let db = open_db(db_path)?;
-    let count = match source {
-        Some(path) => ipranges::store_country(&db, &country, &read_source_file(&path)?)?,
-        None => ipranges::update_country(&db, &country).await?,
+    let countries = match country {
+        Some(country) => vec![country],
+        None => {
+            let selected = db.list_selected_countries()?;
+            if selected.is_empty() {
+                say!("No country is selected, so there is nothing to update (`add-country`).");
+            }
+            selected
+        }
     };
-    say!("Stored {count} CIDR range(s) for country {country}");
-    Ok(())
+    let mut failed = Vec::new();
+    for country in countries {
+        let stored = match &source {
+            Some(path) => {
+                read_source_file(path).and_then(|raw| ipranges::store_country(&db, &country, &raw))
+            }
+            None => ipranges::update_country(&db, &country).await,
+        };
+        match stored {
+            Ok(count) => say!("Stored {count} CIDR range(s) for country {country}"),
+            Err(err) => failed.push(format!("{country}: {err:#}")),
+        }
+    }
+    each_or_fail(failed)
 }
 
 /// Reads a `--source` override, saying which file failed rather than
@@ -2654,7 +2730,7 @@ fn set_geo_mode(db_path: Option<PathBuf>, mode: GeoModeArg) -> Result<()> {
             (stop_bots::db::GeoMode::Allowlist, true) =>
                 "WARNING: no country is selected, so every address is blocked except trusted \
                  addresses, SSH logins from the last week and private networks. Add the countries \
-                 you allow with `add-country`, or trust your address with `trust --address`."
+                 you allow with `add-country`, or trust your address with `add-trusted --address`."
                     .to_string(),
             (stop_bots::db::GeoMode::Allowlist, false) => format!(
                 "Allowed: {countries}. Every other country is blocked on every port; make sure the \
@@ -2666,37 +2742,69 @@ fn set_geo_mode(db_path: Option<PathBuf>, mode: GeoModeArg) -> Result<()> {
     Ok(())
 }
 
-async fn update_reputation_source(
+async fn update_reputation_sources(
     db_path: Option<PathBuf>,
-    source_id: String,
+    source_id: Option<String>,
     source: Option<PathBuf>,
 ) -> Result<()> {
     use stop_bots::ipranges::reputation::{self, ReputationSourceKind};
 
     let db = open_db(db_path)?;
-    let Some(kind) = ReputationSourceKind::from_id(&source_id) else {
-        let known: Vec<&str> = ReputationSourceKind::ALL.iter().map(|k| k.id()).collect();
-        anyhow::bail!("unknown source: {source_id} (known: {})", known.join(", "));
+    let kinds = match source_id {
+        Some(id) => {
+            let Some(kind) = ReputationSourceKind::from_id(&id) else {
+                let known: Vec<&str> = ReputationSourceKind::ALL.iter().map(|k| k.id()).collect();
+                anyhow::bail!("unknown source: {id} (known: {})", known.join(", "));
+            };
+            vec![kind]
+        }
+        None => {
+            let on: Vec<ReputationSourceKind> = db
+                .list_reputation_sources()?
+                .into_iter()
+                .filter(|s| s.enabled)
+                .filter_map(|s| ReputationSourceKind::from_id(&s.id))
+                .collect();
+            if on.is_empty() {
+                say!(
+                    "No feed is switched on, so there is nothing to update \
+                     (`set-reputation-source`, or name one with --source-id)."
+                );
+            }
+            on
+        }
     };
-    let count = match source {
-        Some(path) => reputation::store(&db, kind, &kind.parse(&read_source_file(&path)?)?)?,
-        None => reputation::update(&db, kind).await?,
-    };
-    say!("Stored {count} range(s) for {}", kind.name());
-    // Fetching and enabling are separate on purpose; say so, or a fetch
-    // that appears to succeed but changes nothing reads as a bug.
-    let enabled = db
-        .list_reputation_sources()?
-        .into_iter()
-        .any(|s| s.id == kind.id() && s.enabled);
-    if !enabled {
-        say!(
-            "This feed is currently OFF — run `stop-bots set-reputation-source --source-id {} \
-             --enabled true` to apply it.",
-            kind.id()
-        );
+    let mut failed = Vec::new();
+    for kind in kinds {
+        let stored = match &source {
+            Some(path) => read_source_file(path)
+                .and_then(|raw| kind.parse(&raw))
+                .and_then(|ranges| reputation::store(&db, kind, &ranges)),
+            None => reputation::update(&db, kind).await,
+        };
+        let count = match stored {
+            Ok(count) => count,
+            Err(err) => {
+                failed.push(format!("{}: {err:#}", kind.name()));
+                continue;
+            }
+        };
+        say!("Stored {count} range(s) for {}", kind.name());
+        // Fetching and enabling are separate on purpose; say so, or a fetch
+        // that appears to succeed but changes nothing reads as a bug.
+        let enabled = db
+            .list_reputation_sources()?
+            .into_iter()
+            .any(|s| s.id == kind.id() && s.enabled);
+        if !enabled {
+            say!(
+                "This feed is currently OFF — run `stop-bots set-reputation-source --source-id {} \
+                 --enabled true` to apply it.",
+                kind.id()
+            );
+        }
     }
-    Ok(())
+    each_or_fail(failed)
 }
 
 fn set_reputation_source(db_path: Option<PathBuf>, source_id: String, enabled: bool) -> Result<()> {
@@ -2729,7 +2837,7 @@ fn set_reputation_source(db_path: Option<PathBuf>, source_id: String, enabled: b
             .unwrap_or(0);
         if count == 0 {
             say!(
-                "No ranges stored yet — run `stop-bots update-reputation-source --source-id {}` \
+                "No ranges stored yet — run `stop-bots update-reputation-sources --source-id {}` \
                  first, or this does nothing.",
                 kind.id()
             );
@@ -2955,7 +3063,7 @@ fn trust(
             // address.
             say!(
                 "The detectors and the firewall still judge it by its address — trust that \
-                 too with `stop-bots trust --address` if it must never be blocked at all."
+                 too with `stop-bots add-trusted --address` if it must never be blocked at all."
             );
             say!("Run `stop-bots apply-blocks` to put it in effect.");
         }
@@ -3027,7 +3135,7 @@ fn list_turned_away(
         );
     }
     say!();
-    say!("Allow one with: stop-bots trust --user-agent \"<part of the agent>\"");
+    say!("Allow one with: stop-bots add-trusted --user-agent \"<part of the agent>\"");
     Ok(())
 }
 
@@ -4023,7 +4131,7 @@ fn set_nginx_commands(
     )
 }
 
-/// What `set-web-server` and `set-nginx-commands` may change about one
+/// What `set-web-server` (and the deprecated `set-nginx-commands`) may change about one
 /// server.
 struct ServerSettings {
     test: Option<String>,
@@ -4449,6 +4557,80 @@ fn capitalised(text: &str) -> String {
     }
 }
 
+/// `run-detector`: one detector over a whole log, now. The five that had
+/// a verb of their own before keep their wording; the rest share one.
+fn run_detector(
+    db_path: Option<PathBuf>,
+    detector: Detector,
+    threshold: Option<usize>,
+    ttl_days: Option<i64>,
+    ssh_log: Option<PathBuf>,
+    access_log: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
+    let name = stop_bots::blocks::detector_name(detector);
+    let counts = matches!(
+        detector,
+        Detector::SshScanners
+            | Detector::WebScanners
+            | Detector::AssetRatio
+            | Detector::RotatingUserAgent
+            | Detector::RefererlessCrawl
+    );
+    if threshold.is_some() && !counts {
+        anyhow::bail!(
+            "{name} has no threshold: one matching request is already conclusive (the ones \
+             that have one are ssh-scanners, web-scanners, asset-ratio, rotating-ua and \
+             refererless)"
+        );
+    }
+    if detector == Detector::SshScanners && access_log.is_some() {
+        anyhow::bail!("ssh-scanners reads the SSH log: give --ssh-log, not --access-log");
+    }
+    if detector != Detector::SshScanners && ssh_log.is_some() {
+        anyhow::bail!("{name} reads the access log: give --access-log, not --ssh-log");
+    }
+    match detector {
+        Detector::SshScanners => block_scanners(db_path, threshold, ttl_days, ssh_log, dry_run),
+        Detector::WebScanners => {
+            block_web_scanners(db_path, threshold, ttl_days, access_log, dry_run)
+        }
+        Detector::SpoofedCrawlers => block_spoofed_crawlers(db_path, ttl_days, access_log, dry_run),
+        Detector::ProbePaths => block_probe_paths(db_path, ttl_days, access_log, dry_run),
+        Detector::Honeypot => block_honeypot(db_path, ttl_days, access_log, dry_run),
+        Detector::Injection
+        | Detector::RobotsTxt
+        | Detector::AssetRatio
+        | Detector::RotatingUserAgent
+        | Detector::RefererlessCrawl => {
+            let db = open_db(db_path)?;
+            let ttl_days = match ttl_days {
+                Some(days) => days,
+                None => detector.ttl_days(&db)?,
+            };
+            let log_text = read_access_log(&db, access_log.as_deref())?;
+            use stop_bots::scanblock as sb;
+            let outcome = match detector {
+                Detector::Injection => sb::block_injection(&db, ttl_days, &log_text, dry_run)?,
+                Detector::RobotsTxt => sb::block_robots_txt(&db, ttl_days, &log_text, dry_run)?,
+                Detector::AssetRatio => {
+                    sb::block_asset_ratio(&db, ttl_days, &log_text, threshold, dry_run)?
+                }
+                Detector::RotatingUserAgent => {
+                    sb::block_rotating_ua(&db, ttl_days, &log_text, threshold, dry_run)?
+                }
+                _ => sb::block_refererless(&db, ttl_days, &log_text, threshold, dry_run)?,
+            };
+            if outcome.candidates == 0 {
+                say!("{} found nothing to block.", detector.spec().label);
+                return Ok(());
+            }
+            print_scan_block_outcome(&outcome);
+            Ok(())
+        }
+    }
+}
+
 /// Finds scanning IPs in the SSH log and adds a temporary Block rule for
 /// each — see [`stop_bots::scanblock::block_ssh_scanners`] for the shared
 /// detection/insertion logic (also used by the internal cron's
@@ -4502,7 +4684,7 @@ fn block_web_scanners(
     }
     if !outcome.crawler_exclusion_active {
         say!(
-            "Warning: no crawler IP ranges fetched yet (run update-ip-ranges --source-id \
+            "Warning: no crawler IP ranges fetched yet (run update-crawler-ranges --source-id \
              googlebot/bingbot/gptbot first) — known-crawler exclusion is inactive, so a \
              legitimate search crawler chasing stale links could be flagged below."
         );
@@ -4543,7 +4725,7 @@ fn block_spoofed_crawlers(
     // never ran, not that the log is clean.
     if !outcome.crawler_exclusion_active {
         say!(
-            "No crawler IP ranges fetched yet — run `stop-bots update-ip-ranges --source-id \
+            "No crawler IP ranges fetched yet — run `stop-bots update-crawler-ranges --source-id \
              googlebot` (and bingbot/gptbot) first. Nothing was checked."
         );
         return Ok(());
@@ -5100,7 +5282,7 @@ mod tests {
         }
     }
 
-    /// `block-probe-paths` printed its opening sentence twice, because the
+    /// `run-detector probe-paths` printed its opening sentence twice, because the
     /// summary was repeated as the first paragraph of the long text.
     #[test]
     fn no_paragraph_of_a_command_s_help_is_repeated() {
@@ -5169,20 +5351,90 @@ mod tests {
         }
     }
 
-    /// The old spellings keep working for one release, and stay out of
-    /// `--help` so nobody starts using them now.
+    fn args(words: &[&str]) -> Vec<std::ffi::OsString> {
+        words.iter().map(Into::into).collect()
+    }
+
+    /// Every deprecated spelling still parses, as the command it became,
+    /// and says so on stderr; none is advertised in `--help`.
     #[test]
-    fn a_renamed_command_still_parses_under_its_old_name() {
-        let cli = Cli::try_parse_from(["stop-bots", "block-scanners", "--dry-run"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::BlockSshScanners { dry_run: true, .. })
-        ));
+    fn every_deprecated_spelling_is_rewritten_to_its_replacement_and_warns() {
         let help = Cli::command().render_help().to_string();
-        assert!(
-            !help.contains("block-scanners"),
-            "the old name is advertised:\n{help}"
+        for (old, flag, new, insert) in DEPRECATED {
+            let mut given = vec!["stop-bots", old];
+            if !flag.is_empty() {
+                given.push(flag);
+            }
+            let (rewritten, warning) = undeprecate(args(&given));
+            let mut expected = vec!["stop-bots", new];
+            expected.extend(insert.iter());
+            assert_eq!(rewritten, args(&expected), "{given:?}");
+            let warning = warning.unwrap_or_default();
+            assert!(
+                warning.contains("deprecated") && warning.contains(new),
+                "{given:?} warned: {warning:?}"
+            );
+            assert!(
+                !help.contains(&format!("  {old} ")),
+                "{old} is still advertised:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deprecated_spelling_keeps_its_flags_and_a_global_db_before_it() {
+        let (rewritten, warning) = undeprecate(args(&[
+            "stop-bots",
+            "--db",
+            "/tmp/x.db",
+            "trust",
+            "--remove",
+            "--address",
+            "203.0.113.7",
+        ]));
+        assert_eq!(
+            rewritten,
+            args(&[
+                "stop-bots",
+                "--db",
+                "/tmp/x.db",
+                "remove-trusted",
+                "--address",
+                "203.0.113.7"
+            ])
         );
+        assert!(warning.is_some());
+        let cli = Cli::try_parse_from(rewritten).unwrap();
+        assert!(matches!(cli.command, Some(Command::RemoveTrusted { .. })));
+
+        let (rewritten, _) = undeprecate(args(&["stop-bots", "block-scanners", "--dry-run"]));
+        let cli = Cli::try_parse_from(rewritten).unwrap();
+        assert!(
+            matches!(
+                cli.command,
+                Some(Command::RunDetector {
+                    detector: DetectorArg(Detector::SshScanners),
+                    dry_run: true,
+                    ..
+                })
+            ),
+            "block-scanners --dry-run is not run-detector ssh-scanners --dry-run"
+        );
+    }
+
+    /// The current spellings are left alone, including a `--remove` that
+    /// belongs to a verb no deprecation names.
+    #[test]
+    fn a_current_spelling_is_not_rewritten() {
+        for words in [
+            &["stop-bots", "add-trusted", "--address", "203.0.113.7"][..],
+            &["stop-bots", "run-detector", "injection"][..],
+            &["stop-bots", "--db", "trust", "status"][..],
+        ] {
+            let (rewritten, warning) = undeprecate(args(words));
+            assert_eq!(rewritten, args(words));
+            assert_eq!(warning, None, "{words:?}");
+        }
     }
 
     /// A detector is named the way it is typed, and the stored id — the

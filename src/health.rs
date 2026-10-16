@@ -998,7 +998,7 @@ fn turned_away_clients(db: &Db, probe: &Probe) -> Result<Option<Check>> {
         ),
         fix: Some(
             "see them all with `stop-bots list-turned-away`, and allow one with \
-             `stop-bots trust --user-agent \"<part of the agent>\"`"
+             `stop-bots add-trusted --user-agent \"<part of the agent>\"`"
                 .to_string(),
         ),
     }))
@@ -2032,7 +2032,7 @@ fn nginx_deployment(db: &Db, probe: &Probe) -> Result<Option<Check>> {
                         "NGINX runs on this host, but the reload command is `{}` \u{2014} which targets a container, so no block this tool writes is ever served",
                         commands.reload.join(" ")
                     ),
-                    fix: Some("stop-bots set-nginx-commands --reset".to_string()),
+                    fix: Some("stop-bots set-web-server nginx --reset".to_string()),
                 }
             } else {
                 Check {
@@ -2067,7 +2067,7 @@ fn nginx_deployment(db: &Db, probe: &Probe) -> Result<Option<Check>> {
                 commands.reload.join(" ")
             ),
             fix: Some(format!(
-                "stop-bots set-nginx-commands --test \"docker exec {name} nginx -t\" --reload \"docker exec {name} nginx -s reload\""
+                "stop-bots set-web-server nginx --test \"docker exec {name} nginx -t\" --reload \"docker exec {name} nginx -s reload\""
             )),
         }));
     }

@@ -137,7 +137,7 @@ pub struct Plan {
     pub conf_d_dirs: Vec<PathBuf>,
     /// Generated files the database's record says were written.
     pub recorded: Vec<PathBuf>,
-    /// How to test and reload NGINX, as `set-nginx-commands` stored them.
+    /// How to test and reload NGINX, as `set-web-server` stored them.
     pub nginx: ServerCommands,
     /// The database, kept unless `--purge`.
     pub db_path: PathBuf,

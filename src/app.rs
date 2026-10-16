@@ -224,7 +224,7 @@ pub struct App {
     pub firewall_out: Option<std::path::PathBuf>,
     /// The host settings file ([`crate::hostconf`]): the NGINX commands and
     /// the logs. A field, read at each use, so a test can point it at a
-    /// file of its own and `set-nginx-commands` takes effect without a
+    /// file of its own and `set-web-server` takes effect without a
     /// restart.
     pub host_conf: std::path::PathBuf,
     /// An "update everything" run in progress: the sources still to fetch
@@ -953,7 +953,7 @@ impl App {
 
     /// Starts the `UpdateIpRanges` job's background fetch (Googlebot,
     /// Bingbot, GPTBot — the same three `ipranges::IpRangeSourceKind::ALL`
-    /// sources `update-ip-ranges` fetches). Guarded by
+    /// sources `update-crawler-ranges` fetches). Guarded by
     /// `jobs_in_flight` so a slow round-trip to all three hosts can't
     /// overlap with itself if `check_cron` finds the job still "due" (its
     /// `last_run` doesn't update until it actually finishes) on a later
@@ -1619,7 +1619,7 @@ impl App {
     }
 
     /// Downloads one crawler's published ranges — Enter on a row of the
-    /// Dashboard's Crawler IP ranges panel, the TUI's `update-ip-ranges`.
+    /// Dashboard's Crawler IP ranges panel, the TUI's `update-crawler-ranges`.
     ///
     /// Under the download lease, like `u`: while "update everything", the
     /// scheduled crawler job or another process's download is out it says

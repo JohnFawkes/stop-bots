@@ -405,7 +405,7 @@ pub fn scanning_ips_hosted(log_text: &str, threshold: usize, hosted: Hosted) -> 
 /// One crawler that can be impersonated: a marker that identifies it in a
 /// `User-Agent` string, plus the CIDRs its operator actually publishes.
 /// Built by `crate::scanblock::crawler_claims` from the same
-/// `ipranges::IpRangeSourceKind` data `update-ip-ranges` fetches.
+/// `ipranges::IpRangeSourceKind` data `update-crawler-ranges` fetches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrawlerClaim {
     /// Lowercase substring that identifies a claim to be this crawler
@@ -437,7 +437,7 @@ pub struct CrawlerClaim {
 ///
 /// **A crawler with no fetched ranges is skipped, not treated as
 /// all-spoofed.** `CrawlerClaim::ranges` being empty means
-/// `update-ip-ranges` has never successfully run for that source, in which
+/// `update-crawler-ranges` has never successfully run for that source, in which
 /// case every real crawler request would look like an impersonation — the
 /// single worst failure this detector could have, since it would block the
 /// actual Googlebot on a fresh install. The caller

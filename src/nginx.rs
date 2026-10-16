@@ -1856,7 +1856,7 @@ fn locate_console_block(content: &str, block: &ServerBlock) -> Option<(usize, us
 /// is in a container, or installed under another prefix.
 fn missing_root_hint() -> &'static str {
     "If NGINX's config lives somewhere else, store where with \
-     `stop-bots set-nginx-commands --root <dir>`, or pass `--root <dir>` for one run."
+     `stop-bots set-web-server nginx --root <dir>`, or pass `--root <dir>` for one run."
 }
 
 /// Recursively walks `root` looking for NGINX config files containing

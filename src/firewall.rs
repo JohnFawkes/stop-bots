@@ -442,7 +442,7 @@ impl Guard {
 
 /// What the CLI says gets past [`Guard::NoLogins`].
 pub const NO_LOGINS_CLI_FIX: &str = "Trust the address you log in from \
-    (`stop-bots trust --address <address>`), or, if you never log in over SSH, turn the check off \
+    (`stop-bots add-trusted --address <address>`), or, if you never log in over SSH, turn the check off \
     (`stop-bots set-ssh-lockout-check --enabled false`)";
 
 /// The SSH login window, in days, as the guard's messages say it.

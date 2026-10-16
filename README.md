@@ -297,7 +297,7 @@ That works, and is a setup it was written for. Point it at the config on the bin
 tell it how to test and reload NGINX inside the container, and where the logs end up:
 
 ```
-sudo stop-bots set-nginx-commands --root /srv/app/nginx \
+sudo stop-bots set-web-server nginx --root /srv/app/nginx \
   --test "docker exec web nginx -t" --reload "docker exec web nginx -s reload"
 sudo stop-bots set-log-paths --access-log /srv/app/logs/access.log
 ```

@@ -717,7 +717,7 @@ fn candidate_failed_attempt_counts(log_text: &str) -> std::collections::HashMap<
 /// lines in `log_text` (see [`parse_failed_attempt_ips`] for exactly what
 /// counts, and note the threshold is a count over *however much of the log
 /// `log_text` happens to hold* — could be a day or a month. This is the
-/// one-off form behind `block-scanners`, which reads the log it is given;
+/// one-off form behind `run-detector ssh-scanners`, which reads the log it is given;
 /// the scheduled detector counts only inside its window (see
 /// [`Observer`] and `crate::evidence`). Pick a threshold high enough that
 /// ordinary typos never reach it. Real scanners

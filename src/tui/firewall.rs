@@ -41,7 +41,7 @@
 //! as text — there's no persisted "SSH attempt stats"
 //! table, deliberately: this screen is a real-time view of the current
 //! log, not a lifetime tally (that's what `sshlog::scanning_ips`/
-//! `block-scanners` already handle, on their own cron cadence). The
+//! `run-detector ssh-scanners` already handle, on their own cron cadence). The
 //! User Agent panel *does* read from `Db::list_user_agent_stats` (the
 //! same table `record-access-stats`/`RecordAccessStats` populate) since
 //! that's already a cheap, pre-aggregated lifetime count — counting only
@@ -52,7 +52,7 @@
 //!
 //! Both panels use the same `RowStatus`: `Pending` (no block on file yet,
 //! rendered as "NOT BLOCKED") or `Blocked` (`until: Some(t)` for a temporary
-//! `firewall_rules` block — e.g. one `block-scanners` already added — `None`
+//! `firewall_rules` block — e.g. one `run-detector ssh-scanners` already added — `None`
 //! for permanent). Only the SSH panel can show a temporary `Blocked`; a
 //! manually-blocked user agent is always permanent, since
 //! [`crate::db::Db::block_user_agent`] has no TTL concept.

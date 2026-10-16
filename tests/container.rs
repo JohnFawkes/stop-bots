@@ -1128,7 +1128,7 @@ fn uninstall_puts_the_host_back_as_it_was() {
     host.sh("stop-bots install firewall");
     host.seed_bot("badbot", "BadBot");
     host.stop_bots("set-rate-limit --enabled true");
-    host.stop_bots("trust --address 192.0.2.77");
+    host.stop_bots("add-trusted --address 192.0.2.77");
     host.stop_bots("apply-blocks");
     host.stop_bots("add-firewall-rule --address 203.0.113.60");
     host.stop_bots("render-firewall --backend nftables --out /etc/stop-bots/firewall.nft");
@@ -1384,7 +1384,7 @@ fn fetching_the_honeypot_gets_a_real_client_blocked_end_to_end() {
     // The bait, fetched by the real client through the real server.
     client.get_path(&server.name, "/trap-me", "");
 
-    let found = server.stop_bots("block-honeypot --access-log /var/log/nginx/access.log");
+    let found = server.stop_bots("run-detector honeypot --access-log /var/log/nginx/access.log");
     assert!(
         found.contains(&client.address()),
         "the detector did not find the client in the log NGINX wrote:\n{found}"
@@ -1546,7 +1546,7 @@ fn probing_for_dotenv_gets_a_real_client_blocked_end_to_end() {
     client.get_path(&server.name, "/.env", "");
     client.get_path(&server.name, "/.git/config", "");
 
-    let found = server.stop_bots("block-probe-paths --access-log /var/log/nginx/access.log");
+    let found = server.stop_bots("run-detector probe-paths --access-log /var/log/nginx/access.log");
     assert!(
         found.contains(&client.address()),
         "the detector did not find the probing client in NGINX's own log:\n{found}"
@@ -1984,11 +1984,11 @@ fn every_generated_directive_form_parses() {
     server.stop_bots("set-rate-limit --enabled true --rps 5 --burst 10");
     // And trust, which adds a `geo`, two `map`s and a second zone in
     // `conf.d`, and a clear to every block.
-    server.stop_bots("trust --address 2001:db8::/48");
-    server.stop_bots("trust --user-agent Pingdom.com_bot");
+    server.stop_bots("add-trusted --address 2001:db8::/48");
+    server.stop_bots("add-trusted --user-agent Pingdom.com_bot");
     // And an agent exemption, which sets and reads a variable of its own.
     server.stop_bots(
-        "exempt-path --site test.example --path /remote.php/dav/ --user-agent okhttp/4.10",
+        "add-exempt-path --site test.example --path /remote.php/dav/ --user-agent okhttp/4.10",
     );
 
     server.apply_and_reload();
@@ -2038,7 +2038,7 @@ fn an_agent_exemption_serves_only_its_client_on_only_its_paths() {
     server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
     server.seed_bot("okhttp", "okhttp");
     server.seed_bot("badbot", "BadBot");
-    server.stop_bots("exempt-path --site test.example --path /dav/ --user-agent okhttp");
+    server.stop_bots("add-exempt-path --site test.example --path /dav/ --user-agent okhttp");
     server.apply_and_reload();
 
     for (path, user_agent, expected, why) in [
@@ -2104,7 +2104,7 @@ fn a_trusted_user_agent_is_served_past_every_block_it_trips() {
     server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
     server.seed_bot("badbot", "BadBot");
     server.stop_bots("set-site-rule --site test.example --rule no-accept-language --enabled true");
-    server.stop_bots("trust --user-agent badbot-monitor");
+    server.stop_bots("add-trusted --user-agent badbot-monitor");
     server.apply_and_reload();
 
     assert_eq!(
@@ -2143,7 +2143,7 @@ fn a_trusted_address_is_served_past_blocks_and_never_rate_limited() {
 
     // A range rather than the one address, so the `geo` lookup is doing
     // CIDR matching rather than an exact comparison.
-    server.stop_bots("trust --address 127.0.0.0/8");
+    server.stop_bots("add-trusted --address 127.0.0.0/8");
     server.apply_and_reload();
     assert_eq!(
         server.status("/", "-A 'BadBot/1.0'"),
@@ -2156,7 +2156,7 @@ fn a_trusted_address_is_served_past_blocks_and_never_rate_limited() {
         "a trusted client was rate limited: {codes}"
     );
 
-    server.stop_bots("trust --remove --address 127.0.0.0/8");
+    server.stop_bots("remove-trusted --address 127.0.0.0/8");
     server.apply_and_reload();
     assert_eq!(server.status("/", "-A 'BadBot/1.0'"), "403");
     let codes = server.sh(burst);
@@ -2189,7 +2189,7 @@ fn a_trusted_client_inside_a_blocked_range_still_reaches_the_server() {
     server.stop_bots(&format!(
         "add-firewall-rule --address {range} --action block"
     ));
-    server.stop_bots(&format!("trust --address {client_ip}"));
+    server.stop_bots(&format!("add-trusted --address {client_ip}"));
     server.stop_bots("render-firewall --backend nftables --out /tmp/fw.nft --force");
     server.sh("nft -f /tmp/fw.nft");
 
@@ -2199,7 +2199,7 @@ fn a_trusted_client_inside_a_blocked_range_still_reaches_the_server() {
         "{client_ip} is trusted but was dropped by the block on {range}"
     );
 
-    server.stop_bots(&format!("trust --remove --address {client_ip}"));
+    server.stop_bots(&format!("remove-trusted --address {client_ip}"));
     server.stop_bots("render-firewall --backend nftables --out /tmp/fw.nft --force");
     server.sh("nft -f /tmp/fw.nft");
     assert_eq!(
@@ -2263,7 +2263,7 @@ fn exempt_paths_and_well_known_stay_reachable_for_a_blocked_client() {
 
     // An exempt path, plus a request rule that forces /.well-known/ open.
     server.stop_bots("set-site-rule --site test.example --rule no-user-agent --enabled true");
-    server.stop_bots("exempt-path --site test.example --path /blog");
+    server.stop_bots("add-exempt-path --site test.example --path /blog");
     server.apply_and_reload();
 
     assert_eq!(
@@ -2302,7 +2302,7 @@ fn an_exempt_path_stays_exempt_through_a_front_controller() {
     );
     server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
     server.seed_bot("badbot", "BadBot");
-    server.stop_bots("exempt-path --site wp.example --path /wp-json/");
+    server.stop_bots("add-exempt-path --site wp.example --path /wp-json/");
     server.apply_and_reload();
 
     let bot = "-A 'BadBot/1.0'";
@@ -2822,7 +2822,7 @@ fn a_timed_block_is_loaded_with_a_timeout_that_the_kernel_honours() {
         "for i in $(seq 25); do echo 'Aug 17 10:00:01 host sshd[100]: Failed password \
          for root from 203.0.113.50 port 4444 ssh2'; done > /tmp/auth.log",
     );
-    server.stop_bots("block-scanners --ssh-log /tmp/auth.log --ttl-days 1");
+    server.stop_bots("run-detector ssh-scanners --ssh-log /tmp/auth.log --ttl-days 1");
     server.render_and_load("nftables");
 
     let set = server.sh("nft list set inet stop_bots block_v4");
@@ -3828,9 +3828,9 @@ fn apache_lets_exempt_paths_and_trusted_clients_through() {
     }
     let apache = Apache::start("sb-apache-exempt");
     apache.seed_bot("evilbot", "EvilBot");
-    apache.stop_bots("exempt-path --site test.example --path /api/");
-    apache.stop_bots("exempt-path --site test.example --path /dav/ --user-agent okhttp");
-    apache.stop_bots("trust --user-agent UptimeMonitor");
+    apache.stop_bots("add-exempt-path --site test.example --path /api/");
+    apache.stop_bots("add-exempt-path --site test.example --path /dav/ --user-agent okhttp");
+    apache.stop_bots("add-trusted --user-agent UptimeMonitor");
     apache.apply();
 
     // An exempt path reaches the site, which has nothing there.
@@ -3848,7 +3848,7 @@ fn apache_lets_exempt_paths_and_trusted_clients_through() {
     assert_eq!(apache.status("/", "-A 'EvilBot UptimeMonitor'"), "200");
     assert_eq!(apache.status("/", BAD_AGENT), "403");
 
-    apache.stop_bots("trust --address 127.0.0.1");
+    apache.stop_bots("add-trusted --address 127.0.0.1");
     apache.apply();
     assert_eq!(apache.status("/", BAD_AGENT), "200", "a trusted address");
 }
@@ -3911,7 +3911,7 @@ fn apache_uninstall_puts_the_site_back_byte_for_byte() {
     let original = apache.sh(&format!("cat {APACHE_SITE}"));
     apache.seed_bot("evilbot", "EvilBot");
     apache.stop_bots("set-robots-txt --enabled true");
-    apache.stop_bots("trust --user-agent UptimeMonitor");
+    apache.stop_bots("add-trusted --user-agent UptimeMonitor");
     apache.apply();
     apache.sh("test -f /etc/apache2/conf-enabled/stop-bots-trusted.conf");
     apache.sh("test -f /etc/stop-bots/apache/robots.txt");
@@ -3952,11 +3952,11 @@ fn apache_access_log_is_read_by_the_detectors() {
         stats.contains("ApacheLogProbe/1.0"),
         "record-access-stats said:\n{recorded}\nlist-access-stats said:\n{stats}"
     );
-    let detected = apache.stop_bots("block-probe-paths");
+    let detected = apache.stop_bots("run-detector probe-paths");
     let rules = apache.stop_bots("list-firewall-rules");
     assert!(
         rules.contains("203.0.113.10") && !rules.contains("203.0.113.9"),
-        "block-probe-paths said:\n{detected}\nlist-firewall-rules said:\n{rules}"
+        "run-detector probe-paths said:\n{detected}\nlist-firewall-rules said:\n{rules}"
     );
 }
 
@@ -4174,7 +4174,7 @@ fn apache_keeps_an_exempt_path_exempt_through_a_front_controller() {
     let apache = Apache::start("sb-apache-frontctl");
     with_front_controller(&apache);
     apache.seed_bot("evilbot", "EvilBot");
-    apache.stop_bots("exempt-path --site wp.example --path /wp-json/");
+    apache.stop_bots("add-exempt-path --site wp.example --path /wp-json/");
     apache.apply();
 
     let site = "http://127.0.0.1:8083";
@@ -4206,7 +4206,7 @@ fn apache_lets_a_trusted_client_through_a_front_controller() {
     let apache = Apache::start("sb-apache-frontctl-trust");
     with_front_controller(&apache);
     apache.seed_bot("evilbot", "EvilBot");
-    apache.stop_bots("trust --user-agent UptimeMonitor");
+    apache.stop_bots("add-trusted --user-agent UptimeMonitor");
     apache.apply();
 
     let page = "http://127.0.0.1:8083/about/";
@@ -4390,7 +4390,7 @@ fn apache_serves_an_agent_exemption_only_its_client_on_only_its_paths() {
     let apache = Apache::start("sb-apache-agent-exempt");
     apache.seed_bot("okhttp", "okhttp");
     apache.seed_bot("badbot", "BadBot");
-    apache.stop_bots("exempt-path --site test.example --path /dav/ --user-agent okhttp");
+    apache.stop_bots("add-exempt-path --site test.example --path /dav/ --user-agent okhttp");
     apache.apply();
 
     for (path, user_agent, expected, why) in [
@@ -4538,7 +4538,7 @@ impl Host {
         host.stop_bots(
             "set-site-rule --site test.example --rule no-accept-language --enabled true",
         );
-        host.stop_bots("exempt-path --site other.example --path /wp-json/");
+        host.stop_bots("add-exempt-path --site other.example --path /wp-json/");
         host.stop_bots("apply-blocks");
         host.stop_bots("add-firewall-rule --address 203.0.113.50");
         // An SSH log with nobody in it, for the lockout check to read: with
@@ -4880,7 +4880,7 @@ fn apache_on_rhel_blocks_from_conf_d_and_uninstalls_cleanly() {
     let original = apache.sh(&format!("cat {RHEL_SITE}"));
     apache.seed_bot("evilbot", "EvilBot");
     apache.stop_bots("set-robots-txt --enabled true");
-    apache.stop_bots("trust --user-agent 'EvilBot-Monitor'");
+    apache.stop_bots("add-trusted --user-agent 'EvilBot-Monitor'");
     apache.apply_rhel();
 
     let site = apache.sh(&format!("cat {RHEL_SITE}"));
@@ -4940,11 +4940,11 @@ fn apache_on_rhel_detects_from_httpds_access_log() {
         "httpd did not log the client, so this proves nothing"
     );
 
-    let detected = apache.stop_bots("block-probe-paths");
+    let detected = apache.stop_bots("run-detector probe-paths");
     let rules = apache.stop_bots("list-firewall-rules");
     assert!(
         rules.contains("203.0.113.10") && !rules.contains("203.0.113.9"),
-        "block-probe-paths said:\n{detected}\nlist-firewall-rules said:\n{rules}"
+        "run-detector probe-paths said:\n{detected}\nlist-firewall-rules said:\n{rules}"
     );
 }
 

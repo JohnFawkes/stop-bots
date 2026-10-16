@@ -471,8 +471,8 @@ impl FirewallAction {
 /// address or CIDR range), optionally restricted to `port`. `expires_at`
 /// (Unix seconds) is `None` for a permanent, hand-added rule (via
 /// [`Db::add_firewall_rule`]); `Some` for a temporary one (via
-/// [`Db::add_firewall_rule_with_ttl`], e.g. `block-scanners`/
-/// `block-web-scanners`'s auto-detected rows) — see
+/// [`Db::add_firewall_rule_with_ttl`], e.g. `run-detector ssh-scanners`/
+/// `run-detector web-scanners`'s auto-detected rows) — see
 /// [`Db::list_firewall_rules`] for how expiry is actually enforced.
 ///
 /// `source`, `created_at` and `evidence` say why it exists (see
@@ -5181,7 +5181,7 @@ mod tests {
     }
 
     /// The core behavior this method exists for: an IP already temporarily
-    /// blocked by `block-scanners`/`block-web-scanners` must be upgraded to
+    /// blocked by `run-detector ssh-scanners`/`run-detector web-scanners` must be upgraded to
     /// a permanent block in place, not left with its TTL or duplicated into
     /// a second row.
     #[test]

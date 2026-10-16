@@ -38,8 +38,8 @@ Installing starts nothing, and nothing is written until you apply. On the first 
 the settings a new database starts with:
 
 - **Blocked by user agent:** the Scanner and AI crawler categories. Search engines are allowed.
-- **Watching the logs:** five detectors are on: SSH scanners, web scanners, forged crawlers,
-  probes for secrets and injection attempts. The rest are off (see
+- **Watching the logs:** six detectors are on: SSH scanners, web scanners, forged crawlers,
+  probes for secrets, injection attempts and login brute force. The rest are off (see
   [From your logs](#from-your-logs)).
 - **Blocked by address:** nothing yet. Countries, reputation feeds and hosting providers are
   all off until you turn them on, so the firewall starts with only what the detectors find.
@@ -251,21 +251,30 @@ Each detector is a separate switch, and each block is timed and records the log 
 |---|---|---|
 | SSH and web scanners | on | many failed SSH logins, or many different 404s |
 | Forged crawlers | on | a client claiming to be Googlebot, Bingbot or GPTBot from an address that crawler doesn't use |
-| Probing for secrets | on | a single request for `/.env`, `/.git/config` and the like |
+| Probing for secrets | on | a single request for `/.env`, `/.git/config` and the like, and for `/wp-login.php` or `/phpmyadmin` where no site runs that application |
 | Injection attempts | on | a single request carrying an exploit, such as Shellshock or Log4Shell |
+| Login brute force | on | many POSTs to a login page (`/wp-login.php`, `/xmlrpc.php`, `/user/login`…) from one address in an hour |
 | Honeypot | off | a client that visits a path only `robots.txt` mentions |
+| robots.txt violators | off | a client that fetched the generated `robots.txt` and then a page it forbids to that client |
+| Port scanners | off | an address that tries trap ports nothing on the host serves (telnet, SMB, RDP, database ports), which the firewall drops and logs |
 | Fetches no assets | off | many pages, and never a stylesheet, script or image |
 | Rotating user agent | off | many user agents from one address |
 | Crawls with no referer | off | many deep pages, never with a `Referer` |
+| Request rate | off | more than 120 requests a minute kept up for an hour, or many refusals from NGINX's rate limit; the only rate defence on Apache |
 
-The last three can catch real people, which is why they are off, and none of the three ever
-blocks a verified search engine.
+The last four can catch real people, which is why they are off, and none of them ever
+blocks a verified search engine. The honeypot and robots.txt violators need the generated
+`robots.txt` served, and port scanners adds rules for other ports to the firewall, which is
+why those are off too. On an existing install, a detector added by an upgrade arrives off;
+`sudo stop-bots set-detector <name> --enabled true` turns one on.
 
 ## By address
 
 - **Whole countries**, or everything except a list of countries.
 - **Known-bad addresses**, from FireHOL level 1, Tor exit nodes and blocklist.de.
-- **Whole hosting providers**: AWS, Google Cloud and DigitalOcean.
+- **Whole hosting providers**: AWS, Google Cloud and DigitalOcean, and by network number
+  Hetzner, OVHcloud, Contabo, Akamai Linode, Vultr, Oracle Cloud, Alibaba Cloud, Tencent
+  Cloud, Scaleway, Leaseweb, M247, Hostinger or any other network you name.
 - **Anything else**, by hand.
 
 All of these are off by default.

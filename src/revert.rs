@@ -392,7 +392,7 @@ pub enum Why {
 pub fn keep(tools: &Tools, pending: &Pending, script: &str) -> Result<Settled> {
     let _lock = crate::applylock::hold()?;
     let applied = &pending.applied_path;
-    if !read_pending(applied).is_some_and(|current| current.token == pending.token) {
+    if read_pending(applied).is_none_or(|current| current.token != pending.token) {
         return Ok(too_late(pending));
     }
     let record = pending_path(applied);

@@ -6,6 +6,19 @@ list — which meant the open items below were unfindable inside it.
 
 ## Worth doing next
 
+* **An operator checking their own site for a leak gets blocked.** Found by
+  `scripts/replay-logs.py` on six months of a real host's logs: the owner's
+  home address asked for `/.DS_Store` to check it was no longer served, and
+  `probe-paths` convicts that. A login exempts an address for seven days
+  (`SSH_LOGIN_WINDOW_SECONDS`), and their last one was weeks earlier. On that
+  log it is the only person any detector would block.
+
+* **One missing path asked for over and over is never a scan.**
+  `web-scanners` counts *distinct* 404s (7 a day), so the same path requested
+  hundreds of times adds up to one. On the same log, the busiest addresses
+  nothing convicts are exactly that: 150 to 700 404s each, nearly all for one
+  camera-firmware path that is not on the probe list either.
+
 * **`ua_matches_blocked_bot_patterns`** (`dynamic.rs`) does case-insensitive
   *substring* matching over `|`-split alternatives, while the web server enforces a
   real case-insensitive regex (NGINX's `~*`, Apache's `RewriteCond ... [NC]`). The

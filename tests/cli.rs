@@ -954,6 +954,33 @@ fn scan_sites_says_which_application_runs_behind_a_site() {
     assert!(!out.contains("blog.example runs"), "out was:\n{out}");
 }
 
+/// A site whose file is gone is forgotten by the next scan, and says so,
+/// rather than reading NOT FOUND for good.
+#[test]
+fn scan_sites_forgets_a_site_whose_file_is_gone() {
+    let fx = Fixture::new();
+    fx.write_site("blog.example");
+    let shop = fx.write_site("shop.example");
+    fx.scan_sites();
+    fs::remove_file(&shop).unwrap();
+
+    let out = String::from_utf8(fx.scan_sites().get_output().stdout.clone()).unwrap();
+
+    assert!(out.contains("Discovered 1 site(s)"), "out was:\n{out}");
+    assert!(out.contains("forgot shop.example"), "out was:\n{out}");
+}
+
+/// A copy of a site's config left beside it is not a second site.
+#[test]
+fn scan_sites_skips_a_backup_of_a_site() {
+    let fx = Fixture::new();
+    let blog = fx.write_site("blog.example");
+    fs::copy(&blog, blog.with_extension("bak-2026-10-12")).unwrap();
+
+    fx.scan_sites()
+        .stdout(predicate::str::contains("Discovered 1 site(s)"));
+}
+
 /// robots.txt generation end to end: the file is written, the site config
 /// aliases it, and disabling removes both.
 #[test]

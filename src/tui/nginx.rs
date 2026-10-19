@@ -540,7 +540,7 @@ impl Nginx {
                             .to_string(),
                         SiteApplyStatus::NotFound => format!(
                             "NOT FOUND: {} no longer has a server block for this name, or \
-                             cannot be read. r scans again.",
+                             cannot be read. r scans again, and forgets it if it is gone.",
                             site.config_path
                         ),
                     }
@@ -1212,14 +1212,14 @@ impl Nginx {
     ) -> String {
         let root = self.root.display();
         let stored = sites.and_then(|sites| {
-            for site in &sites {
-                db.upsert_site(&site.server_name, &site.config_path.to_string_lossy())
-                    .map_err(|err| err.to_string())?;
-            }
-            Ok(sites.len())
+            let gone = webserver::store_scan(db, &sites).map_err(|err| err.to_string())?;
+            Ok((sites.len(), gone))
         });
         match stored {
-            Ok(count) => format!("Discovered {count} site(s) under {root}"),
+            Ok((count, gone)) => format!(
+                "Discovered {count} site(s) under {root}{}",
+                webserver::forgotten_note(&gone)
+            ),
             Err(err) => format!("Site scan failed: {err}"),
         }
     }

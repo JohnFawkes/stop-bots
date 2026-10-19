@@ -403,6 +403,67 @@ pub struct DiscoveredSite {
     pub config_path: PathBuf,
 }
 
+/// What a backup or an editor leaves behind ends in, after its last `.`:
+/// `site.conf.bak`, `conf.d.bak-2026-10-12`, `default.dpkg-dist`.
+const BACKUP_SUFFIXES: &[&str] = &[
+    "bak",
+    "backup",
+    "backups",
+    "orig",
+    "old",
+    "save",
+    "swp",
+    "rpmsave",
+    "rpmnew",
+    "dpkg-old",
+    "dpkg-dist",
+    "dpkg-new",
+    "dpkg-bak",
+    "ucf-old",
+    "ucf-dist",
+    "ucf-new",
+];
+
+/// Whether a file or directory named `name` is a copy kept beside the
+/// config rather than config: a backup, a package manager's leftover or an
+/// editor's. Judged by what follows the last `.`, after any purely numeric
+/// parts (`site.conf.bak.1`), so `backup.example.com.conf` is a site and
+/// `site.bak.conf` — which `include conf.d/*.conf` loads — is too.
+pub(crate) fn is_backup_name(name: &str) -> bool {
+    if name.ends_with('~') || (name.starts_with('#') && name.ends_with('#')) {
+        return true;
+    }
+    let last = name
+        .rsplit('.')
+        .find(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    BACKUP_SUFFIXES.iter().any(|suffix| {
+        last.strip_prefix(suffix).is_some_and(|rest| {
+            rest.is_empty()
+                || rest.starts_with(['-', '_'])
+                || rest.starts_with(|c: char| c.is_ascii_digit())
+        })
+    })
+}
+
+/// The regular files under `root` that may hold sites. Links are not
+/// followed, so Debian's `sites-enabled` links lead nowhere and each site
+/// is found once, in `sites-available`; and nothing at or under a backup's
+/// name ([`is_backup_name`]) is, because a copy of a site is not a site.
+/// Counting one made a second row for every site it copied, wrote blocks
+/// into it on every apply, and left that row naming a missing file once
+/// the copy was cleaned up. Anything unreadable is skipped.
+pub(crate) fn config_files(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0 || !is_backup_name(&entry.file_name().to_string_lossy())
+        })
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+}
+
 /// One address a site is served on, as its config declares it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Listen {
@@ -1329,6 +1390,39 @@ pub fn default_block_config(db: &crate::db::Db) -> Result<BlockConfig> {
 /// wrote it.
 pub(crate) fn is_stored_as_valid(value: &str, validate: fn(&str) -> Result<String>) -> bool {
     validate(value).is_ok_and(|valid| valid == value)
+}
+
+/// Stores what a scan found as the sites there are, the one way every
+/// scan does: see [`crate::db::Db::store_scanned_sites`]. Returns the sites
+/// it forgot.
+pub fn store_scan(db: &crate::db::Db, sites: &[DiscoveredSite]) -> Result<Vec<crate::db::Site>> {
+    let paths: Vec<String> = sites
+        .iter()
+        .map(|site| site.config_path.to_string_lossy().into_owned())
+        .collect();
+    let found: Vec<(&str, &str)> = sites
+        .iter()
+        .zip(&paths)
+        .map(|(site, path)| (site.server_name.as_str(), path.as_str()))
+        .collect();
+    db.store_scanned_sites(&found)
+}
+
+/// The sites a scan forgot, for the end of its one-line summary: empty if
+/// none, else `; forgot 2 no longer there: a.example (/etc/…), …`.
+pub fn forgotten_note(gone: &[crate::db::Site]) -> String {
+    if gone.is_empty() {
+        return String::new();
+    }
+    let named: Vec<String> = gone
+        .iter()
+        .map(|site| format!("{} ({})", site.server_name, site.config_path))
+        .collect();
+    format!(
+        "; forgot {} no longer there: {}",
+        gone.len(),
+        named.join(", ")
+    )
 }
 
 /// The file under `root` that declares `server_name`, found on disk.
@@ -2307,6 +2401,40 @@ pub fn reload_with(server: WebServer, commands: &ServerCommands) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_backup_is_told_from_a_site_by_its_name() {
+        let cases = [
+            ("site.conf.bak", true),
+            ("site.conf.BAK", true),
+            ("nextcloud.conf.bak-2026-10-12", true),
+            ("conf.d.bak-2026-10-13-1127", true),
+            ("site.conf.bak.1", true),
+            ("site.conf.20261012.bak", true),
+            ("site.conf.orig", true),
+            ("site.conf.old", true),
+            ("default.dpkg-dist", true),
+            ("site.conf.rpmnew", true),
+            ("site.conf~", true),
+            ("#site.conf#", true),
+            ("backups", true),
+            ("site.conf", false),
+            ("default", false),
+            ("conf.d", false),
+            // A domain may be named anything, but only a backup ends in one.
+            ("backup.example.com.conf", false),
+            ("old.example.com", false),
+            ("bakery.example", false),
+            // `include conf.d/*.conf` loads it, so it is config.
+            ("site.bak.conf", false),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|(name, backup)| is_backup_name(name) != *backup)
+            .map(|(name, backup)| format!("{name}: expected backup = {backup}"))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 
     #[test]
     fn a_listen_address_is_read_the_way_both_servers_write_it() {

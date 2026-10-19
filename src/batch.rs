@@ -217,10 +217,13 @@ fn store_built_in_list(db: &Db) -> Result<String> {
 
 fn scan_sites(server: webserver::WebServer, db: &Db, root: &Path) -> Result<String> {
     let sites = server.discover_sites(root)?;
-    for site in &sites {
-        db.upsert_site(&site.server_name, &site.config_path.to_string_lossy())?;
-    }
-    Ok(format!("{} site(s) under {}", sites.len(), root.display()))
+    let gone = webserver::store_scan(db, &sites)?;
+    Ok(format!(
+        "{} site(s) under {}{}",
+        sites.len(),
+        root.display(),
+        webserver::forgotten_note(&gone)
+    ))
 }
 
 /// Refreshes every list the blocking policy is built from. See the module

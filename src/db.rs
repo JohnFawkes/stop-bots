@@ -2689,6 +2689,79 @@ impl Db {
         Ok(())
     }
 
+    /// Makes the stored sites the ones a scan `found`, as `(server_name,
+    /// config_path)` pairs, and returns the ones it forgot. One transaction.
+    ///
+    /// A site found where it was recorded keeps its row. One found in a new
+    /// file takes over the row of the same name whose file it no longer is,
+    /// so a renamed config keeps its per-site settings. Every row left
+    /// over names a file that no longer declares it, and is forgotten with
+    /// its settings: kept, it would read NOT FOUND for good, since no scan
+    /// could find it again.
+    ///
+    /// A scan that found nothing forgets nothing. That is a config root
+    /// emptied for a moment, or a bind mount not mounted, far more often
+    /// than a host that serves no sites any more, and forgetting would
+    /// lose every site's settings to it.
+    pub fn store_scanned_sites(&self, found: &[(&str, &str)]) -> Result<Vec<Site>> {
+        if found.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Two blocks of one name in one file — a port 80 redirect beside
+        // the site — are one site.
+        let found: std::collections::BTreeSet<(&str, &str)> = found.iter().copied().collect();
+        self.batch(|| {
+            let (kept, mut gone): (Vec<Site>, Vec<Site>) =
+                self.list_sites()?.into_iter().partition(|site| {
+                    found.contains(&(site.server_name.as_str(), site.config_path.as_str()))
+                });
+            let is_kept = |name: &str, path: &str| {
+                kept.iter()
+                    .any(|site| site.server_name == name && site.config_path == path)
+            };
+            for &(server_name, config_path) in &found {
+                let moved = if is_kept(server_name, config_path) {
+                    None
+                } else {
+                    gone.iter()
+                        .position(|site| site.server_name == server_name)
+                        .map(|i| gone.remove(i))
+                };
+                match moved {
+                    Some(site) => {
+                        self.conn.execute(
+                            "UPDATE sites SET config_path = ?1, discovered_at = ?2 WHERE id = ?3",
+                            params![config_path, now(), site.id],
+                        )?;
+                    }
+                    None => self.upsert_site(server_name, config_path)?,
+                }
+            }
+            for site in &gone {
+                self.forget_site(site.id)?;
+            }
+            Ok(gone)
+        })
+    }
+
+    /// Deletes a site's row and every per-site setting hanging off it. The
+    /// schema's `REFERENCES sites(id)` is not enforced, so nothing else
+    /// would.
+    fn forget_site(&self, id: i64) -> Result<()> {
+        for table in [
+            "site_category_overrides",
+            "site_bot_overrides",
+            "site_path_exemptions",
+            "site_agent_exemptions",
+            "site_request_rules",
+        ] {
+            self.conn
+                .execute(&format!("DELETE FROM {table} WHERE site_id = ?1"), [id])?;
+        }
+        self.conn.execute("DELETE FROM sites WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
     pub fn list_sites(&self) -> Result<Vec<Site>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, server_name, config_path, discovered_at FROM sites ORDER BY server_name",
@@ -4946,6 +5019,108 @@ mod tests {
         let sites = db.list_sites().unwrap();
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].server_name, "example.com");
+    }
+
+    /// A site, and a copy of its config that a scan once took for a second
+    /// one: what a host with backups beside its config ended up storing.
+    const LIVE: (&str, &str) = ("cloud.example", "/srv/nginx/conf.d/cloud.conf");
+    const BACKUP: (&str, &str) = (
+        "cloud.example",
+        "/srv/nginx/conf.d.bak-2026-10-12/cloud.conf",
+    );
+
+    fn stored_paths(db: &Db) -> Vec<String> {
+        let sites = db.list_sites().unwrap();
+        sites.into_iter().map(|site| site.config_path).collect()
+    }
+
+    fn id_at(db: &Db, config_path: &str) -> i64 {
+        let sites = db.list_sites().unwrap();
+        let site = sites.iter().find(|site| site.config_path == config_path);
+        site.unwrap_or_else(|| panic!("no site at {config_path}: {sites:?}"))
+            .id
+    }
+
+    /// Once the backup was cleaned up, its row named a file that no longer
+    /// existed and read NOT FOUND, and no rescan could clear it.
+    #[test]
+    fn a_scan_forgets_a_site_whose_file_is_gone() {
+        let db = Db::open_in_memory().unwrap();
+        db.store_scanned_sites(&[LIVE, BACKUP]).unwrap();
+
+        let gone = db.store_scanned_sites(&[LIVE]).unwrap();
+
+        let gone: Vec<&str> = gone.iter().map(|site| site.config_path.as_str()).collect();
+        assert_eq!(gone, [BACKUP.1]);
+        assert_eq!(stored_paths(&db), [LIVE.1]);
+    }
+
+    #[test]
+    fn a_forgotten_site_takes_its_settings_with_it() {
+        let db = Db::open_in_memory().unwrap();
+        db.store_scanned_sites(&[LIVE, BACKUP]).unwrap();
+        let backup = id_at(&db, BACKUP.1);
+        db.set_site_category_override(backup, Category::Ai, Some(Policy::Allowed))
+            .unwrap();
+        db.add_site_path_exemption(backup, "/api/").unwrap();
+
+        db.store_scanned_sites(&[LIVE]).unwrap();
+
+        assert_eq!(
+            db.get_site_category_override(backup, Category::Ai).unwrap(),
+            None,
+            "the override outlived its site, for the next site given its id"
+        );
+        assert_eq!(
+            db.site_path_exemptions(backup).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A renamed config is the same site, so its settings follow it.
+    #[test]
+    fn a_site_found_in_a_new_file_keeps_its_row_and_settings() {
+        let db = Db::open_in_memory().unwrap();
+        db.store_scanned_sites(&[LIVE]).unwrap();
+        let id = id_at(&db, LIVE.1);
+        db.set_site_category_override(id, Category::Ai, Some(Policy::Allowed))
+            .unwrap();
+        let renamed = "/srv/nginx/conf.d/10-cloud.conf";
+
+        let gone = db.store_scanned_sites(&[(LIVE.0, renamed)]).unwrap();
+
+        assert!(gone.is_empty(), "forgot {gone:?}");
+        assert_eq!(id_at(&db, renamed), id);
+        assert_eq!(
+            db.get_site_category_override(id, Category::Ai).unwrap(),
+            Some(Policy::Allowed)
+        );
+    }
+
+    /// Two blocks of one name in a file — a port 80 redirect beside the
+    /// site — and two stale rows of that name: one row is moved, not two
+    /// onto the same file.
+    #[test]
+    fn a_name_found_twice_in_a_new_file_is_stored_once() {
+        let db = Db::open_in_memory().unwrap();
+        db.store_scanned_sites(&[LIVE, BACKUP]).unwrap();
+        let renamed = (LIVE.0, "/srv/nginx/conf.d/10-cloud.conf");
+
+        let gone = db.store_scanned_sites(&[renamed, renamed]).unwrap();
+
+        assert_eq!(gone.len(), 1, "forgot {gone:?}");
+        assert_eq!(stored_paths(&db), [renamed.1]);
+    }
+
+    /// An emptied root or an unmounted bind mount looks like this, and
+    /// is not a reason to lose every site's settings.
+    #[test]
+    fn a_scan_that_found_nothing_forgets_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        db.store_scanned_sites(&[LIVE]).unwrap();
+
+        assert_eq!(db.store_scanned_sites(&[]).unwrap(), Vec::<Site>::new());
+        assert_eq!(stored_paths(&db), [LIVE.1]);
     }
 
     fn site_id(db: &Db, server_name: &str) -> i64 {

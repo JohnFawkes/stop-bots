@@ -2380,14 +2380,19 @@ fn scan_sites(root: Option<&Path>, db_path: Option<PathBuf>) -> Result<()> {
     let root = webserver::root(&host, root);
     let root = root.as_path();
     let sites = server.discover_sites(root)?;
-    for site in &sites {
-        db.upsert_site(&site.server_name, &site.config_path.to_string_lossy())?;
-    }
+    let gone = webserver::store_scan(&db, &sites)?;
     say!(
         "Discovered {} site(s) under {}",
         sites.len(),
         root.display()
     );
+    for site in &gone {
+        say!(
+            "  forgot {}: {} no longer declares it",
+            site.server_name,
+            site.config_path
+        );
+    }
     // What the detectors will make allowances for, so that it is seen
     // before it matters: see `stop_bots::services`.
     let mut named = std::collections::BTreeSet::new();

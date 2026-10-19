@@ -1902,7 +1902,8 @@ fn missing_root_hint() -> &'static str {
 /// Recursively walks `root` looking for NGINX config files containing
 /// `server { ... }` blocks, returning one [`DiscoveredSite`] per block (named
 /// after its first `server_name`). Files with no server block, or that
-/// aren't valid UTF-8 text, are silently skipped.
+/// aren't valid UTF-8 text, are silently skipped, and so are backups: see
+/// [`crate::webserver::config_files`].
 ///
 /// A `root` that does not exist *is* an error, unlike anything unreadable
 /// inside one. The difference matters: a mistyped `--root` used to walk
@@ -1918,10 +1919,7 @@ pub fn discover_sites(root: &Path) -> Result<Vec<DiscoveredSite>> {
         ));
     }
     let mut sites = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
+    for entry in crate::webserver::config_files(root) {
         let path = entry.path();
         let Ok(content) = fs::read_to_string(path) else {
             continue;
@@ -1946,10 +1944,7 @@ pub fn site_listens(root: &Path) -> Result<Vec<crate::webserver::SiteListens>> {
         anyhow::bail!("{} does not exist", root.display());
     }
     let mut sites = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
+    for entry in crate::webserver::config_files(root) {
         let Ok(content) = fs::read_to_string(entry.path()) else {
             continue;
         };
@@ -2192,6 +2187,10 @@ fn enables_http2(root: &Path) -> Option<bool> {
     let files = WalkDir::new(top)
         .max_depth(4)
         .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !crate::webserver::is_backup_name(&entry.file_name().to_string_lossy())
+        })
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
             fs::metadata(entry.path()).is_ok_and(|meta| meta.is_file() && meta.len() < 1 << 20)
@@ -2565,6 +2564,26 @@ mod tests {
 
         let names: Vec<&str> = sites.iter().map(|s| s.server_name.as_str()).collect();
         assert_eq!(names, vec!["example.com", "localhost"]);
+    }
+
+    /// A copy of a site is not a site: counted, it is stored as a second
+    /// one, gets blocks written into it on every apply, and reads NOT
+    /// FOUND once it is cleaned up.
+    #[test]
+    fn discovery_skips_backup_files_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf_d = dir.path().join("conf.d");
+        let backup_dir = dir.path().join("conf.d.bak-2026-10-12");
+        fs::create_dir(&conf_d).unwrap();
+        fs::create_dir(&backup_dir).unwrap();
+        fs::write(conf_d.join("cloud.conf"), one_site()).unwrap();
+        fs::write(conf_d.join("cloud.conf.bak-2026-10-12"), one_site()).unwrap();
+        fs::write(backup_dir.join("cloud.conf"), one_site()).unwrap();
+
+        let sites = discover_sites(dir.path()).unwrap();
+
+        let paths: Vec<&Path> = sites.iter().map(|s| s.config_path.as_path()).collect();
+        assert_eq!(paths, [conf_d.join("cloud.conf")]);
     }
 
     #[test]

@@ -431,9 +431,7 @@ fn finish(host: &mut VirtualHost) {
 /// Walks `root` for config files holding `<VirtualHost>` sections,
 /// returning one [`DiscoveredSite`] per section, named after its
 /// `ServerName`. The same walk, and the same refusal of a root that does
-/// not exist, as `nginx::discover_sites`: links are not followed, so
-/// Debian's `sites-enabled` links lead nowhere and each site is found once,
-/// in `sites-available`.
+/// not exist, as `nginx::discover_sites`: [`crate::webserver::config_files`].
 pub fn discover_sites(root: &Path) -> Result<Vec<DiscoveredSite>> {
     if !root.exists() {
         return Err(crate::hint::with(
@@ -442,10 +440,7 @@ pub fn discover_sites(root: &Path) -> Result<Vec<DiscoveredSite>> {
         ));
     }
     let mut sites = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
+    for entry in crate::webserver::config_files(root) {
         let path = entry.path();
         let Ok(content) = fs::read_to_string(path) else {
             continue;
@@ -469,10 +464,7 @@ pub fn site_listens(root: &Path) -> Result<Vec<SiteListens>> {
         anyhow::bail!("{} does not exist", root.display());
     }
     let mut sites = Vec::new();
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
-            continue;
-        }
+    for entry in crate::webserver::config_files(root) {
         let Ok(content) = fs::read_to_string(entry.path()) else {
             continue;
         };

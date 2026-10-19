@@ -8,6 +8,20 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Fixed
+
+- **A backup of a site's config is no longer a second site.** A copy kept under the config
+  root, such as `conf.d.bak-2026-10-12/` or `site.conf.orig`, was stored as a site of its
+  own, and every apply wrote blocks into it. Files and directories whose names end the way a
+  backup's or a package manager's leftovers do (`.bak`, `.orig`, `.old`, `.dpkg-dist`, `~`
+  and the like) are now skipped.
+
+- **A rescan forgets a site whose file is gone.** Before, its row stayed for good and read
+  NOT FOUND, however often the sites were scanned again. `scan-sites`, `batch` and `r` in the
+  TUI now say which sites they forgot, and drop their per-site settings with them. A site
+  found in a new file keeps its row and settings. A scan that finds no sites at all forgets
+  nothing, since that is more often an empty or unmounted root than a host with no sites.
+
 ## [0.4.0] — 2026-10-16
 
 More ways to catch bots, and one that checks your own sites: a `status` check for secrets

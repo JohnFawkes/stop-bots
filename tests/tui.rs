@@ -7,7 +7,7 @@
 mod common;
 use common::{
     generated_dir, network_tripwire, path_with, quiet_path, scan_sites, seed_bots,
-    writable_nginx_fixture,
+    shared_host_conf, writable_nginx_fixture,
 };
 use std::fs::File;
 use std::io::{Read, Write};
@@ -332,7 +332,7 @@ fn spawn_tui_cmd(
     // it until they were killed.
     match host_conf {
         Some(path) => cmd.env("STOP_BOTS_HOST_CONF", path),
-        None => cmd.env("STOP_BOTS_HOST_CONF", generated_dir("host.conf")),
+        None => cmd.env("STOP_BOTS_HOST_CONF", shared_host_conf()),
     };
 
     spawn_in_pty(cmd, 32, 100, Duration::from_millis(timeout_ms()))
@@ -1473,7 +1473,7 @@ fn spawn_render_firewall_apply(tmp: &Path, fakebin: &Path) -> PtySession {
         .args(["--out", tmp.join("fw.nft").to_str().unwrap()])
         .args(["--ssh-log", "tests/fixtures/logs/auth.log"])
         .env("PATH", path_with(fakebin))
-        .env("STOP_BOTS_HOST_CONF", generated_dir("host.conf"))
+        .env("STOP_BOTS_HOST_CONF", shared_host_conf())
         .env("STOP_BOTS_SSH_CLIENT", "")
         .env_remove("STOP_BOTS_DB");
     network_tripwire().route(&mut cmd);

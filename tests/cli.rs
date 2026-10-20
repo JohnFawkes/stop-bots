@@ -42,6 +42,14 @@ impl Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let nginx_root = tmp.path().join("nginx");
         fs::create_dir_all(&nginx_root).unwrap();
+        // A root of its own from the start, which `set-web-server` replaces:
+        // with none, every command reads the stock `/etc/nginx` for the
+        // access logs its config names, the machine's own.
+        fs::write(
+            tmp.path().join("host.conf"),
+            format!("nginx_root = {}\n", nginx_root.display()),
+        )
+        .unwrap();
         Fixture {
             db: tmp.path().join("db.sqlite3"),
             nginx_root,
@@ -3950,6 +3958,49 @@ fn tick_reads_the_access_log_a_site_names() {
     assert!(
         rules.contains("203.0.113.51"),
         "rules:\n{rules}\ntick said:\n{said}"
+    );
+}
+
+/// `batch --root` is the config this run scans and applies to, so the
+/// access logs that config names are the ones it reads, not those of the
+/// stored root.
+#[test]
+fn batch_reads_the_access_log_a_site_under_its_root_names() {
+    let fx = Fixture::new();
+    let other = fx._tmp.path().join("other-nginx");
+    fs::create_dir_all(&other).unwrap();
+    let access = fx._tmp.path().join("access.log");
+    let shop = fx._tmp.path().join("shop.log");
+    fs::write(&access, "").unwrap();
+    fs::write(&shop, probe_logged_now("203.0.113.52")).unwrap();
+    fs::write(
+        other.join("shop.conf"),
+        format!(
+            "server {{\n    server_name shop.example;\n    access_log {} combined;\n}}\n",
+            shop.display()
+        ),
+    )
+    .unwrap();
+    fx.run(&["set-log-paths", "--access-log", access.to_str().unwrap()]);
+
+    let out = fx.firewall_script();
+    let said = fx.run(&[
+        "batch",
+        "--no-fetch",
+        "--root",
+        other.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--ssh-log",
+        "tests/fixtures/logs/auth.log",
+    ]);
+    let said = String::from_utf8_lossy(&said.get_output().stdout).into_owned();
+
+    let rules = fx.run(&["list-firewall-rules"]);
+    let rules = String::from_utf8_lossy(&rules.get_output().stdout).into_owned();
+    assert!(
+        rules.contains("203.0.113.52"),
+        "rules:\n{rules}\nbatch said:\n{said}"
     );
 }
 

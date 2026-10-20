@@ -50,6 +50,29 @@ pub fn generated_dir(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The host settings file every spawned `stop-bots` shares unless a test
+/// points it at one of its own: [`generated_dir`]'s `host.conf`, with both
+/// web servers' config roots set to an empty directory.
+///
+/// Without a root a command reads the stock one, `/etc/nginx` or
+/// `/etc/apache2`, for the access logs its config names: on a developer
+/// machine with a web server, that is the developer's own config and logs.
+pub fn shared_host_conf() -> PathBuf {
+    static CONF: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CONF.get_or_init(|| {
+        let empty = generated_dir("no-config");
+        fs::create_dir_all(&empty).expect("failed to create the empty config root");
+        let conf = generated_dir("host.conf");
+        fs::write(
+            &conf,
+            format!("nginx_root = {0}\napache_root = {0}\n", empty.display()),
+        )
+        .expect("failed to write the shared host settings");
+        conf
+    })
+    .clone()
+}
+
 /// `stop-bots`, with those directories already pointed somewhere harmless,
 /// and every download sent to the [`NetworkTripwire`] instead of the
 /// internet.
@@ -63,7 +86,7 @@ pub fn stop_bots_bin() -> Command {
         // The host settings file is `/etc/stop-bots/host.conf` otherwise,
         // which a test must neither read nor write. A test that sets one
         // points this at a file of its own.
-        .env("STOP_BOTS_HOST_CONF", generated_dir("host.conf"))
+        .env("STOP_BOTS_HOST_CONF", shared_host_conf())
         // The lockout check counts the SSH session it runs in as
         // connected; not the one a developer runs the tests from.
         .env("STOP_BOTS_SSH_CLIENT", "")

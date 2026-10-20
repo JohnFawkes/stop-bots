@@ -6,12 +6,7 @@ list — which meant the open items below were unfindable inside it.
 
 ## Worth doing next
 
-* **A few CLI tests read the host's SSH journal.** Those that pass no
-  `--ssh-log` fall back to `journalctl` on whatever machine runs them —
-  read-only, but not hermetic. `tests/common::stop_bots_bin` could put a
-  fake `journalctl` first on PATH; tests that set their own PATH would then
-  need to keep it. (The health probe's `systemctl`/`docker ps` calls from
-  unit tests, the worse case, are fixed.)
+Nothing at the moment.
 
 ## Known gaps
 

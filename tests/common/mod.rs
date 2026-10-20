@@ -66,7 +66,8 @@ pub fn stop_bots_bin() -> Command {
         .env("STOP_BOTS_HOST_CONF", generated_dir("host.conf"))
         // The lockout check counts the SSH session it runs in as
         // connected; not the one a developer runs the tests from.
-        .env("STOP_BOTS_SSH_CLIENT", "");
+        .env("STOP_BOTS_SSH_CLIENT", "")
+        .env("PATH", quiet_path());
     for name in NetworkTripwire::UNSET {
         cmd.env_remove(name);
     }
@@ -201,11 +202,30 @@ pub fn scan_sites(db: &Path, root: &Path) -> assert_cmd::assert::Assert {
     ])
 }
 
-/// PATH with `bin` in front, for handing to a spawned child.
+/// PATH with `bin` in front, for handing to a spawned child: in front of
+/// [`quiet_path`], so that a fake tool of the test's own wins and the
+/// quiet `journalctl` is still there when it has none.
 pub fn path_with(bin: &Path) -> String {
+    format!("{}:{}", bin.display(), quiet_path())
+}
+
+/// PATH with a `journalctl` in front that prints nothing.
+///
+/// A command given no `--ssh-log` falls back to `journalctl` for the SSH
+/// log, and the real one reads the journal of whatever machine runs the
+/// tests: what a test then saw depended on who had logged in there. Every
+/// `stop-bots` a test spawns gets this, through [`stop_bots_bin`] or
+/// [`path_with`]. A test about the journal puts a fake of its own first.
+pub fn quiet_path() -> String {
+    static BIN: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let bin = BIN.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("failed to create the quiet bin dir");
+        write_script(&dir.path().join("journalctl"), "exit 0\n");
+        dir
+    });
     format!(
         "{}:{}",
-        bin.display(),
+        bin.path().display(),
         std::env::var("PATH").unwrap_or_default()
     )
 }

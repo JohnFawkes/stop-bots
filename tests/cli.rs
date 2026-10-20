@@ -5254,6 +5254,7 @@ fn output_piped_into_a_reader_that_stops_early_is_not_a_panic() {
     ]);
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("stop-bots"))
         .args(["list-bots", "--db", db.to_str().unwrap()])
+        .env("PATH", common::quiet_path())
         .env_remove("STOP_BOTS_DB")
         .env("STOP_BOTS_HOST_CONF", dir.path().join("host.conf"))
         .stdout(std::process::Stdio::piped())

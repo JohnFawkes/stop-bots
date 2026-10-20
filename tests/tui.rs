@@ -6,7 +6,8 @@
 
 mod common;
 use common::{
-    generated_dir, network_tripwire, path_with, scan_sites, seed_bots, writable_nginx_fixture,
+    generated_dir, network_tripwire, path_with, quiet_path, scan_sites, seed_bots,
+    writable_nginx_fixture,
 };
 use std::fs::File;
 use std::io::{Read, Write};
@@ -310,7 +311,7 @@ fn spawn_tui_cmd(
             cmd.env("PATH", path_with(fakebin));
         }
         None => {
-            cmd.arg("--no-reload");
+            cmd.arg("--no-reload").env("PATH", quiet_path());
         }
     }
     // A fixture SSH log, for the same reason the CLI tests pass --ssh-log:

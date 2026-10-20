@@ -369,6 +369,156 @@ pub fn cidrs_overlap(a: &str, b: &str) -> bool {
     base(b).is_some_and(|ip| cidr_contains(a, ip)) || base(a).is_some_and(|ip| cidr_contains(b, ip))
 }
 
+/// A prefix as numbers, so that thousands of them can be compared without
+/// parsing a string each time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Prefix {
+    v6: bool,
+    base: u128,
+    len: u32,
+}
+
+impl Prefix {
+    /// A CIDR or a bare address (a /32 or /128), with any host bits
+    /// cleared.
+    fn parse(cidr: &str) -> Option<Prefix> {
+        use std::net::IpAddr;
+        let (address, len) = match cidr.split_once('/') {
+            Some((address, len)) => (address, Some(len.parse::<u32>().ok()?)),
+            None => (cidr, None),
+        };
+        let (v6, base, bits) = match address.parse::<IpAddr>().ok()? {
+            IpAddr::V4(v4) => (false, u128::from(u32::from(v4)), 32),
+            IpAddr::V6(v6) => (true, u128::from(v6), 128),
+        };
+        let len = len.unwrap_or(bits);
+        if len > bits {
+            return None;
+        }
+        let prefix = Prefix { v6, base, len };
+        Some(Prefix {
+            base: base & prefix.mask(),
+            ..prefix
+        })
+    }
+
+    fn bits(self) -> u32 {
+        if self.v6 {
+            128
+        } else {
+            32
+        }
+    }
+
+    /// The network bits of an address of this family.
+    fn mask(self) -> u128 {
+        let host = self.bits() - self.len;
+        let all = if self.v6 {
+            u128::MAX
+        } else {
+            u128::from(u32::MAX)
+        };
+        if host >= 128 {
+            0
+        } else {
+            all & !((1u128 << host) - 1)
+        }
+    }
+
+    fn contains(self, other: Prefix) -> bool {
+        self.v6 == other.v6 && self.len <= other.len && other.base & self.mask() == self.base
+    }
+
+    fn overlaps(self, other: Prefix) -> bool {
+        self.contains(other) || other.contains(self)
+    }
+
+    /// The two prefixes one bit longer that make up this one.
+    fn halves(self) -> [Prefix; 2] {
+        let len = self.len + 1;
+        let upper = 1u128 << (self.bits() - len);
+        [
+            Prefix { len, ..self },
+            Prefix {
+                len,
+                base: self.base | upper,
+                ..self
+            },
+        ]
+    }
+}
+
+impl std::fmt::Display for Prefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.v6 {
+            write!(f, "{}/{}", std::net::Ipv6Addr::from(self.base), self.len)
+        } else {
+            write!(
+                f,
+                "{}/{}",
+                std::net::Ipv4Addr::from(self.base as u32),
+                self.len
+            )
+        }
+    }
+}
+
+/// Ranges to keep out of other ranges: see [`Holes::punch`].
+pub struct Holes(Vec<Prefix>);
+
+impl Holes {
+    /// Every parseable entry of `cidrs`; the rest have nothing to take out.
+    pub fn new<S: AsRef<str>>(cidrs: &[S]) -> Holes {
+        Holes(
+            cidrs
+                .iter()
+                .filter_map(|c| Prefix::parse(c.as_ref()))
+                .collect(),
+        )
+    }
+
+    /// `cidr` with every address inside one of the holes taken out: none
+    /// of it when a hole covers it whole, and otherwise the fewest
+    /// prefixes that cover the rest. A `cidr` no hole touches comes back
+    /// exactly as given, and so does one that does not parse, since there
+    /// is nothing known to take out of it.
+    ///
+    /// Taking one /24 out of a /16 leaves eight prefixes, one per bit
+    /// between the two lengths.
+    pub fn punch(&self, cidr: &str) -> Vec<String> {
+        let Some(prefix) = Prefix::parse(cidr) else {
+            return vec![cidr.to_string()];
+        };
+        let touching: Vec<Prefix> = self
+            .0
+            .iter()
+            .copied()
+            .filter(|hole| hole.overlaps(prefix))
+            .collect();
+        if touching.is_empty() {
+            return vec![cidr.to_string()];
+        }
+        let mut kept = Vec::new();
+        punch_into(prefix, &touching, &mut kept);
+        kept.iter().map(Prefix::to_string).collect()
+    }
+}
+
+fn punch_into(prefix: Prefix, holes: &[Prefix], kept: &mut Vec<Prefix>) {
+    let touching: Vec<Prefix> = holes
+        .iter()
+        .copied()
+        .filter(|hole| hole.overlaps(prefix))
+        .collect();
+    if touching.is_empty() {
+        kept.push(prefix);
+    } else if !touching.iter().any(|hole| hole.contains(prefix)) {
+        for half in prefix.halves() {
+            punch_into(half, &touching, kept);
+        }
+    }
+}
+
 /// Whether `ip` is loopback, RFC1918 (IPv4 private) or IPv6 unique-local
 /// (`fc00::/7`) — never worth suggesting as a firewall block, since it's
 /// necessarily either this host talking to itself or a client on the same
@@ -427,6 +577,54 @@ mod tests {
                 "192.178.5.0/27".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn punching_takes_out_exactly_the_holes() {
+        let holes = Holes::new(&["40.77.167.0/24", "2001:4860:4801:10::/64", "not a cidr"]);
+        let cases: [(&str, &str, &[&str]); 7] = [
+            ("an address inside a hole", "40.77.167.5", &[]),
+            ("a prefix inside a hole", "40.77.167.128/25", &[]),
+            ("the hole itself", "40.77.167.0/24", &[]),
+            (
+                "an address outside every hole, as given",
+                "198.51.100.9",
+                &["198.51.100.9"],
+            ),
+            ("what does not parse, as given", "bogus", &["bogus"]),
+            (
+                "a /22 around a hole",
+                "40.77.164.0/22",
+                &["40.77.164.0/23", "40.77.166.0/24"],
+            ),
+            (
+                "an IPv6 /62 around a hole",
+                "2001:4860:4801:10::/62",
+                &["2001:4860:4801:11::/64", "2001:4860:4801:12::/63"],
+            ),
+        ];
+        for (what, cidr, expected) in cases {
+            assert_eq!(holes.punch(cidr), expected, "{what}");
+        }
+    }
+
+    /// Whatever the shape of the hole, what is left covers every address
+    /// the block did except those in the hole.
+    #[test]
+    fn a_punched_block_still_covers_everything_around_the_hole() {
+        let holes = Holes::new(&["10.0.5.16/28", "10.0.200.0/24"]);
+        let left = holes.punch("10.0.0.0/16");
+        for last in [0u8, 15, 16, 31, 32, 255] {
+            for third in [0u8, 5, 199, 200, 201, 255] {
+                let ip: std::net::IpAddr = format!("10.0.{third}.{last}").parse().unwrap();
+                let in_hole = (third == 5 && (16..32).contains(&last)) || third == 200;
+                assert_eq!(
+                    left.iter().any(|cidr| cidr_contains(cidr, ip)),
+                    !in_hole,
+                    "{ip} in {left:?}"
+                );
+            }
+        }
     }
 
     #[test]

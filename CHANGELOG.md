@@ -37,6 +37,12 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   found in a new file keeps its row and settings. A scan that finds no sites at all forgets
   nothing, since that is more often an empty or unmounted root than a host with no sites.
 
+- **A downloaded list no longer blocks Googlebot, Bingbot or GPTBot.** blocklist.de listed
+  13 of their verified addresses on the day this was checked, so switching that feed on
+  blocked them at the firewall. Each crawler's published ranges are now taken out of every
+  abuse feed, cloud feed and hosting provider before the firewall is written. Blocking the
+  crawler's category still blocks it, and so does blocking a country it crawls from.
+
 - **A detector that convicts many addresses at once no longer slows to a crawl.** Each
   block checked every other convicted address to find the ones it covers, so the time grew
   with the square of their number: 40,000 addresses took 76 seconds, and a first run over

@@ -292,7 +292,8 @@ Roughly in the order they would matter to a user:
    `cron::finish` decide every job for both, and only where `Work::run` runs differs
    (`the_tui_records_what_tick_records_for_every_due_job` in `src/app.rs`).
 9. **Structural debt**, when it earns its keep: `Commands` out of `main.rs`, `db.rs` by
-   concern.
+   concern. *Done for `main.rs`:* the command line is `src/cli.rs`, a third of what was
+   `main.rs`. `db.rs` stays whole, for the reason `TODO.md` gives.
 10. **Apache at parity with NGINX.** Recognising the application behind a site works on
     Apache too. What is left: the TUI still offers rate limiting on an Apache host, where
     it writes nothing.

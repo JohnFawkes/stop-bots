@@ -60,7 +60,3 @@ that day.
   one of them easier to read. The banners already provide the navigation a split
   would. The version that would genuinely help — decomposing into per-concern
   types — is a design exercise, not a tidy-up.
-* **`main.rs` is ~3,400 lines before its tests**, about 1,100 of them the
-  `Command` enum and its help text. Lifting the enum into its own module is
-  self-contained and would take a third off the file. Smaller and safer than the `db.rs` split, if file size is what
-  bothers you.

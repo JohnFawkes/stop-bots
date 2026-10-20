@@ -37,6 +37,11 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   found in a new file keeps its row and settings. A scan that finds no sites at all forgets
   nothing, since that is more often an empty or unmounted root than a host with no sites.
 
+- **A detector that convicts many addresses at once no longer slows to a crawl.** Each
+  block checked every other convicted address to find the ones it covers, so the time grew
+  with the square of their number: 40,000 addresses took 76 seconds, and a first run over
+  a month of honeypot traffic took two and a half minutes. Both now take about a second.
+
 ## [0.4.0] — 2026-10-16
 
 More ways to catch bots, and one that checks your own sites: a `status` check for secrets

@@ -1141,6 +1141,7 @@ fn add_block_rules_now(
         _ => HashMap::new(),
     };
     let flagged = kept.clone();
+    let by_block = answered_by(&flagged);
     let kept = match crate::protection::subnet_escalation(db)? {
         Some(min) => escalate_subnets(kept, min),
         None => kept,
@@ -1205,7 +1206,10 @@ fn add_block_rules_now(
         }
         // The addresses this block answers for: the one observed, or every
         // flagged neighbour an escalated /24 or a /64 stands for.
-        let answered: Vec<&String> = observed_in(&flagged, &ip);
+        let answered: Vec<&String> = match by_block.get(&ip) {
+            Some(answered) => answered.clone(),
+            None => observed_in(&flagged, &ip),
+        };
         if existing.contains(&ip) {
             already_covered += 1;
             // Whatever they did before that block was made, it answered. If
@@ -1284,8 +1288,33 @@ fn add_block_rules_now(
     })
 }
 
+/// Each block a pass can write, mapped to the `flagged` addresses it
+/// answers for: an address itself, the /64 it is widened to, or the /24 it
+/// escalates to. Built once per pass. Asking every flagged address about
+/// every block made a pass quadratic: 40,000 addresses convicted at once
+/// took 76 seconds, all of it here.
+fn answered_by(flagged: &[String]) -> HashMap<String, Vec<&String>> {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let mut blocks: HashMap<String, Vec<&String>> = HashMap::new();
+    for address in flagged {
+        blocks.entry(address.clone()).or_default().push(address);
+        let wider = match address.parse::<IpAddr>() {
+            Ok(IpAddr::V4(v4)) => {
+                let o = v4.octets();
+                format!("{}/24", Ipv4Addr::new(o[0], o[1], o[2], 0))
+            }
+            Ok(IpAddr::V6(_)) => blockable_address(address),
+            Err(_) => continue,
+        };
+        blocks.entry(wider).or_default().push(address);
+    }
+    blocks
+}
+
 /// Which of the `flagged` addresses the block `ip` covers: itself, or
-/// every one inside it when it is a /64 or an escalated /24.
+/// every one inside it when it is a /64 or an escalated /24. What
+/// [`answered_by`] does not index, for a block of any other shape.
 fn observed_in<'a>(flagged: &'a [String], ip: &str) -> Vec<&'a String> {
     flagged
         .iter()
@@ -2593,6 +2622,37 @@ mod tests {
                 .is_empty(),
             "the /24 answered for all three"
         );
+    }
+
+    /// The index a pass builds once says what asking every flagged address
+    /// would, for every shape of block a pass writes.
+    #[test]
+    fn each_block_answers_for_the_addresses_inside_it() {
+        let flagged: Vec<String> = [
+            "203.0.113.1",
+            "203.0.113.2",
+            "198.51.100.7",
+            "2001:db8::1",
+            "2001:db8::2",
+            "2001:db8:0:1::1",
+        ]
+        .map(String::from)
+        .to_vec();
+        let index = answered_by(&flagged);
+
+        for block in [
+            "203.0.113.1",
+            "203.0.113.0/24",
+            "198.51.100.7",
+            "2001:db8::/64",
+            "2001:db8:0:1::/64",
+        ] {
+            assert_eq!(
+                index.get(block),
+                Some(&observed_in(&flagged, block)),
+                "block {block}"
+            );
+        }
     }
 
     // ---- what a detector's block records ----

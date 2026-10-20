@@ -88,32 +88,19 @@ pub enum AppEvent {
         kind: crate::ipranges::IpRangeSourceKind,
         result: Result<String, String>,
     },
-    /// The internal cron's background fetch for the `UpdateIpRanges` job
-    /// (see `crate::cron`) has finished. Carries each of the three crawler
-    /// sources' fetch outcome (parsed CIDRs, or a stringified error) so
-    /// `App` can store whatever succeeded and summarize the rest — one
-    /// source failing (e.g. a transient network error) shouldn't discard
-    /// what the other two got.
-    CronIpRangesFetched {
-        results: Vec<(
-            crate::ipranges::IpRangeSourceKind,
-            Result<Vec<String>, String>,
-        )>,
-    },
-    /// A log pass for the internal cron's due `jobs` has read and parsed
-    /// its logs on a background thread (see `App::start_cron_log_pass`).
-    /// Storing what it found, and each job's decision, happen back on the
-    /// main thread in `App::finish_cron_log_pass`, same as every other `Db`
-    /// access in this app (`Db` isn't `Sync`).
-    CronLogRead {
-        jobs: Vec<crate::cron::CronJob>,
-        read: Box<crate::logscan::Read>,
-    },
+    /// The slow half of a scheduled job has come back (see
+    /// `App::start_cron_job`): a log pass's read, the crawler job's
+    /// fetches, one list of a download, or the health probe. Storing what
+    /// it found happens back on the main thread in `App::finish_cron_job`,
+    /// same as every other `Db` access in this app (`Db` isn't `Sync`).
+    /// Boxed to keep every other event small: a download carries its run
+    /// along with the body it fetched.
+    CronWorkDone { done: Box<crate::cron::Done> },
     /// A background read of the SSH log, for Firewall's SSH
     /// panel, has come back (see `App::start_ssh_log_read`). `None` means no log
     /// was readable. Only the read is backgrounded; parsing it into rows
-    /// happens on the main thread, same as `CronLogRead` above and for
-    /// the same reason.
+    /// happens on the main thread, same as a log pass's and for the same
+    /// reason.
     SshLogRead { text: Option<String> },
     /// The background `nginx -t` + `systemctl reload nginx` that follows a
     /// NGINX apply has finished (see `App::start_nginx_reload`). `Err`
@@ -151,22 +138,6 @@ pub enum AppEvent {
     SitesApplied {
         outcome: std::sync::Arc<crate::tui::nginx::ApplyOutcome>,
     },
-    /// One source of an "update everything" run has been downloaded (see
-    /// `App::start_update_everything`). Carries the raw body, not parsed
-    /// rows: parsing and storing both want `Db`, which isn't `Sync`, so
-    /// they happen back on the main thread in
-    /// `App::finish_update_everything_source` — which then starts the next
-    /// download. One event per source, rather than one at the end with
-    /// every payload in it, for the reason `App::update_all` documents.
-    EverythingSourceFetched {
-        source: crate::refresh::Source,
-        result: Result<String, String>,
-    },
-    /// The internal cron's health probe has come back (see
-    /// `App::start_cron_health_check`). Carries the probe, not a report:
-    /// storing it and assessing it are both `Db` work and so wait for the
-    /// main thread, same as every other job here.
-    HealthProbed { probe: Box<crate::health::Probe> },
     /// A background pass over every site's config file, working out which
     /// of them still match what their settings render to (see
     /// `App::start_site_status_check`). In the site list's order.

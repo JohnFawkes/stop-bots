@@ -285,7 +285,9 @@ Roughly in the order they would matter to a user:
    counts both.
 8. **One job layer for the TUI and `tick`.** The TUI starts each scheduled job on a
    background thread and `tick` runs them in line; both go through `cron.rs`, but the
-   dispatch exists twice (`App::check_cron` and `cron::tick`).
+   dispatch exists twice (`App::check_cron` and `cron::tick`). *Done:* `cron::start` and
+   `cron::finish` decide every job for both, and only where `Work::run` runs differs
+   (`the_tui_records_what_tick_records_for_every_due_job` in `src/app.rs`).
 9. **Structural debt**, when it earns its keep: `Commands` out of `main.rs`, `db.rs` by
    concern.
 10. **Apache at parity with NGINX.** Recognising the application behind a site works on

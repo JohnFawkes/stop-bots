@@ -322,6 +322,32 @@ builds the static package the way CI's `deb` job does (it needs `musl-gcc` and
 CI runs them as the `stranger` job, on pushes to main and weekly; the weekly run sets
 `STOP_BOTS_STRANGER_FETCH`.
 
+### Real traffic
+
+The container suite's requests are written by hand, so they show that a detector
+convicts what it was written for, not what it does to real traffic. Two things cover that.
+
+A visitor test in `tests/container.rs` reads a 30-page site the way a browser does
+(assets once, every page through a link) and runs every access-log detector over it:
+none may convict it. Its control reads the same pages with no assets and no `Referer`,
+and must be convicted, which shows the visit was long enough to judge.
+
+`scripts/replay-logs.py` runs every detector in dry-run over a real host's logs, against
+a database of its own, and reports who would be blocked, which of those look like
+visitors or logged in over SSH, and the busiest addresses nothing convicts. Run it on
+the host itself, with `--config-root`, so the probe check can look into the sites'
+document roots:
+
+```
+sudo journalctl -u ssh -o short > ssh.log      # or /var/log/auth.log, where rsyslog runs
+sudo journalctl -k -o short > kern.log         # or /var/log/kern.log
+sudo scripts/replay-logs.py --access-log /var/log/nginx/access.log \
+  --ssh-log ssh.log --kernel-log kern.log --config-root /etc/nginx > report.md
+```
+
+It reads and stores nothing of the host's own. The report names real visitors'
+addresses, so it stays out of this repository and out of issues.
+
 ## CLI conventions
 
 The command line is part of the contract from 0.1 on, so these are decided once. The
@@ -442,7 +468,8 @@ Some directories don't exist yet but should be created if the need arises.
     |- /tests           <- Integration and end-to-end automated tests
     |- /examples        <- screenshots.rs, which generates docs/screenshots/
     |- /packaging       <- APT landing page, AUR PKGBUILDs, Gentoo ebuild, bump.py
-    |- /scripts         <- build-apt-repo.sh (the APT repository) and deploy-remote.sh
+    |- /scripts         <- build-apt-repo.sh (the APT repository), deploy-remote.sh and
+                           replay-logs.py (every detector over a real host's logs)
     |- README.md        <- What the tool is and how to use it. High level only
     |- CONTRIBUTING.md  <- This file. How the code is built, tested and laid out
     |- RELEASING.md     <- The release process, versioning, and what counts as breaking

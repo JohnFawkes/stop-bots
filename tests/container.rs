@@ -1595,6 +1595,160 @@ fn status_names_an_env_file_nginx_really_serves() {
     );
 }
 
+// ---- a visitor, through every detector ----
+
+/// How many pages [`serve_linked_pages`] writes: more than the thresholds
+/// of the detectors that count pages (`asset-ratio`'s 15, `refererless`'s
+/// 25 distinct deep pages), so a visitor they misjudged would be convicted.
+const LINKED_PAGES: usize = 30;
+
+/// Every detector that reads the access log, as `run-detector` names them.
+/// `honeypot` and `robots-violators` are left out: both need a generated
+/// robots.txt, which nothing here serves.
+const ACCESS_LOG_DETECTORS: &[&str] = &[
+    "web-scanners",
+    "spoofed-crawlers",
+    "probe-paths",
+    "injection",
+    "asset-ratio",
+    "rotating-ua",
+    "refererless",
+    "login-attempts",
+    "request-rate",
+];
+
+/// A site of [`LINKED_PAGES`] pages, each linking the next and loading the
+/// same stylesheet, script and image.
+fn serve_linked_pages(server: &Server) {
+    server.sh(&format!(
+        "cd /var/www/test && printf 'body {{}}' > style.css && : > app.js && \
+         printf '<svg xmlns=\"http://www.w3.org/2000/svg\"/>' > logo.svg && \
+         for i in $(seq 1 {LINKED_PAGES}); do \
+           printf '<link rel=stylesheet href=/style.css><script src=/app.js></script>\
+<img src=/logo.svg><a href=/page-%d.html>next</a>' $((i + 1)) > page-$i.html; \
+         done"
+    ));
+}
+
+/// Reads the site as a person in a browser does: in at `/`, its assets
+/// once (a browser caches them, which is the harder case for `asset-ratio`),
+/// then every page by following its link, so each carries a `Referer`.
+fn browse(client: &Client, host: &str) {
+    sh_in(
+        &client.name,
+        &format!(
+            "base=http://{host}:8080; \
+             get() {{ curl -s -o /dev/null -A '{FIREFOX}' \
+               -H 'Accept: text/html,*/*;q=0.8' -H 'Accept-Language: en' \"$@\"; }}; \
+             get \"$base/\"; \
+             for asset in style.css app.js logo.svg; do get -e \"$base/\" \"$base/$asset\"; done; \
+             previous=\"$base/\"; \
+             for i in $(seq 1 {LINKED_PAGES}); do \
+               get -e \"$previous\" \"$base/page-$i.html\"; previous=\"$base/page-$i.html\"; \
+             done"
+        ),
+    );
+}
+
+/// The same pages, as a crawler working from a list: no assets, no
+/// `Referer`.
+fn crawl(client: &Client, host: &str) {
+    sh_in(
+        &client.name,
+        &format!(
+            "for i in $(seq 1 {LINKED_PAGES}); do \
+               curl -s -o /dev/null -A '{FIREFOX}' http://{host}:8080/page-$i.html; \
+             done"
+        ),
+    );
+}
+
+const FIREFOX: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0";
+
+/// The detectors that convict `address` in the server's access log, each
+/// judging on its own: a dry run, because once one has stored a block the
+/// next reports the address as already covered without naming it.
+fn convicting_detectors(server: &Server, address: &str) -> Vec<&'static str> {
+    ACCESS_LOG_DETECTORS
+        .iter()
+        .copied()
+        .filter(|detector| {
+            server
+                .stop_bots(&format!(
+                    "run-detector {detector} --dry-run --access-log /var/log/nginx/access.log"
+                ))
+                .contains(address)
+        })
+        .collect()
+}
+
+/// Runs every access-log detector for real, storing what each finds the
+/// way `tick` does.
+fn run_every_detector(server: &Server) {
+    for detector in ACCESS_LOG_DETECTORS {
+        server.stop_bots(&format!(
+            "run-detector {detector} --access-log /var/log/nginx/access.log"
+        ));
+    }
+}
+
+/// **No detector takes a person for a bot.** Every one that reads the access
+/// log, switched on or not, judges a browser-like visit of more pages than
+/// any of their thresholds, and the firewall loaded afterwards still lets
+/// the visitor in.
+#[test]
+fn a_visitor_reading_the_site_is_convicted_by_no_detector() {
+    if !enabled() {
+        return;
+    }
+    let net = Network::create("stop-bots-visitor-net");
+    let server = Server::start_on_network("stop-bots-visitor", &net);
+    let visitor = Client::start("stop-bots-visitor-client", &net);
+    serve_linked_pages(&server);
+
+    browse(&visitor, &server.name);
+
+    let convicted = convicting_detectors(&server, &visitor.address());
+    assert_eq!(
+        convicted,
+        Vec::<&str>::new(),
+        "the visitor was convicted. access log:\n{}",
+        server.sh("cat /var/log/nginx/access.log")
+    );
+    run_every_detector(&server);
+    server.render_and_load("nftables");
+    assert_eq!(
+        visitor.get(&server.name, "--max-time 5"),
+        "200",
+        "the visitor is turned away. rules:\n{}",
+        server.stop_bots("list-firewall-rules")
+    );
+}
+
+/// The control for the test above: the same pages without what a browser
+/// adds are convicted, by the two detectors that look for exactly that. If
+/// they were not, the visitor's acquittal would only show its visit was too
+/// short to judge.
+#[test]
+fn the_same_pages_read_without_assets_or_referer_are_convicted() {
+    if !enabled() {
+        return;
+    }
+    let net = Network::create("stop-bots-crawler-net");
+    let server = Server::start_on_network("stop-bots-crawler", &net);
+    let crawler = Client::start("stop-bots-crawler-client", &net);
+    serve_linked_pages(&server);
+
+    crawl(&crawler, &server.name);
+
+    assert_eq!(
+        convicting_detectors(&server, &crawler.address()),
+        ["asset-ratio", "refererless"],
+        "access log:\n{}",
+        server.sh("cat /var/log/nginx/access.log")
+    );
+}
+
 // ---- is this host actually protected? ----
 
 /// **The check the whole `health` module exists for**, against a host

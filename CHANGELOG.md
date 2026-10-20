@@ -8,6 +8,25 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-20
+
+Checked against what attacks look like elsewhere: a month of public honeypot traffic and two
+hosts' real logs. A detector for requests that are not for a web page, every access log the
+web server writes read instead of one, single-request detectors that recognise much more of
+what honeypots see, and downloaded lists that no longer block the real search engines.
+
+**Before upgrading:** nothing to do. The database schema is unchanged, and 0.4.0 still opens a
+database 0.5.0 has used; a block `protocol-probes` made shows there with an unknown source and
+stays in force.
+
+**After upgrading:** the protocol-probe detector arrives off and marked new;
+`stop-bots set-detector protocol-probes --enabled true` turns it on. Two things change on their
+own, because they widen detectors that are already on rather than add one. Every access log
+the web server's config names is now read, the first time with what logrotate kept back to the
+longest detector window, so a site's own log can produce blocks on the first pass. And probe
+paths, injection attempts and probes for absent apps recognise more. `stop-bots status` lists
+the logs read.
+
 ### Added
 
 - **A protocol-probe detector, `protocol-probes`: one request that is not for a web page.**
@@ -2638,7 +2657,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ivankovic/stop-bots/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ivankovic/stop-bots/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ivankovic/stop-bots/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/ivankovic/stop-bots/compare/v0.2.0...v0.2.1

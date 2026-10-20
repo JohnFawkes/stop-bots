@@ -159,6 +159,18 @@ impl WebServer {
         }
     }
 
+    /// Every file the config under `root` names as an access log, that is
+    /// a file on this host to read: see `nginx::access_logs` and
+    /// `apache::access_logs`. Paths as the config names them, which are
+    /// this host's only when the server runs here (see
+    /// [`crate::logpaths`]).
+    pub fn access_logs(self, root: &Path) -> Vec<PathBuf> {
+        match self {
+            WebServer::Nginx => nginx::access_logs(root),
+            WebServer::Apache => apache::access_logs(root),
+        }
+    }
+
     /// Every named block under `root` and the addresses it listens on, one
     /// entry per block: a site's port-80 and port-443 blocks are two.
     pub fn site_listens(self, root: &Path) -> Result<Vec<SiteListens>> {

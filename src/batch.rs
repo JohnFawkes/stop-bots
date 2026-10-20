@@ -325,8 +325,9 @@ fn scan_logs(db: &Db, options: &BatchOptions) -> Vec<Step> {
     let stats = if applied.access.is_readable() {
         crate::cron::record_run(db, CronJob::RecordAccessStats, "recorded by batch run");
         Ok(format!(
-            "{} user agent(s)",
-            applied.stats.distinct_user_agents
+            "{} user agent(s){}",
+            applied.stats.distinct_user_agents,
+            applied.unreadable_note()
         ))
     } else {
         Ok("skipped: no access log".to_string())

@@ -102,6 +102,9 @@ pub struct Report {
     pub checks: Vec<Check>,
     /// Unix seconds.
     pub checked_at: i64,
+    /// Every access log the detectors read, from the probe: what `status
+    /// --json` lists beside the checks.
+    pub access_logs: Vec<AccessLogState>,
 }
 
 impl Report {
@@ -176,6 +179,13 @@ pub struct Probe {
     /// can say: the operator's next question is always which file.
     #[serde(default)]
     pub access_log_path: Option<String>,
+    /// Every access log a pass reads, the stored or default one first,
+    /// then those the web server's config names (see
+    /// [`crate::logpaths::LogPaths::access_logs_to_read`]), each with
+    /// whether it could be opened. Empty in a probe from before it was
+    /// carried here.
+    #[serde(default)]
+    pub access_logs: Vec<AccessLogState>,
     /// Whether the kernel log, which the port-scan detector reads, could
     /// be read, and what was tried. `None` in a probe from before it was
     /// carried here.
@@ -280,6 +290,15 @@ pub struct Probe {
     /// sites to ask, or in a probe from before this was carried.
     #[serde(default)]
     pub exposed_files: Option<crate::exposure::Survey>,
+}
+
+/// One access log the detectors read, as a probe found it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AccessLogState {
+    pub path: String,
+    /// Where the path came from: [`crate::logpaths::LogOrigin::id`].
+    pub origin: String,
+    pub readable: bool,
 }
 
 /// How much of the access log a probe reads: its last 32 MB. Every
@@ -420,6 +439,15 @@ pub fn probe(
         ssh_log_readable: Some(ssh_readable),
         access_log_readable: Some(access_readable),
         access_log_path: Some(paths.access_description(None)),
+        access_logs: paths
+            .access_logs_to_read(None)
+            .into_iter()
+            .map(|log| AccessLogState {
+                readable: crate::logread::open_log(&log.path).is_ok(),
+                path: log.path.display().to_string(),
+                origin: log.origin.id().to_string(),
+            })
+            .collect(),
         kernel_log_readable: Some(crate::portscan::kernel_log_is_readable(&paths.kernel(None))),
         kernel_log_path: Some(paths.kernel_description(None)),
         listening_known: Some(crate::portscan::listening_ports().is_some()),
@@ -949,6 +977,7 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     Ok(Report {
         checks,
         checked_at: now_secs(),
+        access_logs: probe.access_logs.clone(),
     })
 }
 
@@ -2296,6 +2325,15 @@ fn log_sources(probe: &Probe) -> Check {
     .filter_map(|(readable, name)| (readable == Some(false)).then_some(name))
     .collect();
 
+    // The config's own logs, after the stored or default one: only those
+    // that are there, so one that cannot be opened is a real problem
+    // rather than a site that is not enabled.
+    let config_logs = probe.access_logs.get(1..).unwrap_or_default();
+    let unopened: Vec<&str> = config_logs
+        .iter()
+        .filter(|log| !log.readable)
+        .map(|log| log.path.as_str())
+        .collect();
     let unknown = probe.ssh_log_readable.is_none() || probe.access_log_readable.is_none();
     let (level, detail, fix) = if unknown {
         (
@@ -2303,8 +2341,29 @@ fn log_sources(probe: &Probe) -> Check {
             "could not check the log sources".to_string(),
             None,
         )
+    } else if missing.is_empty() && unopened.is_empty() {
+        let also = match config_logs {
+            [] => String::new(),
+            logs => format!(
+                ", and the {} other access log(s) the config names: {}",
+                logs.len(),
+                logs.iter()
+                    .map(|log| log.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        (Level::Ok, format!("both readable{also}"), None)
     } else if missing.is_empty() {
-        (Level::Ok, "both readable".to_string(), None)
+        (
+            Level::Warn,
+            format!(
+                "the access log(s) {} that the config names could not be opened — \
+                 the detectors do not see those sites' requests",
+                unopened.join(", ")
+            ),
+            Some("run stop-bots as root, or check what is at that path".to_string()),
+        )
     } else {
         (
             Level::Warn,
@@ -2490,6 +2549,7 @@ mod tests {
             ssh_log_readable: Some(true),
             access_log_readable: Some(true),
             access_log_path: None,
+            access_logs: Vec::new(),
             kernel_log_readable: Some(true),
             kernel_log_path: None,
             listening_known: Some(true),
@@ -3834,6 +3894,54 @@ mod tests {
         let check = check(&report, "disk-room");
         assert_eq!(check.level, Level::Critical);
         assert!(check.detail.contains("4.0MB"), "was: {}", check.detail);
+    }
+
+    /// The access logs the config names are listed with the main one, and
+    /// one of them that cannot be opened is a warning that names it.
+    #[test]
+    fn the_config_s_access_logs_are_listed_and_an_unopened_one_named() {
+        let log = |path: &str, origin: &str, readable| AccessLogState {
+            path: path.to_string(),
+            origin: origin.to_string(),
+            readable,
+        };
+        let cases = [
+            (
+                "all open",
+                vec![
+                    log("/var/log/nginx/access.log", "default", true),
+                    log("/var/log/nginx/shop.log", "config", true),
+                ],
+                Level::Ok,
+                "both readable, and the 1 other access log(s) the config names: \
+                 /var/log/nginx/shop.log",
+            ),
+            (
+                "one that cannot be opened",
+                vec![
+                    log("/var/log/nginx/access.log", "default", true),
+                    log("/var/log/nginx/shop.log", "config", false),
+                ],
+                Level::Warn,
+                "the access log(s) /var/log/nginx/shop.log that the config names could not \
+                 be opened — the detectors do not see those sites' requests",
+            ),
+        ];
+        for (case, access_logs, level, detail) in cases {
+            let probe = Probe {
+                access_logs,
+                ..healthy()
+            };
+
+            let report = assess(&db(), &probe).unwrap();
+
+            let check = check(&report, "log-sources");
+            assert_eq!(
+                (check.level, check.detail.as_str()),
+                (level, detail),
+                "{case}"
+            );
+        }
     }
 
     /// A log the detectors cannot read looks exactly like a log with

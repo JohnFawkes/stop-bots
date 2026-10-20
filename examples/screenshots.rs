@@ -133,6 +133,7 @@ async fn main() -> Result<()> {
             ssh_log_readable: Some(true),
             access_log_readable: Some(true),
             access_log_path: None,
+            access_logs: Vec::new(),
             kernel_log_readable: Some(true),
             kernel_log_path: None,
             listening_known: Some(true),

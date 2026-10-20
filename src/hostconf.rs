@@ -316,6 +316,19 @@ impl HostConf {
             kernel: self.kernel_log.clone(),
             server: self.web_server(),
             root: self.root(None),
+            config_logs_here: self.config_paths_are_here(),
+        }
+    }
+
+    /// Whether the paths the web server's config names are paths on this
+    /// host. A test command of its own is how a server in a container is
+    /// set up (see `set-web-server --test`): its config names the paths it
+    /// has inside the container, and a file of the same name here says
+    /// nothing about it.
+    pub fn config_paths_are_here(&self) -> bool {
+        match self.web_server() {
+            WebServer::Nginx => self.nginx_test_command.is_none(),
+            WebServer::Apache => self.apache_test_command.is_none(),
         }
     }
 }

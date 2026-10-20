@@ -209,6 +209,28 @@ pub(crate) fn mkfifo(path: &std::path::Path) {
     );
 }
 
+/// Writes `text` gzipped to `path`, as logrotate's `compress` leaves an
+/// old log, and sets its modification time to `at`, the moment its last
+/// line was written.
+pub(crate) fn write_gzip(path: &std::path::Path, text: &str, at: i64) {
+    use std::io::Write;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(text.as_bytes()).unwrap();
+    std::fs::write(path, gz.finish().unwrap()).unwrap();
+    set_modified(path, at);
+}
+
+/// Sets `path`'s modification time to `at`, in Unix seconds.
+pub(crate) fn set_modified(path: &std::path::Path, at: i64) {
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(at.max(0) as u64);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
 /// Now, in Unix seconds.
 pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()

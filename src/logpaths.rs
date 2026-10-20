@@ -48,8 +48,68 @@
 //! database: the lockout guard runs as root on the SSH log named here, and
 //! the database is a file root does not always own (see
 //! [`crate::hostconf`]).
+//!
+//! ## Several access logs
+//!
+//! A web server writes as many access logs as its config names: a site
+//! with an `access_log` (NGINX) or `CustomLog` (Apache) of its own logs
+//! there and nowhere else, so a detector reading only the main log never
+//! saw its traffic. Every pass therefore reads the stored or default log
+//! *and* each other file the config names ([`LogPaths::access_logs`]).
+//!
+//! The two ways of naming a log by hand do different things, on purpose:
+//!
+//! - **A stored path adds to them.** It replaces the default, as it always
+//!   did, and the config's own logs are read beside it. Someone who stored
+//!   where their main log is did not mean "and ignore every site that logs
+//!   elsewhere", and a stored path is the only way the schedule is told
+//!   anything, so it cannot also mean "only this".
+//! - **A flag replaces them.** `--access-log` is for one run against one
+//!   file — a copy, a rotated log, a test — and reading the live logs
+//!   beside it, moving their cursors, would be the surprise. So a run with
+//!   the flag reads exactly that file, as it did before there were several.
+//!
+//! The config's paths are only read when the web server runs on this host.
+//! One in a container (a test command of its own, see `set-web-server
+//! --test`) names paths inside the container, and a file of the same name
+//! here is somebody else's; there, the stored path is what is read, as
+//! [`crate::logscan::app_probes`] reads no document root for the same
+//! reason.
 
 use std::path::{Path, PathBuf};
+
+/// Where one of the access logs a pass reads came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogOrigin {
+    /// `--access-log`, for this run only.
+    Flag,
+    /// `set-log-paths --access-log`.
+    Stored,
+    /// The web server's stock path, with nothing stored.
+    Default,
+    /// An `access_log` or `CustomLog` in the web server's config.
+    Config,
+}
+
+impl LogOrigin {
+    /// How `status --json` names it. Part of the contract, so never
+    /// renamed.
+    pub fn id(self) -> &'static str {
+        match self {
+            LogOrigin::Flag => "flag",
+            LogOrigin::Stored => "stored",
+            LogOrigin::Default => "default",
+            LogOrigin::Config => "config",
+        }
+    }
+}
+
+/// One access log a pass reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessLog {
+    pub path: PathBuf,
+    pub origin: LogOrigin,
+}
 
 /// The stored location of each log this project reads.
 ///
@@ -71,6 +131,11 @@ pub struct LogPaths {
     /// Its config root, which decides where that default is: Apache logs
     /// to `/var/log/httpd` in RHEL's tree, not Debian's `/var/log/apache2`.
     pub root: PathBuf,
+    /// Whether the paths in the config under [`Self::root`] are paths on
+    /// this host: false for a web server in a container. See the module
+    /// docs. False unless the host settings say so, so that paths built
+    /// by hand read only what they name.
+    pub config_logs_here: bool,
 }
 
 impl LogPaths {
@@ -88,11 +153,91 @@ impl LogPaths {
         self.server.default_access_log_at(&self.root)
     }
 
-    /// [`Self::access_path`], read whole. For the one-off CLI commands;
-    /// everything that runs on a schedule reads incrementally instead (see
-    /// [`crate::logscan`]).
+    /// Every access log this run should read: the flag alone if given;
+    /// else [`Self::access_path`] first, then each other file the web
+    /// server's config names, when that config is this host's. See the
+    /// module docs for why the two differ.
+    ///
+    /// A file is named once however many directives name it, and however
+    /// it is spelled: a second name for the same file would read its lines
+    /// twice, under two cursors.
+    pub fn access_logs(&self, flag: Option<&Path>) -> Vec<AccessLog> {
+        if let Some(flag) = flag {
+            return vec![AccessLog {
+                path: flag.to_path_buf(),
+                origin: LogOrigin::Flag,
+            }];
+        }
+        let mut logs = vec![AccessLog {
+            path: self.access_path(None),
+            origin: match self.access {
+                Some(_) => LogOrigin::Stored,
+                None => LogOrigin::Default,
+            },
+        }];
+        for path in self.config_logs() {
+            if !logs.iter().any(|log| same_file(&log.path, &path)) {
+                logs.push(AccessLog {
+                    path,
+                    origin: LogOrigin::Config,
+                });
+            }
+        }
+        logs
+    }
+
+    /// [`Self::access_logs`] without those the config names that are not
+    /// there: what a pass reads, and what `status` lists.
+    ///
+    /// The web server opens every log it is configured with when it
+    /// starts, so one that does not exist belongs to a site it is not
+    /// serving: a file in `sites-available` that is not enabled, say. It is
+    /// read from its start once it appears. The stored or default log is
+    /// kept whether or not it is there, and reported when it is not.
+    pub fn access_logs_to_read(&self, flag: Option<&Path>) -> Vec<AccessLog> {
+        self.access_logs(flag)
+            .into_iter()
+            .filter(|log| {
+                log.origin != LogOrigin::Config
+                    || !std::fs::symlink_metadata(&log.path)
+                        .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+            })
+            .collect()
+    }
+
+    /// The access logs the web server's config names, when it is this
+    /// host's.
+    fn config_logs(&self) -> Vec<PathBuf> {
+        // Unit tests never read the host's own config: there, the root is
+        // the stock one, and nothing points it elsewhere.
+        let stock = cfg!(test) && self.root == Path::new(self.server.default_root());
+        if !self.config_logs_here || stock {
+            return Vec::new();
+        }
+        self.server.access_logs(&self.root)
+    }
+
+    /// [`Self::access_logs_to_read`], read whole, one after another. For
+    /// the one-off CLI commands; everything that runs on a schedule reads
+    /// incrementally instead (see [`crate::logscan`]). Unavailable only
+    /// when none of them could be read.
     pub fn access_source(&self, flag: Option<&Path>) -> crate::accesslog::LogSource {
-        crate::accesslog::read_log_file(&self.access_path(flag))
+        let mut text: Option<String> = None;
+        for log in self.access_logs_to_read(flag) {
+            if let crate::accesslog::LogSource::Found(found) =
+                crate::accesslog::read_log_file(&log.path)
+            {
+                let text = text.get_or_insert_with(String::new);
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&found);
+            }
+        }
+        match text {
+            Some(text) => crate::accesslog::LogSource::Found(text),
+            None => crate::accesslog::LogSource::Unavailable,
+        }
     }
 
     /// The SSH log this run should read, by the same precedence.
@@ -140,6 +285,20 @@ impl LogPaths {
             Some(path) => path.display().to_string(),
             None => self.default_access_log().to_string(),
         }
+    }
+}
+
+/// Whether `a` and `b` name the same file: the same path, or, for two
+/// that exist, the same inode. RHEL's Apache logs to `logs/access_log`
+/// under its server root, a link to `/var/log/httpd`.
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if a == b {
+        return true;
+    }
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => false,
     }
 }
 
@@ -238,6 +397,115 @@ mod tests {
             ),
             crate::accesslog::LogSource::Unavailable => panic!("the named file exists"),
         }
+    }
+
+    /// An NGINX config root under `dir` with one site logging to
+    /// `dir/site.log`, which exists, and host settings with `main.log`
+    /// stored and that root.
+    fn host_with_a_site_log(dir: &Path) -> crate::hostconf::HostConf {
+        let root = dir.join("nginx");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("site.conf"),
+            format!(
+                "server {{ server_name a.example; access_log {}; }}\n",
+                dir.join("site.log").display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("site.log"), "").unwrap();
+        crate::hostconf::HostConf {
+            nginx_root: Some(root),
+            access_log: Some(dir.join("main.log")),
+            ..Default::default()
+        }
+    }
+
+    /// A stored path is read beside the logs the config names; a flag is
+    /// read alone; and a server in a container has its config's paths
+    /// left alone, since they are the container's.
+    #[test]
+    fn a_flag_reads_only_itself_and_a_stored_path_adds_the_config_s_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (main, site, asked) = (
+            dir.path().join("main.log"),
+            dir.path().join("site.log"),
+            dir.path().join("asked.log"),
+        );
+        let here = host_with_a_site_log(dir.path());
+        let in_a_container = crate::hostconf::HostConf {
+            nginx_test_command: Some("docker exec web nginx -t".to_string()),
+            ..here.clone()
+        };
+        let cases = [
+            (
+                "stored, server here",
+                &here,
+                None,
+                vec![(&main, LogOrigin::Stored), (&site, LogOrigin::Config)],
+            ),
+            (
+                "a flag",
+                &here,
+                Some(asked.as_path()),
+                vec![(&asked, LogOrigin::Flag)],
+            ),
+            (
+                "stored, server in a container",
+                &in_a_container,
+                None,
+                vec![(&main, LogOrigin::Stored)],
+            ),
+        ];
+        for (case, host, flag, expected) in cases {
+            let logs = host.log_paths().access_logs(flag);
+            let logs: Vec<(&PathBuf, LogOrigin)> =
+                logs.iter().map(|log| (&log.path, log.origin)).collect();
+            assert_eq!(logs, expected, "{case}");
+        }
+    }
+
+    /// The config naming the stored log again, by another name for the
+    /// same file, does not make it two logs: its lines would be read
+    /// twice, under two cursors.
+    #[test]
+    fn a_file_named_twice_is_one_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = host_with_a_site_log(dir.path());
+        let link = dir.path().join("link.log");
+        std::os::unix::fs::symlink(dir.path().join("site.log"), &link).unwrap();
+        host.access_log = Some(link.clone());
+
+        let logs = host.log_paths().access_logs(None);
+
+        assert_eq!(
+            logs,
+            [AccessLog {
+                path: link,
+                origin: LogOrigin::Stored
+            }]
+        );
+    }
+
+    /// A log the config names that is not there is a site the server is
+    /// not serving, and is not read; the stored one is kept, to be
+    /// reported, whether or not it is there.
+    #[test]
+    fn only_the_config_s_logs_that_are_there_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = host_with_a_site_log(dir.path());
+        std::fs::remove_file(dir.path().join("site.log")).unwrap();
+
+        let logs = host.log_paths().access_logs_to_read(None);
+
+        assert_eq!(
+            logs,
+            [AccessLog {
+                path: dir.path().join("main.log"),
+                origin: LogOrigin::Stored
+            }],
+            "main.log is not there either, and is still read"
+        );
     }
 
     /// The health check's whole improvement: naming the file it tried.

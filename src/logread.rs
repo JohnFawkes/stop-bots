@@ -343,6 +343,29 @@ fn drain_rotated_copy(
     }
 }
 
+/// Every line of the rotated copy at `path`, from its start, decompressed
+/// if its name ends in `.gz`, until `budget` bytes of lines have been
+/// read; the bytes read. For the first read of a log, which also reads
+/// what logrotate kept of it (see [`crate::hostlog::read_rotated`]).
+///
+/// Opened as [`open_log`] opens a log, and a line longer than
+/// [`MAX_LINE`] is passed over here too: a copy sits in the same directory
+/// as the log, and whoever can write there can plant one. The budget
+/// counts the decompressed bytes, so a small file that unpacks to a great
+/// deal is read no further than a large one.
+pub fn read_rotated_copy(path: &Path, budget: u64, visit: &mut dyn FnMut(&str)) -> io::Result<u64> {
+    let file = open_log(path)?;
+    // Complete lines and the last one too, as in a copy being drained:
+    // nothing is appended to a rotated file.
+    let (read, _) = if path.extension().is_some_and(|ext| ext == "gz") {
+        let unpacked = flate2::read::MultiGzDecoder::new(file);
+        stream_reader(BufReader::new(unpacked), 0, false, budget, visit)?
+    } else {
+        stream_reader(BufReader::new(file), 0, false, budget, visit)?
+    };
+    Ok(read)
+}
+
 /// Every line in the last `max_bytes` of `path`, starting at the first
 /// line boundary inside them. For a report about what a log looks like,
 /// which a recent sample answers as well as the whole file.
@@ -1097,5 +1120,36 @@ mod tests {
     fn a_journal_that_cannot_be_run_is_an_error() {
         let result = read_journal(&query(Path::new("/nonexistent/journalctl")), &mut |_| {});
         assert!(result.is_err());
+    }
+
+    /// What logrotate leaves, plain or compressed, reads as the lines it
+    /// held, the last one whole even without its newline.
+    #[test]
+    fn a_rotated_copy_is_read_whole_whether_or_not_it_is_compressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("access.log.1");
+        let packed = dir.path().join("access.log.2.gz");
+        std::fs::write(&plain, "one\ntwo").unwrap();
+        crate::testing::write_gzip(&packed, "three\nfour\n", 0);
+
+        for (path, expected) in [(&plain, ["one", "two"]), (&packed, ["three", "four"])] {
+            let mut lines = Vec::new();
+            read_rotated_copy(path, u64::MAX, &mut |line| lines.push(line.to_string())).unwrap();
+            assert_eq!(lines, expected, "read from {}", path.display());
+        }
+    }
+
+    /// A compressed copy is read no further than the budget, counted in
+    /// what it unpacks to.
+    #[test]
+    fn a_rotated_copy_is_read_no_further_than_its_budget_unpacked() {
+        let dir = tempfile::tempdir().unwrap();
+        let packed = dir.path().join("access.log.2.gz");
+        crate::testing::write_gzip(&packed, &"0123456789\n".repeat(1000), 0);
+
+        let mut lines = 0;
+        let read = read_rotated_copy(&packed, 55, &mut |_| lines += 1).unwrap();
+
+        assert_eq!((read, lines), (55, 5), "five 11-byte lines fit in 55 bytes");
     }
 }

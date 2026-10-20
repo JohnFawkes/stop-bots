@@ -288,27 +288,35 @@ pub fn looks_like_a_bot(ua: &str) -> bool {
 /// the lists would block it right now. A bot that is known and allowed is
 /// still known; only something no list has heard of is `Unknown`.
 pub fn ua_matches_any_bot_pattern(ua: &str, bots: &[Bot]) -> bool {
-    let ua_lower = ua.to_lowercase();
+    let subject = crate::uaregex::Subject::new(ua);
     bots.iter()
-        .any(|bot| matched_alternative_lowered(&ua_lower, bot).is_some())
+        .any(|bot| alternative_matched(&subject, ua, bot).is_some())
 }
 
-/// Which of `bot`'s accepted patterns `ua` contains, if any, in the
-/// casing the list published it in.
+/// Which of `bot`'s top-level alternatives `ua` matches, if any, as the
+/// list wrote it with its escapes taken out.
 ///
-/// The same comparison [`ua_matches_any_bot_pattern`] makes, but keeping
-/// *which* alternative matched instead of discarding it. A detail view
-/// saying "matched `Googlebot`" is worth more than one saying "matched
-/// `Googlebot|Googlebot-Image|Googlebot-News|Storebot-Google`", which is
-/// what a merged row's whole pattern often looks like after three lists
-/// have contributed to it.
+/// Matched as the web server matches it, a case-insensitive regex (see
+/// [`crate::uaregex`]): the tag beside a row has to agree with what the
+/// web server does to that client. A pattern that uses something
+/// `uaregex` does not read is compared as before, as unescaped substrings.
+///
+/// Keeping *which* alternative matched is the point of returning it. A
+/// detail view saying "matched `Googlebot`" is worth more than one saying
+/// "matched `Googlebot|Googlebot-Image|Googlebot-News|Storebot-Google`",
+/// which is what a merged row's whole pattern often looks like after three
+/// lists have contributed to it.
 pub fn matched_alternative(ua: &str, bot: &Bot) -> Option<String> {
-    matched_alternative_lowered(&ua.to_lowercase(), bot)
+    alternative_matched(&crate::uaregex::Subject::new(ua), ua, bot)
 }
 
-/// [`matched_alternative`] with the lowercasing already done, so a scan
-/// over a thousand bots pays for it once rather than once per bot.
-fn matched_alternative_lowered(ua_lower: &str, bot: &Bot) -> Option<String> {
+/// [`matched_alternative`] with `ua` already prepared as `subject`, so that
+/// a scan over a thousand bots prepares it once.
+fn alternative_matched(subject: &crate::uaregex::Subject, ua: &str, bot: &Bot) -> Option<String> {
+    if let Some(pattern) = crate::uaregex::compiled(&bot.user_agent_pattern) {
+        return pattern.matching_alternative(subject).map(unescape_pattern);
+    }
+    let ua_lower = ua.to_lowercase();
     unescape_pattern(&bot.user_agent_pattern)
         .split('|')
         .find(|alternative| {
@@ -318,7 +326,7 @@ fn matched_alternative_lowered(ua_lower: &str, bot: &Bot) -> Option<String> {
 }
 
 /// Strips regex backslash-escapes from a stored pattern so it can be
-/// compared as a literal substring.
+/// compared as a literal substring, or shown.
 ///
 /// **Not cosmetic.** 217 of the 1,606 patterns on a real host come from
 /// `nginx-bad-bots`, which ships them regex-ready: `Googlebot\/`,
@@ -329,10 +337,9 @@ fn matched_alternative_lowered(ua_lower: &str, bot: &Bot) -> Option<String> {
 /// thing for display; this is the matching half.
 ///
 /// Only the escapes are removed, so a pattern that is *genuinely* a regex
-/// (`AdsBot-Google([^-]|$)`) still will not match as a literal. That is a
-/// known limit of comparing without a regex engine, and it errs the safe
-/// way for this screen: an unmatched pattern means a row is called unknown
-/// when a list does know it, which is a missed hint, not a wrong block.
+/// (`AdsBot-Google([^-]|$)`) will not match as a literal. Such a pattern
+/// is matched by [`crate::uaregex`] instead; this comparison is only for
+/// one that uses something `uaregex` does not read.
 fn unescape_pattern(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len());
     let mut chars = pattern.chars();
@@ -348,10 +355,9 @@ fn unescape_pattern(pattern: &str) -> String {
     out
 }
 
-/// Checks if a user agent string matches any blocked bot pattern.
-/// Uses a simple case-insensitive substring check since we don't have
-/// the regex crate available. This is a best-effort check that may have
-/// false positives/negatives compared to proper regex matching.
+/// Whether a bot the current policy blocks has a pattern `ua` matches,
+/// matched as [`matched_alternative`] matches it: the way the web server
+/// does.
 pub fn ua_matches_blocked_bot_patterns(
     ua: &str,
     bots: &[Bot],
@@ -359,8 +365,7 @@ pub fn ua_matches_blocked_bot_patterns(
     search_policy: Policy,
     scanner_policy: Policy,
 ) -> bool {
-    // For each bot that is currently blocked (based on its status and category policies),
-    // check if the UA contains the bot's pattern (case-insensitive).
+    let subject = crate::uaregex::Subject::new(ua);
     for bot in bots {
         // Check if this bot is currently blocked
         let bot_blocked = match bot.status {
@@ -373,16 +378,8 @@ pub fn ua_matches_blocked_bot_patterns(
             }
         };
 
-        if bot_blocked {
-            // Simple case-insensitive substring check
-            let ua_lower = ua.to_lowercase();
-            let pattern_lower = bot.user_agent_pattern.to_lowercase();
-            // Split pattern by | and check if any alternative matches
-            for alternative in pattern_lower.split('|') {
-                if ua_lower.contains(alternative) {
-                    return true;
-                }
-            }
+        if bot_blocked && alternative_matched(&subject, ua, bot).is_some() {
+            return true;
         }
     }
     false
@@ -1089,6 +1086,65 @@ mod tests {
         );
         assert_eq!(rows[0].status, RowStatus::Blocklist);
         assert_eq!(rows[0].status.label(), "BLOCKLIST");
+    }
+
+    /// A search engine on the default policy.
+    fn sample_bot() -> Bot {
+        Bot {
+            id: 1,
+            slug: "sample".to_string(),
+            name: "Sample".to_string(),
+            is_ai: false,
+            is_search_engine: true,
+            is_scanner: false,
+            user_agent_pattern: "Sample".to_string(),
+            status: crate::db::BotStatus::Default,
+            source_id: "test".to_string(),
+            updated_at: 1000,
+        }
+    }
+
+    /// The tag says what the web server does, and the web server reads a
+    /// pattern as a regex. Each pattern is one a built-in list publishes.
+    #[test]
+    fn the_blocklist_tag_reads_a_pattern_as_the_web_server_does() {
+        let cases = [
+            ("bingbot\\/", "Mozilla/5.0 (compatible; bingbot/2.0)", true),
+            ("^curl", "curl/8.7.1", true),
+            ("^curl", "Mozilla/5.0 curl-like", false),
+            (
+                "AdsBot-Google([^-]|$)",
+                "AdsBot-Google (+http://www.google.com/adsbot.html)",
+                true,
+            ),
+            ("AdsBot-Google([^-]|$)", "AdsBot-Google-Mobile", false),
+            ("[cC]laude(?:[bB]ot|-[Ww]eb)", "ClaudeBot/1.0", true),
+        ];
+        for (pattern, user_agent, blocked) in cases {
+            let bots = [Bot {
+                user_agent_pattern: pattern.to_string(),
+                ..sample_bot()
+            }];
+            let stats = vec![UserAgentStat {
+                user_agent: user_agent.to_string(),
+                hit_count: 1,
+                last_seen_at: 1000,
+            }];
+            let rows = build_ua_rows(
+                stats,
+                &HashSet::new(),
+                &bots,
+                Policy::Blocked,
+                Policy::Blocked,
+                Policy::Blocked,
+            );
+            assert_eq!(
+                rows[0].status == RowStatus::Blocklist,
+                blocked,
+                "{pattern} against {user_agent}: {:?}",
+                rows[0].status
+            );
+        }
     }
 
     #[test]

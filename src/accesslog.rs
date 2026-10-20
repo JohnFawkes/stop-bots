@@ -675,7 +675,7 @@ fn impersonates(line: &ParsedLine, claims: &[CrawlerClaim]) -> Option<&'static s
 /// What's left is credential and source-tree exposure — files that only
 /// ever exist because of a deployment mistake, and that only ever get
 /// requested by something looking for that mistake.
-pub const DEFAULT_PROBE_PATHS: [&str; 13] = [
+pub const DEFAULT_PROBE_PATHS: [&str; 15] = [
     "/.env",            // and /.env.local, /api/.env, ... (see the matching note)
     "/.git/",           // /.git/config, /.git/HEAD, ...
     "/.svn/",           //
@@ -684,8 +684,15 @@ pub const DEFAULT_PROBE_PATHS: [&str; 13] = [
     "/.ssh/",           // /.ssh/id_rsa
     "/wp-config.php",   // never served as content, only ever probed
     "/vendor/phpunit/", // the eval-stdin.php RCE probe and friends
-    "/.DS_Store",       // leaks a directory listing
-    "/.htpasswd",       //
+    // The same probe wherever the scanner guesses PHPUnit was unpacked:
+    // `/phpunit/phpunit/src/Util/PHP/eval-stdin.php`, `/lib/phpunit/...`.
+    // DShield's honeypots see 5.3 million a month outside `/vendor/`.
+    "/eval-stdin.php",
+    // An editor's SFTP settings, `sftp.json`, password and all, uploaded
+    // with the site by mistake.
+    "/.vscode/",
+    "/.DS_Store", // leaks a directory listing
+    "/.htpasswd", //
     // A WordPress "plugin" that is a file-manager backdoor. Nobody
     // installs it on purpose, and it was the single most-requested path
     // from clients sending no user agent at all on the host this came
@@ -1197,6 +1204,15 @@ impl Observer {
     pub fn counting_user_agents(mut self) -> Observer {
         self.user_agents = Some(HashMap::new());
         self
+    }
+
+    /// Reads one line as [`Self::line`] does, but leaves it out of the
+    /// user-agent tally: a rotated copy's line, read on a log's first read
+    /// for its evidence only (see [`crate::logscan`]).
+    pub fn line_uncounted(&mut self, text: &str, clock: Clock) {
+        let tally = self.user_agents.take();
+        self.line(text, clock);
+        self.user_agents = tally;
     }
 
     /// Reads one line.

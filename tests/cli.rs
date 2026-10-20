@@ -42,6 +42,14 @@ impl Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let nginx_root = tmp.path().join("nginx");
         fs::create_dir_all(&nginx_root).unwrap();
+        // A root of its own from the start, which `set-web-server` replaces:
+        // with none, every command reads the stock `/etc/nginx` for the
+        // access logs its config names, the machine's own.
+        fs::write(
+            tmp.path().join("host.conf"),
+            format!("nginx_root = {}\n", nginx_root.display()),
+        )
+        .unwrap();
         Fixture {
             db: tmp.path().join("db.sqlite3"),
             nginx_root,
@@ -3835,14 +3843,9 @@ fn install_cron_refuses_a_binary_in_a_build_directory() {
         .stderr(predicate::str::contains("build directory"));
 }
 
-/// One `tick` runs the due detectors against the stored access log and
-/// blocks what they find; the next one, straight after, has nothing due.
-/// The jobs that download or probe the host are marked just run, so
-/// nothing leaves this machine.
-#[test]
-fn tick_runs_what_is_due_and_then_nothing() {
-    let fx = Fixture::new();
-    let access = fx._tmp.path().join("access.log");
+/// A request for `/.env` from `ip`, logged now: what the probe-paths
+/// detector, on by default, blocks on sight.
+fn probe_logged_now(ip: &str) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -3852,19 +3855,35 @@ fn tick_runs_what_is_due_and_then_nothing() {
         .output()
         .unwrap();
     let stamp = String::from_utf8(stamp.stdout).unwrap();
-    fs::write(
-        &access,
-        format!(
-            "203.0.113.50 - - [{}] \"GET /.env HTTP/1.1\" 404 0 \"-\" \"curl/8\"\n",
-            stamp.trim()
-        ),
+    format!(
+        "{ip} - - [{}] \"GET /.env HTTP/1.1\" 404 0 \"-\" \"curl/8\"\n",
+        stamp.trim()
     )
-    .unwrap();
-    let ssh = fx._tmp.path().join("auth.log");
-    fs::write(&ssh, "").unwrap();
-    fx.run(&["set-log-paths", "--access-log", access.to_str().unwrap()]);
-    {
-        let db = stop_bots::db::Db::open(&fx.db).unwrap();
+}
+
+impl Fixture {
+    /// Readies this fixture for `tick`: the web server's config is this
+    /// fixture's root, whose logs it names are the only ones read beside
+    /// `access_log`; the jobs that download or probe the host are marked
+    /// just run, so nothing leaves this machine; and the SSH log is an
+    /// empty file of the fixture's, which `tick --ssh-log` is handed.
+    fn ready_for_tick(&self, access_log: &Path) -> std::path::PathBuf {
+        self.run(&[
+            "set-web-server",
+            "nginx",
+            "--root",
+            self.nginx_root.to_str().unwrap(),
+        ]);
+        self.run(&[
+            "set-log-paths",
+            "--access-log",
+            access_log.to_str().unwrap(),
+        ]);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let db = stop_bots::db::Db::open(&self.db).unwrap();
         for job in [
             "update_ip_ranges",
             "update_everything",
@@ -3873,16 +3892,116 @@ fn tick_runs_what_is_due_and_then_nothing() {
         ] {
             db.set_cron_last_run(job, now, "skipped for test").unwrap();
         }
+        let ssh = self._tmp.path().join("auth.log");
+        fs::write(&ssh, "").unwrap();
+        ssh
     }
 
-    let first = fx.run(&["tick", "--verbose", "--ssh-log", ssh.to_str().unwrap()]);
-    let said = String::from_utf8(first.get_output().stdout.clone()).unwrap();
+    /// `tick --verbose --ssh-log <ssh>`, and what it said. With a temporary
+    /// directory of the fixture's own, which is where an unprivileged
+    /// `tick` takes its lock: two tests ticking at once would otherwise
+    /// each find "another tick still running" and do nothing.
+    fn tick(&self, ssh: &Path) -> String {
+        let ran = self
+            .cmd(&["tick", "--verbose", "--ssh-log", ssh.to_str().unwrap()])
+            .env("TMPDIR", self._tmp.path())
+            .assert()
+            .success();
+        String::from_utf8_lossy(&ran.get_output().stdout).into_owned()
+    }
+}
+
+/// One `tick` runs the due detectors against the stored access log and
+/// blocks what they find; the next one, straight after, has nothing due.
+#[test]
+fn tick_runs_what_is_due_and_then_nothing() {
+    let fx = Fixture::new();
+    let access = fx._tmp.path().join("access.log");
+    fs::write(&access, probe_logged_now("203.0.113.50")).unwrap();
+    let ssh = fx.ready_for_tick(&access);
+
+    let said = fx.tick(&ssh);
     assert!(said.contains("Block probe paths"), "tick said:\n{said}");
     fx.run(&["list-firewall-rules"])
         .stdout(predicate::str::contains("203.0.113.50"));
 
-    fx.run(&["tick", "--verbose", "--ssh-log", ssh.to_str().unwrap()])
-        .stdout(predicate::str::contains("Nothing was due."));
+    let said = fx.tick(&ssh);
+    assert!(said.contains("Nothing was due."), "tick said:\n{said}");
+}
+
+/// A site that logs to a file of its own is watched as the main log is:
+/// `tick` reads every access log the config names, beside the stored one,
+/// and `set-log-paths` says which they are.
+#[test]
+fn tick_reads_the_access_log_a_site_names() {
+    let fx = Fixture::new();
+    let access = fx._tmp.path().join("access.log");
+    let shop = fx._tmp.path().join("shop.log");
+    fs::write(&access, "").unwrap();
+    fs::write(&shop, probe_logged_now("203.0.113.51")).unwrap();
+    fs::write(
+        fx.nginx_root.join("shop.conf"),
+        format!(
+            "server {{\n    server_name shop.example;\n    access_log {} combined;\n}}\n",
+            shop.display()
+        ),
+    )
+    .unwrap();
+    let ssh = fx.ready_for_tick(&access);
+
+    fx.run(&["set-log-paths"])
+        .stdout(predicate::str::contains(shop.to_str().unwrap()));
+    let said = fx.tick(&ssh);
+
+    let rules = fx.run(&["list-firewall-rules"]);
+    let rules = String::from_utf8_lossy(&rules.get_output().stdout).into_owned();
+    assert!(
+        rules.contains("203.0.113.51"),
+        "rules:\n{rules}\ntick said:\n{said}"
+    );
+}
+
+/// `batch --root` is the config this run scans and applies to, so the
+/// access logs that config names are the ones it reads, not those of the
+/// stored root.
+#[test]
+fn batch_reads_the_access_log_a_site_under_its_root_names() {
+    let fx = Fixture::new();
+    let other = fx._tmp.path().join("other-nginx");
+    fs::create_dir_all(&other).unwrap();
+    let access = fx._tmp.path().join("access.log");
+    let shop = fx._tmp.path().join("shop.log");
+    fs::write(&access, "").unwrap();
+    fs::write(&shop, probe_logged_now("203.0.113.52")).unwrap();
+    fs::write(
+        other.join("shop.conf"),
+        format!(
+            "server {{\n    server_name shop.example;\n    access_log {} combined;\n}}\n",
+            shop.display()
+        ),
+    )
+    .unwrap();
+    fx.run(&["set-log-paths", "--access-log", access.to_str().unwrap()]);
+
+    let out = fx.firewall_script();
+    let said = fx.run(&[
+        "batch",
+        "--no-fetch",
+        "--root",
+        other.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--ssh-log",
+        "tests/fixtures/logs/auth.log",
+    ]);
+    let said = String::from_utf8_lossy(&said.get_output().stdout).into_owned();
+
+    let rules = fx.run(&["list-firewall-rules"]);
+    let rules = String::from_utf8_lossy(&rules.get_output().stdout).into_owned();
+    assert!(
+        rules.contains("203.0.113.52"),
+        "rules:\n{rules}\nbatch said:\n{said}"
+    );
 }
 
 /// `--purge` deletes the database, which every part still installed reads.
@@ -5254,6 +5373,7 @@ fn output_piped_into_a_reader_that_stops_early_is_not_a_panic() {
     ]);
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("stop-bots"))
         .args(["list-bots", "--db", db.to_str().unwrap()])
+        .env("PATH", common::quiet_path())
         .env_remove("STOP_BOTS_DB")
         .env("STOP_BOTS_HOST_CONF", dir.path().join("host.conf"))
         .stdout(std::process::Stdio::piped())

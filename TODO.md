@@ -6,17 +6,7 @@ list — which meant the open items below were unfindable inside it.
 
 ## Worth doing next
 
-* **`ua_matches_blocked_bot_patterns`** (`dynamic.rs`) does case-insensitive
-  *substring* matching over `|`-split alternatives, while the web server enforces a
-  real case-insensitive regex (NGINX's `~*`, Apache's `RewriteCond ... [NC]`). The
-  `BLOCKLIST` tag can therefore disagree with what actually gets blocked.
-
-* **A few CLI tests read the host's SSH journal.** Those that pass no
-  `--ssh-log` fall back to `journalctl` on whatever machine runs them —
-  read-only, but not hermetic. `tests/common::stop_bots_bin` could put a
-  fake `journalctl` first on PATH; tests that set their own PATH would then
-  need to keep it. (The health probe's `systemctl`/`docker ps` calls from
-  unit tests, the worse case, are fixed.)
+Nothing at the moment.
 
 ## Known gaps
 
@@ -70,7 +60,3 @@ that day.
   one of them easier to read. The banners already provide the navigation a split
   would. The version that would genuinely help — decomposing into per-concern
   types — is a design exercise, not a tidy-up.
-* **`main.rs` is ~3,400 lines before its tests**, about 1,100 of them the
-  `Command` enum and its help text. Lifting the enum into its own module is
-  self-contained and would take a third off the file. Smaller and safer than the `db.rs` split, if file size is what
-  bothers you.

@@ -46,6 +46,31 @@ impl AccessStatsOutcome {
         }
     }
 
+    /// The outcome of tallying every one of `counts` together: an agent in
+    /// two of them is one agent. A pass reads each access log on its own.
+    pub fn of_all<'a>(
+        counts: impl IntoIterator<Item = &'a HashMap<String, u64>>,
+    ) -> AccessStatsOutcome {
+        let mut agents = std::collections::HashSet::new();
+        let mut total_hits = 0;
+        for counts in counts {
+            agents.extend(counts.keys());
+            total_hits += counts.values().sum::<u64>();
+        }
+        AccessStatsOutcome {
+            distinct_user_agents: agents.len(),
+            total_hits,
+        }
+    }
+
+    /// Both outcomes' hits and agents, added up.
+    pub fn plus(self, other: AccessStatsOutcome) -> AccessStatsOutcome {
+        AccessStatsOutcome {
+            distinct_user_agents: self.distinct_user_agents + other.distinct_user_agents,
+            total_hits: self.total_hits + other.total_hits,
+        }
+    }
+
     /// A one-line summary suitable for a status display (the Dashboard's
     /// "Scheduled tasks" panel, `Db::set_cron_last_run`'s `summary`
     /// argument), mirroring `ScanBlockOutcome::summary`'s role.
@@ -78,6 +103,21 @@ mod tests {
         assert_eq!(
             outcome.summary(),
             "recorded 3 hit(s) across 2 distinct user agent(s)"
+        );
+    }
+
+    /// Read from two logs, an agent seen in both is still one agent.
+    #[test]
+    fn an_agent_in_two_logs_is_one_agent() {
+        let main = HashMap::from([("Mozilla/5.0".to_string(), 2), ("curl/8.0".to_string(), 1)]);
+        let site = HashMap::from([("Mozilla/5.0".to_string(), 4)]);
+
+        assert_eq!(
+            AccessStatsOutcome::of_all([&main, &site]),
+            AccessStatsOutcome {
+                distinct_user_agents: 2,
+                total_hits: 7
+            }
         );
     }
 

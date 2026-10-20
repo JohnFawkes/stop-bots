@@ -301,7 +301,12 @@ fn scan_logs(db: &Db, options: &BatchOptions) -> Vec<Step> {
         ssh_log: options.ssh_log.clone(),
         access_log: options.access_log.clone(),
         kernel_log: None,
-        stored: options.host.log_paths(),
+        // The config root this run scans and applies to, `--root` and all:
+        // the access logs its config names are the ones to read.
+        stored: crate::logpaths::LogPaths {
+            root: options.root.clone(),
+            ..options.host.log_paths()
+        },
     };
     let applied = match crate::logscan::run(db, &jobs, &flags) {
         Ok(applied) => applied,
@@ -325,8 +330,9 @@ fn scan_logs(db: &Db, options: &BatchOptions) -> Vec<Step> {
     let stats = if applied.access.is_readable() {
         crate::cron::record_run(db, CronJob::RecordAccessStats, "recorded by batch run");
         Ok(format!(
-            "{} user agent(s)",
-            applied.stats.distinct_user_agents
+            "{} user agent(s){}",
+            applied.stats.distinct_user_agents,
+            applied.unreadable_note()
         ))
     } else {
         Ok("skipped: no access log".to_string())

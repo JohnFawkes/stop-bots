@@ -163,6 +163,11 @@ const WEAK: &[(&str, &[&str])] = &[
             "shell_exec(",
             "passthru(",
             "base64_decode(",
+            // ThinkPHP's remote code execution (CVE-2018-20062), which
+            // DShield's web honeypots see about 1.4 million times a month:
+            // `?s=/index/\think\app/invokefunction&function=call_user_func_array`.
+            "invokefunction",
+            "call_user_func_array",
             "/bin/sh",
             "/bin/bash",
             "busybox",
@@ -269,6 +274,13 @@ fn weak(text: &str) -> Option<&'static str> {
     let squashed = squash(text);
     if let Some(found) = matching(&squashed, WEAK) {
         return Some(found);
+    }
+    // One step up with Windows' separator: `/\..\adm\management.asp`, a
+    // router exploit the honeypots see over a million times a month. Two
+    // steps of either kind are strong; one forward-slash step is something
+    // a relative link produces, but no link is written with backslashes.
+    if squashed.contains("\\..\\") {
+        return Some("path traversal");
     }
     if sleeps(&squashed) {
         return Some("sql injection");
@@ -546,6 +558,27 @@ mod tests {
         );
     }
 
+    /// The commonest payloads DShield's web honeypots logged in the month
+    /// to 2026-10-19 that the signatures above did not recognise.
+    #[test]
+    fn the_honeypots_commonest_missed_payloads_are_recognised() {
+        let seen: &[(&str, &str)] = &[
+            (
+                "GET /index.php?s=/index/\\think\\app/invokefunction&function=call_user_func_array\
+                 &vars[0]=md5&vars[1][]=Hello HTTP/1.1",
+                "code injection",
+            ),
+            ("GET /\\..\\adm\\management.asp HTTP/1.1", "path traversal"),
+            (
+                "GET /\\.gif\\..\\adm\\management.asp HTTP/1.1",
+                "path traversal",
+            ),
+        ];
+        for (line, expected) in seen {
+            assert_eq!(request(line), Some(*expected), "{line}");
+        }
+    }
+
     /// Ordinary traffic, including the near misses that shaped the
     /// signatures.
     #[test]
@@ -581,6 +614,8 @@ mod tests {
             "GET /search?q=union+select+example HTTP/2.0",
             "GET /?query=%3Cscript%3E+tag HTTP/2.0",
             "GET /?keyword=what+is+%2Fbin%2Fsh HTTP/2.0",
+            "GET /?s=call_user_func_array+example HTTP/2.0",
+            "GET /?q=c%3A%5C..%5Cwindows HTTP/2.0",
         ] {
             assert_eq!(request(line), None, "{line}");
         }

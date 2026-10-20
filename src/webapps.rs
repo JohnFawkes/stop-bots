@@ -72,7 +72,9 @@ pub struct WebApp {
     pub files: &'static [&'static str],
     /// The path segments its users request, matched against each segment
     /// of a request path ignoring case: `/blog/wp-login.php` is a request
-    /// for `wp-login.php`.
+    /// for `wp-login.php`. One with a `/` is several segments in a row,
+    /// for an application whose own names are ordinary words:
+    /// `remote/logincheck` is FortiGate's, `remote` alone anyone's.
     pub paths: &'static [&'static str],
 }
 
@@ -81,7 +83,7 @@ pub struct WebApp {
 /// A path listed under two applications (`xmlrpc.php`) is a probe only
 /// where both are absent. Any path here that exists in a document root is
 /// served there, whatever application put it there.
-pub const APPS: [WebApp; 3] = [
+pub const APPS: [WebApp; 11] = [
     WebApp {
         name: "WordPress",
         config_names: &["wordpress"],
@@ -100,6 +102,73 @@ pub const APPS: [WebApp; 3] = [
         config_names: &["drupal"],
         files: &["core/lib/Drupal.php", "includes/bootstrap.inc"],
         paths: &["xmlrpc.php"],
+    },
+    // The rest are what DShield's web honeypots were asked for most, in
+    // the month to 2026-10-19, that no other probe path covered: appliances
+    // and servers a web host does not run, but that some host behind a
+    // reverse proxy might. Each path is one only that product uses.
+    // Exchange's `/autodiscover/` is left out, whatever the product: a
+    // person's Outlook asks for it on the domain of their email address.
+    WebApp {
+        name: "Microsoft Exchange",
+        config_names: &["exchange", "owa"],
+        files: &[],
+        paths: &[
+            "auth.owa",
+            "rpcproxy.dll",
+            "emsmdb",
+            "microsoft-server-activesync",
+            "reportingwebservice",
+        ],
+    },
+    WebApp {
+        name: "FortiGate SSL VPN",
+        config_names: &["fortigate", "fortinet"],
+        files: &[],
+        paths: &["remote/logincheck", "remote/fgt_lang"],
+    },
+    WebApp {
+        name: "Tomcat manager",
+        config_names: &["tomcat"],
+        files: &[],
+        paths: &["manager/html", "host-manager"],
+    },
+    WebApp {
+        name: "Solr",
+        config_names: &["solr"],
+        files: &[],
+        paths: &["solr/admin"],
+    },
+    WebApp {
+        name: "Spring Boot",
+        config_names: &["actuator", "spring"],
+        files: &[],
+        paths: &["actuator"],
+    },
+    WebApp {
+        name: "Docker API or registry",
+        config_names: &["docker", "registry"],
+        files: &[],
+        paths: &["containers/json", "v2/_catalog"],
+    },
+    WebApp {
+        name: "a router's admin pages",
+        config_names: &["luci", "goform", "boaform"],
+        files: &[],
+        paths: &[
+            "hnap1",
+            "boaform",
+            "goform",
+            "gponform",
+            "cgi-bin/luci",
+            "authlogin.cgi",
+        ],
+    },
+    WebApp {
+        name: "GeoServer",
+        config_names: &["geoserver"],
+        files: &[],
+        paths: &["geoserver"],
     },
 ];
 
@@ -399,6 +468,15 @@ fn inspect_root(root: &str, files_here: bool, verdicts: &mut Verdicts) {
     }
 }
 
+/// Whether `path`'s segments (one, or several joined by `/`) appear one
+/// after another among `segments`.
+fn in_a_row(segments: &[String], path: &str) -> bool {
+    let wanted: Vec<&str> = path.split('/').collect();
+    segments
+        .windows(wanted.len())
+        .any(|window| window.iter().zip(&wanted).all(|(have, want)| have == want))
+}
+
 /// Which conditional paths are probes where, for every request: the
 /// probe-paths detector's half of this module.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -458,7 +536,7 @@ impl AppProbes {
         let asked: Vec<&'static str> = conditional_paths()
             .iter()
             .copied()
-            .filter(|path| segments.iter().any(|segment| segment == path))
+            .filter(|path| in_a_row(&segments, path))
             .collect();
         if asked.is_empty() {
             return None;
@@ -767,19 +845,47 @@ mod tests {
     }
 
     /// Every path has an application, and every application paths and a
-    /// way to be recognised.
+    /// way to be recognised. Files are optional: an appliance or a server
+    /// with its own port is never in a document root, and is recognised
+    /// by its name in the config or doubted for the proxy in front of it.
     #[test]
     fn the_table_is_complete() {
         for app in &APPS {
             assert!(
-                !app.paths.is_empty() && !app.files.is_empty() && !app.config_names.is_empty(),
+                !app.paths.is_empty() && !app.config_names.is_empty(),
                 "{}",
                 app.name
             );
         }
         assert_eq!(apps_serving("xmlrpc.php"), ["WordPress", "Drupal"]);
         for path in conditional_paths() {
-            assert!(!path.contains('/'), "{path} must be one segment");
+            assert!(
+                path.split('/').all(|segment| !segment.is_empty()) && *path == path.to_lowercase(),
+                "{path} must be lowercase segments joined by single slashes"
+            );
+        }
+    }
+
+    /// A path of several segments is a probe only with all of them, in
+    /// order: `remote` alone is anyone's.
+    #[test]
+    fn a_path_of_several_segments_matches_only_all_of_them_in_a_row() {
+        let probes = AppProbes::new(
+            vec![site("static.example", static_site())],
+            &Verdicts::default(),
+        );
+        let cases = [
+            ("/remote/logincheck", true),
+            ("/REMOTE/LoginCheck", true),
+            ("/vpn/remote/logincheck", true),
+            ("/remote/login", false),
+            ("/remote/", false),
+            ("/logincheck/remote", false),
+            ("/owa/auth.owa", true),
+            ("/cgi-bin/luci/;stok=/locale", true),
+        ];
+        for (path, probe) in cases {
+            assert_eq!(probes.probe([], path).is_some(), probe, "{path}");
         }
     }
 }

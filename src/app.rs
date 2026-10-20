@@ -212,10 +212,10 @@ pub struct App {
     /// both exist for exactly the same "don't really execute system-
     /// changing commands under test" reason.
     apply_firewall: bool,
-    /// Where "Apply everything" writes the firewall script. `None` means
-    /// "follow the backend", which is what [`crate::firewall::output_path`]
-    /// does: an nftables render lands in `.nft` and an iptables one in
-    /// `.sh`.
+    /// Where "Apply everything" and the scheduled render write the firewall
+    /// script. `None` means "follow the backend", which is what
+    /// [`crate::firewall::output_path`] does: an nftables render lands in
+    /// `.nft` and an iptables one in `.sh`.
     ///
     /// A field rather than a call at the point of use because the default
     /// is a real path under `/etc`, and a test that presses the key must be able to point it somewhere
@@ -227,18 +227,6 @@ pub struct App {
     /// file of its own and `set-web-server` takes effect without a
     /// restart.
     pub host_conf: std::path::PathBuf,
-    /// An "update everything" run in progress: the sources still to fetch
-    /// and what the finished ones came to. `None` when none is running.
-    ///
-    /// One source at a time, deliberately. The whole plan is eight or more
-    /// downloads of several megabytes each; fetching them all at once
-    /// would hold every payload in memory and show nothing until the last
-    /// one landed, while one-at-a-time keeps it to a single body and gives
-    /// the message line something true to say throughout.
-    update_all: Option<UpdateAllRun>,
-    /// The download lease the scheduled crawler-range update holds while
-    /// its fetch is out. See [`crate::refresh::Lease`].
-    ip_ranges_lease: Option<crate::refresh::Lease>,
     /// The download lease a one-source crawler refresh holds while its
     /// fetch is out — see [`App::start_crawler_ranges_refresh`].
     crawler_refresh_lease: Option<crate::refresh::Lease>,
@@ -264,29 +252,14 @@ pub struct App {
     pub revert_tools: crate::revert::Tools,
 }
 
-/// The state of one "Update everything", pressed or scheduled.
-struct UpdateAllRun {
-    /// Sources not yet fetched, in plan order, popped from the front.
-    remaining: std::collections::VecDeque<crate::refresh::Source>,
-    /// Every outcome so far: what [`crate::refresh::record`] reports and
-    /// decides the crawler job from.
-    outcomes: Vec<(crate::refresh::Source, Result<String, String>)>,
-    /// The download lease, renewed after each source and given back at the
-    /// end. `None` only in tests that build a run by hand.
-    lease: Option<crate::refresh::Lease>,
-    /// Whether the weekly job started it rather than `u`. A scheduled run
-    /// works in the background: it says nothing on the message line, and
-    /// its outcome goes to the Scheduled panel.
-    scheduled: bool,
-}
-
-impl UpdateAllRun {
-    fn job(&self) -> Job {
-        if self.scheduled {
-            Job::Cron(CronJob::UpdateEverything)
-        } else {
-            Job::UpdateEverything
-        }
+/// The key a scheduled job's work is in flight under: its own, except for
+/// the download `u` asks for, which is `Job::UpdateEverything` so that the
+/// Scheduled tasks panel does not show it as the weekly job running.
+fn cron_job_key(job: CronJob, by_hand: bool) -> Job {
+    if by_hand {
+        Job::UpdateEverything
+    } else {
+        Job::Cron(job)
     }
 }
 
@@ -425,8 +398,6 @@ impl App {
             session_client: crate::sshlog::session_client(),
             firewall_out: None,
             host_conf: crate::hostconf::path(),
-            update_all: None,
-            ip_ranges_lease: None,
             crawler_refresh_lease: None,
             apply_everything: false,
             cron_apply_nginx: false,
@@ -578,12 +549,7 @@ impl App {
             Event::App(AppEvent::ReputationFetchFinished { source_id, result }) => {
                 self.finish_reputation_fetch(source_id, result)?;
             }
-            Event::App(AppEvent::CronIpRangesFetched { results }) => {
-                self.finish_cron_update_ip_ranges(results)?;
-            }
-            Event::App(AppEvent::CronLogRead { jobs, read }) => {
-                self.finish_cron_log_pass(jobs, *read)?;
-            }
+            Event::App(AppEvent::CronWorkDone { done }) => self.finish_cron_job(*done)?,
             Event::App(AppEvent::SshLogRead { text }) => self.finish_ssh_log_read(text)?,
             Event::App(AppEvent::NginxReloaded { result }) => self.finish_nginx_reload(result),
             Event::App(AppEvent::FirewallRendered { outcome }) => {
@@ -608,21 +574,15 @@ impl App {
                     std::sync::Arc::try_unwrap(outcome).unwrap_or_else(|shared| (*shared).clone());
                 self.finish_site_apply(outcome)?;
             }
-            Event::App(AppEvent::EverythingSourceFetched { source, result }) => {
-                self.finish_update_everything_source(source, result)?
-            }
             Event::App(AppEvent::CrawlerRangesFetched { kind, result }) => {
                 self.finish_crawler_ranges_refresh(kind, result)?
-            }
-            Event::App(AppEvent::HealthProbed { probe }) => {
-                self.finish_cron_health_check(*probe)?
             }
         }
         Ok(())
     }
     // ---- background work: every `start_` has a `finish_` ----
     //
-    // The shape is the same fourteen times over, and it is the reason the
+    // The shape is the same every time, and it is the reason the
     // TUI never blocks. A `start_` method does the `Db` reads on the main
     // thread, puts the slow half on a runtime or blocking-pool task, and
     // returns immediately; the task sends an `AppEvent`; the matching
@@ -898,10 +858,10 @@ impl App {
 
     /// The internal cron's tick handler (see `crate::cron`'s module docs
     /// for the overall design): throttled against `Event::Tick`'s 30fps
-    /// rate via [`CRON_CHECK_INTERVAL`], runs whichever jobs are currently
-    /// due. Never surfaces a `Result` error out of a single job to the
-    /// user as a hard failure — a background job failing (e.g. the SSH log
-    /// being unreadable) is recorded as that job's own summary, not
+    /// rate via [`CRON_CHECK_INTERVAL`], starts whichever jobs are
+    /// currently due. Never surfaces a `Result` error out of a single job
+    /// to the user as a hard failure — a background job failing (e.g. the
+    /// SSH log being unreadable) is recorded as that job's own summary, not
     /// something that should interrupt the TUI.
     fn check_cron(&mut self) -> Result<()> {
         if self.last_cron_check.elapsed() < CRON_CHECK_INTERVAL {
@@ -913,47 +873,136 @@ impl App {
         if due.is_empty() {
             return Ok(());
         }
-        // Every due job that reads a log goes in one pass, which reads each
-        // log once for all of them.
-        let (log_jobs, others): (Vec<CronJob>, Vec<CronJob>) = due
-            .into_iter()
-            .partition(|job| crate::cron::is_log_job(*job));
-        if !log_jobs.is_empty() {
-            self.start_cron_log_pass(log_jobs);
-        }
-        for job in others {
-            self.run_cron_job(job)?;
+        for task in crate::cron::tasks(due) {
+            self.start_cron_job(task)?;
         }
         self.refresh()?;
         Ok(())
     }
 
-    fn run_cron_job(&mut self, job: CronJob) -> Result<()> {
-        match job {
-            CronJob::UpdateIpRanges => self.start_cron_update_ip_ranges(),
-            CronJob::UpdateEverything => self.start_update_everything(true),
-            CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::RenderFirewall => {
-                self.start_cron_log_pass(vec![job])
-            }
-            CronJob::HealthCheck => self.start_cron_health_check(),
-            // Runs inline rather than on the blocking pool like its
-            // neighbours: it touches nothing but the database, and `Db`
-            // isn't `Sync`, so moving it off-thread would mean moving the
-            // handle, not just the slow half. A prune is a pair of
-            // statements and a compaction only happens on a file already
-            // known to be mostly slack.
-            CronJob::Maintenance => {
-                let summary = crate::cron::maintenance(&self.db);
-                crate::cron::record_run(&self.db, CronJob::Maintenance, &summary);
-            }
-            CronJob::ApplyNginx => self.start_cron_apply_nginx()?,
+    /// Starts one of the schedule's tasks through [`crate::cron::start`],
+    /// the same dispatch `tick` uses: the `Db` half here, the slow half on
+    /// a task of its own, and [`Self::finish_cron_job`] back here when it
+    /// returns.
+    ///
+    /// A task that would run beside the same work already out waits for
+    /// the next check instead (see [`Self::cron_job_waits`]). `due_jobs`
+    /// cannot say so itself: a job's `last_run` does not move until it
+    /// finishes.
+    fn start_cron_job(&mut self, task: crate::cron::Task) -> Result<()> {
+        if self.cron_job_waits(&task) {
+            return Ok(());
         }
+        let host = self.host().unwrap_or_default();
+        let settings = crate::cron::Settings {
+            host: &host,
+            ssh_log: self.ssh_log.as_deref(),
+            // `None` in real use, so the path follows the stored backend:
+            // an nftables render lands in `.nft` and an iptables one in
+            // `.sh`.
+            firewall_out: self.firewall_out.as_deref(),
+            for_real: self.apply_firewall,
+        };
+        match crate::cron::start(&self.db, &task, &settings) {
+            Ok(next) => self.carry_on_cron_job(next),
+            Err(err) => {
+                self.message = Some(match task {
+                    crate::cron::Task::LogPass(_) => {
+                        format!("The scheduled log scan could not start: {err:#}")
+                    }
+                    crate::cron::Task::Job(job) => {
+                        format!("{} (scheduled) could not start: {err:#}", job.label())
+                    }
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether `task` has to wait for work this process already has out:
+    ///
+    /// - the same job, which would only do the same thing twice;
+    /// - any log pass, for a log pass. One pass at a time: this used to
+    ///   start one read per job, all at once, so a fresh start ran a dozen
+    ///   full reads of the access log together, 2.9 GB of memory for a
+    ///   200 MB log. The pass a due job would have joined is reading the
+    ///   same lines anyway;
+    /// - any download, `u`'s included, for a download. The lease (see
+    ///   [`crate::refresh::Lease`]) would refuse it too; this says so
+    ///   before asking the database.
+    fn cron_job_waits(&self, task: &crate::cron::Task) -> bool {
+        use crate::cron::{is_download, is_log_job};
+        let out: Vec<CronJob> = self
+            .jobs_in_flight
+            .iter()
+            .filter_map(|job| match job {
+                Job::Cron(job) => Some(*job),
+                Job::UpdateEverything => Some(CronJob::UpdateEverything),
+                _ => None,
+            })
+            .collect();
+        task.jobs().iter().any(|&wanted| {
+            out.iter().any(|&out| {
+                out == wanted
+                    || (is_log_job(out) && is_log_job(wanted))
+                    || (is_download(out) && is_download(wanted))
+            })
+        })
+    }
+
+    /// Does what [`crate::cron::start`] or [`crate::cron::finish`] said
+    /// comes next: put the slow half on a task of its own, or start the
+    /// site apply.
+    fn carry_on_cron_job(&mut self, next: crate::cron::Next) -> Result<()> {
+        let work = match next {
+            crate::cron::Next::Ran(_) | crate::cron::Next::Waiting => return Ok(()),
+            crate::cron::Next::ApplySites => return self.start_cron_apply_nginx(),
+            crate::cron::Next::Work(work) => work,
+        };
+        if let Some(progress) = work.progress() {
+            self.message = Some(progress);
+        }
+        let by_hand = work.by_hand();
+        for job in work.jobs() {
+            self.jobs_in_flight.insert(cron_job_key(job, by_hand));
+        }
+        let sender = self.events.sender();
+        // A runtime task rather than the blocking pool: a download is
+        // `async` all the way down, and `Work::run` puts the read of a log
+        // and the probe of the host on the blocking pool itself.
+        tokio::spawn(async move {
+            let done = work.run().await;
+            let _ = sender.send(Event::App(AppEvent::CronWorkDone {
+                done: Box::new(done),
+            }));
+        });
         Ok(())
     }
 
-    /// The internal cron's auto-apply, which in the TUI is the same work
-    /// the operator's own "Apply everything" does — so it is started the
-    /// same way rather than through `cron::apply_nginx`.
+    /// Stores what a scheduled job's slow half found, through
+    /// [`crate::cron::finish`], and carries on with whatever comes next:
+    /// for a download, the next list.
+    ///
+    /// The weekly download says nothing on the message line; `u`'s says
+    /// what it did, since someone asked.
+    fn finish_cron_job(&mut self, done: crate::cron::Done) -> Result<()> {
+        let by_hand = done.by_hand();
+        for job in done.jobs() {
+            self.jobs_in_flight.remove(&cron_job_key(job, by_hand));
+        }
+        let next = crate::cron::finish(&self.db, done)?;
+        if let (true, crate::cron::Next::Ran(ran)) = (by_hand, &next) {
+            if let Some((_, summary)) = ran.last() {
+                self.message = Some(summary.clone());
+            }
+        }
+        self.carry_on_cron_job(next)?;
+        self.refresh()
+    }
+
+    /// The internal cron's auto-apply, with the switch on: in the TUI the
+    /// same work the operator's own "Apply everything" does — so it is
+    /// started the same way rather than through `cron::apply_sites`.
     ///
     /// That function takes a `&Db` and does the whole job inline, which is
     /// right for `tick` (which has nothing to redraw) and wrong here: `apply_all_sites` walks the config root and the
@@ -965,20 +1014,9 @@ impl App {
     /// reload, gated by the `reload_nginx_for_real` flag. Reimplementing any of that would mean a
     /// second copy of the plan/run split.
     ///
-    /// The toggle is still read here, before the plan, so a host with the
-    /// switch off does no work at all — and records that it did none, so
-    /// the Scheduled tasks panel says why rather than going quiet.
+    /// The switch itself is read in `cron::start`, before this, so a host
+    /// with it off does no work at all.
     fn start_cron_apply_nginx(&mut self) -> Result<()> {
-        let summary_if_idle = match self.db.get_auto_apply() {
-            Ok(true) => None,
-            Ok(false) => Some("auto-apply is off".to_string()),
-            Err(err) => Some(format!("error: {err}")),
-        };
-        if let Some(summary) = summary_if_idle {
-            crate::cron::record_run(&self.db, CronJob::ApplyNginx, &summary);
-            return Ok(());
-        }
-
         self.cron_apply_nginx = true;
         self.start_site_action(crate::tui::nginx::SiteAction::ApplyAll)?;
         if !self.jobs_in_flight.contains(&Job::ApplySites) {
@@ -996,108 +1034,6 @@ impl App {
             );
         }
         Ok(())
-    }
-
-    /// Starts the `UpdateIpRanges` job's background fetch (Googlebot,
-    /// Bingbot, GPTBot — the same three `ipranges::IpRangeSourceKind::ALL`
-    /// sources `update-crawler-ranges` fetches). Guarded by
-    /// `jobs_in_flight` so a slow round-trip to all three hosts can't
-    /// overlap with itself if `check_cron` finds the job still "due" (its
-    /// `last_run` doesn't update until it actually finishes) on a later
-    /// tick. Only fetches and parses in the background, same
-    /// `Db`-isn't-`Sync` reasoning as `start_source_update`/
-    /// `start_country_select`: storing happens back on the main thread in
-    /// `finish_cron_update_ip_ranges`.
-    ///
-    /// Not while any download holds the lease — an "update everything" in
-    /// this process or another, which fetches these three as well: the job
-    /// stays due, and the next check asks again.
-    fn start_cron_update_ip_ranges(&mut self) {
-        if self.update_all.is_some()
-            || self
-                .jobs_in_flight
-                .contains(&Job::Cron(CronJob::UpdateIpRanges))
-        {
-            return;
-        }
-        let Ok(crate::refresh::Claim::Granted(lease)) = crate::refresh::claim(&self.db, now_secs())
-        else {
-            return;
-        };
-        self.ip_ranges_lease = Some(lease);
-        self.jobs_in_flight
-            .insert(Job::Cron(CronJob::UpdateIpRanges));
-        let sender = self.events.sender();
-        tokio::spawn(async move {
-            let results = crate::cron::fetch_ip_ranges().await;
-            let _ = sender.send(Event::App(AppEvent::CronIpRangesFetched { results }));
-        });
-    }
-
-    /// Stores whichever of the three crawler sources' fetches succeeded
-    /// (one failing, e.g. a transient network error, shouldn't discard
-    /// what the other two got) and records the job's outcome, run back on
-    /// the main thread once `start_cron_update_ip_ranges`'s background
-    /// fetch completes.
-    fn finish_cron_update_ip_ranges(
-        &mut self,
-        results: Vec<(ipranges::IpRangeSourceKind, Result<Vec<String>, String>)>,
-    ) -> Result<()> {
-        self.jobs_in_flight
-            .remove(&Job::Cron(CronJob::UpdateIpRanges));
-
-        let stored = crate::cron::store_ip_ranges(&self.db, results);
-        if let Some(lease) = self.ip_ranges_lease.take() {
-            crate::refresh::release(&self.db, &lease)?;
-        }
-        stored?;
-        self.refresh()?;
-        Ok(())
-    }
-
-    /// Starts one log pass for `jobs` (see [`crate::logscan`]): the plan
-    /// here, on the main thread that owns the `Db`; the read and the parse
-    /// on the blocking pool; storing what it found and each job's decision
-    /// back here in [`Self::finish_cron_log_pass`].
-    ///
-    /// **One pass at a time.** This used to start one read per job, each
-    /// on its own blocking thread, so a fresh start ran a dozen full reads
-    /// of the access log at once: 2.9 GB of memory for a 200 MB log. While
-    /// a pass is out, due jobs wait for the next tick rather than starting
-    /// a second one; the pass they would have joined is reading the same
-    /// lines anyway.
-    fn start_cron_log_pass(&mut self, jobs: Vec<CronJob>) {
-        let in_flight = self
-            .jobs_in_flight
-            .iter()
-            .any(|job| matches!(job, Job::Cron(cron) if crate::cron::is_log_job(*cron)));
-        if in_flight {
-            return;
-        }
-        let flags = crate::logscan::Flags {
-            ssh_log: self.ssh_log.clone(),
-            access_log: None,
-            kernel_log: None,
-            stored: self.host().unwrap_or_default().log_paths(),
-        };
-        let plan = match crate::logscan::plan(&self.db, &jobs, &flags) {
-            Ok(plan) => plan,
-            Err(err) => {
-                self.message = Some(format!("The scheduled log scan could not start: {err:#}"));
-                return;
-            }
-        };
-        for job in &jobs {
-            self.jobs_in_flight.insert(Job::Cron(*job));
-        }
-        let sender = self.events.sender();
-        tokio::task::spawn_blocking(move || {
-            let read = crate::logscan::read(&plan, plan.sources());
-            let _ = sender.send(Event::App(AppEvent::CronLogRead {
-                jobs,
-                read: Box::new(read),
-            }));
-        });
     }
 
     /// Works out each site's UP TO DATE / STALE tag in the background.
@@ -1362,27 +1298,6 @@ impl App {
         Ok(())
     }
 
-    /// Stores what a background log pass read, then runs each of its jobs
-    /// on it, back on the main thread -- mirroring
-    /// `finish_cron_update_ip_ranges`. Both halves are shared with the web
-    /// front-end ([`crate::logscan::apply`], [`crate::cron::run_log_jobs`])
-    /// so that the two can't drift.
-    fn finish_cron_log_pass(
-        &mut self,
-        jobs: Vec<CronJob>,
-        read: crate::logscan::Read,
-    ) -> Result<()> {
-        for job in &jobs {
-            self.jobs_in_flight.remove(&Job::Cron(*job));
-        }
-        let applied = crate::logscan::apply(&self.db, read)?;
-        // `None`: no override, so the path follows the stored backend —
-        // an nftables render lands in `.nft` and an iptables one in `.sh`.
-        crate::cron::run_log_jobs(&self.db, &jobs, &applied, None, self.apply_firewall)?;
-        self.refresh()?;
-        Ok(())
-    }
-
     /// Renders firewall rules through the one path every front-end uses
     /// (`firewall::prepare`/`execute`/`record`) — the allowlist/iptables
     /// guard, the lockout check and the policy on what it may refuse.
@@ -1527,11 +1442,12 @@ impl App {
         self.refresh()
     }
 
-    /// Downloads every list this host uses, one source at a time — the
-    /// TUI's half of what `stop-bots batch` and the schedule's weekly job
-    /// do, through the same [`crate::refresh::plan`].
-    /// `scheduled` is the weekly job's run, which says nothing on the
-    /// message line.
+    /// Downloads every list this host uses, one source at a time — `u`,
+    /// the TUI's half of what `stop-bots batch` does, through the same
+    /// [`crate::refresh::plan`]. It is the weekly `UpdateEverything` job
+    /// run by hand, so it runs as that job does, through
+    /// [`crate::cron::download`] and [`Self::finish_cron_job`]; only the
+    /// message line, which says what it is doing, is its own.
     ///
     /// One source failing is reported and the rest still run: these are
     /// eight third parties, and a transient failure at one of them is not
@@ -1542,127 +1458,29 @@ impl App {
     /// weekly job, the crawler-range job or another process's download is
     /// out says so and fetches nothing, and the scheduled jobs wait for
     /// `u`'s run in the same way.
-    fn start_update_everything(&mut self, scheduled: bool) {
-        if self.update_all.is_some() || self.jobs_in_flight.contains(&Job::UpdateEverything) {
-            if !scheduled {
-                self.message = Some("Already downloading every list.".to_string());
-            }
-            return;
+    fn start_update_everything(&mut self) -> Result<()> {
+        if self.jobs_in_flight.contains(&Job::UpdateEverything)
+            || self
+                .jobs_in_flight
+                .contains(&Job::Cron(CronJob::UpdateEverything))
+        {
+            self.message = Some("Already downloading every list.".to_string());
+            return Ok(());
         }
-
         // Planning reads `Db`, so it happens here, on the main thread.
-        let lease = match crate::refresh::claim(&self.db, now_secs()) {
-            Ok(crate::refresh::Claim::Granted(lease)) => lease,
-            Ok(crate::refresh::Claim::Busy { since }) => {
-                if !scheduled {
-                    self.message = Some(crate::refresh::Claim::busy_message(since));
-                }
-                return;
+        match crate::refresh::begin(&self.db, now_secs(), false) {
+            Ok(crate::refresh::Begin::Started(run)) => {
+                let next = crate::cron::download(&self.db, run);
+                self.carry_on_cron_job(next)
+            }
+            Ok(crate::refresh::Begin::Busy { since }) => {
+                self.message = Some(crate::refresh::Claim::busy_message(since));
+                Ok(())
             }
             Err(err) => {
                 self.message = Some(format!("Could not start the download: {err:#}"));
-                return;
+                Ok(())
             }
-        };
-        let plan = match crate::refresh::plan(&self.db) {
-            Ok(plan) => plan,
-            Err(err) => {
-                let _ = crate::refresh::release(&self.db, &lease);
-                self.message = Some(format!("Could not work out what to update: {err}"));
-                return;
-            }
-        };
-        let run = UpdateAllRun {
-            remaining: plan.into(),
-            outcomes: Vec::new(),
-            lease: Some(lease),
-            scheduled,
-        };
-        self.jobs_in_flight.insert(run.job());
-        self.update_all = Some(run);
-        self.fetch_next_everything_source();
-    }
-
-    /// Sends the next source of an in-flight "update everything" to the
-    /// network, or finishes the run when there is none left.
-    fn fetch_next_everything_source(&mut self) {
-        let Some(run) = self.update_all.as_mut() else {
-            return;
-        };
-        let Some(source) = run.remaining.pop_front() else {
-            self.finish_update_everything();
-            return;
-        };
-
-        if !run.scheduled {
-            self.message = Some(format!("Downloading {}\u{2026}", source.label()));
-        }
-        let sender = self.events.sender();
-        // A runtime task rather than the blocking pool: `refresh::fetch`
-        // is `async` all the way down, and it touches no `Db`.
-        tokio::spawn(async move {
-            let result = crate::refresh::fetch(&source)
-                .await
-                .map_err(|err| format!("{err:#}"));
-            let _ = sender.send(Event::App(AppEvent::EverythingSourceFetched {
-                source,
-                result,
-            }));
-        });
-    }
-
-    /// Stores one downloaded source and starts the next.
-    ///
-    /// Storing is a `Db` write, so it waits for the main thread like every
-    /// other one — which is also why the event carries the raw body rather
-    /// than parsed rows.
-    fn finish_update_everything_source(
-        &mut self,
-        source: crate::refresh::Source,
-        result: Result<String, String>,
-    ) -> Result<()> {
-        // A run that was never started (or already finished) has nothing
-        // to record. Reachable only if an event outlives its run, but
-        // dropping it beats panicking on a live server.
-        let Some(run) = self.update_all.as_mut() else {
-            return Ok(());
-        };
-
-        let outcome = match result {
-            Ok(raw) => {
-                crate::refresh::store(&self.db, &source, &raw).map_err(|err| format!("{err:#}"))
-            }
-            Err(err) => Err(err),
-        };
-        run.outcomes.push((source, outcome));
-        if let Some(lease) = &run.lease {
-            crate::refresh::renew(&self.db, lease, now_secs())?;
-        }
-
-        self.fetch_next_everything_source();
-        // Every source is a list something on screen counts or dates, so
-        // the screens are stale whether this one stored or not.
-        self.refresh()
-    }
-
-    /// Reports a finished "update everything", records it against the
-    /// cron jobs it covers, gives the lease back and clears its state.
-    fn finish_update_everything(&mut self) {
-        let Some(run) = self.update_all.take() else {
-            return;
-        };
-        self.jobs_in_flight.remove(&run.job());
-        if let Some(lease) = &run.lease {
-            let _ = crate::refresh::release(&self.db, lease);
-        }
-        let by = if run.scheduled {
-            "by the schedule"
-        } else {
-            "from the Dashboard"
-        };
-        let summary = crate::refresh::record(&self.db, &run.outcomes, by);
-        if !run.scheduled {
-            self.message = Some(summary);
         }
     }
 
@@ -1841,64 +1659,6 @@ impl App {
         self.start_firewall_render(backend, out.display().to_string(), false, true);
     }
 
-    /// Probes the host for the internal cron's health check.
-    ///
-    /// The probe shells out to `nft`, `systemctl` and `df` — `nft list` on
-    /// a large ruleset is megabytes of text — so it goes to the blocking
-    /// pool. The database reads it needs (which backend, where the file
-    /// is) happen here first, on the main thread, like every other pair.
-    fn start_cron_health_check(&mut self) {
-        let job = Job::Cron(CronJob::HealthCheck);
-        if self.jobs_in_flight.contains(&job) {
-            return;
-        }
-        let backend = match crate::firewall::stored_backend(&self.db) {
-            Ok(backend) => backend,
-            Err(err) => {
-                self.message = Some(format!("Could not read the firewall backend: {err}"));
-                return;
-            }
-        };
-        let db_path = self
-            .db
-            .path()
-            .unwrap_or_else(|| std::path::PathBuf::from("./stop-bots.sqlite3"));
-
-        self.jobs_in_flight.insert(job);
-        let ssh_log = self.ssh_log.clone();
-        let sender = self.events.sender();
-        let host = self.host().unwrap_or_default();
-        let block_status = self
-            .db
-            .get_block_response()
-            .map(|r| r.status_code())
-            .unwrap_or_else(|_| crate::db::BlockResponse::default().status_code());
-        let claims = crate::scanblock::crawler_claims(&self.db).unwrap_or_default();
-        tokio::task::spawn_blocking(move || {
-            let probe = crate::health::probe(
-                backend,
-                &db_path,
-                ssh_log.as_deref(),
-                &host,
-                block_status,
-                claims,
-            );
-            let _ = sender.send(Event::App(AppEvent::HealthProbed {
-                probe: Box::new(probe),
-            }));
-        });
-    }
-
-    /// Records a finished probe and the one-line summary the Scheduled
-    /// tasks panel shows.
-    fn finish_cron_health_check(&mut self, probe: crate::health::Probe) -> Result<()> {
-        self.jobs_in_flight.remove(&Job::Cron(CronJob::HealthCheck));
-        crate::health::store_probe(&self.db, &probe)?;
-        let summary = crate::health::assess(&self.db, &probe)?.headline();
-        crate::cron::record_run(&self.db, CronJob::HealthCheck, &summary);
-        self.refresh()
-    }
-
     /// A key press, with what it does to the footer's message: any key
     /// puts the key hints back, and a message the key itself produced
     /// shows in their place — even one that reads the same as the last,
@@ -2039,8 +1799,7 @@ impl App {
                 return Ok(());
             }
             KeyOutcome::UpdateEverything => {
-                self.start_update_everything(false);
-                return Ok(());
+                return self.start_update_everything();
             }
             KeyOutcome::RefreshCrawlerRanges(kind) => {
                 self.start_crawler_ranges_refresh(kind);
@@ -2381,8 +2140,11 @@ mod tests {
 
         let message = app.message.as_deref().unwrap_or_default();
         assert!(message.contains("Another update"), "was: {message}");
-        assert!(app.update_all.is_none());
-        assert!(!app.jobs_in_flight.contains(&Job::UpdateEverything));
+        assert!(
+            !app.jobs_in_flight.contains(&Job::UpdateEverything),
+            "{:?}",
+            app.jobs_in_flight
+        );
     }
 
     /// Refreshing one crawler's ranges waits for a download someone else
@@ -2477,22 +2239,19 @@ mod tests {
     #[tokio::test]
     async fn the_scheduled_downloads_wait_for_one_started_by_hand() {
         let mut app = test_app();
-        app.update_all = Some(UpdateAllRun {
-            remaining: std::collections::VecDeque::new(),
-            outcomes: Vec::new(),
-            lease: None,
-            scheduled: false,
-        });
+        // `u`'s run, which has the lease in a real run; it does not here, so
+        // only the in-process check stands between this test and a fetch.
+        app.jobs_in_flight.insert(Job::UpdateEverything);
 
-        app.run_cron_job(CronJob::UpdateEverything).unwrap();
-        app.run_cron_job(CronJob::UpdateIpRanges).unwrap();
-
-        assert!(!app
-            .jobs_in_flight
-            .contains(&Job::Cron(CronJob::UpdateEverything)));
-        assert!(!app
-            .jobs_in_flight
-            .contains(&Job::Cron(CronJob::UpdateIpRanges)));
+        for job in [CronJob::UpdateEverything, CronJob::UpdateIpRanges] {
+            app.start_cron_job(crate::cron::Task::Job(job)).unwrap();
+            assert!(
+                !app.jobs_in_flight.contains(&Job::Cron(job)),
+                "{} started beside `u`: {:?}",
+                job.id(),
+                app.jobs_in_flight
+            );
+        }
     }
 
     /// The weekly run works in the background: its outcome goes to the
@@ -2506,17 +2265,13 @@ mod tests {
         };
         app.jobs_in_flight
             .insert(Job::Cron(CronJob::UpdateEverything));
-        app.update_all = Some(UpdateAllRun {
-            remaining: std::collections::VecDeque::new(),
-            outcomes: Vec::new(),
-            lease: Some(lease),
-            scheduled: true,
-        });
+        let run = crate::refresh::Run::with_nothing_left(Vec::new(), Some(lease), true);
 
-        app.finish_update_everything_source(
+        app.finish_cron_job(crate::cron::Done::downloaded(
+            run,
             crate::refresh::Source::Country("ru".to_string()),
             Ok("5.8.0.0/19\n".to_string()),
-        )
+        ))
         .unwrap();
 
         assert_eq!(app.message, None);
@@ -2908,14 +2663,21 @@ mod tests {
         let mut app = test_app();
         app.jobs_in_flight
             .insert(Job::Cron(CronJob::UpdateIpRanges));
+        let lease = match crate::refresh::claim(&app.db, now_secs()).unwrap() {
+            crate::refresh::Claim::Granted(lease) => lease,
+            busy => panic!("{busy:?}"),
+        };
 
-        app.finish_cron_update_ip_ranges(vec![
-            (
-                IpRangeSourceKind::GoogleBot,
-                Ok(vec!["8.8.8.0/24".to_string()]),
-            ),
-            (IpRangeSourceKind::BingBot, Err("timed out".to_string())),
-        ])
+        app.finish_cron_job(crate::cron::Done::crawler_ranges(
+            lease,
+            vec![
+                (
+                    IpRangeSourceKind::GoogleBot,
+                    Ok(vec!["8.8.8.0/24".to_string()]),
+                ),
+                (IpRangeSourceKind::BingBot, Err("timed out".to_string())),
+            ],
+        ))
         .unwrap();
 
         assert!(!app
@@ -2946,9 +2708,9 @@ mod tests {
     }
 
     /// The log-based cron jobs read their logs in one pass on a
-    /// background thread (see `App::start_cron_log_pass`) rather than
+    /// background thread (see `App::start_cron_job`) rather than
     /// running inline, so tests that trigger them via `check_cron` must
-    /// drive the resulting `CronLogRead` event through the same
+    /// drive the resulting `CronWorkDone` event through the same
     /// `handle_event` dispatch `App::run` uses before asserting on `Db`
     /// state. Drains until `jobs_in_flight` (populated synchronously
     /// by `check_cron` before this is called) is empty again, rather than a
@@ -3073,20 +2835,20 @@ mod tests {
         let mut app = test_app();
         let stored = |source| (source, Ok("1 range(s)".to_string()));
         app.jobs_in_flight.insert(Job::UpdateEverything);
-        app.update_all = Some(UpdateAllRun {
-            remaining: std::collections::VecDeque::new(),
-            outcomes: vec![
+        let run = crate::refresh::Run::with_nothing_left(
+            vec![
                 stored(crate::refresh::Source::Country("ru".to_string())),
                 stored(crate::refresh::Source::Country("cn".to_string())),
             ],
-            lease: None,
-            scheduled: false,
-        });
+            None,
+            false,
+        );
 
-        app.finish_update_everything_source(
+        app.finish_cron_job(crate::cron::Done::downloaded(
+            run,
             crate::refresh::Source::CrawlerRanges(crate::ipranges::IpRangeSourceKind::GoogleBot),
             Err("timed out".to_string()),
-        )
+        ))
         .unwrap();
 
         assert!(!app.jobs_in_flight.contains(&Job::UpdateEverything));
@@ -3118,17 +2880,13 @@ mod tests {
         let mut app = test_app();
         let raw = std::fs::read_to_string("tests/fixtures/ipranges/googlebot-sample.json").unwrap();
         app.jobs_in_flight.insert(Job::UpdateEverything);
-        app.update_all = Some(UpdateAllRun {
-            remaining: std::collections::VecDeque::new(),
-            outcomes: Vec::new(),
-            lease: None,
-            scheduled: false,
-        });
+        let run = crate::refresh::Run::with_nothing_left(Vec::new(), None, false);
 
-        app.finish_update_everything_source(
+        app.finish_cron_job(crate::cron::Done::downloaded(
+            run,
             crate::refresh::Source::CrawlerRanges(crate::ipranges::IpRangeSourceKind::GoogleBot),
             Ok(raw),
-        )
+        ))
         .unwrap();
 
         let message = app.message.as_deref().unwrap_or_default();
@@ -3488,7 +3246,8 @@ mod tests {
         let mut app = test_app();
         assert!(!app.db.get_auto_apply().unwrap(), "off is the default");
 
-        app.run_cron_job(CronJob::ApplyNginx).unwrap();
+        app.start_cron_job(crate::cron::Task::Job(CronJob::ApplyNginx))
+            .unwrap();
 
         assert_eq!(
             app.db
@@ -3508,7 +3267,7 @@ mod tests {
     /// (`BlockScanners`/`BlockWebScanners`/`RecordAccessStats`/
     /// `RenderFirewall` — no network I/O, so safe to exercise directly
     /// rather than mocking) and record each one's state, once their
-    /// background `CronLogRead` event is drained. `UpdateIpRanges` is
+    /// background `CronWorkDone` event is drained. `UpdateIpRanges` is
     /// deliberately pre-marked as just-run so this test never triggers its
     /// real network fetch.
     #[tokio::test]
@@ -3571,8 +3330,10 @@ mod tests {
             else {
                 continue;
             };
-            if matches!(event, Event::App(AppEvent::CronLogRead { .. })) {
-                passes += 1;
+            if let Event::App(AppEvent::CronWorkDone { done }) = &event {
+                if done.jobs().iter().any(|job| crate::cron::is_log_job(*job)) {
+                    passes += 1;
+                }
             }
             app.handle_event(event).unwrap();
         }
@@ -3620,13 +3381,105 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    // `start_cron_update_ip_ranges`'s in-flight guard (skip spawning a
-    // second fetch while one is already running) isn't separately unit
-    // tested: proving a *real* network task wasn't spawned would mean
-    // either mocking the network layer or racing a timeout against
-    // whatever latency `reqwest::get` happens to have on the test
-    // machine, neither of which is worth it for a one-line early return.
-    // Covered by inspection instead.
+    /// A scheduled job never starts beside itself: `due_jobs` still says
+    /// it is due while its work is out, since `last_run` only moves when it
+    /// finishes. Seen through the lease, which a crawler job that started
+    /// would have taken.
+    #[tokio::test]
+    async fn a_scheduled_job_does_not_start_while_its_own_work_is_out() {
+        let mut app = test_app();
+        app.jobs_in_flight
+            .insert(Job::Cron(CronJob::UpdateIpRanges));
+
+        app.start_cron_job(crate::cron::Task::Job(CronJob::UpdateIpRanges))
+            .unwrap();
+
+        let claim = crate::refresh::claim(&app.db, now_secs()).unwrap();
+        assert!(
+            matches!(claim, crate::refresh::Claim::Granted(_)),
+            "a second crawler job took the lease: {claim:?}"
+        );
+    }
+
+    /// The property one job layer exists for: whatever is due, the TUI
+    /// runs it and records what `tick` would. Both are handed the same
+    /// database state and the same logs, and every job's summary is
+    /// compared — so a job one of them skips, or runs differently, shows
+    /// up here by name.
+    #[tokio::test]
+    async fn the_tui_records_what_tick_records_for_every_due_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let access = dir.path().join("access.log");
+        std::fs::write(
+            &access,
+            format!(
+                "203.0.113.50 - - [{}] \"GET /.env HTTP/1.1\" 404 0 \"-\" \"curl/8\"\n",
+                crate::testing::nginx_time(now_secs() - 60)
+            ),
+        )
+        .unwrap();
+        let ssh = dir.path().join("auth.log");
+        std::fs::write(&ssh, "").unwrap();
+        let host = crate::hostconf::HostConf {
+            access_log: Some(access),
+            ..Default::default()
+        };
+        let host_conf = dir.path().join("host.conf");
+        host.save_to(&host_conf).unwrap();
+        let firewall_out = dir.path().join("firewall.nft");
+        // The jobs that reach the network or the host itself, marked just
+        // run in both: everything else is due on a fresh database.
+        let seed = |db: &Db| {
+            for job in [
+                CronJob::UpdateIpRanges,
+                CronJob::UpdateEverything,
+                CronJob::HealthCheck,
+            ] {
+                db.set_cron_last_run(job.id(), now_secs(), "skipped for test")
+                    .unwrap();
+            }
+        };
+
+        let mut app = App::new(
+            Db::open_in_memory().unwrap(),
+            dir.path().to_path_buf(),
+            false,
+            Some(ssh.clone()),
+        )
+        .unwrap();
+        app.host_conf = host_conf;
+        app.firewall_out = Some(firewall_out.clone());
+        seed(&app.db);
+        app.check_cron().unwrap();
+        drain_background_work(&mut app).await;
+
+        let db = Db::open_in_memory().unwrap();
+        seed(&db);
+        let settings = crate::cron::TickSettings {
+            host: &host,
+            root: dir.path(),
+            ssh_log: Some(ssh),
+            firewall_out: Some(&firewall_out),
+        };
+        crate::cron::tick(&db, &settings).await.unwrap();
+
+        let summaries = |db: &Db| -> Vec<(&'static str, Option<String>)> {
+            crate::cron::status(db)
+                .unwrap()
+                .into_iter()
+                .map(|status| (status.job.id(), status.last_summary))
+                .collect()
+        };
+        let (tui, tick) = (summaries(&app.db), summaries(&db));
+        for ((job, by_tui), (_, by_tick)) in tui.iter().zip(&tick) {
+            assert_eq!(by_tui, by_tick, "{job}: the TUI and tick disagree");
+        }
+        assert!(
+            tui.iter().any(|(job, summary)| *job == "block_probe_paths"
+                && summary.as_deref() == Some("blocked 1 IP(s)")),
+            "the probe was not blocked, so this compared nothing: {tui:?}"
+        );
+    }
 
     // ---- the lockout guard on the apply path ----
 

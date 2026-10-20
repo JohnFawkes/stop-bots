@@ -39,6 +39,23 @@
 //! schedulers computing "what this job does" separately are two
 //! schedulers that will eventually disagree.
 //!
+//! ## One dispatch, two ways of waiting
+//!
+//! Which job does what is decided once, in [`start`] and [`finish`]. What
+//! the two front-ends do differently is only *where the slow half runs*:
+//! [`start`] does the database half and hands back a [`Work`] that holds no
+//! database, [`Work::run`] does the reading, downloading or probing, and
+//! [`finish`] stores what it found. [`tick`] runs the three in line; the
+//! TUI runs [`Work::run`] on another task and [`finish`] back on the thread
+//! that owns its `Db`, the same split as every other `start_`/`finish_`
+//! pair there. A job added to [`CronJob`] gets an arm in [`start`], and
+//! both front-ends run it.
+//!
+//! The one job each front-end runs its own way is `ApplyNginx` with the
+//! switch on ([`Next::ApplySites`]): in the TUI it is the site apply the
+//! operator's own "Apply everything" starts, so it shares that apply's
+//! one-at-a-time guard and its reload, rather than racing it.
+//!
 //! **Each job only does what its equivalent CLI subcommand does, and by
 //! default that stops at writing.** `RenderFirewall` writes the script to
 //! disk on a timer, same as `render-firewall` — beside the applied script
@@ -296,8 +313,9 @@ pub fn next_run_at(db: &Db, job: CronJob) -> Result<Option<i64>> {
 }
 
 /// Whether `job` downloads something, and so waits for the operator's
-/// first download before it ever runs (see [`first_download_base`]).
-fn is_download(job: CronJob) -> bool {
+/// first download before it ever runs (see [`first_download_base`]) and
+/// for the download lease every time (see [`crate::refresh::Lease`]).
+pub fn is_download(job: CronJob) -> bool {
     matches!(job, CronJob::UpdateEverything | CronJob::UpdateIpRanges)
 }
 
@@ -457,7 +475,7 @@ pub fn run_log_jobs(
             CronJob::Detect(detector) => run_detector(db, detector, applied),
             CronJob::RecordAccessStats => {
                 if applied.access.is_readable() {
-                    applied.stats.summary()
+                    format!("{}{}", applied.stats.summary(), applied.unreadable_note())
                 } else {
                     "access log unavailable".to_string()
                 }
@@ -478,20 +496,12 @@ pub fn run_log_jobs(
                 };
                 render_firewall(db, firewall_out, connected.as_deref(), apply_for_real)
             }
-            CronJob::UpdateIpRanges => {
-                unreachable!("UpdateIpRanges is run via fetch_ip_ranges/store_ip_ranges")
-            }
-            CronJob::UpdateEverything => {
-                unreachable!("UpdateEverything is run through refresh's plan, fetch and store")
-            }
-            CronJob::HealthCheck => {
-                unreachable!("HealthCheck is run via health_check, which needs no log")
-            }
-            CronJob::Maintenance => {
-                unreachable!("Maintenance is run via maintenance, which needs no log")
-            }
-            CronJob::ApplyNginx => {
-                unreachable!("ApplyNginx is run via apply_nginx, which needs the config root")
+            CronJob::UpdateIpRanges
+            | CronJob::UpdateEverything
+            | CronJob::HealthCheck
+            | CronJob::Maintenance
+            | CronJob::ApplyNginx => {
+                unreachable!("{} reads no log, so `start` runs it on its own", job.id())
             }
         };
         db.set_cron_last_run(job.id(), now(), &summary)?;
@@ -622,10 +632,9 @@ pub fn maintenance(db: &Db) -> String {
 ///
 /// Never fails, like every other job: a reload that NGINX rejects becomes
 /// the recorded summary, which is what puts it in front of an admin on
-/// the Scheduled tasks panel. Returning an error instead would reach
-/// `run_due_jobs`, which prints to stderr and moves on — so on the one
-/// host where this matters, a broken config would fail silently every
-/// hour.
+/// the Scheduled tasks panel. Returning an error instead would only be
+/// printed to stderr by the caller, which moves on — so on the one host
+/// where this matters, a broken config would fail silently every hour.
 ///
 /// The commands come from `host`, the host settings, never from `db`.
 pub fn apply_nginx(
@@ -634,12 +643,31 @@ pub fn apply_nginx(
     root: &std::path::Path,
     reload: bool,
 ) -> String {
-    match db.get_auto_apply() {
-        Ok(false) => return "auto-apply is off".to_string(),
-        Ok(true) => {}
-        Err(err) => return format!("error: {err}"),
+    match auto_apply_is_off(db) {
+        Some(summary) => summary,
+        None => apply_sites(db, host, root, reload),
     }
+}
 
+/// Why `ApplyNginx` does nothing this time — the switch is off, or could
+/// not be read — or `None` when it is on. Asked by both front-ends before
+/// they do any work, for the reason [`apply_nginx`] gives.
+fn auto_apply_is_off(db: &Db) -> Option<String> {
+    match db.get_auto_apply() {
+        Ok(false) => Some("auto-apply is off".to_string()),
+        Ok(true) => None,
+        Err(err) => Some(format!("error: {err}")),
+    }
+}
+
+/// `ApplyNginx`'s work once the switch is on, done in line: `tick`'s half
+/// of [`Next::ApplySites`].
+pub fn apply_sites(
+    db: &Db,
+    host: &crate::hostconf::HostConf,
+    root: &std::path::Path,
+    reload: bool,
+) -> String {
     let commands = match reload.then(|| ServerCommands::from_host(host)).transpose() {
         Ok(commands) => commands,
         Err(err) => return format!("error: {err:#}"),
@@ -680,38 +708,70 @@ pub fn apply_nginx_summary(applied: &crate::webserver::ApplyAllOutcome) -> Strin
     summary
 }
 
-/// Takes a health probe and records it, for the dashboards to read.
+/// What the `HealthCheck` probe needs from the database, read before it
+/// runs: the probe shells out to `nft`, `systemctl` and `df` — `nft list`
+/// on a large ruleset is megabytes of text — and so runs where no `Db`
+/// can reach.
+#[derive(Debug)]
+struct ProbeInputs {
+    backend: crate::firewall::FirewallBackend,
+    db_path: std::path::PathBuf,
+    ssh_log: Option<std::path::PathBuf>,
+    host: crate::hostconf::HostConf,
+    block_status: u16,
+    claims: Vec<crate::accesslog::CrawlerClaim>,
+}
+
+impl ProbeInputs {
+    /// `Err` is the summary to record: with no backend there is no
+    /// ruleset to ask about.
+    fn read(db: &Db, settings: &Settings) -> std::result::Result<ProbeInputs, String> {
+        let backend = crate::firewall::stored_backend(db).map_err(|err| format!("error: {err}"))?;
+        // An in-memory database has no filesystem to run out of, so the
+        // free space check is asked about the working directory instead of
+        // being skipped — it still answers "can this host write anything
+        // at all".
+        let db_path = db
+            .path()
+            .unwrap_or_else(|| std::path::PathBuf::from("./stop-bots.sqlite3"));
+        let block_status = db
+            .get_block_response()
+            .map(|r| r.status_code())
+            .unwrap_or_else(|_| crate::db::BlockResponse::default().status_code());
+        Ok(ProbeInputs {
+            backend,
+            db_path,
+            ssh_log: settings.ssh_log.map(std::path::Path::to_path_buf),
+            host: settings.host.clone(),
+            block_status,
+            claims: crate::scanblock::crawler_claims(db).unwrap_or_default(),
+        })
+    }
+
+    fn probe(self) -> crate::health::Probe {
+        crate::health::probe(
+            self.backend,
+            &self.db_path,
+            self.ssh_log.as_deref(),
+            &self.host,
+            self.block_status,
+            self.claims,
+        )
+    }
+}
+
+/// Records a health probe, for the dashboards to read, and returns the
+/// `HealthCheck` job's summary.
 ///
 /// Split across [`crate::health::probe`] and [`crate::health::store_probe`]
 /// rather than storing a finished report: the probe is the expensive half
 /// and the slow-moving half, and re-deriving the report at render time is
 /// what keeps the panel agreeing with the rules on the screen above it.
-pub fn health_check(
-    db: &Db,
-    host: &crate::hostconf::HostConf,
-    ssh_log: Option<&std::path::Path>,
-) -> String {
-    let backend = match crate::firewall::stored_backend(db) {
-        Ok(backend) => backend,
-        Err(err) => return format!("error: {err}"),
-    };
-    // An in-memory database has no filesystem to run out of, so the free
-    // space check is asked about the working directory instead of being
-    // skipped — it still answers "can this host write anything at all".
-    let db_path = db
-        .path()
-        .unwrap_or_else(|| std::path::PathBuf::from("./stop-bots.sqlite3"));
-
-    let block_status = db
-        .get_block_response()
-        .map(|r| r.status_code())
-        .unwrap_or_else(|_| crate::db::BlockResponse::default().status_code());
-    let claims = crate::scanblock::crawler_claims(db).unwrap_or_default();
-    let probe = crate::health::probe(backend, &db_path, ssh_log, host, block_status, claims);
-    if let Err(err) = crate::health::store_probe(db, &probe) {
+fn store_health(db: &Db, probe: &crate::health::Probe) -> String {
+    if let Err(err) = crate::health::store_probe(db, probe) {
         return format!("error: {err}");
     }
-    match crate::health::assess(db, &probe) {
+    match crate::health::assess(db, probe) {
         Ok(report) => report.headline(),
         Err(err) => format!("error: {err}"),
     }
@@ -818,7 +878,7 @@ pub fn render_summary(write: &crate::firewall::WriteStep, summary: &str) -> Stri
 /// source failing is carried as its own `Err` rather than failing the
 /// batch: a transient network error on one shouldn't discard what the
 /// other two got.
-pub async fn fetch_ip_ranges() -> Vec<(
+async fn fetch_ip_ranges() -> Vec<(
     crate::ipranges::IpRangeSourceKind,
     std::result::Result<Vec<String>, String>,
 )> {
@@ -839,7 +899,7 @@ pub async fn fetch_ip_ranges() -> Vec<(
 
 /// Stores whatever [`fetch_ip_ranges`] managed to get and records the
 /// job's outcome, returning its summary.
-pub fn store_ip_ranges(
+fn store_ip_ranges(
     db: &Db,
     results: Vec<(
         crate::ipranges::IpRangeSourceKind,
@@ -870,6 +930,353 @@ pub fn store_ip_ranges(
     Ok(summary)
 }
 
+/// How the due jobs are started: every log job in one pass (see
+/// [`crate::logscan`]), which reads each log once for all of them, and
+/// every other job on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Task {
+    LogPass(Vec<CronJob>),
+    Job(CronJob),
+}
+
+impl Task {
+    /// The jobs this task runs.
+    pub fn jobs(&self) -> &[CronJob] {
+        match self {
+            Task::LogPass(jobs) => jobs,
+            Task::Job(job) => std::slice::from_ref(job),
+        }
+    }
+}
+
+/// The due jobs, as the [`Task`]s that start them: the log pass first,
+/// then the rest in [`CronJob::all()`] order.
+pub fn tasks(due: Vec<CronJob>) -> Vec<Task> {
+    let (log_jobs, others): (Vec<CronJob>, Vec<CronJob>) =
+        due.into_iter().partition(|job| is_log_job(*job));
+    let pass = (!log_jobs.is_empty()).then_some(Task::LogPass(log_jobs));
+    pass.into_iter()
+        .chain(others.into_iter().map(Task::Job))
+        .collect()
+}
+
+/// What a front-end tells [`start`] about where the host is and what it may
+/// do there.
+pub struct Settings<'a> {
+    pub host: &'a crate::hostconf::HostConf,
+    /// An SSH log to read in place of the stored one or the search.
+    pub ssh_log: Option<&'a std::path::Path>,
+    /// Where the applied firewall script is; `None` for the backend's own.
+    pub firewall_out: Option<&'a std::path::Path>,
+    /// Whether this process may change the host: run the firewall script
+    /// when `Db::get_auto_apply_firewall` says to. `false` only under the
+    /// TUI's `--no-reload`, which its end-to-end tests use.
+    pub for_real: bool,
+}
+
+/// Where a task is after [`start`] or [`finish`].
+#[derive(Debug)]
+pub enum Next {
+    /// Finished, and recorded: what each job did.
+    Ran(Vec<(CronJob, String)>),
+    /// Not started, because another download holds the lease. Nothing is
+    /// recorded, so the job is still due and the next check asks again.
+    Waiting,
+    /// The slow half, to [`Work::run`] and then hand to [`finish`].
+    Work(Work),
+    /// `ApplyNginx`, with the switch on: apply every site's config in the
+    /// front-end's own way (see this module's docs), and record what that
+    /// did against the job. `tick` uses [`apply_sites`].
+    ApplySites,
+}
+
+/// The slow half of a job: reading the logs, downloading a list, probing
+/// the host. It holds no database, so it can go to another thread; what
+/// [`Work::run`] returns goes to [`finish`], back where the database is.
+#[derive(Debug)]
+pub struct Work(Slow);
+
+#[derive(Debug)]
+enum Slow {
+    LogPass {
+        jobs: Vec<CronJob>,
+        plan: Box<crate::logscan::Plan>,
+        firewall_out: Option<std::path::PathBuf>,
+        for_real: bool,
+    },
+    CrawlerRanges {
+        lease: crate::refresh::Lease,
+    },
+    Download {
+        run: crate::refresh::Run,
+        source: crate::refresh::Source,
+    },
+    Probe(Box<ProbeInputs>),
+}
+
+/// A [`Work`] that has run, for [`finish`]. `Clone` because the TUI's
+/// events are.
+#[derive(Debug, Clone)]
+pub struct Done(Finished);
+
+#[derive(Debug, Clone)]
+enum Finished {
+    LogPass {
+        jobs: Vec<CronJob>,
+        read: Box<crate::logscan::Read>,
+        firewall_out: Option<std::path::PathBuf>,
+        for_real: bool,
+    },
+    CrawlerRanges {
+        lease: crate::refresh::Lease,
+        results: Vec<(
+            crate::ipranges::IpRangeSourceKind,
+            std::result::Result<Vec<String>, String>,
+        )>,
+    },
+    Download {
+        run: crate::refresh::Run,
+        source: crate::refresh::Source,
+        fetched: std::result::Result<String, String>,
+    },
+    Probe(Box<crate::health::Probe>),
+}
+
+impl Work {
+    /// The jobs this is the slow half of: what the TUI shows as running.
+    pub fn jobs(&self) -> Vec<CronJob> {
+        match &self.0 {
+            Slow::LogPass { jobs, .. } => jobs.clone(),
+            Slow::CrawlerRanges { .. } => vec![CronJob::UpdateIpRanges],
+            Slow::Download { .. } => vec![CronJob::UpdateEverything],
+            Slow::Probe(_) => vec![CronJob::HealthCheck],
+        }
+    }
+
+    /// Whether someone asked for this: `u`, rather than the weekly job.
+    pub fn by_hand(&self) -> bool {
+        matches!(&self.0, Slow::Download { run, .. } if !run.scheduled())
+    }
+
+    /// What to tell whoever asked for this while it runs.
+    pub fn progress(&self) -> Option<String> {
+        match &self.0 {
+            Slow::Download { run, source } if !run.scheduled() => {
+                Some(format!("Downloading {}\u{2026}", source.label()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Does the slow half. Reading a log and probing the host are blocking
+    /// work and go to the blocking pool; a download is `async` all the way
+    /// down.
+    pub async fn run(self) -> Done {
+        Done(match self.0 {
+            Slow::LogPass {
+                jobs,
+                plan,
+                firewall_out,
+                for_real,
+            } => Finished::LogPass {
+                jobs,
+                read: Box::new(
+                    off_thread(move || crate::logscan::read(&plan, plan.sources())).await,
+                ),
+                firewall_out,
+                for_real,
+            },
+            Slow::CrawlerRanges { lease } => Finished::CrawlerRanges {
+                lease,
+                results: fetch_ip_ranges().await,
+            },
+            Slow::Download { run, source } => {
+                let fetched = crate::refresh::fetch(&source)
+                    .await
+                    .map_err(|err| format!("{err:#}"));
+                Finished::Download {
+                    run,
+                    source,
+                    fetched,
+                }
+            }
+            Slow::Probe(inputs) => Finished::Probe(Box::new(off_thread(|| inputs.probe()).await)),
+        })
+    }
+}
+
+impl Done {
+    /// The jobs this finished the slow half of.
+    pub fn jobs(&self) -> Vec<CronJob> {
+        match &self.0 {
+            Finished::LogPass { jobs, .. } => jobs.clone(),
+            Finished::CrawlerRanges { .. } => vec![CronJob::UpdateIpRanges],
+            Finished::Download { .. } => vec![CronJob::UpdateEverything],
+            Finished::Probe(_) => vec![CronJob::HealthCheck],
+        }
+    }
+
+    /// See [`Work::by_hand`].
+    pub fn by_hand(&self) -> bool {
+        matches!(&self.0, Finished::Download { run, .. } if !run.scheduled())
+    }
+
+    /// A download that has fetched `source`.
+    #[cfg(test)]
+    pub(crate) fn downloaded(
+        run: crate::refresh::Run,
+        source: crate::refresh::Source,
+        fetched: std::result::Result<String, String>,
+    ) -> Done {
+        Done(Finished::Download {
+            run,
+            source,
+            fetched,
+        })
+    }
+
+    /// The crawler job's fetches, back with `results`.
+    #[cfg(test)]
+    pub(crate) fn crawler_ranges(
+        lease: crate::refresh::Lease,
+        results: Vec<(
+            crate::ipranges::IpRangeSourceKind,
+            std::result::Result<Vec<String>, String>,
+        )>,
+    ) -> Done {
+        Done(Finished::CrawlerRanges { lease, results })
+    }
+}
+
+/// Runs `work` on the blocking pool. A panic there is a panic here, as it
+/// was when this work ran in line.
+async fn off_thread<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => value,
+        Err(err) => std::panic::resume_unwind(err.into_panic()),
+    }
+}
+
+/// Starts `task`: every database read it needs, and then either the job
+/// itself, when nothing about it is slow, or the [`Work`] that is.
+///
+/// The one place a job is matched to what it does, for every front-end:
+/// a job missing here is a compile error, not a job one of them forgot.
+///
+/// `Err` only for what stops the task starting at all: the logs could not
+/// be planned, the lease could not be read. A job's own failure becomes
+/// its recorded summary, as everywhere here.
+pub fn start(db: &Db, task: &Task, settings: &Settings) -> Result<Next> {
+    let job = match task {
+        Task::LogPass(jobs) => return start_log_pass(db, jobs.clone(), settings),
+        Task::Job(job) => *job,
+    };
+    Ok(match job {
+        // A log job on its own is a pass of one.
+        CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::RenderFirewall => {
+            return start_log_pass(db, vec![job], settings)
+        }
+        CronJob::UpdateIpRanges => match crate::refresh::claim(db, now())? {
+            crate::refresh::Claim::Busy { .. } => Next::Waiting,
+            crate::refresh::Claim::Granted(lease) => {
+                Next::Work(Work(Slow::CrawlerRanges { lease }))
+            }
+        },
+        CronJob::UpdateEverything => match crate::refresh::begin(db, now(), true)? {
+            crate::refresh::Begin::Busy { .. } => Next::Waiting,
+            crate::refresh::Begin::Started(run) => download(db, run),
+        },
+        CronJob::HealthCheck => match ProbeInputs::read(db, settings) {
+            Ok(inputs) => Next::Work(Work(Slow::Probe(Box::new(inputs)))),
+            Err(summary) => ran(db, job, summary),
+        },
+        // In line in every front-end: it touches nothing but the database,
+        // and `Db` isn't `Sync`, so moving it off-thread would mean moving
+        // the handle, not just the slow half. A prune is a pair of
+        // statements and a compaction only happens on a file already known
+        // to be mostly slack.
+        CronJob::Maintenance => ran(db, job, maintenance(db)),
+        CronJob::ApplyNginx => match auto_apply_is_off(db) {
+            Some(summary) => ran(db, job, summary),
+            None => Next::ApplySites,
+        },
+    })
+}
+
+fn start_log_pass(db: &Db, jobs: Vec<CronJob>, settings: &Settings) -> Result<Next> {
+    let flags = crate::logscan::Flags {
+        ssh_log: settings.ssh_log.map(std::path::Path::to_path_buf),
+        access_log: None,
+        kernel_log: None,
+        stored: settings.host.log_paths(),
+    };
+    let plan = crate::logscan::plan(db, &jobs, &flags)?;
+    Ok(Next::Work(Work(Slow::LogPass {
+        jobs,
+        plan: Box::new(plan),
+        firewall_out: settings.firewall_out.map(std::path::Path::to_path_buf),
+        for_real: settings.for_real,
+    })))
+}
+
+/// Records `summary` against `job`, which has just run.
+fn ran(db: &Db, job: CronJob, summary: String) -> Next {
+    record_run(db, job, &summary);
+    Next::Ran(vec![(job, summary)])
+}
+
+/// Carries `run` on: the next source to fetch, or, with none left, the
+/// run's end. The weekly job goes through here, and so does `u` in the
+/// TUI, with a run it began itself.
+pub fn download(db: &Db, mut run: crate::refresh::Run) -> Next {
+    match run.next_source() {
+        Some(source) => Next::Work(Work(Slow::Download { run, source })),
+        // `end` keeps the job's books itself.
+        None => Next::Ran(vec![(CronJob::UpdateEverything, run.end(db))]),
+    }
+}
+
+/// Stores what `done` found and decides each job on it: the database half
+/// after the slow one. Hands back more [`Work`] while there is more to do,
+/// which is the next list of a download.
+pub fn finish(db: &Db, done: Done) -> Result<Next> {
+    Ok(match done.0 {
+        Finished::LogPass {
+            jobs,
+            read,
+            firewall_out,
+            for_real,
+        } => {
+            let applied = crate::logscan::apply(db, *read)?;
+            Next::Ran(run_log_jobs(
+                db,
+                &jobs,
+                &applied,
+                firewall_out.as_deref(),
+                for_real,
+            )?)
+        }
+        Finished::CrawlerRanges { lease, results } => {
+            let stored = store_ip_ranges(db, results);
+            crate::refresh::release(db, &lease)?;
+            // `store_ip_ranges` keeps the job's books itself.
+            Next::Ran(vec![(CronJob::UpdateIpRanges, stored?)])
+        }
+        Finished::Download {
+            mut run,
+            source,
+            fetched,
+        } => {
+            run.stored(db, source, fetched, now())?;
+            download(db, run)
+        }
+        Finished::Probe(probe) => {
+            let summary = store_health(db, &probe);
+            ran(db, CronJob::HealthCheck, summary)
+        }
+    })
+}
+
 /// What [`tick`] needs from its caller: where the host is and what it may
 /// do there.
 pub struct TickSettings<'a> {
@@ -886,93 +1293,41 @@ pub struct TickSettings<'a> {
 /// tick of the schedule, for `stop-bots tick` under `/etc/cron.d`, which
 /// is what keeps a host protected with no front-end open.
 ///
-/// In process, as the TUI runs them, and as root: the log jobs in one pass
-/// that reads each log once, then the rest one at a time. A job only does
-/// what its switches allow, exactly as under the TUI — auto-apply for the
-/// web server and the firewall stays off until the operator turns it on.
-/// A job's failure becomes its recorded summary; only a schedule that
-/// cannot be read at all is an error.
+/// Each task through [`start`], [`Work::run`] and [`finish`], in line: the
+/// log jobs in one pass that reads each log once, then the rest one at a
+/// time. A job only does what its switches allow, exactly as under the
+/// TUI — auto-apply for the web server and the firewall stays off until
+/// the operator turns it on. A job's failure becomes its recorded summary;
+/// only a schedule that cannot be read at all is an error.
 pub async fn tick(db: &Db, settings: &TickSettings<'_>) -> Result<Vec<(CronJob, String)>> {
     // The list built into this binary, as the TUI stores it when it starts:
     // after an upgrade, what the new binary added is what the next apply
     // and every staleness check have to see.
     crate::botlist::register_all_sources(db)?;
-    let due = due_jobs(db)?;
-    let (log_jobs, others): (Vec<CronJob>, Vec<CronJob>) =
-        due.into_iter().partition(|job| is_log_job(*job));
+    let shared = Settings {
+        host: settings.host,
+        ssh_log: settings.ssh_log.as_deref(),
+        firewall_out: settings.firewall_out,
+        // Unlike the TUI, `tick` has no `--no-reload`: the switches alone
+        // decide what it changes.
+        for_real: true,
+    };
     let mut ran = Vec::new();
-
-    if !log_jobs.is_empty() {
-        let flags = crate::logscan::Flags {
-            ssh_log: settings.ssh_log.clone(),
-            access_log: None,
-            kernel_log: None,
-            stored: settings.host.log_paths(),
-        };
-        let plan = crate::logscan::plan(db, &log_jobs, &flags)?;
-        let read = crate::logscan::read(&plan, plan.sources());
-        let mut storing = crate::logscan::store(read);
-        let applied = loop {
-            if let Some(applied) = storing.step(db)? {
-                break applied;
+    for task in tasks(due_jobs(db)?) {
+        let mut next = start(db, &task, &shared)?;
+        while let Next::Work(work) = next {
+            next = finish(db, work.run().await)?;
+        }
+        match next {
+            Next::Ran(summaries) => ran.extend(summaries),
+            Next::Waiting => {}
+            Next::ApplySites => {
+                let summary = apply_sites(db, settings.host, settings.root, true);
+                record_run(db, CronJob::ApplyNginx, &summary);
+                ran.push((CronJob::ApplyNginx, summary));
             }
-        };
-        let apply_firewall = db.get_auto_apply_firewall()?;
-        ran.extend(run_log_jobs(
-            db,
-            &log_jobs,
-            &applied,
-            settings.firewall_out,
-            apply_firewall,
-        )?);
-    }
-
-    for job in others {
-        let summary = match job {
-            CronJob::UpdateIpRanges => match crate::refresh::claim(db, now())? {
-                crate::refresh::Claim::Busy { .. } => continue,
-                crate::refresh::Claim::Granted(lease) => {
-                    let results = fetch_ip_ranges().await;
-                    let stored = store_ip_ranges(db, results);
-                    crate::refresh::release(db, &lease)?;
-                    stored?
-                }
-            },
-            CronJob::UpdateEverything => match crate::refresh::claim(db, now())? {
-                crate::refresh::Claim::Busy { .. } => continue,
-                crate::refresh::Claim::Granted(lease) => {
-                    let mut outcomes = Vec::new();
-                    match crate::refresh::plan(db) {
-                        Ok(plan) => {
-                            for source in plan {
-                                let stored = crate::refresh::fetch(&source)
-                                    .await
-                                    .and_then(|raw| crate::refresh::store(db, &source, &raw));
-                                crate::refresh::renew(db, &lease, now())?;
-                                outcomes.push((source, stored.map_err(|err| format!("{err:#}"))));
-                            }
-                        }
-                        Err(err) => {
-                            crate::refresh::release(db, &lease)?;
-                            return Err(err.context("could not work out what to update"));
-                        }
-                    }
-                    let summary = crate::refresh::record(db, &outcomes, "by the schedule");
-                    crate::refresh::release(db, &lease)?;
-                    // `record` keeps the job's books itself.
-                    ran.push((job, summary));
-                    continue;
-                }
-            },
-            CronJob::HealthCheck => health_check(db, settings.host, settings.ssh_log.as_deref()),
-            CronJob::Maintenance => maintenance(db),
-            CronJob::ApplyNginx => apply_nginx(db, settings.host, settings.root, true),
-            CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::RenderFirewall => {
-                unreachable!("run in the log pass above")
-            }
-        };
-        record_run(db, job, &summary);
-        ran.push((job, summary));
+            Next::Work(_) => unreachable!("the loop above runs every piece of work"),
+        }
     }
     Ok(ran)
 }
@@ -983,6 +1338,126 @@ mod tests {
 
     fn test_db() -> Db {
         Db::open_in_memory().unwrap()
+    }
+
+    /// What a front-end tells `start`, with every log in `dir`: nothing
+    /// here reads the host's own.
+    fn with_settings<T>(dir: &std::path::Path, then: impl FnOnce(&Settings) -> T) -> T {
+        let host = crate::hostconf::HostConf {
+            access_log: Some(dir.join("access.log")),
+            ..Default::default()
+        };
+        let ssh = dir.join("auth.log");
+        let firewall_out = dir.join("fw.nft");
+        then(&Settings {
+            host: &host,
+            ssh_log: Some(&ssh),
+            firewall_out: Some(&firewall_out),
+            for_real: false,
+        })
+    }
+
+    /// The property the one dispatch exists for: every job, including any
+    /// added after this was written, is started by `start` — which `tick`
+    /// and the TUI both drive — and comes back as having run, recorded, or
+    /// as the slow half of that same job. Nothing slow is run here: no
+    /// download, no probe of the host.
+    #[test]
+    fn every_job_is_started_by_the_one_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        with_settings(dir.path(), |settings| {
+            for job in CronJob::all() {
+                let db = test_db();
+                match start(&db, &Task::Job(job), settings).unwrap() {
+                    Next::Work(work) => {
+                        assert_eq!(work.jobs(), [job], "{}: someone else's work", job.id())
+                    }
+                    Next::Ran(ran) => {
+                        assert_eq!(ran.len(), 1, "{}: ran {ran:?}", job.id());
+                        assert_eq!(ran[0].0, job, "{}: ran {ran:?}", job.id());
+                        assert_eq!(
+                            db.get_cron_last_summary(job.id()).unwrap().as_ref(),
+                            Some(&ran[0].1),
+                            "{}: ran but did not record it",
+                            job.id()
+                        );
+                    }
+                    other => panic!("{}: {other:?} on a fresh database", job.id()),
+                }
+            }
+        });
+    }
+
+    /// The jobs that read a log share one read of it, ahead of the rest,
+    /// and every other job starts on its own.
+    #[test]
+    fn the_due_log_jobs_start_as_one_pass_ahead_of_the_rest() {
+        let due = CronJob::all();
+        let (log_jobs, others): (Vec<CronJob>, Vec<CronJob>) =
+            due.iter().partition(|job| is_log_job(**job));
+
+        let tasks = tasks(due);
+
+        assert_eq!(tasks[0], Task::LogPass(log_jobs), "{tasks:?}");
+        assert_eq!(
+            tasks[1..],
+            others.into_iter().map(Task::Job).collect::<Vec<_>>(),
+            "{tasks:?}"
+        );
+    }
+
+    /// A scheduled download while another holds the lease starts nothing
+    /// and records nothing, so it is still due when the next check comes.
+    #[test]
+    fn a_download_waits_while_another_holds_the_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+        crate::refresh::claim(&db, now()).unwrap();
+
+        with_settings(dir.path(), |settings| {
+            for job in [CronJob::UpdateIpRanges, CronJob::UpdateEverything] {
+                let next = start(&db, &Task::Job(job), settings).unwrap();
+                assert!(matches!(next, Next::Waiting), "{}: {next:?}", job.id());
+                assert_eq!(
+                    db.get_cron_last_run(job.id()).unwrap(),
+                    None,
+                    "{} was recorded, so the next check would not retry it",
+                    job.id()
+                );
+            }
+        });
+    }
+
+    /// The switch is read before anything else, for both front-ends:
+    /// off, `ApplyNginx` records why it did nothing; on, it goes on to
+    /// the sites, and records nothing until that apply has said how it
+    /// went.
+    #[test]
+    fn the_auto_apply_switch_decides_whether_apply_nginx_reaches_the_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = test_db();
+        let job = Task::Job(CronJob::ApplyNginx);
+
+        with_settings(dir.path(), |settings| {
+            let off = start(&db, &job, settings).unwrap();
+            assert!(
+                matches!(&off, Next::Ran(ran) if ran[0].1 == "auto-apply is off"),
+                "{off:?}"
+            );
+
+            db.set_auto_apply(true).unwrap();
+            db.set_cron_last_run(CronJob::ApplyNginx.id(), 0, "before")
+                .unwrap();
+            let on = start(&db, &job, settings).unwrap();
+            assert!(matches!(on, Next::ApplySites), "{on:?}");
+            assert_eq!(
+                db.get_cron_last_summary(CronJob::ApplyNginx.id())
+                    .unwrap()
+                    .as_deref(),
+                Some("before"),
+                "ApplyNginx was recorded before its apply had run"
+            );
+        });
     }
 
     /// Weekly, pushed back by a jitter that stays inside its bound and

@@ -8,6 +8,25 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-20
+
+Checked against what attacks look like elsewhere: a month of public honeypot traffic and two
+hosts' real logs. A detector for requests that are not for a web page, every access log the
+web server writes read instead of one, single-request detectors that recognise much more of
+what honeypots see, and downloaded lists that no longer block the real search engines.
+
+**Before upgrading:** nothing to do. The database schema is unchanged, and 0.4.0 still opens a
+database 0.5.0 has used; a block `protocol-probes` made shows there with an unknown source and
+stays in force.
+
+**After upgrading:** the protocol-probe detector arrives off and marked new;
+`stop-bots set-detector protocol-probes --enabled true` turns it on. Two things change on their
+own, because they widen detectors that are already on rather than add one. Every access log
+the web server's config names is now read, the first time with what logrotate kept back to the
+longest detector window, so a site's own log can produce blocks on the first pass. And probe
+paths, injection attempts and probes for absent apps recognise more. `stop-bots status` lists
+the logs read.
+
 ### Added
 
 - **A protocol-probe detector, `protocol-probes`: one request that is not for a web page.**
@@ -25,7 +44,28 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   On for a new install. After an upgrade it is off and marked new until you choose:
   `stop-bots set-detector protocol-probes --enabled true`.
 
+- **Every access log the web server's config names is read**, each from a cursor of its own: a
+  site with its own `access_log` (NGINX) or `CustomLog` (Apache) was invisible to the detectors.
+  `status` names them, and `status --json` lists every log read under `access_logs`.
+
+- **A stored `set-log-paths --access-log` is read beside those logs; `--access-log` still reads
+  only its file.** One says where the main log is, the other is one run against one file. A web
+  server in a container (`set-web-server --test`) has only the stored log read: its paths are its own.
+
+- **A log's first read also reads what logrotate kept**, `<log>.1` and `<log>.N.gz`, back to the
+  longest window of a detector that is on. After an upgrade, a site's log read for the first time
+  can therefore block at once, as the main log could on a new install.
+
 ### Changed
+
+- **Probe paths, injection attempts and probes for absent apps know what honeypots see.**
+  Replaying a month of SANS ISC DShield's web honeypot URLs showed what these single-request
+  detectors missed. New probe paths: `/eval-stdin.php` anywhere, and `/.vscode/`. New
+  payloads: ThinkPHP's `invokefunction`, and a backslash `\..\` traversal. Apps they
+  probe for where no site runs them: Exchange, FortiGate SSL VPN, Tomcat manager, Solr,
+  Spring Boot actuator, the Docker API, router admin pages and GeoServer. Together they
+  cover 36% of the honeypots' requests, from 21%. On one host's month they block 87 more
+  addresses, none a visitor's. `/autodiscover/` stays out, since Outlook asks for it.
 
 - **An operator checking their own site is not taken for a prober.** A successful SSH
   login is now remembered for 90 days. For the first 7, nothing blocks the address, as
@@ -41,6 +81,11 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   since a browser asks again for a missing favicon on every page.
 
 ### Fixed
+
+- **The BLOCKLIST tag agrees with the web server.** It compared each bot pattern as plain
+  text, while NGINX and Apache read it as a case-insensitive regex. So `bingbot\/`,
+  `^curl` and `[wW]get` never matched, though the web server blocked those clients. Of one
+  host's 1,305 user agents, 24 were tagged wrong. Patterns are now read as a regex.
 
 - **A backup of a site's config is no longer a second site.** A copy kept under the config
   root, such as `conf.d.bak-2026-10-12/` or `site.conf.orig`, was stored as a site of its
@@ -64,6 +109,10 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   block checked every other convicted address to find the ones it covers, so the time grew
   with the square of their number: 40,000 addresses took 76 seconds, and a first run over
   a month of honeypot traffic took two and a half minutes. Both now take about a second.
+
+- **The TUI's health check records a failure instead of closing.** A database error while
+  the TUI stored its hourly probe ended the TUI. Now the error is the job's summary on the
+  Scheduled tasks panel, as it always was under `tick`.
 
 ## [0.4.0] — 2026-10-16
 
@@ -2608,7 +2657,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ivankovic/stop-bots/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ivankovic/stop-bots/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ivankovic/stop-bots/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/ivankovic/stop-bots/compare/v0.2.0...v0.2.1

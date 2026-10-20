@@ -50,6 +50,29 @@ pub fn generated_dir(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The host settings file every spawned `stop-bots` shares unless a test
+/// points it at one of its own: [`generated_dir`]'s `host.conf`, with both
+/// web servers' config roots set to an empty directory.
+///
+/// Without a root a command reads the stock one, `/etc/nginx` or
+/// `/etc/apache2`, for the access logs its config names: on a developer
+/// machine with a web server, that is the developer's own config and logs.
+pub fn shared_host_conf() -> PathBuf {
+    static CONF: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    CONF.get_or_init(|| {
+        let empty = generated_dir("no-config");
+        fs::create_dir_all(&empty).expect("failed to create the empty config root");
+        let conf = generated_dir("host.conf");
+        fs::write(
+            &conf,
+            format!("nginx_root = {0}\napache_root = {0}\n", empty.display()),
+        )
+        .expect("failed to write the shared host settings");
+        conf
+    })
+    .clone()
+}
+
 /// `stop-bots`, with those directories already pointed somewhere harmless,
 /// and every download sent to the [`NetworkTripwire`] instead of the
 /// internet.
@@ -63,10 +86,11 @@ pub fn stop_bots_bin() -> Command {
         // The host settings file is `/etc/stop-bots/host.conf` otherwise,
         // which a test must neither read nor write. A test that sets one
         // points this at a file of its own.
-        .env("STOP_BOTS_HOST_CONF", generated_dir("host.conf"))
+        .env("STOP_BOTS_HOST_CONF", shared_host_conf())
         // The lockout check counts the SSH session it runs in as
         // connected; not the one a developer runs the tests from.
-        .env("STOP_BOTS_SSH_CLIENT", "");
+        .env("STOP_BOTS_SSH_CLIENT", "")
+        .env("PATH", quiet_path());
     for name in NetworkTripwire::UNSET {
         cmd.env_remove(name);
     }
@@ -201,11 +225,30 @@ pub fn scan_sites(db: &Path, root: &Path) -> assert_cmd::assert::Assert {
     ])
 }
 
-/// PATH with `bin` in front, for handing to a spawned child.
+/// PATH with `bin` in front, for handing to a spawned child: in front of
+/// [`quiet_path`], so that a fake tool of the test's own wins and the
+/// quiet `journalctl` is still there when it has none.
 pub fn path_with(bin: &Path) -> String {
+    format!("{}:{}", bin.display(), quiet_path())
+}
+
+/// PATH with a `journalctl` in front that prints nothing.
+///
+/// A command given no `--ssh-log` falls back to `journalctl` for the SSH
+/// log, and the real one reads the journal of whatever machine runs the
+/// tests: what a test then saw depended on who had logged in there. Every
+/// `stop-bots` a test spawns gets this, through [`stop_bots_bin`] or
+/// [`path_with`]. A test about the journal puts a fake of its own first.
+pub fn quiet_path() -> String {
+    static BIN: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let bin = BIN.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("failed to create the quiet bin dir");
+        write_script(&dir.path().join("journalctl"), "exit 0\n");
+        dir
+    });
     format!(
         "{}:{}",
-        bin.display(),
+        bin.path().display(),
         std::env::var("PATH").unwrap_or_default()
     )
 }

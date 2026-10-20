@@ -38,8 +38,9 @@ Installing starts nothing, and nothing is written until you apply. On the first 
 the settings a new database starts with:
 
 - **Blocked by user agent:** the Scanner and AI crawler categories. Search engines are allowed.
-- **Watching the logs:** six detectors are on: SSH scanners, web scanners, forged crawlers,
-  probes for secrets, injection attempts and login brute force. The rest are off (see
+- **Watching the logs:** seven detectors are on: SSH scanners, web scanners, forged crawlers,
+  probes for secrets, injection attempts, protocol probes and login brute force. The rest are
+  off (see
   [From your logs](#from-your-logs)).
 - **Blocked by address:** nothing yet. Countries, reputation feeds and hosting providers are
   all off until you turn them on, so the firewall starts with only what the detectors find.
@@ -253,6 +254,7 @@ Each detector is a separate switch, and each block is timed and records the log 
 | Forged crawlers | on | a client claiming to be Googlebot, Bingbot or GPTBot from an address that crawler doesn't use |
 | Probing for secrets | on | a single request for `/.env`, `/.git/config` and the like, and for `/wp-login.php` or `/phpmyadmin` where no site runs that application |
 | Injection attempts | on | a single request carrying an exploit, such as Shellshock or Log4Shell |
+| Protocol probes | on | a single request that is not for a web page: a TLS, SOCKS or SSH handshake sent to plain HTTP, or a request to use the server as a proxy |
 | Login brute force | on | many POSTs to a login page (`/wp-login.php`, `/xmlrpc.php`, `/user/login`…) from one address in an hour |
 | Honeypot | off | a client that visits a path only `robots.txt` mentions |
 | robots.txt violators | off | a client that fetched the generated `robots.txt` and then a page it forbids to that client |

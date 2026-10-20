@@ -405,7 +405,8 @@ Some directories don't exist yet but should be created if the need arises.
 ```
 <root of the repository>
     |- /src               <- The implementation
-        |- main.rs        <- CLI entry point (clap subcommands) and their handlers
+        |- main.rs        <- CLI entry point: what each subcommand does
+        |- cli.rs         <- The command line itself: every verb, flag and help text (clap)
         |- lib.rs         <- Every module below, for main.rs and tests/; not a supported API
         |- app.rs         <- The TUI app controller, responds to events and controls the UI
         |- applylock.rs   <- One web server or firewall apply at a time, across processes (flock)
@@ -447,6 +448,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- ipranges/      <- Crawler, country and third-party IP-range fetching/storage
         |- ipdetail.rs    <- Everything already known about one address (Firewall detail view)
         |- uadetail.rs    <- The same for one user agent string
+        |- uaregex.rs     <- Matching a user agent against a list's pattern as the web server does
         |- health.rs      <- Is this host actually protected? The checks behind `status`
         |- hint.rs        <- Errors that name the next step (run with sudo, set-web-server)
         |- host.rs        <- The host name, and where the system programs this runs are

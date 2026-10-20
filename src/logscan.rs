@@ -49,7 +49,7 @@
 //!
 //! ## Which logs, and when
 //!
-//! A log is read when a due job wants it and not otherwise: the access log
+//! A log is read when a due job wants it and not otherwise: the access logs
 //! for access-stats and any access-log detector that is on, the SSH log
 //! for the SSH detector's job (on or off: the logins it records keep the
 //! anti-lockout window fed) and the firewall render's guard, and the
@@ -57,6 +57,23 @@
 //!
 //! A read feeds *every* consumer of that log, due or not, because the
 //! cursor moves past the lines for all of them at once.
+//!
+//! ## Several access logs
+//!
+//! The web server may write more than one: the stored or default log, and
+//! each other file its config names (see [`crate::logpaths`] for which,
+//! and why a flag reads only itself). Each is read on its own, with a
+//! cursor of its own, so that one rotating, going missing or being read by
+//! another process at the same moment changes nothing for the rest. One
+//! that cannot be read is reported in [`Applied::access_logs`]; the access
+//! detectors run as long as any of them was read.
+//!
+//! The first read of one, with no cursor yet, also reads what logrotate
+//! kept of it (see [`crate::hostlog::read_rotated`]), as far back as the
+//! longest window of a detector that is on: an install on the morning after
+//! a rotation would otherwise know nothing of the day before. Those lines
+//! are evidence only. The access-stats tally counts from the first read
+//! on, as it always has.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -117,13 +134,25 @@ pub struct Plan {
 
 #[derive(Debug, Clone)]
 struct AccessPlan {
+    watch: Watch,
+    /// One per access log in [`Sources::access`], in its order.
+    logs: Vec<AccessLogPlan>,
+}
+
+#[derive(Debug, Clone)]
+struct AccessLogPlan {
+    /// Its place in [`Sources::access`].
+    which: usize,
     /// The cursor as stored, which the store compares against.
     cursor: Option<Cursor>,
     /// Where 0.0.x's access-stats tally stopped, for a log with no cursor
     /// yet: the first read starts there rather than counting the whole
     /// file into `user_agent_stats` a second time.
     legacy_offset: Option<u64>,
-    watch: Watch,
+    /// On a first read, how far back its rotated copies are read: the
+    /// oldest time a detector that is on still counts. `None` on a later
+    /// read, and when no detector looks back at all.
+    rotated_since: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,17 +241,29 @@ pub fn plan(db: &Db, jobs: &[CronJob], flags: &Flags) -> Result<Plan> {
         wants_access |= wants_access_log(db, *job)?;
     }
     let access = if wants_access {
-        let source = source_key(&sources.access);
-        let stored = db.get_log_cursor(&source)?;
-        let legacy_offset = match stored {
-            Some(_) => None,
-            None => legacy_offset(db, &sources.access)?,
-        };
-        Some(AccessPlan {
-            cursor: stored.map(|at| Cursor { source, at }),
-            legacy_offset,
-            watch: watch(db, now)?,
-        })
+        let watch = watch(db, now)?;
+        let longest = watch
+            .detectors
+            .iter()
+            .filter_map(|(_, cutoff)| *cutoff)
+            .min();
+        let mut logs = Vec::new();
+        for (which, path) in sources.access.iter().enumerate() {
+            let source = source_key(path);
+            let stored = db.get_log_cursor(&source)?;
+            let legacy_offset = match stored {
+                Some(_) => None,
+                None => legacy_offset(db, path)?,
+            };
+            let first = stored.is_none() && legacy_offset.is_none();
+            logs.push(AccessLogPlan {
+                which,
+                cursor: stored.map(|at| Cursor { source, at }),
+                legacy_offset,
+                rotated_since: longest.filter(|_| first),
+            });
+        }
+        Some(AccessPlan { watch, logs })
     } else {
         None
     };
@@ -365,13 +406,9 @@ pub fn app_probes(db: &Db) -> Result<crate::webapps::AppProbes> {
         return Ok(crate::webapps::AppProbes::default());
     };
     let server = host.web_server();
-    // A test command of its own is how a server in a container is set up
-    // (see `set-web-server --test`): its document roots are paths in the
-    // container, and a directory of the same name here says nothing.
-    let files_here = match server {
-        crate::webserver::WebServer::Nginx => host.nginx_test_command.is_none(),
-        crate::webserver::WebServer::Apache => host.apache_test_command.is_none(),
-    };
+    // In a container, its document roots are paths in the container, and
+    // a directory of the same name here says nothing.
+    let files_here = host.config_paths_are_here();
     let mut sites = Vec::new();
     for site in db.list_sites()? {
         let path = Path::new(&site.config_path);
@@ -443,7 +480,8 @@ pub struct LogRead<T> {
     source: String,
     from: Option<String>,
     to: Option<String>,
-    /// Bytes (a file) or entries (the journal) read.
+    /// Bytes (a file, with its rotated copies on a first read) or entries
+    /// (the journal) read.
     pub amount: u64,
     pub findings: T,
 }
@@ -471,7 +509,9 @@ pub struct SshFindings {
 #[derive(Debug, Clone)]
 pub struct Read {
     now: i64,
-    pub access: Option<Outcome<AccessFindings>>,
+    /// One per access log, in [`Sources::access`]' order: empty when no
+    /// due job wanted them.
+    pub access: Vec<Outcome<AccessFindings>>,
     pub ssh: Option<Outcome<SshFindings>>,
     pub kernel: Option<Outcome<KernelFindings>>,
 }
@@ -481,10 +521,13 @@ pub struct Read {
 pub fn read(plan: &Plan, reader: &dyn LogReader) -> Read {
     Read {
         now: plan.now,
-        access: plan
-            .access
-            .as_ref()
-            .map(|access| read_access(access, plan.now, reader)),
+        access: plan.access.as_ref().map_or_else(Vec::new, |access| {
+            access
+                .logs
+                .iter()
+                .map(|log| read_access(log, &access.watch, plan.now, reader))
+                .collect()
+        }),
         ssh: plan.ssh.as_ref().map(|ssh| read_ssh(ssh, plan.now, reader)),
         kernel: plan
             .kernel
@@ -543,22 +586,36 @@ fn follow(
     followed.ok_or_else(|| "nothing was asked for".to_string())
 }
 
-fn read_access(plan: &AccessPlan, now: i64, reader: &dyn LogReader) -> Outcome<AccessFindings> {
+fn read_access(
+    plan: &AccessLogPlan,
+    watch: &Watch,
+    now: i64,
+    reader: &dyn LogReader,
+) -> Outcome<AccessFindings> {
     let request = Request {
+        which: plan.which,
         legacy_offset: plan.legacy_offset,
         ..Request::new(hostlog::Log::Access, plan.cursor.iter().cloned().collect())
     };
     let mut reading: Option<(accesslog::Observer, Clock)> = None;
+    let mut rotated = 0;
     let followed = follow(reader, request, &mut |chunk| {
         let (observer, clock) = reading.get_or_insert_with(|| {
             // On a first read nothing dates an undated line, which may be
             // months old: it counts for nothing. After that, a line that
             // was not there last pass is from since then.
             let undated = chunk.resumed.then_some(now);
-            (
-                accesslog::Observer::new(plan.watch.clone()).counting_user_agents(),
-                Clock::Logged { now, undated },
-            )
+            let mut observer = accesslog::Observer::new(watch.clone()).counting_user_agents();
+            // Only once the log itself has answered, so a log that is not
+            // there does not have its copies read again every pass; and
+            // before its own lines, so the observer sees them in order.
+            if let (Some(since), false) = (plan.rotated_since, chunk.resumed) {
+                let clock = Clock::Logged { now, undated: None };
+                rotated = reader.read_rotated(plan.which, since, &mut |line| {
+                    observer.line_uncounted(line, clock)
+                });
+            }
+            (observer, Clock::Logged { now, undated })
         });
         for line in chunk.lines.split_terminator('\n') {
             observer.line(line, *clock);
@@ -574,7 +631,7 @@ fn read_access(plan: &AccessPlan, now: i64, reader: &dyn LogReader) -> Outcome<A
                 source: done.source,
                 from: done.from,
                 to: done.to,
-                amount: done.amount,
+                amount: done.amount + rotated,
                 findings: AccessFindings {
                     evidence,
                     user_agents,
@@ -672,15 +729,43 @@ impl Availability {
 #[derive(Debug, Clone)]
 pub struct Applied {
     pub now: i64,
+    /// The access logs as one: read when any of them was (stored when any
+    /// read was ours to store), and otherwise unavailable, naming every
+    /// one tried. What the access detectors and the tally go by.
     pub access: Availability,
+    /// Each access log the pass meant to read, by its path, and how that
+    /// went: for saying which one could not be read.
+    pub access_logs: Vec<(String, Availability)>,
     pub ssh: Availability,
     pub kernel: Availability,
     /// Addresses that logged in over SSH, in what this pass read.
     pub logins: Vec<String>,
     /// The access-stats tally of what this pass read.
     pub stats: crate::accessstats::AccessStatsOutcome,
-    /// Lines in the access log this pass read, and how many parsed.
+    /// Lines in the access logs this pass read, and how many parsed.
     pub access_counts: Counts,
+}
+
+impl Applied {
+    /// The access logs this pass could not read, as each was tried.
+    pub fn unreadable_access_logs(&self) -> Vec<&str> {
+        self.access_logs
+            .iter()
+            .filter(|(_, availability)| matches!(availability, Availability::Unavailable(_)))
+            .map(|(path, _)| path.as_str())
+            .collect()
+    }
+
+    /// `"; could not read <path>, <path>"` when some access logs were read
+    /// and others could not be, for the end of a summary; nothing otherwise.
+    /// A log missing among several is not fatal, and not silent either.
+    pub fn unreadable_note(&self) -> String {
+        match self.unreadable_access_logs().as_slice() {
+            [] => String::new(),
+            _ if !self.access.is_readable() => String::new(),
+            paths => format!("; could not read {}", paths.join(", ")),
+        }
+    }
 }
 
 /// Stores what `read` found, all at once. See the module docs, and
@@ -694,10 +779,11 @@ pub fn apply(db: &Db, read: Read) -> Result<Applied> {
     }
 }
 
-/// Which log a [`Storing`] is on.
+/// Which log a [`Storing`] is on: an access log by its place in
+/// [`Applied::access_logs`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Log {
-    Access,
+    Access(usize),
     Ssh,
     Kernel,
 }
@@ -720,8 +806,11 @@ impl Applied {
 pub struct Storing {
     applied: Applied,
     pending: Vec<(Log, Ingest)>,
-    /// The access-stats tally, for when the access log's store is ours.
-    stats: crate::accessstats::AccessStatsOutcome,
+    /// The access-stats tally of each access log, by its place, for when
+    /// its store is ours; and of all of them at once, for when every one
+    /// is (an agent in two logs is one agent).
+    stats: Vec<crate::accessstats::AccessStatsOutcome>,
+    all_stats: crate::accessstats::AccessStatsOutcome,
     /// The most rows a step writes.
     chunk: usize,
 }
@@ -732,6 +821,7 @@ pub fn store(read: Read) -> Storing {
     let mut applied = Applied {
         now: read.now,
         access: Availability::NotRead,
+        access_logs: Vec::new(),
         ssh: Availability::NotRead,
         kernel: Availability::NotRead,
         logins: Vec::new(),
@@ -739,28 +829,47 @@ pub fn store(read: Read) -> Storing {
         access_counts: Counts::default(),
     };
     let mut pending = Vec::new();
-    let mut stats = crate::accessstats::AccessStatsOutcome::default();
+    let mut stats = Vec::new();
+    let all_stats =
+        crate::accessstats::AccessStatsOutcome::of_all(read.access.iter().filter_map(|outcome| {
+            match outcome {
+                Outcome::Read(log) => Some(&log.findings.user_agents),
+                Outcome::Unavailable(_) => None,
+            }
+        }));
 
-    match read.access {
-        None => {}
-        Some(Outcome::Unavailable(tried)) => applied.access = Availability::Unavailable(tried),
-        Some(Outcome::Read(log)) => {
-            let findings = log.findings;
-            stats = crate::accessstats::AccessStatsOutcome::of(&findings.user_agents);
-            applied.access_counts = findings.counts;
-            pending.push((
-                Log::Access,
-                Ingest::new(
-                    &log.source,
-                    log.from.as_deref(),
-                    log.to.as_deref(),
-                    findings.evidence,
-                    findings.user_agents,
-                    Vec::new(),
-                    read.now,
-                ),
-            ));
-        }
+    for (place, outcome) in read.access.into_iter().enumerate() {
+        let log = match outcome {
+            Outcome::Unavailable(tried) => {
+                applied
+                    .access_logs
+                    .push((tried.clone(), Availability::Unavailable(tried)));
+                stats.push(Default::default());
+                continue;
+            }
+            Outcome::Read(log) => log,
+        };
+        let findings = log.findings;
+        stats.push(crate::accessstats::AccessStatsOutcome::of(
+            &findings.user_agents,
+        ));
+        applied.access_counts.lines += findings.counts.lines;
+        applied.access_counts.parsed += findings.counts.parsed;
+        applied
+            .access_logs
+            .push((log.source.clone(), Availability::NotRead));
+        pending.push((
+            Log::Access(place),
+            Ingest::new(
+                &log.source,
+                log.from.as_deref(),
+                log.to.as_deref(),
+                findings.evidence,
+                findings.user_agents,
+                Vec::new(),
+                read.now,
+            ),
+        ));
     }
 
     match read.ssh {
@@ -809,6 +918,7 @@ pub fn store(read: Read) -> Storing {
         applied,
         pending,
         stats,
+        all_stats,
         chunk: INGEST_CHUNK,
     }
 }
@@ -832,18 +942,16 @@ impl Storing {
                 self.pending.pop();
                 let read = Availability::Read { stored };
                 match log {
-                    Log::Access => {
-                        if stored {
-                            self.applied.stats = std::mem::take(&mut self.stats);
-                        }
-                        self.applied.access = read;
-                    }
+                    Log::Access(place) => self.applied.access_logs[place].1 = read,
                     Log::Ssh => self.applied.ssh = read,
                     Log::Kernel => self.applied.kernel = read,
                 }
             }
             return Ok(None);
         }
+
+        self.applied.access = all_access(&self.applied.access_logs);
+        self.applied.stats = self.stats_stored();
 
         // Whatever has fallen out of its detector's window can never count
         // again. Every detector, on or off: one switched off keeps nothing
@@ -858,6 +966,49 @@ impl Storing {
         })?;
         Ok(Some(self.applied.clone()))
     }
+
+    /// The access-stats tally of the access logs whose store was ours.
+    fn stats_stored(&self) -> crate::accessstats::AccessStatsOutcome {
+        let logs = &self.applied.access_logs;
+        let ours = |read: &Availability| *read == Availability::Read { stored: true };
+        if logs
+            .iter()
+            .filter(|(_, read)| read.is_readable())
+            .all(|(_, read)| ours(read))
+        {
+            return self.all_stats;
+        }
+        // Another process stored some of them, and their lines are its to
+        // tally. An agent in two of ours is counted twice here, which is
+        // the most this can say without the agents themselves.
+        logs.iter()
+            .zip(&self.stats)
+            .filter(|((_, read), _)| ours(read))
+            .fold(Default::default(), |sum, (_, stats)| sum.plus(*stats))
+    }
+}
+
+/// The access logs as one, for [`Applied::access`].
+fn all_access(logs: &[(String, Availability)]) -> Availability {
+    if logs.is_empty() {
+        return Availability::NotRead;
+    }
+    if logs
+        .iter()
+        .any(|(_, availability)| availability.is_readable())
+    {
+        return Availability::Read {
+            stored: logs
+                .iter()
+                .any(|(_, availability)| *availability == Availability::Read { stored: true }),
+        };
+    }
+    Availability::Unavailable(
+        logs.iter()
+            .map(|(tried, _)| tried.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
 }
 
 /// A whole pass, for a caller with nothing to gain from splitting it: the
@@ -1006,7 +1157,7 @@ mod tests {
         )
         .unwrap();
         let read = read_here(&plan);
-        let Some(Outcome::Read(log)) = &read.access else {
+        let [Outcome::Read(log)] = read.access.as_slice() else {
             panic!("the log is there");
         };
         assert_eq!(log.amount, 0, "nothing new to read");
@@ -1456,6 +1607,10 @@ mod tests {
                 request.max_bytes = 500;
                 self.0.read_log(&request)
             }
+
+            fn read_rotated(&self, which: usize, since: i64, visit: &mut dyn FnMut(&str)) -> u64 {
+                self.0.read_rotated(which, since, visit)
+            }
         }
         let (whole, chunked) = (host(), host());
         for host in [&whole, &chunked] {
@@ -1491,9 +1646,213 @@ mod tests {
         );
         // Both stopped at the end, so a second pass reads nothing more.
         let again = plan(&chunked.db, &jobs, &chunked.flags).unwrap();
-        let Some(Outcome::Read(log)) = read(&again, again.sources()).access else {
+        let again = read(&again, again.sources());
+        let [Outcome::Read(log)] = again.access.as_slice() else {
             panic!("the log is there");
         };
         assert_eq!(log.amount, 0);
+    }
+
+    // ---- several access logs ----
+
+    /// Gives `host` an NGINX config root beside its logs, served from this
+    /// host, with a site that logs to a file of its own, `name`; and
+    /// returns that file. Each call adds a site.
+    fn site_logging_to(host: &mut Host, name: &str) -> PathBuf {
+        let dir = host.access.parent().unwrap().to_path_buf();
+        let root = dir.join("nginx");
+        std::fs::create_dir_all(&root).unwrap();
+        let log = dir.join(name);
+        std::fs::write(&log, "").unwrap();
+        std::fs::write(
+            root.join(format!("{name}.conf")),
+            format!(
+                "server {{ server_name {name}; access_log {}; }}\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        host.flags.stored.root = root;
+        host.flags.stored.config_logs_here = true;
+        log
+    }
+
+    /// How many times `detector` counted each address, in address order.
+    fn counted(db: &Db, detector: Detector) -> Vec<(String, u64)> {
+        let mut counts: Vec<(String, u64)> = Vec::new();
+        for row in db.evidence_rows(detector, 0, Rule::Once).unwrap() {
+            match counts
+                .iter_mut()
+                .find(|(address, _)| *address == row.address)
+            {
+                Some((_, count)) => *count += row.tally.count,
+                None => counts.push((row.address, row.tally.count)),
+            }
+        }
+        counts.sort();
+        counts
+    }
+
+    /// A site that logs to its own file is seen as the main log is, and
+    /// each file is read from its own cursor: one of them rotating changes
+    /// nothing for the other, and no line is counted twice.
+    #[test]
+    fn every_access_log_the_config_names_is_read_from_its_own_cursor() {
+        let mut host = host();
+        let site = site_logging_to(&mut host, "shop.log");
+        append(&host.access, &probe("203.0.113.1", now() - 60));
+        append(&site, &probe("203.0.113.2", now() - 60));
+        pass(&host);
+
+        std::fs::rename(&site, host.access.with_file_name("shop.log.1")).unwrap();
+        append(&site, &probe("203.0.113.3", now()));
+        append(&host.access, &probe("203.0.113.4", now()));
+        pass(&host);
+        pass(&host);
+
+        assert_eq!(
+            counted(&host.db, Detector::ProbePaths),
+            [
+                ("203.0.113.1".to_string(), 1),
+                ("203.0.113.2".to_string(), 1),
+                ("203.0.113.3".to_string(), 1),
+                ("203.0.113.4".to_string(), 1),
+            ]
+        );
+        for log in [&host.access, &site] {
+            assert!(
+                host.db.get_log_cursor(&source_key(log)).unwrap().is_some(),
+                "no cursor of its own for {}",
+                log.display()
+            );
+        }
+    }
+
+    /// A fresh install the morning after a rotation: what logrotate kept,
+    /// plain and compressed, is evidence as far back as the window, and no
+    /// further. The tally of visits counts from the first read on.
+    #[test]
+    fn a_first_read_also_reads_what_logrotate_kept_within_the_window() {
+        let host = host();
+        let named = |suffix: &str| host.access.with_file_name(format!("access.log{suffix}"));
+        let visit = format!(
+            "{}\n",
+            crate::testing::access_line_at(
+                "203.0.113.9",
+                "GET / HTTP/1.1",
+                200,
+                "Mozilla/5.0",
+                now()
+            )
+        );
+        std::fs::write(named(".1"), probe("203.0.113.1", now() - HOUR) + &visit).unwrap();
+        crate::testing::write_gzip(
+            &named(".2.gz"),
+            &probe("203.0.113.2", now() - 6 * HOUR),
+            now() - 6 * HOUR,
+        );
+        crate::testing::write_gzip(
+            &named(".3.gz"),
+            &probe("203.0.113.3", now() - 72 * HOUR),
+            now() - 72 * HOUR,
+        );
+        append(&host.access, &probe("203.0.113.4", now()));
+
+        let applied = pass(&host);
+
+        assert_eq!(
+            probers(&host.db),
+            ["203.0.113.1", "203.0.113.2", "203.0.113.4"],
+            "the three-day-old copy is outside the 24-hour window"
+        );
+        assert_eq!(
+            applied.stats.total_hits, 0,
+            "the rotated visit is not tallied"
+        );
+    }
+
+    /// Only the first read: after it, the cursor says where the log is,
+    /// and what was kept beside it is not read again.
+    #[test]
+    fn what_logrotate_kept_is_not_read_again_after_the_first_read() {
+        let host = host();
+        let copy = host.access.with_file_name("access.log.1");
+        std::fs::write(&copy, probe("203.0.113.1", now() - HOUR)).unwrap();
+        pass(&host);
+
+        append(&copy, &probe("203.0.113.2", now()));
+        append(&host.access, &probe("203.0.113.3", now()));
+        pass(&host);
+
+        assert_eq!(
+            counted(&host.db, Detector::ProbePaths),
+            [
+                ("203.0.113.1".to_string(), 1),
+                ("203.0.113.3".to_string(), 1)
+            ]
+        );
+    }
+
+    /// One log missing among several is reported, by its path, and the
+    /// detectors still have the rest.
+    #[test]
+    fn a_log_missing_among_several_is_reported_and_the_rest_are_read() {
+        let mut host = host();
+        let site = site_logging_to(&mut host, "shop.log");
+        append(&site, &probe("203.0.113.2", now()));
+        std::fs::remove_file(&host.access).unwrap();
+
+        let applied = pass(&host);
+
+        assert!(applied.access.is_readable(), "{:?}", applied.access);
+        assert_eq!(
+            applied.unreadable_access_logs(),
+            [host.access.display().to_string()]
+        );
+        assert_eq!(
+            applied.unreadable_note(),
+            format!("; could not read {}", host.access.display())
+        );
+        assert_eq!(probers(&host.db), ["203.0.113.2"]);
+    }
+
+    /// A web server in a container names the paths it has inside it: a
+    /// file of the same name on this host is not its log, and is not read.
+    #[test]
+    fn the_config_s_logs_are_not_read_for_a_web_server_in_a_container() {
+        let mut host = host();
+        let site = site_logging_to(&mut host, "shop.log");
+        append(&site, &probe("203.0.113.2", now()));
+        append(&host.access, &probe("203.0.113.1", now()));
+        host.flags.stored = crate::hostconf::HostConf {
+            nginx_root: Some(host.flags.stored.root.clone()),
+            nginx_test_command: Some("docker exec web nginx -t".to_string()),
+            access_log: Some(host.access.clone()),
+            ssh_log: Some(host.auth.clone()),
+            ..Default::default()
+        }
+        .log_paths();
+
+        let applied = pass(&host);
+
+        assert_eq!(applied.access_logs.len(), 1, "{:?}", applied.access_logs);
+        assert_eq!(probers(&host.db), ["203.0.113.1"]);
+    }
+
+    /// `--access-log` reads the file it names and nothing else: not the
+    /// stored log, and not the config's.
+    #[test]
+    fn a_flag_reads_only_the_file_it_names() {
+        let mut host = host();
+        let site = site_logging_to(&mut host, "shop.log");
+        let asked = host.access.with_file_name("copy.log");
+        append(&site, &probe("203.0.113.2", now()));
+        append(&host.access, &probe("203.0.113.1", now()));
+        append(&asked, &probe("203.0.113.3", now()));
+        host.flags.access_log = Some(asked);
+
+        pass(&host);
+
+        assert_eq!(probers(&host.db), ["203.0.113.3"]);
     }
 }

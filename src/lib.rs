@@ -137,6 +137,8 @@ pub mod tui;
 #[doc(hidden)]
 pub mod uadetail;
 #[doc(hidden)]
+pub mod uaregex;
+#[doc(hidden)]
 pub mod uninstall;
 #[doc(hidden)]
 pub mod webapps;

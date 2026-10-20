@@ -6,11 +6,6 @@ list — which meant the open items below were unfindable inside it.
 
 ## Worth doing next
 
-* **`ua_matches_blocked_bot_patterns`** (`dynamic.rs`) does case-insensitive
-  *substring* matching over `|`-split alternatives, while the web server enforces a
-  real case-insensitive regex (NGINX's `~*`, Apache's `RewriteCond ... [NC]`). The
-  `BLOCKLIST` tag can therefore disagree with what actually gets blocked.
-
 * **A few CLI tests read the host's SSH journal.** Those that pass no
   `--ssh-log` fall back to `journalctl` on whatever machine runs them —
   read-only, but not hermetic. `tests/common::stop_bots_bin` could put a

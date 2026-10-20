@@ -42,6 +42,11 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ### Fixed
 
+- **The BLOCKLIST tag agrees with the web server.** It compared each bot pattern as plain
+  text, while NGINX and Apache read it as a case-insensitive regex. So `bingbot\/`,
+  `^curl` and `[wW]get` never matched, though the web server blocked those clients. Of one
+  host's 1,305 user agents, 24 were tagged wrong. Patterns are now read as a regex.
+
 - **A backup of a site's config is no longer a second site.** A copy kept under the config
   root, such as `conf.d.bak-2026-10-12/` or `site.conf.orig`, was stored as a site of its
   own, and every apply wrote blocks into it. Files and directories whose names end the way a

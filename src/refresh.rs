@@ -228,6 +228,132 @@ pub fn record(db: &Db, outcomes: &[(Source, Result<String, String>)], by: &str) 
     summary
 }
 
+// ---- one run, pressed or scheduled ----
+
+/// One "update everything" in progress: the sources still to fetch, what
+/// the finished ones came to, and the lease it holds. `u` in the TUI, the
+/// TUI's weekly job and `tick`'s all drive this one (through
+/// [`crate::cron`]): [`Run::next_source`], [`fetch`] it, [`Run::stored`],
+/// and [`Run::end`] once none is left.
+///
+/// One source at a time, deliberately. The whole plan is eight or more
+/// downloads of several megabytes each; fetching them all at once would
+/// hold every payload in memory and show nothing until the last one
+/// landed, while one at a time keeps it to a single body and gives the
+/// TUI's message line something true to say throughout.
+#[derive(Debug, Clone)]
+pub struct Run {
+    /// Sources not yet fetched, in plan order, popped from the front.
+    remaining: std::collections::VecDeque<Source>,
+    /// Every outcome so far: what [`record`] reports and decides the
+    /// crawler job from.
+    outcomes: Vec<(Source, Result<String, String>)>,
+    /// Renewed after each source and given back at the end. `None` only
+    /// in tests that build a run by hand.
+    lease: Option<Lease>,
+    /// Whether the weekly job started it rather than someone pressing `u`.
+    scheduled: bool,
+}
+
+/// What asking to [`begin`] a run got.
+#[derive(Debug)]
+pub enum Begin {
+    Started(Run),
+    /// Someone else is downloading, and last renewed at `since`.
+    Busy {
+        since: i64,
+    },
+}
+
+/// Takes the lease and plans a run, or says who holds the lease. A plan
+/// that cannot be made gives the lease straight back.
+pub fn begin(db: &Db, now: i64, scheduled: bool) -> Result<Begin> {
+    let lease = match claim(db, now)? {
+        Claim::Granted(lease) => lease,
+        Claim::Busy { since } => return Ok(Begin::Busy { since }),
+    };
+    match plan(db) {
+        Ok(plan) => Ok(Begin::Started(Run {
+            remaining: plan.into(),
+            outcomes: Vec::new(),
+            lease: Some(lease),
+            scheduled,
+        })),
+        Err(err) => {
+            let _ = release(db, &lease);
+            Err(err.context("could not work out what to update"))
+        }
+    }
+}
+
+impl Run {
+    /// Whether the weekly job started it. A scheduled run works in the
+    /// background: its outcome goes to the Scheduled panel, not over
+    /// whatever the operator is doing.
+    pub fn scheduled(&self) -> bool {
+        self.scheduled
+    }
+
+    /// The next source to fetch, or `None` when the run is over.
+    pub fn next_source(&mut self) -> Option<Source> {
+        self.remaining.pop_front()
+    }
+
+    /// Stores what fetching `source` got, if it got anything, and renews
+    /// the lease.
+    pub fn stored(
+        &mut self,
+        db: &Db,
+        source: Source,
+        fetched: Result<String, String>,
+        now: i64,
+    ) -> Result<()> {
+        let outcome =
+            fetched.and_then(|raw| store(db, &source, &raw).map_err(|err| format!("{err:#}")));
+        self.outcomes.push((source, outcome));
+        if let Some(lease) = &self.lease {
+            renew(db, lease, now)?;
+        }
+        Ok(())
+    }
+
+    /// Records the finished run against the jobs it covers, gives the
+    /// lease back and returns the one line to show for it.
+    ///
+    /// Recorded before the lease goes, so that nobody can take the lease
+    /// and find the weekly job still due in between. A lease that cannot
+    /// be given back is left to expire, like a failure to record (see
+    /// [`crate::cron::record_run`]): the lists are updated by then.
+    pub fn end(self, db: &Db) -> String {
+        let by = if self.scheduled {
+            "by the schedule"
+        } else {
+            "from the Dashboard"
+        };
+        let summary = record(db, &self.outcomes, by);
+        if let Some(lease) = &self.lease {
+            let _ = release(db, lease);
+        }
+        summary
+    }
+
+    /// A run with nothing left to fetch, which has already got
+    /// `outcomes`: the moment before its last source is stored.
+    #[cfg(test)]
+    pub(crate) fn with_nothing_left(
+        outcomes: Vec<(Source, Result<String, String>)>,
+        lease: Option<Lease>,
+        scheduled: bool,
+    ) -> Run {
+        Run {
+            remaining: std::collections::VecDeque::new(),
+            outcomes,
+            lease,
+            scheduled,
+        }
+    }
+}
+
 // ---- one download at a time, across every stop-bots ----
 
 /// How long a download may go without a sign of life before another
@@ -351,6 +477,59 @@ mod tests {
 
         release(&db, &first).unwrap();
         granted(claim(&db, T + 6).unwrap());
+    }
+
+    /// A run begun while another download holds the lease plans nothing,
+    /// and says since when it has been held.
+    #[test]
+    fn a_run_waits_for_a_download_already_out() {
+        let db = Db::open_in_memory().unwrap();
+        granted(claim(&db, T).unwrap());
+
+        let begun = begin(&db, T + 5, true).unwrap();
+
+        assert!(matches!(begun, Begin::Busy { since: T }), "{begun:?}");
+    }
+
+    /// A whole run, offline: every source in the plan is tried, each one's
+    /// failure is counted, the weekly job is recorded with what happened,
+    /// and the lease is free again for the next download.
+    #[test]
+    fn a_run_tries_every_planned_source_then_records_and_frees_the_lease() {
+        let db = Db::open_in_memory().unwrap();
+        let planned = plan(&db).unwrap().len();
+        let Begin::Started(mut run) = begin(&db, T, true).unwrap() else {
+            panic!("refused on a database nothing holds")
+        };
+
+        let mut tried = 0;
+        while let Some(source) = run.next_source() {
+            run.stored(&db, source, Err("offline".to_string()), T)
+                .unwrap();
+            tried += 1;
+        }
+        let summary = run.end(&db);
+
+        assert_eq!(tried, planned, "not every planned source was tried");
+        assert_eq!(
+            summary,
+            format!(
+                "Updated 0 list(s). {planned} failed \u{2014} {}",
+                plan(&db)
+                    .unwrap()
+                    .iter()
+                    .map(|source| format!("{}: offline", source.label()))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        );
+        assert_eq!(
+            db.get_cron_last_summary(crate::cron::CronJob::UpdateEverything.id())
+                .unwrap()
+                .as_deref(),
+            Some(summary.as_str())
+        );
+        granted(claim(&db, T + 1).unwrap());
     }
 
     /// A holder that died stops holding once it has gone quiet for

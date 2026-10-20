@@ -79,6 +79,10 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   with the square of their number: 40,000 addresses took 76 seconds, and a first run over
   a month of honeypot traffic took two and a half minutes. Both now take about a second.
 
+- **The TUI's health check records a failure instead of closing.** A database error while
+  the TUI stored its hourly probe ended the TUI. Now the error is the job's summary on the
+  Scheduled tasks panel, as it always was under `tick`.
+
 ## [0.4.0] — 2026-10-16
 
 More ways to catch bots, and one that checks your own sites: a `status` check for secrets

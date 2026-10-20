@@ -27,6 +27,15 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ### Changed
 
+- **Probe paths, injection attempts and probes for absent apps know what honeypots see.**
+  Replaying a month of SANS ISC DShield's web honeypot URLs showed what these single-request
+  detectors missed. New probe paths: `/eval-stdin.php` anywhere, and `/.vscode/`. New
+  payloads: ThinkPHP's `invokefunction`, and a backslash `\..\` traversal. Apps they
+  probe for where no site runs them: Exchange, FortiGate SSL VPN, Tomcat manager, Solr,
+  Spring Boot actuator, the Docker API, router admin pages and GeoServer. Together they
+  cover 36% of the honeypots' requests, from 21%. On one host's month they block 87 more
+  addresses, none a visitor's. `/autodiscover/` stays out, since Outlook asks for it.
+
 - **An operator checking their own site is not taken for a prober.** A successful SSH
   login is now remembered for 90 days. For the first 7, nothing blocks the address, as
   before; for the rest, the two detectors that convict on a single request (probe paths

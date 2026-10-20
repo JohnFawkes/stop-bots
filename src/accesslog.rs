@@ -1199,6 +1199,15 @@ impl Observer {
         self
     }
 
+    /// Reads one line as [`Self::line`] does, but leaves it out of the
+    /// user-agent tally: a rotated copy's line, read on a log's first read
+    /// for its evidence only (see [`crate::logscan`]).
+    pub fn line_uncounted(&mut self, text: &str, clock: Clock) {
+        let tally = self.user_agents.take();
+        self.line(text, clock);
+        self.user_agents = tally;
+    }
+
     /// Reads one line.
     pub fn line(&mut self, text: &str, clock: Clock) {
         if text.trim().is_empty() {

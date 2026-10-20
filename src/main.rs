@@ -74,9 +74,10 @@ const ROOT_HELP: &str = "The web server's config root. Defaults to the one store
 `set-web-server --root`, else /etc/nginx, or /etc/apache2 for Apache";
 
 /// Help text shared by every detector subcommand's `--access-log`.
-const ACCESS_LOG_HELP: &str = "Read this access log instead of the stored one \
-(`set-log-paths`), else /var/log/nginx/access.log, or for Apache /var/log/apache2/access.log \
-(/var/log/httpd/access_log in RHEL's /etc/httpd)";
+const ACCESS_LOG_HELP: &str = "Read only this access log. Without it, the stored one \
+(`set-log-paths`) is read, else /var/log/nginx/access.log, or for Apache \
+/var/log/apache2/access.log (/var/log/httpd/access_log in RHEL's /etc/httpd), and with it \
+every other access log the web server's config names";
 
 /// Help text shared by `status --json` and every `list-* --json`.
 const JSON_HELP: &str = "Print one JSON object instead of text. Its field names are part of \
@@ -1083,8 +1084,15 @@ enum Command {
     /// A path given here is used whenever no flag overrides it. Pass an
     /// empty string to clear one. Give neither flag to print what is
     /// stored.
+    ///
+    /// The access logs the web server's config names (`access_log`,
+    /// `CustomLog`) are read as well as the one stored here, unless the
+    /// server runs in a container (`set-web-server --test`), whose paths
+    /// are its own. A command's `--access-log` reads only the file it
+    /// names.
     SetLogPaths {
-        /// The web server's access log every web-side detector reads.
+        /// The web server's main access log, which every web-side detector
+        /// reads, beside the ones its config names.
         #[arg(long)]
         access_log: Option<String>,
         /// The SSH authentication log, feeding the SSH scanner detector
@@ -4101,6 +4109,13 @@ fn run_set_log_paths(
             paths.default_access_log()
         ),
     }
+    for log in paths.access_logs_to_read(None).iter().skip(1) {
+        say!(
+            "  and:        {} (named in the {} config)",
+            log.path.display(),
+            host.web_server().label()
+        );
+    }
     match &paths.ssh {
         Some(path) => say!("  ssh log:    {}", path.display()),
         None => say!("  ssh log:    auto-detected (auth.log, secure, then journalctl)"),
@@ -5546,7 +5561,7 @@ fn record_access_stats(db_path: Option<PathBuf>, access_log: Option<PathBuf>) ->
             host.web_server().label()
         );
     }
-    say!("{}", applied.stats.summary());
+    say!("{}{}", applied.stats.summary(), applied.unreadable_note());
     Ok(())
 }
 

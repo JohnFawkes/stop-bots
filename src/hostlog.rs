@@ -16,7 +16,7 @@
  */
 
 //! The host logs the detectors read, a bounded piece at a time, from
-//! where the last piece stopped: the NGINX access log, sshd's
+//! where the last piece stopped: the web server's access logs, sshd's
 //! authentication lines, and the lines the firewall's trap ports write to
 //! the kernel log.
 //!
@@ -30,16 +30,18 @@
 //!
 //! ## What a request can choose, and what it cannot
 //!
-//! A request names one of the two logs, never a path: where each is comes
+//! A request names one of the logs, never a path: where each is comes
 //! from [`Sources`], which the reader is configured with — the host
-//! settings ([`crate::hostconf`]) and autodetection. What a request does
-//! choose is where in that log to start: a cursor, or a time for the
-//! journal. A cursor is a place, compared with the log the reader finds
-//! and otherwise ignored; it cannot point the read anywhere else.
+//! settings ([`crate::hostconf`]), the web server's config and
+//! autodetection; an access log is named by its place in
+//! [`Sources::access`]. What a request does choose is where in that log to
+//! start: a cursor, or a time for the journal. A cursor is a place,
+//! compared with the log the reader finds and otherwise ignored; it cannot
+//! point the read anywhere else.
 //!
 //! ## What comes back
 //!
-//! The access log's lines, every one, since every access-log detector and
+//! An access log's lines, every one, since every access-log detector and
 //! the access statistics read them all. Of the SSH log, only the lines
 //! sshd wrote about an authentication — `Accepted`, `Failed`, `Invalid
 //! user`, as [`crate::sshlog`] reads them — and from the journal only the
@@ -54,6 +56,19 @@
 //! At most [`MAX_CHUNK`] bytes of log, stopping at a line or an entry:
 //! a first read of a large log, or a journal with a month of brute-forcing
 //! in it, is many requests, each quick.
+//!
+//! ## What logrotate kept
+//!
+//! The first read of an access log also reads its rotated copies,
+//! `<log>.1` and `<log>.<n>.gz`, as far back as a detector looks
+//! ([`read_rotated`]): on a host where the log was rotated last night, a
+//! fresh install would otherwise start knowing nothing of the day before.
+//! They are streamed straight to the caller rather than returned in
+//! pieces, because a compressed file can only be read from its start, and
+//! picking one up again where a piece stopped would unpack it again from
+//! there each time. Only the first read does this; after it, the cursor
+//! says where the log is, and a later rotation is followed as
+//! [`crate::logread`] describes.
 
 use std::path::{Path, PathBuf};
 
@@ -73,10 +88,18 @@ const MAX_CURSORS: usize = 4;
 /// The stored form of a journal cursor, before journald's own.
 pub const JOURNAL_CURSOR_PREFIX: &str = "journal ";
 
+/// The most of its rotated copies a first read of an access log reads,
+/// in bytes of lines: the gigabyte a pass reads of a live log at most.
+pub const MAX_ROTATED_BYTES: u64 = 1 << 30;
+
+/// How many rotated copies are looked for: more than any `rotate` a
+/// distribution ships, and the windows stop the search well before.
+const MAX_ROTATED_COPIES: u32 = 64;
+
 /// Which log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Log {
-    /// The NGINX access log.
+    /// One of the web server's access logs, by [`Request::which`].
     Access,
     /// sshd's authentication lines: from the auth log file, or the
     /// journal.
@@ -132,6 +155,10 @@ pub struct Cursor {
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub log: Log,
+    /// Which access log, by its place in [`Sources::access`]: 0 is the
+    /// stored or default one. Not read for the other logs.
+    #[serde(default)]
+    pub which: usize,
     /// Where earlier reads stopped, one per place the log might be. The
     /// one for where it turns out to be is used; with none, the read starts
     /// at the beginning.
@@ -152,6 +179,7 @@ impl Request {
     pub fn new(log: Log, cursors: Vec<Cursor>) -> Self {
         Request {
             log,
+            which: 0,
             cursors,
             legacy_offset: None,
             since: None,
@@ -212,11 +240,14 @@ impl Chunk {
     }
 }
 
-/// Where this host's two logs are, as the reader resolves them. Never from
+/// Where this host's logs are, as the reader resolves them. Never from
 /// a request.
 #[derive(Debug, Clone)]
 pub struct Sources {
-    pub access: PathBuf,
+    /// The access logs: the stored or default one first, then those the
+    /// web server's config names that are there to read (see
+    /// [`crate::logpaths::LogPaths::access_logs_to_read`]).
+    pub access: Vec<PathBuf>,
     pub ssh: SshSource,
     /// Where [`SshSource::Search`] looks before the journal.
     pub search: Vec<PathBuf>,
@@ -229,15 +260,19 @@ pub struct Sources {
 }
 
 impl Sources {
-    /// The logs `paths` names, a flag winning over each: the access log,
-    /// and the SSH log or the search for it.
+    /// The logs `paths` names, a flag winning over each: the access logs
+    /// there are to read, and the SSH log or the search for it.
     pub fn new(
         paths: &crate::logpaths::LogPaths,
         access_flag: Option<&Path>,
         ssh_flag: Option<&Path>,
     ) -> Self {
         Sources {
-            access: paths.access_path(access_flag),
+            access: paths
+                .access_logs_to_read(access_flag)
+                .into_iter()
+                .map(|log| log.path)
+                .collect(),
             ssh: paths.ssh(ssh_flag),
             search: sshlog::DEFAULT_LOG_PATHS
                 .iter()
@@ -255,7 +290,7 @@ impl Sources {
     /// Only an SSH log, for its readers that read nothing else.
     pub fn ssh_only(ssh: SshSource) -> Self {
         Sources {
-            access: PathBuf::new(),
+            access: Vec::new(),
             ..Sources::new(&Default::default(), None, None)
         }
         .with_ssh(ssh)
@@ -276,11 +311,23 @@ pub fn source_key(path: &Path) -> String {
 /// Blocking.
 pub trait LogReader {
     fn read_log(&self, request: &Request) -> anyhow::Result<Reply>;
+
+    /// The rotated copies of access log `which` that hold anything from
+    /// `since` on, oldest first, a line at a time to `visit`; the bytes
+    /// read. See [`read_rotated`].
+    fn read_rotated(&self, which: usize, since: i64, visit: &mut dyn FnMut(&str)) -> u64;
 }
 
 impl LogReader for Sources {
     fn read_log(&self, request: &Request) -> anyhow::Result<Reply> {
         Ok(read(self, request))
+    }
+
+    fn read_rotated(&self, which: usize, since: i64, visit: &mut dyn FnMut(&str)) -> u64 {
+        match self.access.get(which) {
+            Some(path) => read_rotated(path, since, visit),
+            None => 0,
+        }
     }
 }
 
@@ -289,7 +336,10 @@ impl LogReader for Sources {
 pub fn read(sources: &Sources, request: &Request) -> Reply {
     let budget = request.max_bytes.clamp(1, MAX_CHUNK);
     match request.log {
-        Log::Access => read_access(&sources.access, request, budget),
+        Log::Access => match sources.access.get(request.which) {
+            Some(path) => read_access(path, request, budget),
+            None => Reply::Unavailable(format!("access log {}", request.which)),
+        },
         Log::Ssh => read_located(
             sources.ssh.locate_among(&sources.search),
             &SSH_JOURNAL,
@@ -328,6 +378,53 @@ fn read_access(path: &Path, request: &Request, budget: u64) -> Reply {
         }),
         Err(_) => Reply::Unavailable(path.display().to_string()),
     }
+}
+
+/// What logrotate kept of the log at `path` from `since` on, oldest first:
+/// `<path>.1`, then `<path>.2.gz` and on (each plain or compressed, as
+/// `compress` and `delaycompress` leave them), up to the first that is not
+/// there or was last written before `since`, since every older one was
+/// too. Each line goes to `visit`; the bytes read, at most
+/// [`MAX_ROTATED_BYTES`].
+///
+/// Only a copy's last write is checked, not each line's time: a copy that
+/// reaches into the window is read whole, and the reader keeps what falls
+/// inside each detector's window. A copy that cannot be read is passed
+/// over, as a log rotated away before the first read always was.
+pub fn read_rotated(path: &Path, since: i64, visit: &mut dyn FnMut(&str)) -> u64 {
+    let mut copies = Vec::new();
+    for n in 1..=MAX_ROTATED_COPIES {
+        let named = |suffix: &str| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
+        let Some((copy, written)) = [named(&format!(".{n}")), named(&format!(".{n}.gz"))]
+            .into_iter()
+            .find_map(|copy| {
+                let written = std::fs::metadata(&copy).ok()?.modified().ok()?;
+                Some((copy, written))
+            })
+        else {
+            break;
+        };
+        let written = written
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |at| at.as_secs() as i64);
+        if written < since {
+            break;
+        }
+        copies.push(copy);
+    }
+    let mut read = 0;
+    for copy in copies.iter().rev() {
+        let budget = MAX_ROTATED_BYTES - read;
+        if budget == 0 {
+            break;
+        }
+        read += logread::read_rotated_copy(copy, budget, visit).unwrap_or(0);
+    }
+    read
 }
 
 fn push(lines: &mut String, line: &str) {
@@ -503,7 +600,7 @@ mod tests {
 
     fn sources(dir: &Path) -> Sources {
         Sources {
-            access: dir.join("access.log"),
+            access: vec![dir.join("access.log")],
             ssh: SshSource::File(dir.join("auth.log")),
             search: vec![dir.join("no-auth.log")],
             kernel: SshSource::File(dir.join("kern.log")),
@@ -696,6 +793,10 @@ mod tests {
             request.max_bytes = self.1;
             Ok(read(&self.0, &request))
         }
+
+        fn read_rotated(&self, which: usize, since: i64, visit: &mut dyn FnMut(&str)) -> u64 {
+            self.0.read_rotated(which, since, visit)
+        }
     }
 
     /// The whole-log readers ask until there is no more, and get the same
@@ -718,5 +819,54 @@ mod tests {
     fn an_ssh_log_that_is_not_there_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(ssh_since(&sources(dir.path()), 0), None);
+    }
+
+    /// Each access log is asked for by its place, and one past the last
+    /// is not there rather than another file.
+    #[test]
+    fn an_access_log_is_read_by_its_place_in_the_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("access.log"), "main\n").unwrap();
+        std::fs::write(dir.path().join("site.log"), "site\n").unwrap();
+        let mut sources = sources(dir.path());
+        sources.access.push(dir.path().join("site.log"));
+        let asking = |which| Request {
+            which,
+            ..Request::new(Log::Access, Vec::new())
+        };
+
+        let main = chunk(read(&sources, &asking(0)));
+        let site = chunk(read(&sources, &asking(1)));
+
+        assert_eq!(
+            (main.lines.as_str(), site.lines.as_str()),
+            ("main\n", "site\n")
+        );
+        assert_eq!(site.source, source_key(&dir.path().join("site.log")));
+        assert!(
+            matches!(read(&sources, &asking(2)), Reply::Unavailable(_)),
+            "there is no third log"
+        );
+    }
+
+    /// Oldest first, plain and compressed, and no further back than the
+    /// first copy last written before the window opened.
+    #[test]
+    fn the_rotated_copies_are_read_oldest_first_back_to_the_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("access.log");
+        let now = crate::testing::now_secs();
+        let day = 24 * 3600;
+        crate::testing::write_gzip(&dir.path().join("access.log.3.gz"), "old\n", now - 30 * day);
+        crate::testing::write_gzip(&dir.path().join("access.log.2.gz"), "older\n", now - day);
+        std::fs::write(dir.path().join("access.log.1"), "newest\n").unwrap();
+
+        let mut lines = Vec::new();
+        let read = read_rotated(&log, now - 7 * day, &mut |line| {
+            lines.push(line.to_string())
+        });
+
+        assert_eq!(lines, ["older", "newest"], "the 30-day-old copy is outside");
+        assert_eq!(read, 13);
     }
 }

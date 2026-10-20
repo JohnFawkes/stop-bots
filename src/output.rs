@@ -97,6 +97,20 @@ pub struct Status {
     pub cached: bool,
     pub summary: StatusSummary,
     pub checks: Vec<StatusCheck>,
+    /// Every access log the detectors read, the stored or default one
+    /// first. Empty in a probe taken before 0.5.0.
+    pub access_logs: Vec<StatusAccessLog>,
+}
+
+/// One access log, in `status --json`.
+#[derive(Debug, Serialize)]
+pub struct StatusAccessLog {
+    pub path: String,
+    /// `stored` (`set-log-paths`), `default`, or `config` (an
+    /// `access_log` or `CustomLog` in the web server's config).
+    pub origin: String,
+    /// Whether it could be opened when the probe was taken.
+    pub readable: bool,
 }
 
 /// How many checks are at each level, and the worst of them, which is
@@ -146,6 +160,15 @@ impl Status {
                     level: level_name(check.level),
                     detail: check.detail.clone(),
                     fix: check.fix.clone(),
+                })
+                .collect(),
+            access_logs: report
+                .access_logs
+                .iter()
+                .map(|log| StatusAccessLog {
+                    path: log.path.clone(),
+                    origin: log.origin.clone(),
+                    readable: log.readable,
                 })
                 .collect(),
         }

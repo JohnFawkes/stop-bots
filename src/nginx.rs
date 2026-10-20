@@ -2179,24 +2179,9 @@ const MAIN_CONFIG_LEVELS_UP: usize = 2;
 /// Read with [`lex`], so a commented-out `# listen 443 ssl http2;` does
 /// not count.
 fn enables_http2(root: &Path) -> Option<bool> {
-    let root = std::path::absolute(root).ok()?;
-    let top = root
-        .ancestors()
-        .take(MAIN_CONFIG_LEVELS_UP + 1)
-        .find(|dir| dir.join("nginx.conf").is_file())?;
-    let files = WalkDir::new(top)
-        .max_depth(4)
-        .into_iter()
-        .filter_entry(|entry| {
-            entry.depth() == 0
-                || !crate::webserver::is_backup_name(&entry.file_name().to_string_lossy())
-        })
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| {
-            fs::metadata(entry.path()).is_ok_and(|meta| meta.is_file() && meta.len() < 1 << 20)
-        });
-    for entry in files {
-        let Ok(content) = fs::read_to_string(entry.path()) else {
+    let top = main_config_dir(root)?;
+    for file in tree_files(&top) {
+        let Ok(content) = fs::read_to_string(&file) else {
             continue;
         };
         let mut statement: Vec<String> = Vec::new();
@@ -2215,6 +2200,95 @@ fn enables_http2(root: &Path) -> Option<bool> {
         }
     }
     Some(false)
+}
+
+/// The directory `nginx.conf` is in, at `root` or up to
+/// [`MAIN_CONFIG_LEVELS_UP`] above it: the top of the tree NGINX reads its
+/// config from. `None` when there is none to be found.
+fn main_config_dir(root: &Path) -> Option<PathBuf> {
+    let root = std::path::absolute(root).ok()?;
+    root.ancestors()
+        .take(MAIN_CONFIG_LEVELS_UP + 1)
+        .find(|dir| dir.join("nginx.conf").is_file())
+        .map(Path::to_path_buf)
+}
+
+/// Every config file under `top`, a few levels deep: not a backup's
+/// ([`crate::webserver::is_backup_name`]), not a link (each file is found
+/// once, where it is), and not larger than any config file is. In name
+/// order, so what is found in them is found in the same order every time.
+fn tree_files(top: &Path) -> impl Iterator<Item = PathBuf> {
+    WalkDir::new(top)
+        .max_depth(4)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0
+                || !crate::webserver::is_backup_name(&entry.file_name().to_string_lossy())
+        })
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            fs::metadata(entry.path()).is_ok_and(|meta| meta.is_file() && meta.len() < 1 << 20)
+        })
+        .map(|entry| entry.into_path())
+}
+
+// ---- the access logs the config names ----
+
+/// Every file an `access_log` directive under `root` names, in the order
+/// they are found, each once. From the whole tree `nginx.conf` heads, when
+/// there is one at or just above `root`: the `http` block's own log is in
+/// `nginx.conf`, not with the sites.
+///
+/// Left out, because they are not a file on this host to read: `off`, a
+/// `syslog:` target, and a path with a variable in it (`$host.log`), whose
+/// files are named per request. A relative path is NGINX's prefix's; that
+/// is taken to be the directory `nginx.conf` is in, which it is in
+/// nginx.org's packages and the official image. (Debian's prefix is
+/// `/usr/share/nginx`, where no log goes.)
+///
+/// Like the site scan, this reads `sites-available` rather than following
+/// the links in `sites-enabled`, so a site that is not enabled can name a
+/// log here; the reader leaves out one that is not there (see
+/// [`crate::hostlog::Sources::new`]).
+pub fn access_logs(root: &Path) -> Vec<PathBuf> {
+    let top = main_config_dir(root).or_else(|| std::path::absolute(root).ok());
+    let Some(top) = top else {
+        return Vec::new();
+    };
+    let mut logs: Vec<PathBuf> = Vec::new();
+    for file in tree_files(&top) {
+        let Ok(content) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let mut statement: Vec<String> = Vec::new();
+        for (token, _) in lex(&content).tokens {
+            if !matches!(token.as_str(), ";" | "{" | "}") {
+                statement.push(token);
+                continue;
+            }
+            if let [directive, path, ..] = statement.as_slice() {
+                if directive == "access_log" {
+                    if let Some(path) = access_log_path(path, &top) {
+                        if !logs.contains(&path) {
+                            logs.push(path);
+                        }
+                    }
+                }
+            }
+            statement.clear();
+        }
+    }
+    logs
+}
+
+/// The file an `access_log`'s first argument names, made absolute against
+/// `prefix`; `None` for one that names no file here. See [`access_logs`].
+fn access_log_path(written: &str, prefix: &Path) -> Option<PathBuf> {
+    if written == "off" || written.starts_with("syslog:") || written.contains('$') {
+        return None;
+    }
+    Some(prefix.join(written))
 }
 
 /// Why an apply cannot write `content`'s blocks as `config_for` asks, if
@@ -6236,6 +6310,67 @@ server {
         assert_eq!(
             site_service(&dir.path().join("missing.conf"), "a.example.com"),
             None
+        );
+    }
+
+    /// Every file the tree's `access_log`s name, once each, from
+    /// `nginx.conf` down, whatever the root is inside it; nothing for
+    /// `off`, syslog, a variable, or a comment; a relative path under the
+    /// directory `nginx.conf` is in.
+    #[test]
+    fn the_logs_the_config_names_are_found_once_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path();
+        let files = [
+            (
+                "nginx.conf",
+                "http {\n    access_log /var/log/nginx/access.log;\n    \
+                 include sites-enabled/*;\n}\n",
+            ),
+            (
+                "sites-available/shop",
+                "server {\n    server_name shop.example;\n    \
+                 access_log \"/srv/shop/access.log\" combined buffer=32k flush=5s;\n    \
+                 location /health { access_log off; }\n    \
+                 # access_log /srv/shop/commented.log;\n}\n",
+            ),
+            (
+                "sites-available/blog",
+                "server {\n    server_name blog.example;\n    \
+                 access_log syslog:server=unix:/dev/log combined;\n    \
+                 access_log /var/log/nginx/$host.log;\n    \
+                 access_log logs/blog.log;\n    \
+                 access_log /srv/shop/access.log;\n}\n",
+            ),
+        ];
+        for (name, text) in files {
+            fs::create_dir_all(top.join(name).parent().unwrap()).unwrap();
+            fs::write(top.join(name), text).unwrap();
+        }
+
+        let expected = [
+            PathBuf::from("/var/log/nginx/access.log"),
+            top.join("logs/blog.log"),
+            PathBuf::from("/srv/shop/access.log"),
+        ];
+        for root in [top.to_path_buf(), top.join("sites-available")] {
+            assert_eq!(access_logs(&root), expected, "from {}", root.display());
+        }
+    }
+
+    /// With no `nginx.conf` at or above it, the root's own files are read.
+    #[test]
+    fn a_root_without_nginx_conf_is_read_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("site.conf"),
+            "server { server_name a.example; access_log /srv/a/access.log; }\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            access_logs(dir.path()),
+            [PathBuf::from("/srv/a/access.log")]
         );
     }
 }

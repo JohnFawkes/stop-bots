@@ -692,6 +692,96 @@ impl Tree {
     }
 }
 
+// ---- the access logs the config names ----
+
+/// Every file a `CustomLog`, `TransferLog` or `GlobalLog` names in the
+/// config Apache reads under `root` ([`Tree`]), in the order Apache reads
+/// them, each once; under a root with no main file, in every file the site
+/// scan reads.
+///
+/// Left out, because they are not a file on this host to read: a piped
+/// log (`"|/usr/bin/rotatelogs ..."`), a `syslog:` target, and a path
+/// with a variable in it, whose value only Apache's environment knows.
+/// The one exception is Debian's `${APACHE_LOG_DIR}`, which every site
+/// Debian ships logs under: it is read from the `envvars` file beside
+/// `apache2.conf`, as `apache2ctl` reads it. A relative path is the server
+/// root's, as Apache resolves it: RHEL's `logs/access_log` is
+/// `/etc/httpd/logs/access_log`.
+pub fn access_logs(root: &Path) -> Vec<PathBuf> {
+    let (files, base) = match Tree::find(root) {
+        Some(tree) => (tree.files, tree.base),
+        None => {
+            let Ok(base) = std::path::absolute(root) else {
+                return Vec::new();
+            };
+            let files = crate::webserver::config_files(root)
+                .filter_map(|entry| {
+                    let text = fs::read_to_string(entry.path()).ok()?;
+                    Some((entry.into_path(), text))
+                })
+                .collect();
+            (files, base)
+        }
+    };
+    let log_dir = apache_log_dir(&base);
+    let mut logs: Vec<PathBuf> = Vec::new();
+    for (_, text) in &files {
+        for line in lines(text) {
+            let parts = words(line.text.trim());
+            let [directive, written, ..] = parts.as_slice() else {
+                continue;
+            };
+            if !["customlog", "transferlog", "globallog"]
+                .iter()
+                .any(|name| directive.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            if let Some(path) = access_log_path(written, &base, log_dir.as_deref()) {
+                if !logs.contains(&path) {
+                    logs.push(path);
+                }
+            }
+        }
+    }
+    logs
+}
+
+/// The file a log directive's first argument names; `None` for one that
+/// names no file here. See [`access_logs`].
+fn access_log_path(written: &str, base: &Path, log_dir: Option<&Path>) -> Option<PathBuf> {
+    if written.starts_with('|') || written.starts_with("syslog:") {
+        return None;
+    }
+    let written = match (written.strip_prefix("${APACHE_LOG_DIR}"), log_dir) {
+        (Some(rest), Some(dir)) => format!("{}{rest}", dir.display()),
+        _ => written.to_string(),
+    };
+    if written.contains('$') {
+        return None;
+    }
+    Some(base.join(written))
+}
+
+/// The value Debian's `envvars` beside the main config gives
+/// `APACHE_LOG_DIR`, for the default instance: `/var/log/apache2`. Its
+/// `$SUFFIX` names another instance (`apache2@name`) and is empty for
+/// this one. `None` when there is no such file, or it says something else.
+fn apache_log_dir(base: &Path) -> Option<PathBuf> {
+    let text = fs::read_to_string(base.join("envvars")).ok()?;
+    let value = text.lines().find_map(|line| {
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        line.strip_prefix("APACHE_LOG_DIR=")
+    })?;
+    let value = value
+        .trim()
+        .trim_matches(['"', '\''])
+        .replace("$SUFFIX", "");
+    let dir = PathBuf::from(value);
+    (dir.is_absolute() && !dir.as_os_str().to_string_lossy().contains('$')).then_some(dir)
+}
+
 /// Whether a path holds a wildcard Apache expands.
 fn has_wildcard(text: &str) -> bool {
     text.contains(['*', '?', '['])
@@ -2369,5 +2459,63 @@ mod tests {
                 assert!(format!("{err:#}").contains("HTTP/1.x"), "{what}: {err:#}");
             }
         }
+    }
+
+    // ---- the access logs the config names ----
+
+    /// Debian's tree: every log a file Apache reads names, once, with
+    /// `${APACHE_LOG_DIR}` from `envvars`; nothing from a file it does not
+    /// read, a pipe, or another variable.
+    #[test]
+    fn the_logs_debian_s_config_names_are_found_once_each() {
+        let root = tree(&[
+            DEBIAN_MAIN,
+            (
+                "envvars",
+                "export APACHE_RUN_USER=www-data\nexport APACHE_LOG_DIR=/var/log/apache2$SUFFIX\n",
+            ),
+            (
+                "conf-enabled/other-vhosts-access-log.conf",
+                "CustomLog ${APACHE_LOG_DIR}/other_vhosts_access.log vhost_combined\n",
+            ),
+            (
+                "sites-enabled/000-default.conf",
+                "<VirtualHost *:80>\n    CustomLog ${APACHE_LOG_DIR}/access.log combined\n</VirtualHost>\n",
+            ),
+            (
+                "sites-enabled/shop.conf",
+                "<VirtualHost *:443>\n    ServerName shop.example\n    \
+                 CustomLog \"/srv/shop/logs/access.log\" combined env=!dontlog\n    \
+                 TransferLog \"|/usr/bin/rotatelogs /srv/shop/logs/x 86400\"\n    \
+                 CustomLog ${SHOP_LOGS}/access.log combined\n    \
+                 # CustomLog /srv/shop/logs/commented.log combined\n    \
+                 CustomLog ${APACHE_LOG_DIR}/access.log combined\n</VirtualHost>\n",
+            ),
+            (
+                "sites-available/disabled.conf",
+                "<VirtualHost *:80>\n    CustomLog /srv/disabled/access.log combined\n</VirtualHost>\n",
+            ),
+        ]);
+
+        assert_eq!(
+            access_logs(root.path()),
+            [
+                PathBuf::from("/var/log/apache2/other_vhosts_access.log"),
+                PathBuf::from("/var/log/apache2/access.log"),
+                PathBuf::from("/srv/shop/logs/access.log"),
+            ]
+        );
+    }
+
+    /// A relative path is the server root's, as Apache resolves it: RHEL's
+    /// `logs/access_log`.
+    #[test]
+    fn a_relative_log_is_under_the_server_root() {
+        let root = tree(&[RHEL_MAIN]);
+
+        assert_eq!(
+            access_logs(root.path()),
+            [root.path().join("logs/access_log")]
+        );
     }
 }

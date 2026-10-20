@@ -272,7 +272,10 @@ Roughly in the order they would matter to a user:
 
 1. **Time windows everywhere, then escalating TTLs**, with an offence count per address.
 2. **Several access logs**, taken from the `access_log` directives already parsed, plus
-   rotated `.1`/`.gz` files on the first scan.
+   rotated `.1`/`.gz` files on the first scan. *Done:* each file an `access_log` or
+   `CustomLog` names is read beside the stored or default log, with its own cursor, and a
+   first read takes in `.1` and `.N.gz` back to the longest window (`logscan.rs`). A web
+   server in a container has only its stored log read.
 3. **`--json`** on `status` and every `list-*`.
 4. **A resource benchmark in CI**: a 1 GB log and 100k ranges, with budgets.
 5. **Upgrade tests from every released 0.x** database and generated file.

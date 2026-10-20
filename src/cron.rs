@@ -457,7 +457,7 @@ pub fn run_log_jobs(
             CronJob::Detect(detector) => run_detector(db, detector, applied),
             CronJob::RecordAccessStats => {
                 if applied.access.is_readable() {
-                    applied.stats.summary()
+                    format!("{}{}", applied.stats.summary(), applied.unreadable_note())
                 } else {
                     "access log unavailable".to_string()
                 }

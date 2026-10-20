@@ -25,6 +25,18 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   On for a new install. After an upgrade it is off and marked new until you choose:
   `stop-bots set-detector protocol-probes --enabled true`.
 
+- **Every access log the web server's config names is read**, each from a cursor of its own: a
+  site with its own `access_log` (NGINX) or `CustomLog` (Apache) was invisible to the detectors.
+  `status` names them, and `status --json` lists every log read under `access_logs`.
+
+- **A stored `set-log-paths --access-log` is read beside those logs; `--access-log` still reads
+  only its file.** One says where the main log is, the other is one run against one file. A web
+  server in a container (`set-web-server --test`) has only the stored log read: its paths are its own.
+
+- **A log's first read also reads what logrotate kept**, `<log>.1` and `<log>.N.gz`, back to the
+  longest window of a detector that is on. After an upgrade, a site's log read for the first time
+  can therefore block at once, as the main log could on a new install.
+
 ### Changed
 
 - **An operator checking their own site is not taken for a prober.** A successful SSH

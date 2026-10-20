@@ -55,7 +55,8 @@
 //!   one fetched asset, one sent referer, and the address is not a
 //!   suspect for as long as that is inside the window;
 //! - **one line is enough** ([`Rule::Once`]): a probe path, a payload, the
-//!   honeypot.
+//!   honeypot. Or one line unless the address was also answered normally
+//!   ([`Rule::OnceUnlessCleared`]): a request in another protocol.
 //!
 //! And two that are a little of each. One line after a warning
 //! ([`Rule::AfterWarning`]): the robots.txt-violator detector, where a
@@ -235,6 +236,23 @@ impl Evidence {
         })
     }
 
+    /// Drops `detector`'s clearing rows for every address it has nothing
+    /// else against. For a detector that clears on an ordinary answer,
+    /// that is nearly every visitor, and storing a row for each of them
+    /// tripled the time a large log took to scan; one only matters beside
+    /// something it clears.
+    pub fn keep_clears_only_beside_suspicion(&mut self, detector: Detector) {
+        let suspects: std::collections::HashSet<IpAddr> = self
+            .rows
+            .keys()
+            .filter(|(d, _, item)| *d == detector && *item != Item::Clear)
+            .map(|(_, address, _)| *address)
+            .collect();
+        self.rows.retain(|(d, address, item), _| {
+            *d != detector || *item != Item::Clear || suspects.contains(address)
+        });
+    }
+
     /// The rows one detector collected.
     pub fn rows_for(&self, detector: Detector) -> Vec<Row> {
         self.rows
@@ -268,6 +286,11 @@ pub enum Rule {
     DistinctOrRepeated { distinct: usize, repeated: u64 },
     /// One line.
     Once,
+    /// One line, and nothing that clears the address. For
+    /// `protocol-probes`: a client that also got an ordinary answer is one
+    /// the site talks to, whatever else it sent, and a server that speaks
+    /// plain HTTP where its visitors expect TLS is mistaken, not attacked.
+    OnceUnlessCleared,
     /// At least `lines` lines, or at least `refused` of them refused by a
     /// rate limit, counted from [`Item::Bucket`]s and [`Item::Refused`]s.
     Rate { lines: usize, refused: usize },
@@ -394,7 +417,10 @@ pub fn decide(rows: &[Row], rule: Rule, cutoff: Option<i64>) -> Vec<(String, Str
                 }
                 any
             }
-            Rule::Once => {
+            Rule::Once | Rule::OnceUnlessCleared => {
+                if rule == Rule::OnceUnlessCleared && cleared(&rows, &inside) {
+                    continue;
+                }
                 let mut any = false;
                 for row in &rows {
                     if matches!(row.item, Item::Seen(_)) && inside(row.tally.last) {
@@ -724,6 +750,58 @@ mod tests {
         assert_eq!(
             decide(&rows, Rule::Once, Some(100)),
             [("203.0.113.5".to_string(), "/.env".to_string())]
+        );
+    }
+
+    #[test]
+    fn one_line_convicts_unless_the_address_was_cleared_inside_the_window() {
+        let probe = seen("203.0.113.5", "tls handshake", 200);
+        let cases = [
+            ("no clearing", None, true),
+            ("cleared inside the window", Some(150), false),
+            ("cleared before it", Some(60), true),
+        ];
+        for (what, cleared_at, convicted) in cases {
+            let mut rows = vec![probe.clone()];
+            rows.extend(cleared_at.map(|at| row("203.0.113.5", Item::Clear, 50, at, 1)));
+            assert_eq!(
+                decide(&rows, Rule::OnceUnlessCleared, Some(100)).len(),
+                usize::from(convicted),
+                "{what}"
+            );
+        }
+    }
+
+    /// A visitor's clearing row is dropped; a suspect's is kept, and so
+    /// is every other detector's.
+    #[test]
+    fn only_a_clearing_row_beside_suspicion_is_kept() {
+        let mut evidence = Evidence::default();
+        let (visitor, suspect): (IpAddr, IpAddr) = (
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.5".parse().unwrap(),
+        );
+        let probes = Detector::ProtocolProbes;
+        evidence.add(probes, visitor, Item::Clear, 10);
+        evidence.add(probes, suspect, Item::Clear, 10);
+        evidence.add(probes, suspect, Item::seen("tls handshake"), 10);
+        evidence.add(Detector::AssetRatio, visitor, Item::Clear, 10);
+
+        evidence.keep_clears_only_beside_suspicion(probes);
+
+        let mut kept: Vec<(Detector, String, Item)> = evidence
+            .into_rows()
+            .into_iter()
+            .map(|(detector, address, item, _)| (detector, address, item))
+            .collect();
+        kept.sort_by_key(|(detector, address, item)| (detector.id(), address.clone(), item.key()));
+        assert_eq!(
+            kept,
+            [
+                (Detector::AssetRatio, visitor.to_string(), Item::Clear),
+                (probes, suspect.to_string(), Item::Clear),
+                (probes, suspect.to_string(), Item::seen("tls handshake")),
+            ]
         );
     }
 

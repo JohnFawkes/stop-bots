@@ -5007,6 +5007,7 @@ fn run_detector(
             block_port_scanners(db_path, threshold, ttl_days, kernel_log, dry_run)
         }
         Detector::Injection
+        | Detector::ProtocolProbes
         | Detector::RobotsTxt
         | Detector::AssetRatio
         | Detector::RotatingUserAgent
@@ -5023,6 +5024,9 @@ fn run_detector(
             use stop_bots::scanblock as sb;
             let outcome = match detector {
                 Detector::Injection => sb::block_injection(&db, ttl_days, &log_text, dry_run)?,
+                Detector::ProtocolProbes => {
+                    sb::block_protocol_probes(&db, ttl_days, &log_text, dry_run)?
+                }
                 Detector::RobotsTxt => sb::block_robots_txt(&db, ttl_days, &log_text, dry_run)?,
                 Detector::AssetRatio => {
                     sb::block_asset_ratio(&db, ttl_days, &log_text, threshold, dry_run)?

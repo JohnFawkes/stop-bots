@@ -1610,6 +1610,7 @@ const ACCESS_LOG_DETECTORS: &[&str] = &[
     "spoofed-crawlers",
     "probe-paths",
     "injection",
+    "protocol-probes",
     "asset-ratio",
     "rotating-ua",
     "refererless",

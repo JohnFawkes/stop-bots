@@ -43,6 +43,7 @@ pub enum ScanKind {
     SpoofedCrawler,
     ProbePath,
     Injection,
+    ProtocolProbe,
     Honeypot,
     /// The three behavioural detectors share a noun: each finds a client
     /// that doesn't act like a browser, by a different tell.
@@ -62,6 +63,7 @@ impl ScanKind {
             Detector::SpoofedCrawlers => ScanKind::SpoofedCrawler,
             Detector::ProbePaths => ScanKind::ProbePath,
             Detector::Injection => ScanKind::Injection,
+            Detector::ProtocolProbes => ScanKind::ProtocolProbe,
             Detector::Honeypot => ScanKind::Honeypot,
             Detector::AssetRatio | Detector::RotatingUserAgent | Detector::RefererlessCrawl => {
                 ScanKind::NonBrowser
@@ -82,6 +84,7 @@ impl ScanKind {
             ScanKind::SpoofedCrawler => "forged crawler IP",
             ScanKind::ProbePath => "probing IP",
             ScanKind::Injection => "injecting IP",
+            ScanKind::ProtocolProbe => "protocol-probing IP",
             ScanKind::Honeypot => "trapped IP",
             ScanKind::NonBrowser => "non-browser IP",
             ScanKind::RobotsTxt => "robots.txt fetcher",
@@ -221,6 +224,7 @@ pub fn rule(db: &Db, detector: crate::protection::Detector) -> Result<Rule> {
         },
         (_, Some(n)) => Rule::Distinct(n),
         (D::RobotsViolators, None) => Rule::AfterWarning,
+        (D::ProtocolProbes, None) => Rule::OnceUnlessCleared,
         (_, None) => Rule::Once,
     })
 }
@@ -264,18 +268,21 @@ pub fn run_detector(
         dry_run,
     };
     match detector {
-        D::SshScanners | D::ProbePaths | D::Injection | D::Honeypot | D::RobotsTxt => {
-            add_block_rules(
-                db,
-                detector,
-                found,
-                hinted(convicted),
-                0,
-                true,
-                ttl_days,
-                trigger,
-            )
-        }
+        D::SshScanners
+        | D::ProbePaths
+        | D::Injection
+        | D::ProtocolProbes
+        | D::Honeypot
+        | D::RobotsTxt => add_block_rules(
+            db,
+            detector,
+            found,
+            hinted(convicted),
+            0,
+            true,
+            ttl_days,
+            trigger,
+        ),
         D::SpoofedCrawlers => {
             // Checked again against the ranges as they are now: the
             // evidence was judged against the ranges at the time it was
@@ -605,6 +612,34 @@ pub fn block_injection(
     add_block_rules(
         db,
         Detector::Injection,
+        found,
+        candidates,
+        0,
+        true,
+        ttl_days,
+        Trigger::log(log_text, dry_run),
+    )
+}
+
+/// Finds addresses in `log_text` that sent a request not for a web page
+/// (see [`accesslog::protocol_probe_ips`]) and adds a Block rule expiring
+/// after `ttl_days` for each, through the same exemptions as every
+/// detector here.
+pub fn block_protocol_probes(
+    db: &Db,
+    ttl_days: i64,
+    log_text: &str,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    let hits = accesslog::protocol_probe_ips(log_text, crate::logscan::hosted(db)?);
+    let found = hits.len();
+    let candidates = hits
+        .into_iter()
+        .map(|(ip, kind)| (ip, Some(kind)))
+        .collect();
+    add_block_rules(
+        db,
+        Detector::ProtocolProbes,
         found,
         candidates,
         0,
@@ -1002,6 +1037,7 @@ fn evidence_line(detector: Detector, item: Option<&str>, line: Option<&String>) 
             format!("requested {path}")
         }
         (Detector::Injection, Some(kind)) => format!("sent an exploit payload: {kind}"),
+        (Detector::ProtocolProbes, Some(kind)) => format!("sent a request not for a page: {kind}"),
         (Detector::AssetRatio, Some(path)) => format!("pages and no assets, the first {path}"),
         (Detector::RotatingUserAgent, Some(agent)) => {
             format!("many user agents, the first \"{agent}\"")
@@ -1024,6 +1060,19 @@ fn evidence_line(detector: Detector, item: Option<&str>, line: Option<&String>) 
     })
 }
 
+/// Whether `detector` convicts on a single request, and so leaves alone an
+/// address that logged in over SSH any time in
+/// [`crate::db::SSH_LOGIN_MEMORY_SECONDS`], not only in the week every
+/// detector does. One request for a secret is what an operator checking
+/// their own site sends; a detector that counts needs many, which an
+/// operator does not, so those keep the week.
+fn spares_remembered_logins(detector: Detector) -> bool {
+    matches!(
+        detector,
+        Detector::ProbePaths | Detector::Injection | Detector::ProtocolProbes
+    )
+}
+
 /// Adds a Block rule, expiring after `ttl_days`, for each of `kept` not
 /// already covered by an existing firewall rule of the same exact address.
 /// `kept` is each address as the detector saw it, with what it matched
@@ -1036,16 +1085,6 @@ fn evidence_line(detector: Detector, item: Option<&str>, line: Option<&String>) 
 /// re-flagged, and re-running this after a rule expires would otherwise
 /// leave the address referenced by two rows (one dead, one freshly
 /// inserted) instead of cleanly replacing it.
-/// Whether `detector` convicts on a single request, and so leaves alone an
-/// address that logged in over SSH any time in
-/// [`crate::db::SSH_LOGIN_MEMORY_SECONDS`], not only in the week every
-/// detector does. One request for a secret is what an operator checking
-/// their own site sends; a detector that counts needs many, which an
-/// operator does not, so those keep the week.
-fn spares_remembered_logins(detector: Detector) -> bool {
-    matches!(detector, Detector::ProbePaths | Detector::Injection)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn add_block_rules(
     db: &Db,
@@ -1876,6 +1915,48 @@ mod tests {
         let outcome = block_web_scanners(&db, 7, 1, &log, false).unwrap();
 
         assert_eq!(outcome.newly_blocked, ["198.51.100.9"], "{outcome:?}");
+    }
+
+    /// The scheduled pass, from stored evidence: an ordinary answer
+    /// stored beside the probe spares the address.
+    #[test]
+    fn the_scheduled_pass_blocks_a_protocol_prober_unless_it_was_also_answered() {
+        let db = Db::open_in_memory().unwrap();
+        let now = now_secs();
+        for ip in ["203.0.113.9", "198.51.100.4"] {
+            let tls = Item::seen("tls handshake");
+            observe(&db, Detector::ProtocolProbes, ip, tls, now - 60, 1);
+        }
+        observe(
+            &db,
+            Detector::ProtocolProbes,
+            "198.51.100.4",
+            Item::Clear,
+            now - 30,
+            1,
+        );
+
+        let outcome = run_detector(&db, Detector::ProtocolProbes, 5, now, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, ["203.0.113.9"], "{outcome:?}");
+        assert_eq!(
+            the_only_rule(&db).evidence.as_deref(),
+            Some("sent a request not for a page: tls handshake")
+        );
+    }
+
+    /// From the whole log, the block records the line itself.
+    #[test]
+    fn a_protocol_probe_s_block_records_what_was_sent() {
+        let db = Db::open_in_memory().unwrap();
+        let log = "203.0.113.9 - - [10/Oct/2026:13:55:36 +0000] \"\\x05\\x01\\x00\" 400 157 \"-\" \"-\"\n";
+
+        block_protocol_probes(&db, 5, log, false).unwrap();
+
+        assert_eq!(
+            the_only_rule(&db).evidence.as_deref(),
+            Some("socks handshake: \"\\x05\\x01\\x00\" 400")
+        );
     }
 
     #[test]

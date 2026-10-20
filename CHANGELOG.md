@@ -8,6 +8,23 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Added
+
+- **A protocol-probe detector, `protocol-probes`: one request that is not for a web page.**
+  Scanners looking for open proxies, SSH, SOCKS, WebLogic or mining pools send port 80
+  the bytes they send everywhere. NGINX answers 400 and logs them as the request line.
+  The detector counts a TLS handshake on the plain-HTTP port, a SOCKS or SSH handshake,
+  `CONNECT`, a full URL naming a host that is none of this server's sites, and anything
+  else that is not an HTTP request line. These lines used to be skipped as unreadable, so
+  nothing judged them. On a month of one host's log, it blocked 248 addresses, 235 of
+  which no other detector caught. It is never counted:
+  - an empty request, which an unused browser connection also leaves;
+  - a TLS alert, which one host's owner's own client was found sending;
+  - anything from an address the site also answered normally in the same read.
+
+  On for a new install. After an upgrade it is off and marked new until you choose:
+  `stop-bots set-detector protocol-probes --enabled true`.
+
 ### Changed
 
 - **An operator checking their own site is not taken for a prober.** A successful SSH

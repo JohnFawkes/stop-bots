@@ -2752,7 +2752,8 @@ fn block_web_scanners_adds_a_rule_for_distinct_not_found_paths_and_is_idempotent
 
 /// The core discriminator this feature exists to get right, verified again
 /// at the CLI/DB-state level (already unit-tested in `accesslog.rs`):
-/// hitting the *same* dead path repeatedly must never look like scanning.
+/// hitting the *same* dead path repeatedly must not look like scanning,
+/// short of the fifty times (`WEB_SCANNERS_REPEATS`) only a bot reaches.
 #[test]
 fn block_web_scanners_ignores_repeated_hits_on_a_single_dead_path() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2760,7 +2761,7 @@ fn block_web_scanners_ignores_repeated_hits_on_a_single_dead_path() {
     let db_path = db_path.to_str().unwrap();
 
     let log_path = tmp.path().join("access.log");
-    let log: String = (0..50)
+    let log: String = (0..49)
         .map(|_| not_found_line("198.51.100.9", "/missing"))
         .collect();
     fs::write(&log_path, log).unwrap();

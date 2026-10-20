@@ -1102,6 +1102,16 @@ fn reject_an_overbroad_fetch(source: &str, addresses: &[String], max_v4_share: f
 /// used.
 pub const SSH_LOGIN_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 
+/// How long a successful SSH login is remembered at all. Past
+/// [`SSH_LOGIN_WINDOW_SECONDS`] it no longer stops every block, but it
+/// still stops the detectors that convict on a single request (see
+/// `scanblock::spares_remembered_logins`): one request for `/.DS_Store` is
+/// exactly what an operator checking their own site for a leak sends, and
+/// a replay of a real host's logs found the operator convicted for it six
+/// weeks after their last login. Ninety days, because an operator who has
+/// not logged in for longer than that is not checking their site.
+pub const SSH_LOGIN_MEMORY_SECONDS: i64 = 90 * 24 * 60 * 60;
+
 /// The columns [`firewall_rule_from_row`] reads, in its order.
 const FIREWALL_RULE_COLUMNS: &str =
     "id, address, port, action, enabled, expires_at, source, created_at, evidence";
@@ -3176,29 +3186,39 @@ impl Db {
     }
 
     /// Every address with a successful SSH login inside
-    /// [`SSH_LOGIN_WINDOW_SECONDS`], pruning anything older first — so a
-    /// row cannot outlive the window even if nothing else ever cleans up.
+    /// [`SSH_LOGIN_WINDOW_SECONDS`]: the ones nothing blocks.
     ///
     /// Sorted, because this feeds `firewall::all_rules` and so reaches
     /// `firewall::rules_signature`: an unordered read would change the
     /// fingerprint on nothing but SQLite's row order and report the
     /// firewall as needing a re-render when it does not.
     pub fn recent_ssh_login_ips(&self) -> Result<Vec<String>> {
+        self.ssh_login_ips_within(SSH_LOGIN_WINDOW_SECONDS)
+    }
+
+    /// Every address with a successful SSH login inside
+    /// [`SSH_LOGIN_MEMORY_SECONDS`]: the ones a single-request detector
+    /// leaves alone. Sorted, like [`Self::recent_ssh_login_ips`].
+    pub fn remembered_ssh_login_ips(&self) -> Result<Vec<String>> {
+        self.ssh_login_ips_within(SSH_LOGIN_MEMORY_SECONDS)
+    }
+
+    /// The logins inside the last `seconds`, pruning any older than
+    /// [`SSH_LOGIN_MEMORY_SECONDS`] first, so a row cannot outlive the
+    /// memory even if nothing else ever cleans up.
+    fn ssh_login_ips_within(&self, seconds: i64) -> Result<Vec<String>> {
         self.conn.execute(
             "DELETE FROM ssh_login_ips WHERE seen_at <= ?1",
-            params![now() - SSH_LOGIN_WINDOW_SECONDS],
+            params![now() - SSH_LOGIN_MEMORY_SECONDS],
         )?;
         let mut stmt = self
             .conn
-            .prepare("SELECT address FROM ssh_login_ips ORDER BY address")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            .prepare("SELECT address FROM ssh_login_ips WHERE seen_at > ?1 ORDER BY address")?;
+        let rows = stmt.query_map(params![now() - seconds], |row| row.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("failed to list recent SSH login addresses")
+            .context("failed to list SSH login addresses")
     }
 
-    /// Moves a stored login `seconds` further into the past. Test-only —
-    /// the window is seven days, so the alternative is a test that cannot
-    /// run without waiting a week or injecting a clock everywhere.
     /// Stores a row the way a release that did not validate it would have:
     /// what a host that upgrades already has in its database. Test-only,
     /// since the point of every real write path is that it refuses these.
@@ -3218,6 +3238,9 @@ impl Db {
         self.conn.execute(&sql, params.as_slice()).unwrap();
     }
 
+    /// Moves a stored login `seconds` further into the past. Test-only —
+    /// the window is seven days, so the alternative is a test that cannot
+    /// run without waiting a week or injecting a clock everywhere.
     #[cfg(test)]
     pub fn backdate_ssh_login_for_tests(&self, address: &str, seconds: i64) -> Result<()> {
         self.conn.execute(
@@ -5656,13 +5679,24 @@ mod tests {
     }
 
     #[test]
-    fn recent_ssh_login_ips_drops_a_login_older_than_the_window() {
+    fn a_login_older_than_the_window_is_remembered_but_not_recent() {
         let db = Db::open_in_memory().unwrap();
         db.record_ssh_login_ips(&["1.1.1.1".to_string()]).unwrap();
         db.backdate_ssh_login_for_tests("1.1.1.1", SSH_LOGIN_WINDOW_SECONDS + 1)
             .unwrap();
 
-        assert!(db.recent_ssh_login_ips().unwrap().is_empty());
+        assert_eq!(db.recent_ssh_login_ips().unwrap(), Vec::<String>::new());
+        assert_eq!(db.remembered_ssh_login_ips().unwrap(), ["1.1.1.1"]);
+    }
+
+    #[test]
+    fn a_login_older_than_the_memory_is_pruned() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_ssh_login_ips(&["1.1.1.1".to_string()]).unwrap();
+        db.backdate_ssh_login_for_tests("1.1.1.1", SSH_LOGIN_MEMORY_SECONDS + 1)
+            .unwrap();
+
+        assert_eq!(db.remembered_ssh_login_ips().unwrap(), Vec::<String>::new());
         // Pruned, not merely filtered out of the read.
         let count: i64 = db
             .conn

@@ -8,6 +8,21 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Changed
+
+- **An operator checking their own site is not taken for a prober.** A successful SSH
+  login is now remembered for 90 days. For the first 7, nothing blocks the address, as
+  before; for the rest, the two detectors that convict on a single request (probe paths
+  and injection attempts) still leave it alone. A replay of a real host's logs found the
+  owner convicted for asking for their own `/.DS_Store`, weeks after their last login.
+  Detectors that count, such as web scanners, still block the address after the first week.
+
+- **Web scanners also convicts one missing page asked for over and over**: 50 times
+  inside its window, however few distinct paths that makes. A camera-firmware probe that
+  asked for one path about 140 times a day never reached the seven distinct ones the
+  detector counts. Assets, `robots.txt`, sitemaps and `/.well-known/` never count this way,
+  since a browser asks again for a missing favicon on every page.
+
 ### Fixed
 
 - **A backup of a site's config is no longer a second site.** A copy kept under the config

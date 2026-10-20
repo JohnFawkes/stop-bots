@@ -632,10 +632,9 @@ pub fn maintenance(db: &Db) -> String {
 ///
 /// Never fails, like every other job: a reload that NGINX rejects becomes
 /// the recorded summary, which is what puts it in front of an admin on
-/// the Scheduled tasks panel. Returning an error instead would reach
-/// `run_due_jobs`, which prints to stderr and moves on — so on the one
-/// host where this matters, a broken config would fail silently every
-/// hour.
+/// the Scheduled tasks panel. Returning an error instead would only be
+/// printed to stderr by the caller, which moves on — so on the one host
+/// where this matters, a broken config would fail silently every hour.
 ///
 /// The commands come from `host`, the host settings, never from `db`.
 pub fn apply_nginx(

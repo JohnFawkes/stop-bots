@@ -115,6 +115,8 @@ pub mod preview;
 #[doc(hidden)]
 pub mod protection;
 #[doc(hidden)]
+pub mod protocol;
+#[doc(hidden)]
 pub mod refresh;
 #[doc(hidden)]
 pub mod revert;

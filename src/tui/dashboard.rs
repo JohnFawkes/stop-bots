@@ -6011,7 +6011,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         let rows = dashboard.protection_rows();
-        assert_eq!(rows.len(), 24, "if this changes, so does the panel height");
+        assert_eq!(rows.len(), 25, "if this changes, so does the panel height");
         for row in rows {
             let label = dashboard.protection_label(row);
             assert!(content.contains(&label), "{label:?} is not on screen");

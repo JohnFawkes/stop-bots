@@ -58,7 +58,7 @@ mostly *integrity* failures, not memory safety:
   answer is tuning: switch off the detector or the category that caught it, exempt
   the path, or allow the address. Several detectors are on by default (the SSH and
   web scanners, forged crawlers, probe paths and injection attempts, and on a
-  database created since login brute force arrived, that too), because each has a
+  database created since they arrived, login brute force and protocol probes too), because each has a
   threshold or a signature that ordinary visitors do not reach; the rest start off. A default that blocks clearly legitimate traffic on an ordinary site is worth a
   normal bug report, not a security one.
 - **Requiring root.** Writing firewall rules and web server config needs privilege. That is the

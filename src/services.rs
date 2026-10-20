@@ -239,6 +239,37 @@ impl Hosted {
         self.for_site(hosts, |service| service.routes(&path))
     }
 
+    /// Whether `host` is a name one of the sites here answers to: `None`
+    /// when that cannot be told, because no site is known or one is named
+    /// by a regular expression. NGINX's wildcards are matched, `*.example.com`,
+    /// `.example.com` and `www.example.*`.
+    pub fn serves(&self, host: &str) -> Option<bool> {
+        if self.sites.is_empty() {
+            return None;
+        }
+        let host = host_name(host).to_ascii_lowercase();
+        let mut in_doubt = false;
+        for (name, _) in &self.sites {
+            let name = name.to_ascii_lowercase();
+            let matches = if name.starts_with('~') {
+                in_doubt = true;
+                false
+            } else if let Some(domain) = name.strip_prefix("*.") {
+                host.ends_with(&format!(".{domain}"))
+            } else if let Some(domain) = name.strip_prefix('.') {
+                host == domain || host.ends_with(&name)
+            } else if let Some(start) = name.strip_suffix(".*") {
+                host.starts_with(&format!("{start}."))
+            } else {
+                host == name
+            };
+            if matches {
+                return Some(true);
+            }
+        }
+        (!in_doubt).then_some(false)
+    }
+
     /// Whether a request for `path` is a sign-in to the application behind
     /// its site ([`Service::login_routes`]), given every host name the
     /// line carries. As [`Self::app_request`] does, a request naming no
@@ -399,6 +430,44 @@ mod tests {
                 "{hosts:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_host_name_is_served_when_a_site_answers_to_it_wildcards_and_all() {
+        let hosted = Hosted::new(
+            [
+                "blog.example.com",
+                "*.shop.example",
+                ".docs.example",
+                "www.example.*",
+            ]
+            .map(|name| (name.to_string(), None))
+            .to_vec(),
+        );
+        let cases = [
+            ("a site's name", "blog.example.com", Some(true)),
+            (
+                "in another case, with a port",
+                "BLOG.example.com:443",
+                Some(true),
+            ),
+            ("under a leading *.", "eu.shop.example", Some(true)),
+            ("the domain a leading *. names", "shop.example", Some(false)),
+            ("a leading dot's domain", "docs.example", Some(true)),
+            ("under a leading dot", "v2.docs.example", Some(true)),
+            ("a trailing .*", "www.example.net", Some(true)),
+            ("someone else's", "httpbin.org", Some(false)),
+        ];
+        for (what, host, expected) in cases {
+            assert_eq!(hosted.serves(host), expected, "{what}: {host}");
+        }
+    }
+
+    #[test]
+    fn a_host_name_is_in_doubt_with_no_sites_or_a_site_named_by_a_regex() {
+        assert_eq!(Hosted::default().serves("httpbin.org"), None);
+        let regex = Hosted::new(vec![("~^(?<user>.+)\\.example\\.net$".to_string(), None)]);
+        assert_eq!(regex.serves("httpbin.org"), None);
     }
 
     #[test]

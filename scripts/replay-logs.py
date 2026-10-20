@@ -66,6 +66,7 @@ DETECTORS = {
     "spoofed-crawlers": "access",
     "probe-paths": "access",
     "injection": "access",
+    "protocol-probes": "access",
     "asset-ratio": "access",
     "rotating-ua": "access",
     "refererless": "access",

@@ -234,6 +234,9 @@ impl Db {
         // where there is none.
         let (least, measure, repeated) = match rule {
             Rule::Once => (1, "COUNT(*)", i64::MAX),
+            // A clearing row alone, which every visitor has, is no reason
+            // to read an address.
+            Rule::OnceUnlessCleared => (1, "SUM(item != char(10) || 'clear')", i64::MAX),
             Rule::AfterWarning => (2, "COUNT(*)", i64::MAX),
             Rule::Distinct(n) => (n as i64, "COUNT(*)", i64::MAX),
             Rule::DistinctOrRepeated { distinct, repeated } => {
@@ -455,6 +458,41 @@ mod tests {
                 .len(),
             4
         );
+    }
+
+    /// Every visitor has a clearing row; only an address with something
+    /// besides one is read, and then with its clearing row too, which is
+    /// what decides it.
+    #[test]
+    fn a_clearing_row_alone_is_not_read_for_one_line_unless_cleared() {
+        let db = Db::open_in_memory().unwrap();
+        let mut evidence = Evidence::default();
+        let (visitor, prober) = ("198.51.100.1", "203.0.113.5");
+        evidence.add(
+            Detector::ProtocolProbes,
+            visitor.parse().unwrap(),
+            Item::Clear,
+            100,
+        );
+        evidence.add(
+            Detector::ProtocolProbes,
+            prober.parse().unwrap(),
+            Item::Clear,
+            100,
+        );
+        evidence.add(
+            Detector::ProtocolProbes,
+            prober.parse().unwrap(),
+            Item::seen("tls handshake"),
+            100,
+        );
+        ingest(&db, None, "c1", &evidence);
+
+        let rows = db
+            .evidence_rows(Detector::ProtocolProbes, 0, Rule::OnceUnlessCleared)
+            .unwrap();
+        assert!(rows.iter().all(|r| r.address == prober), "{rows:?}");
+        assert_eq!(rows.len(), 2, "{rows:?}");
     }
 
     /// One row, under the distinct threshold, is still read when it was

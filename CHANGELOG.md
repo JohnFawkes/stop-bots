@@ -8,6 +8,23 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Added
+
+- **A protocol-probe detector, `protocol-probes`: one request that is not for a web page.**
+  Scanners looking for open proxies, SSH, SOCKS, WebLogic or mining pools send port 80
+  the bytes they send everywhere. NGINX answers 400 and logs them as the request line.
+  The detector counts a TLS handshake on the plain-HTTP port, a SOCKS or SSH handshake,
+  `CONNECT`, a full URL naming a host that is none of this server's sites, and anything
+  else that is not an HTTP request line. These lines used to be skipped as unreadable, so
+  nothing judged them. On a month of one host's log, it blocked 248 addresses, 235 of
+  which no other detector caught. It is never counted:
+  - an empty request, which an unused browser connection also leaves;
+  - a TLS alert, which one host's owner's own client was found sending;
+  - anything from an address the site also answered normally in the same read.
+
+  On for a new install. After an upgrade it is off and marked new until you choose:
+  `stop-bots set-detector protocol-probes --enabled true`.
+
 ### Changed
 
 - **An operator checking their own site is not taken for a prober.** A successful SSH
@@ -36,6 +53,17 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   TUI now say which sites they forgot, and drop their per-site settings with them. A site
   found in a new file keeps its row and settings. A scan that finds no sites at all forgets
   nothing, since that is more often an empty or unmounted root than a host with no sites.
+
+- **A downloaded list no longer blocks Googlebot, Bingbot or GPTBot.** blocklist.de listed
+  13 of their verified addresses on the day this was checked, so switching that feed on
+  blocked them at the firewall. Each crawler's published ranges are now taken out of every
+  abuse feed, cloud feed and hosting provider before the firewall is written. Blocking the
+  crawler's category still blocks it, and so does blocking a country it crawls from.
+
+- **A detector that convicts many addresses at once no longer slows to a crawl.** Each
+  block checked every other convicted address to find the ones it covers, so the time grew
+  with the square of their number: 40,000 addresses took 76 seconds, and a first run over
+  a month of honeypot traffic took two and a half minutes. Both now take about a second.
 
 ## [0.4.0] — 2026-10-16
 

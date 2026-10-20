@@ -436,6 +436,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- portscan.rs    <- The port-scan detector: trap ports, what listens, the kernel log's lines
         |- accesslog.rs   <- Access log parsing (NGINX's and Apache's), the web-log detectors, UA tallying
         |- injection.rs   <- Recognising an exploit payload in a logged request
+        |- protocol.rs    <- Recognising a request that is not for a page: another protocol, or a proxy
         |- accessstats.rs <- What one pass tallied into the access-log UA stats
         |- cdn.rs         <- A CDN's edge addresses, which no detector blocks
         |- scanblock.rs   <- Shared CLI+cron logic for every detector's detect-and-block pass

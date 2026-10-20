@@ -146,6 +146,11 @@ fn describe(detector: Detector, request: &Request, hint: Option<&str>) -> Option
                 in_referer(referer).map(|kind| format!("{kind} in the referer: \"{referer}\""))
             }
         }
+        // What the detector named it, which a request naming a site here
+        // is not: it is not judged here against the sites, as it was then.
+        Detector::ProtocolProbes => crate::protocol::signature(&request.request, |_| Some(false))
+            .filter(|kind| hint.is_none_or(|named| named == *kind))
+            .map(|kind| format!("{kind}: {}", plain())),
         Detector::RotatingUserAgent => Some(with_agent()),
         Detector::AssetRatio | Detector::RefererlessCrawl => Some(plain()),
         // The last request: the rate needs no one line to stand for it.

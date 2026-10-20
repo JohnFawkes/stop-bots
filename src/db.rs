@@ -3656,7 +3656,37 @@ impl Db {
     /// mode turns away most of Let's Encrypt's validators regardless. Nor
     /// when [`Self::get_cloud_port_80_open`] is off: a host that renews
     /// over DNS, or has no certificate, may want the port closed too.
+    ///
+    /// **A verified crawler is left out of every downloaded list** — the
+    /// abuse feeds, the cloud feeds and the hosting providers — by taking
+    /// its published ranges out of each entry (see
+    /// [`crate::ipranges::Holes::punch`]). blocklist.de was found listing
+    /// four of Bingbot's own addresses, reported by servers it had crawled
+    /// too eagerly, and a hosting provider chosen by ASN can be the network
+    /// a crawler runs in. Whether a crawler is blocked is its category's
+    /// decision, which [`Self::blocked_ip_ranges`] has already made ahead
+    /// of everything here; a country, and the operator's own rules, still
+    /// apply to it as to anyone. Taken out rather than let through by an
+    /// Allow placed first, because an Allow would also have overruled the
+    /// countries that come after it.
     pub fn derived_firewall_entries(&self) -> Result<Vec<(String, Option<u16>, FirewallAction)>> {
+        let crawlers: Vec<String> = self
+            .ip_ranges_by_source_name()?
+            .into_iter()
+            .map(|(_, cidr)| cidr)
+            .collect();
+        let crawlers = crate::ipranges::Holes::new(&crawlers);
+        let punched = |entries: Vec<(String, String)>| -> Vec<(String, String)> {
+            entries
+                .into_iter()
+                .flat_map(|(source, cidr)| {
+                    crawlers
+                        .punch(&cidr)
+                        .into_iter()
+                        .map(move |left| (source.clone(), left))
+                })
+                .collect()
+        };
         let mut entries: Vec<(String, Option<u16>, FirewallAction)> = self
             .blocked_ip_ranges()?
             .into_iter()
@@ -3676,6 +3706,7 @@ impl Db {
                 .into_iter()
                 .map(|(asn, cidr)| (format!("AS{asn}"), cidr)),
         );
+        let (abuse, cloud) = (punched(abuse), punched(cloud));
         entries.extend(
             abuse
                 .into_iter()
@@ -6558,6 +6589,76 @@ mod tests {
         for (what, ip, port, expected) in cases {
             assert_eq!(verdict(&entries, ip, port), expected, "{what}: {entries:?}");
         }
+    }
+
+    /// `db` with Bingbot's ranges fetched, under its category, Search.
+    fn with_bingbot(db: &Db, cidrs: &[&str]) {
+        db.register_ip_range_source(&sample_ip_range_source("bingbot", Category::Search))
+            .unwrap();
+        let cidrs: Vec<String> = cidrs.iter().map(|c| c.to_string()).collect();
+        db.replace_ip_ranges("bingbot", &cidrs).unwrap();
+    }
+
+    /// blocklist.de was found listing Bingbot's own addresses.
+    #[test]
+    fn an_abuse_feed_does_not_block_a_verified_crawler_it_lists() {
+        let db = with_feeds(&[("blocklist-de", &["40.77.167.5", "198.51.100.9"])]);
+        with_bingbot(&db, &["40.77.167.0/24"]);
+        let entries = db.derived_firewall_entries().unwrap();
+
+        assert_eq!(verdict(&entries, "40.77.167.5", 443), None, "{entries:?}");
+        assert_eq!(
+            verdict(&entries, "198.51.100.9", 443),
+            Some(FirewallAction::Block),
+            "{entries:?}"
+        );
+    }
+
+    /// A hosting provider can be the network a crawler runs in: the rest
+    /// of it is still blocked, and a country still applies to the crawler.
+    #[test]
+    fn a_hosting_block_leaves_out_a_crawler_inside_it() {
+        let db = with_hosting_asn(8075, &["40.64.0.0/10"]);
+        with_bingbot(&db, &["40.77.167.0/24"]);
+        let entries = db.derived_firewall_entries().unwrap();
+        let cases = [
+            ("Bingbot", "40.77.167.5", None),
+            ("its neighbour", "40.77.166.1", Some(FirewallAction::Block)),
+            (
+                "the far end of the block",
+                "40.127.255.1",
+                Some(FirewallAction::Block),
+            ),
+        ];
+        for (what, ip, expected) in cases {
+            assert_eq!(verdict(&entries, ip, 443), expected, "{what}: {entries:?}");
+        }
+
+        db.replace_country_ranges("us", &["40.77.0.0/16".to_string()])
+            .unwrap();
+        db.set_country_selected("us", true).unwrap();
+        let entries = db.derived_firewall_entries().unwrap();
+        assert_eq!(
+            verdict(&entries, "40.77.167.5", 443),
+            Some(FirewallAction::Block),
+            "a blocked country: {entries:?}"
+        );
+    }
+
+    /// Leaving a crawler out of the lists is not allowing it: blocking its
+    /// category still blocks its ranges.
+    #[test]
+    fn a_crawler_whose_category_is_blocked_stays_blocked() {
+        let db = with_feeds(&[("blocklist-de", &["40.77.167.5"])]);
+        with_bingbot(&db, &["40.77.167.0/24"]);
+        db.set_category_default(Category::Search, Policy::Blocked)
+            .unwrap();
+        let entries = db.derived_firewall_entries().unwrap();
+        assert_eq!(
+            verdict(&entries, "40.77.167.5", 443),
+            Some(FirewallAction::Block),
+            "{entries:?}"
+        );
     }
 
     /// The operator's choice, for a host that renews over DNS or has no

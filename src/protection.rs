@@ -125,6 +125,21 @@ pub const INJECTION_ENABLED_DEFAULT: bool = true;
 /// honeypot's thirty, which is the one signal that cannot be an accident.
 pub const INJECTION_TTL_DAYS_DEFAULT: i64 = 7;
 
+/// Protocol probes default to **on**, for the reason injection does: one
+/// request is conclusive, and what is counted is not HTTP at all, or HTTP
+/// asking to be forwarded elsewhere. See `crate::protocol` for what is
+/// never counted, and the two hosts' logs it was checked against.
+pub const PROTOCOL_PROBES_ENABLED_DEFAULT: bool = true;
+
+/// Five days, a probe path's: both are a scanner looking for something to
+/// attack, not an attack.
+pub const PROTOCOL_PROBES_TTL_DAYS_DEFAULT: i64 = 5;
+
+/// The defaults generation the protocol-probe detector arrived in (see
+/// `db::schema::DEFAULTS_GENERATION`): on a database an earlier release
+/// created it is off, and marked new, until the operator chooses.
+pub const PROTOCOL_PROBES_INTRODUCED_IN: u32 = 4;
+
 /// robots.txt violators default to **off**, for the reason the honeypot
 /// does: it judges by the robots.txt this project generates, and does
 /// nothing until that is served, so on by default it would be an enabled
@@ -345,6 +360,9 @@ pub enum Detector {
     LoginAttempts,
     RequestRate,
     RobotsViolators,
+    /// Another protocol spoken to the web server, or the web server asked
+    /// to be a proxy: see [`crate::protocol`].
+    ProtocolProbes,
     /// Reads the kernel log the firewall's trap ports write: see
     /// [`crate::portscan`].
     PortScanners,
@@ -400,12 +418,13 @@ pub struct DetectorSpec {
 }
 
 impl Detector {
-    pub const ALL: [Detector; 14] = [
+    pub const ALL: [Detector; 15] = [
         Detector::SshScanners,
         Detector::WebScanners,
         Detector::SpoofedCrawlers,
         Detector::ProbePaths,
         Detector::Injection,
+        Detector::ProtocolProbes,
         Detector::Honeypot,
         Detector::AssetRatio,
         Detector::RotatingUserAgent,
@@ -560,6 +579,16 @@ impl Detector {
                 log: DetectorLog::Access,
                 introduced_in: MORE_DETECTORS_INTRODUCED_IN,
             },
+            Detector::ProtocolProbes => DetectorSpec {
+                id: "block_protocol_probes",
+                label: "Protocol probes",
+                job_label: "Block protocol probes",
+                enabled_default: PROTOCOL_PROBES_ENABLED_DEFAULT,
+                ttl_days_default: PROTOCOL_PROBES_TTL_DAYS_DEFAULT,
+                window_hours_default: EVIDENCE_WINDOW_HOURS,
+                log: DetectorLog::Access,
+                introduced_in: PROTOCOL_PROBES_INTRODUCED_IN,
+            },
             // Off by default, new database or old: it adds rules to the
             // firewall for ports beyond the web server and SSH, and a
             // service started on one of them after a render is dropped
@@ -608,6 +637,13 @@ impl Detector {
             Detector::Injection => {
                 "Blocks an address on a single request carrying a known exploit, such as \
                  Shellshock or Log4Shell, in its path or headers."
+            }
+            Detector::ProtocolProbes => {
+                "Blocks an address on a single request that is not for a web page: another \
+                 protocol's handshake (TLS on the plain-HTTP port, SOCKS, SSH), or a request \
+                 asking this server to forward it somewhere else, as a proxy would. Scanners \
+                 looking for open proxies and other services send these; browsers never do. \
+                 An address the site also answered normally is left alone."
             }
             Detector::Honeypot => {
                 "Blocks a client that visits a trap path that only robots.txt mentions, as a \
@@ -706,6 +742,12 @@ impl Detector {
                  web server's screen), the only one it knows the rules of. A person who reads \
                  robots.txt and then opens a page it forbids by hand is blocked too. It never \
                  blocks a verified search engine.",
+            ),
+            Detector::ProtocolProbes => Some(
+                "If a site's TLS is misconfigured, so that the port visitors reach for HTTPS \
+                 answers plain HTTP, every visitor's browser sends a TLS handshake there, and \
+                 one that arrives by a link, without first being redirected from http://, is \
+                 blocked. Such a site serves nobody until it is fixed; the blocks last after it.",
             ),
             Detector::PortScanners => Some(
                 "A service you start later on a trap port is dropped until the firewall is \
@@ -847,6 +889,7 @@ impl Detector {
             Detector::SpoofedCrawlers
             | Detector::ProbePaths
             | Detector::Injection
+            | Detector::ProtocolProbes
             | Detector::Honeypot
             | Detector::RobotsTxt
             | Detector::RobotsViolators => None,
@@ -1621,6 +1664,23 @@ mod tests {
             !Detector::ProbePaths.is_new_here(&db).unwrap(),
             "turned off"
         );
+    }
+
+    /// An upgrade from 0.4 (generation 3) does not start blocking protocol
+    /// probes by itself; a new install does.
+    #[test]
+    fn protocol_probes_are_new_and_off_after_an_upgrade_and_on_for_a_new_install() {
+        let d = Detector::ProtocolProbes;
+        let new = Db::open_in_memory().unwrap();
+        assert!(d.is_enabled(&new).unwrap(), "off on a new install");
+        assert!(!d.is_new_here(&new).unwrap(), "new on a new install");
+
+        let upgraded = Db::open_in_memory().unwrap();
+        upgraded
+            .set_int_setting(crate::db::keys::DEFAULTS_GENERATION, 3)
+            .unwrap();
+        assert!(!d.is_enabled(&upgraded).unwrap(), "on after an upgrade");
+        assert!(d.is_new_here(&upgraded).unwrap(), "not marked new");
     }
 
     /// A database created by 0.2 or 0.3 (generation 2) is offered the

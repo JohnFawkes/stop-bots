@@ -133,9 +133,13 @@ fn parse_combined_line(line: &str) -> Option<ParsedLine> {
     let request = fields.next()?;
     let after_request = fields.next()?;
 
+    // A request line with no target is not HTTP, and is read anyway, with
+    // no path: what it is instead is the protocol-probe detector's
+    // business (see `crate::protocol`). An empty one is `""`, NGINX's
+    // record of a connection closed before it sent anything.
     let mut request_parts = request.split_whitespace();
-    let method = request_parts.next()?.to_string();
-    let target = request_parts.next()?;
+    let method = request_parts.next().unwrap_or_default().to_string();
+    let target = request_parts.next().unwrap_or_default();
     // Strip any query string: `/foo?a=1` and `/foo?a=2` are the same path
     // as far as "is this a valid URL on this site" goes, and counting them
     // as distinct would let a real, repeatedly-hit-with-varying-params 404
@@ -791,6 +795,21 @@ pub fn injection_ips(log_text: &str) -> Vec<(String, String)> {
     convicted_in_text(log_text, Watch::only(Detector::Injection), Rule::Once)
 }
 
+/// Every address that sent a request that is not for a web page (see
+/// [`crate::protocol`]) and was never answered normally, with what it
+/// sent. `hosted` says which host names are this server's own, for a
+/// request that asks to be forwarded.
+pub fn protocol_probe_ips(log_text: &str, hosted: Hosted) -> Vec<(String, String)> {
+    convicted_in_text(
+        log_text,
+        Watch {
+            hosted,
+            ..Watch::only(Detector::ProtocolProbes)
+        },
+        Rule::OnceUnlessCleared,
+    )
+}
+
 /// Filename extensions treated as "an asset a browser fetches alongside a
 /// page". Deliberately generous — a miss here means a real browser looks
 /// asset-less, which is the false positive that matters.
@@ -1282,6 +1301,15 @@ impl Observer {
                 self.injecting.insert(line.ip);
                 Some(Item::seen(kind))
             }
+            // An ordinary answer clears the address (see
+            // `Rule::OnceUnlessCleared`).
+            Detector::ProtocolProbes => {
+                if (200..400).contains(&line.status) {
+                    return Some(Item::Clear);
+                }
+                crate::protocol::signature(&line.request, |host| self.watch.hosted.serves(host))
+                    .map(Item::seen)
+            }
             // A page, or the asset that clears the whole address.
             Detector::AssetRatio => (line.status < 400).then(|| {
                 if is_asset(&line.path) {
@@ -1352,7 +1380,15 @@ impl Observer {
 
     /// Everything collected: the evidence, the user-agent tally if one was
     /// asked for, and the line counts.
-    pub fn finish(self) -> (Evidence, HashMap<String, u64>, Counts) {
+    ///
+    /// An ordinary answer clears an address of a protocol probe only when
+    /// the same read saw both. One read is the whole log for `run-detector`,
+    /// and a minute of it for the scheduled pass, which decides every minute
+    /// anyway; a browser sent from `http://` to a misconfigured `https://`
+    /// gets its redirect and sends its handshake within the same second.
+    pub fn finish(mut self) -> (Evidence, HashMap<String, u64>, Counts) {
+        self.evidence
+            .keep_clears_only_beside_suspicion(Detector::ProtocolProbes);
         (
             self.evidence,
             self.user_agents.unwrap_or_default(),
@@ -1381,6 +1417,7 @@ fn allows_app_requests(detector: Detector) -> bool {
         Detector::SpoofedCrawlers
         | Detector::ProbePaths
         | Detector::Injection
+        | Detector::ProtocolProbes
         | Detector::Honeypot
         | Detector::RobotsTxt
         | Detector::LoginAttempts
@@ -2637,6 +2674,72 @@ mod tests {
     #[test]
     fn refererless_crawl_ips_ignores_a_client_below_the_threshold() {
         assert!(refererless_crawl_ips(&pages("203.0.113.9", 5), 25).is_empty());
+    }
+
+    // ---- protocol probes ----
+
+    const TLS_HANDSHAKE: &str = r"\x16\x03\x01\x00\xEE\x01\x00\x00\xEA\x03\x03";
+
+    /// No detector judged these before: the line did not parse.
+    #[test]
+    fn a_request_line_that_is_not_http_is_read_with_no_path() {
+        let parsed = parse_line(&request_line("203.0.113.9", r"\x05\x01\x00", 400))
+            .expect("the line should parse");
+        assert_eq!(
+            (parsed.path.as_str(), parsed.request.as_str()),
+            ("", r"\x05\x01\x00")
+        );
+    }
+
+    #[test]
+    fn protocol_probes_convict_each_address_with_what_it_sent() {
+        let log = [
+            request_line("203.0.113.9", TLS_HANDSHAKE, 400),
+            request_line("203.0.113.10", "SSH-2.0-Go", 400),
+            request_line("198.51.100.4", "GET / HTTP/1.1", 200),
+            request_line("198.51.100.5", "", 400),
+        ]
+        .concat();
+        assert_eq!(
+            protocol_probe_ips(&log, Hosted::default()),
+            [
+                ("203.0.113.10".to_string(), "ssh handshake".to_string()),
+                ("203.0.113.9".to_string(), "tls handshake".to_string()),
+            ]
+        );
+    }
+
+    /// A browser that speaks TLS to a plain-HTTP port, on a site whose
+    /// HTTPS is misconfigured, also gets the redirect that sent it there.
+    #[test]
+    fn an_address_the_site_also_answered_is_not_a_protocol_prober() {
+        for answered in [200, 301] {
+            let log = [
+                request_line("203.0.113.9", TLS_HANDSHAKE, 400),
+                request_line("203.0.113.9", "GET / HTTP/1.1", answered),
+            ]
+            .concat();
+            assert_eq!(
+                protocol_probe_ips(&log, Hosted::default()),
+                [],
+                "answered {answered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_url_for_another_host_is_a_proxy_request_once_the_sites_are_known() {
+        let log = request_line("203.0.113.9", "GET http://httpbin.org/get HTTP/1.1", 404);
+        let sites = Hosted::new(vec![("example.com".to_string(), None)]);
+        assert_eq!(
+            protocol_probe_ips(&log, sites),
+            [("203.0.113.9".to_string(), "proxy request".to_string())]
+        );
+        assert_eq!(
+            protocol_probe_ips(&log, Hosted::default()),
+            [],
+            "with no site known"
+        );
     }
 
     // ---- timestamps ----

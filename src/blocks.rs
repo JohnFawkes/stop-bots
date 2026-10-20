@@ -175,6 +175,7 @@ pub fn detector_name(detector: Detector) -> &'static str {
         Detector::SpoofedCrawlers => "spoofed-crawlers",
         Detector::ProbePaths => "probe-paths",
         Detector::Injection => "injection",
+        Detector::ProtocolProbes => "protocol-probes",
         Detector::Honeypot => "honeypot",
         Detector::AssetRatio => "asset-ratio",
         Detector::RotatingUserAgent => "rotating-ua",

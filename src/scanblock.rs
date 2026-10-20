@@ -206,7 +206,8 @@ impl ScanBlockOutcome {
 /// for every scheduler; the CLI's one-off `run-detector` takes its from a
 /// flag instead. The SSH scanner counts failed-login lines and the login
 /// brute-force detector login attempts; the others that have a threshold
-/// count distinct things; the rest need one line.
+/// count distinct things, and the web scanner one page asked for over and
+/// over as well; the rest need one line.
 pub fn rule(db: &Db, detector: crate::protection::Detector) -> Result<Rule> {
     use crate::protection::Detector as D;
     Ok(match (detector, detector.threshold(db)?) {
@@ -214,6 +215,10 @@ pub fn rule(db: &Db, detector: crate::protection::Detector) -> Result<Rule> {
         (D::RequestRate, Some(n)) => {
             crate::protection::request_rate_rule(n, detector.window_seconds(db)?)
         }
+        (D::WebScanners, Some(n)) => Rule::DistinctOrRepeated {
+            distinct: n,
+            repeated: crate::protection::WEB_SCANNERS_REPEATS,
+        },
         (_, Some(n)) => Rule::Distinct(n),
         (D::RobotsViolators, None) => Rule::AfterWarning,
         (_, None) => Rule::Once,
@@ -1031,6 +1036,16 @@ fn evidence_line(detector: Detector, item: Option<&str>, line: Option<&String>) 
 /// re-flagged, and re-running this after a rule expires would otherwise
 /// leave the address referenced by two rows (one dead, one freshly
 /// inserted) instead of cleanly replacing it.
+/// Whether `detector` convicts on a single request, and so leaves alone an
+/// address that logged in over SSH any time in
+/// [`crate::db::SSH_LOGIN_MEMORY_SECONDS`], not only in the week every
+/// detector does. One request for a secret is what an operator checking
+/// their own site sends; a detector that counts needs many, which an
+/// operator does not, so those keep the week.
+fn spares_remembered_logins(detector: Detector) -> bool {
+    matches!(detector, Detector::ProbePaths | Detector::Injection)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn add_block_rules(
     db: &Db,
@@ -1091,14 +1106,17 @@ fn add_block_rules_now(
         .map(|rule| rule.address)
         .collect();
 
-    // Addresses the operator has actually logged in from recently. Parsed
-    // once, and kept as `IpAddr` rather than strings because the comparison
-    // below is containment, not equality.
-    let ssh_logins: Vec<std::net::IpAddr> = db
-        .recent_ssh_login_ips()?
-        .iter()
-        .filter_map(|ip| ip.parse().ok())
-        .collect();
+    // Addresses the operator has actually logged in from recently, or for a
+    // single-request detector at all in the last while. Parsed once, and
+    // kept as `IpAddr` rather than strings because the comparison below is
+    // containment, not equality.
+    let ssh_logins = if spares_remembered_logins(detector) {
+        db.remembered_ssh_login_ips()?
+    } else {
+        db.recent_ssh_login_ips()?
+    };
+    let ssh_logins: Vec<std::net::IpAddr> =
+        ssh_logins.iter().filter_map(|ip| ip.parse().ok()).collect();
     let trusted = db.list_trusted_addresses()?;
     // Addresses an operator unblocked by hand. Matched exactly, since a
     // detector writes the same address for the same client every time,
@@ -1791,6 +1809,44 @@ mod tests {
         assert!(outcome.newly_blocked.is_empty());
         assert_eq!(outcome.skipped_ssh_logins, 1);
         assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    /// An address that logged in over SSH 40 days ago: past the week that
+    /// spares it from everything, inside the memory that spares it from a
+    /// single request.
+    fn logged_in_weeks_ago(ip: &str) -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.record_ssh_login_ips(&[ip.to_string()]).unwrap();
+        db.backdate_ssh_login_for_tests(ip, 40 * 24 * 60 * 60)
+            .unwrap();
+        db
+    }
+
+    /// What a replay of a real host's logs found: the operator, checking
+    /// their own site for a leak six weeks after their last login.
+    #[test]
+    fn a_single_probe_from_an_address_that_logged_in_weeks_ago_is_left_alone() {
+        let db = logged_in_weeks_ago("198.51.100.9");
+
+        let outcome =
+            block_probe_paths(&db, 5, &probe_line("198.51.100.9", "/.DS_Store"), false).unwrap();
+
+        assert_eq!(outcome.skipped_ssh_logins, 1, "{outcome:?}");
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    /// A detector that counts still convicts it: an operator checking
+    /// something does not ask for seven missing pages.
+    #[test]
+    fn a_scan_from_an_address_that_logged_in_weeks_ago_is_still_blocked() {
+        let db = logged_in_weeks_ago("198.51.100.9");
+        let log: String = (0..10)
+            .map(|i| not_found_line("198.51.100.9", &format!("/missing-{i}")))
+            .collect();
+
+        let outcome = block_web_scanners(&db, 7, 1, &log, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, ["198.51.100.9"], "{outcome:?}");
     }
 
     #[test]

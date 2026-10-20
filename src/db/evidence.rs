@@ -229,21 +229,27 @@ impl Db {
     /// still makes the decision on what is read. On a day's worth of 404s
     /// that is a few hundred rows instead of a hundred thousand.
     pub fn evidence_rows(&self, detector: Detector, since: i64, rule: Rule) -> Result<Vec<Row>> {
-        let (least, measure) = match rule {
-            Rule::Once => (1, "COUNT(*)"),
-            Rule::AfterWarning => (2, "COUNT(*)"),
-            Rule::Distinct(n) => (n as i64, "COUNT(*)"),
-            Rule::AtLeast(n) => (n as i64, "SUM(count)"),
-            Rule::Rate { lines, refused } => (lines.min(refused) as i64, "SUM(count)"),
+        // `?4` is a second way in, for the one rule that has two: an
+        // address that asked for one thing that many times. `i64::MAX`
+        // where there is none.
+        let (least, measure, repeated) = match rule {
+            Rule::Once => (1, "COUNT(*)", i64::MAX),
+            Rule::AfterWarning => (2, "COUNT(*)", i64::MAX),
+            Rule::Distinct(n) => (n as i64, "COUNT(*)", i64::MAX),
+            Rule::DistinctOrRepeated { distinct, repeated } => {
+                (distinct as i64, "COUNT(*)", repeated as i64)
+            }
+            Rule::AtLeast(n) => (n as i64, "SUM(count)", i64::MAX),
+            Rule::Rate { lines, refused } => (lines.min(refused) as i64, "SUM(count)", i64::MAX),
         };
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT address, item, count, first_seen, last_seen FROM log_evidence
              WHERE detector = ?1 AND last_seen >= ?2 AND address IN (
                  SELECT address FROM log_evidence
                  WHERE detector = ?1 AND last_seen >= ?2
-                 GROUP BY address HAVING {measure} >= ?3)"
+                 GROUP BY address HAVING {measure} >= ?3 OR MAX(count) >= ?4)"
         ))?;
-        let rows = stmt.query_map(params![detector.id(), since, least], |row| {
+        let rows = stmt.query_map(params![detector.id(), since, least, repeated], |row| {
             Ok(Row {
                 address: row.get(0)?,
                 item: Item::from_key(&row.get::<_, String>(1)?),
@@ -449,6 +455,34 @@ mod tests {
                 .len(),
             4
         );
+    }
+
+    /// One row, under the distinct threshold, is still read when it was
+    /// seen often enough to meet the rule's other half: narrowing the read
+    /// by distinct items alone would leave the scheduled pass unable to
+    /// convict what `run-detector` does.
+    #[test]
+    fn one_path_asked_for_often_enough_is_read_for_the_repeated_rule() {
+        let db = Db::open_in_memory().unwrap();
+        let mut evidence = Evidence::default();
+        for _ in 0..50 {
+            evidence.add(
+                Detector::WebScanners,
+                "203.0.113.5".parse().unwrap(),
+                Item::seen("/SDK/webLanguage"),
+                100,
+            );
+        }
+        ingest(&db, None, "c1", &evidence);
+        let rule = Rule::DistinctOrRepeated {
+            distinct: 7,
+            repeated: 50,
+        };
+
+        let rows = db.evidence_rows(Detector::WebScanners, 0, rule).unwrap();
+
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(crate::evidence::decide(&rows, rule, Some(0)).len(), 1);
     }
 
     #[test]

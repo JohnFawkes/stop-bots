@@ -903,6 +903,15 @@ pub const SSH_SCANNERS_MIN_ATTEMPTS_DEFAULT: i64 = 20;
 pub const WEB_SCANNERS_MIN_PATHS: &str = keys::DETECT_WEB_SCANNERS_MIN_PATHS;
 pub const WEB_SCANNERS_MIN_PATHS_DEFAULT: i64 = 7;
 
+/// How many times one missing page convicts an address, inside the
+/// web-scanner window, however few distinct ones it asked for. Found by a
+/// replay of a real host's logs: a camera-firmware probe asked for one
+/// path about 140 times a day, and never reached seven distinct ones. A
+/// person who follows a broken link, or reloads it, does not get near
+/// fifty; assets, which a browser does ask for again on every page, are
+/// not counted (see [`crate::evidence::Rule::DistinctOrRepeated`]).
+pub const WEB_SCANNERS_REPEATS: u64 = 50;
+
 /// `settings` key: whether a detector that flags several addresses in one
 /// IPv4 `/24` blocks the whole `/24` instead.
 pub const SUBNET_ESCALATION: &str = keys::DETECT_SUBNET_ESCALATION;

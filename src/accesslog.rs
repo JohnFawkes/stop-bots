@@ -568,7 +568,10 @@ pub fn scanning_ips_hosted(log_text: &str, threshold: usize, hosted: Hosted) -> 
             hosted,
             ..Watch::only(Detector::WebScanners)
         },
-        Rule::Distinct(threshold),
+        Rule::DistinctOrRepeated {
+            distinct: threshold,
+            repeated: crate::protection::WEB_SCANNERS_REPEATS,
+        },
     ))
 }
 
@@ -815,6 +818,31 @@ const ASSET_EXTENSIONS: [&str; 18] = [
 fn is_asset(path: &str) -> bool {
     let lower = path.to_lowercase();
     ASSET_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// Files a client asks for by convention rather than through a link, and a
+/// well-behaved crawler asks for again every time it comes back.
+const WELL_KNOWN_FILES: [&str; 5] = [
+    "/robots.txt",
+    "/ads.txt",
+    "/app-ads.txt",
+    "/humans.txt",
+    "/security.txt",
+];
+
+/// Whether `path` is a page: not an asset ([`is_asset`]), not under
+/// `/.well-known/`, not a sitemap and none of [`WELL_KNOWN_FILES`]. What
+/// [`crate::evidence::Rule::DistinctOrRepeated`] counts the repeats of.
+pub(crate) fn is_page(path: &str) -> bool {
+    let path = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    let well_known = path.starts_with("/.well-known/")
+        || (path.starts_with("/sitemap") && path.ends_with(".xml"))
+        || WELL_KNOWN_FILES.contains(&path.as_str());
+    !(is_asset(&path) || well_known)
 }
 
 /// Every IP that fetched at least `min_pages` *distinct* pages and not one
@@ -1933,13 +1961,13 @@ mod tests {
         );
     }
 
-    /// The core discriminator this module exists to get right: repeatedly
-    /// hitting the *same* dead path must never look like scanning, no
-    /// matter how many times, while hitting many *different* dead paths
-    /// must, even at a lower total count.
+    /// The core discriminator this module exists to get right: a visitor
+    /// following, or reloading, the *same* dead link must not look like
+    /// scanning, while hitting many *different* dead paths must, even at a
+    /// lower total count.
     #[test]
     fn scanning_ips_distinguishes_repeated_from_distinct_not_found_paths() {
-        let repeated: String = (0..50)
+        let repeated: String = (1..crate::protection::WEB_SCANNERS_REPEATS)
             .map(|_| not_found_line("198.51.100.9", "/missing"))
             .collect();
         assert!(scanning_ips(&repeated, 10).is_empty());
@@ -1951,6 +1979,51 @@ mod tests {
             scanning_ips(&distinct, 10),
             vec!["198.51.100.9".to_string()]
         );
+    }
+
+    /// What a replay of a real host's logs found: a camera-firmware probe
+    /// asking for one path about 140 times a day, and never for seven.
+    #[test]
+    fn scanning_ips_flags_one_page_asked_for_over_and_over() {
+        let log: String = (0..crate::protection::WEB_SCANNERS_REPEATS)
+            .map(|_| not_found_line("198.51.100.9", "/SDK/webLanguage"))
+            .collect();
+
+        assert_eq!(scanning_ips(&log, 7), ["198.51.100.9"]);
+    }
+
+    /// A browser asks for a missing favicon with every page it shows, and
+    /// a crawler for a missing robots.txt every time it comes back.
+    #[test]
+    fn scanning_ips_ignores_an_asset_or_well_known_file_asked_for_over_and_over() {
+        for path in ["/favicon.ico", "/robots.txt", "/.well-known/security.txt"] {
+            let log: String = (0..2 * crate::protection::WEB_SCANNERS_REPEATS)
+                .map(|_| not_found_line("198.51.100.9", path))
+                .collect();
+            assert_eq!(scanning_ips(&log, 7), Vec::<String>::new(), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_page_is_told_from_an_asset_or_a_well_known_file() {
+        let cases = [
+            ("/SDK/webLanguage", true),
+            ("/contact/", true),
+            ("/missing.php?x=1", true),
+            ("/style.css", false),
+            ("/style.css?v=3", false),
+            ("/favicon.ico", false),
+            ("/robots.txt", false),
+            ("/sitemap.xml", false),
+            ("/sitemap-posts.xml", false),
+            ("/.well-known/acme-challenge/x", false),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|(path, page)| is_page(path) != *page)
+            .map(|(path, page)| format!("{path}: expected page = {page}"))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

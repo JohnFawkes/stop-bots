@@ -257,6 +257,15 @@ pub enum Rule {
     /// At least this many distinct items, and nothing that clears the
     /// address.
     Distinct(usize),
+    /// [`Rule::Distinct`], or one page asked for at least `repeated`
+    /// times, every time inside the window. For `web-scanners`, which
+    /// counts distinct missing paths: a scanner that asks for the same one
+    /// over and over never adds up to many. Only a page counts this way,
+    /// never an asset or a well-known file (see
+    /// [`crate::accesslog::is_page`]): a browser asks for a missing favicon
+    /// with every page it shows, and a crawler for a missing robots.txt
+    /// every time it comes back.
+    DistinctOrRepeated { distinct: usize, repeated: u64 },
     /// One line.
     Once,
     /// At least `lines` lines, or at least `refused` of them refused by a
@@ -278,6 +287,10 @@ pub enum Rule {
 ///   never includes a line from before it;
 /// - a distinct item counts if it was seen inside the window at all, and
 ///   so does a clearing observation;
+/// - a repeated item counts only if it was *first* seen inside the window.
+///   Its count runs from then to the last time, and is only all inside the
+///   window if its start is, so one asked for a few times a day for weeks
+///   never adds up;
 /// - a single line counts if it was inside the window.
 pub fn decide(rows: &[Row], rule: Rule, cutoff: Option<i64>) -> Vec<(String, String)> {
     let inside = |at: i64| cutoff.is_none_or(|c| at >= c);
@@ -309,17 +322,26 @@ pub fn decide(rows: &[Row], rule: Rule, cutoff: Option<i64>) -> Vec<(String, Str
                 lines >= threshold as u64
             }
             Rule::Distinct(threshold) => {
-                let cleared = rows
-                    .iter()
-                    .any(|row| row.item == Item::Clear && inside(row.tally.last));
-                let mut distinct = 0usize;
-                for row in &rows {
-                    if matches!(row.item, Item::Seen(_)) && inside(row.tally.last) {
-                        distinct += 1;
-                        note(&mut earliest, row);
-                    }
+                !cleared(&rows, &inside) && distinct(&rows, &inside, &mut earliest) >= threshold
+            }
+            Rule::DistinctOrRepeated {
+                distinct: threshold,
+                repeated,
+            } => {
+                if cleared(&rows, &inside) {
+                    false
+                } else if distinct(&rows, &inside, &mut earliest) >= threshold {
+                    true
+                } else if let Some((page, times)) = repeated_page(&rows, &inside, repeated) {
+                    // The count is the reason, as for a rate.
+                    convicted.push((
+                        address.to_string(),
+                        format!("{page} asked for {times} times"),
+                    ));
+                    continue;
+                } else {
+                    false
                 }
-                !cleared && distinct >= threshold
             }
             Rule::Rate {
                 lines: most,
@@ -391,6 +413,50 @@ pub fn decide(rows: &[Row], rule: Rule, cutoff: Option<i64>) -> Vec<(String, Str
         }
     }
     convicted
+}
+
+/// Whether something inside the window clears the address.
+fn cleared(rows: &[&Row], inside: &impl Fn(i64) -> bool) -> bool {
+    rows.iter()
+        .any(|row| row.item == Item::Clear && inside(row.tally.last))
+}
+
+/// How many distinct items were seen inside the window, noting the
+/// earliest of them in `earliest`.
+fn distinct<'a>(
+    rows: &[&'a Row],
+    inside: &impl Fn(i64) -> bool,
+    earliest: &mut Option<(i64, &'a str)>,
+) -> usize {
+    let mut count = 0;
+    for row in rows {
+        if matches!(row.item, Item::Seen(_)) && inside(row.tally.last) {
+            count += 1;
+            note(earliest, row);
+        }
+    }
+    count
+}
+
+/// The page asked for most, if it was asked for at least `repeated` times,
+/// all of them inside the window: see [`Rule::DistinctOrRepeated`].
+fn repeated_page<'a>(
+    rows: &[&'a Row],
+    inside: &impl Fn(i64) -> bool,
+    repeated: u64,
+) -> Option<(&'a str, u64)> {
+    rows.iter()
+        .filter_map(|row| match &row.item {
+            Item::Seen(page)
+                if inside(row.tally.first)
+                    && row.tally.count >= repeated
+                    && crate::accesslog::is_page(page) =>
+            {
+                Some((page.as_str(), row.tally.count))
+            }
+            _ => None,
+        })
+        .max_by_key(|(page, times)| (*times, std::cmp::Reverse(*page)))
 }
 
 /// Keeps whichever of `earliest` and `row`'s item was seen first.
@@ -467,6 +533,58 @@ mod tests {
             decide(&rows, Rule::AtLeast(20), Some(300)).is_empty(),
             "the first bucket began before the window, so only 10 count"
         );
+    }
+
+    const REPEATED: Rule = Rule::DistinctOrRepeated {
+        distinct: 7,
+        repeated: 50,
+    };
+
+    #[test]
+    fn one_page_asked_for_often_enough_inside_the_window_convicts_and_is_named() {
+        let rows = [row(
+            "203.0.113.5",
+            Item::seen("/SDK/webLanguage"),
+            100,
+            900,
+            50,
+        )];
+
+        assert_eq!(
+            decide(&rows, REPEATED, Some(100)),
+            [(
+                "203.0.113.5".to_string(),
+                "/SDK/webLanguage asked for 50 times".to_string()
+            )]
+        );
+    }
+
+    /// Its count runs from its first sighting, so one that began before the
+    /// window may have most of its count from outside it.
+    #[test]
+    fn a_page_first_asked_for_before_the_window_is_not_counted_as_repeated() {
+        let rows = [row(
+            "203.0.113.5",
+            Item::seen("/SDK/webLanguage"),
+            50,
+            900,
+            500,
+        )];
+
+        assert_eq!(decide(&rows, REPEATED, Some(100)), Vec::new());
+    }
+
+    #[test]
+    fn an_asset_asked_for_over_and_over_is_not_counted_as_repeated() {
+        let rows = [row(
+            "203.0.113.5",
+            Item::seen("/favicon.ico"),
+            100,
+            900,
+            500,
+        )];
+
+        assert_eq!(decide(&rows, REPEATED, Some(100)), Vec::new());
     }
 
     /// A brute-forcer's buckets count its POSTs; the page it posted to

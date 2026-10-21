@@ -51,6 +51,12 @@ delete the `web_server` and `traefik_*` lines from `host.conf`, then install 0.5
   says which application answers behind a router, and sites from Docker labels are in no
   file at all, so `/wp-login.php` is never taken for a scan there.
 
+### Security
+
+- `rustls-webpki` is 0.103.16 and `webpki-root-certs` 1.0.10, for RUSTSEC-2026-0382 and
+  -0383: certificates under distrusted intermediates could be accepted. stop-bots uses them
+  only as a client, to download the bot lists and address feeds.
+
 ## [0.5.0] — 2026-10-20
 
 Checked against what attacks look like elsewhere: a month of public honeypot traffic and two

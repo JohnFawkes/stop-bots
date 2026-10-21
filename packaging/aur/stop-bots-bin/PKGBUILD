@@ -1,9 +1,9 @@
 # Maintainer: Marko Ivankovic <marko@ivankovic.me>
 pkgname=stop-bots-bin
 _pkgname=stop-bots
-pkgver=0.5.0
+pkgver=0.6.0
 pkgrel=1
-pkgdesc="A TUI and CLI that help you configure NGINX or Apache and your firewall to stop bad bots and still allow good bots (prebuilt binary)"
+pkgdesc="A TUI and CLI that help you configure NGINX, Apache or Traefik and your firewall to stop bad bots and still allow good bots (prebuilt binary)"
 # Both architectures the release workflow builds a static musl binary for.
 # Arch's $CARCH spells them the way the Rust target triples do, which is what
 # lets one package() serve both.
@@ -18,6 +18,7 @@ provides=("$_pkgname=$pkgver")
 conflicts=("$_pkgname")
 optdepends=('nginx: to apply the generated site blocking rules'
             'apache: to apply the generated site blocking rules, instead of nginx'
+            'traefik: to apply the generated blocking routers, instead of nginx'
             'nftables: to apply the generated firewall script'
             'iptables: alternative firewall backend')
 _release="$url/releases/download/v$pkgver/$_pkgname-$pkgver"
@@ -25,8 +26,8 @@ source_x86_64=("$_pkgname-$pkgver-x86_64.tar.gz::$_release-x86_64-unknown-linux-
 source_aarch64=("$_pkgname-$pkgver-aarch64.tar.gz::$_release-aarch64-unknown-linux-musl.tar.gz")
 # Written by packaging/bump.py from the .sha256 file the release workflow
 # publishes next to each tarball, rather than from a fresh download.
-sha256sums_x86_64=('82fb5fdc0f4d343cf59f2a25a08b740136017f7ad7da4acfe5177de1241031b4')
-sha256sums_aarch64=('a5e6547c736470e6557902520dc99ebd72ccada3d9aa56fc38f51fe2125b6049')
+sha256sums_x86_64=('e6877c1fa8ea54057519216192e5580279cdbb62d89aba97a28de92dcd76696d')
+sha256sums_aarch64=('3bf815ce91ca61ad201d50925be1d1cef6c56a2a3fc762ad1431686da9275f0c')
 
 package() {
   cd "$_pkgname-$pkgver-$CARCH-unknown-linux-musl"

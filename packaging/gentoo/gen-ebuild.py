@@ -105,7 +105,7 @@ RUST_MIN_VER="{rust_min_ver}"
 
 inherit cargo
 
-DESCRIPTION="TUI and CLI to stop bad bots in NGINX or Apache and the firewall"
+DESCRIPTION="TUI and CLI to stop bad bots in NGINX, Apache or Traefik and the firewall"
 HOMEPAGE="https://github.com/ivankovic/stop-bots"
 SRC_URI="
 	https://github.com/ivankovic/stop-bots/archive/v${{PV}}.tar.gz -> ${{P}}.tar.gz

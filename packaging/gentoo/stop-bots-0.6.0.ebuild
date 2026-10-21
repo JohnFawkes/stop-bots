@@ -273,7 +273,7 @@ CRATES="
 	rustls-pki-types@1.15.1
 	rustls-platform-verifier-android@0.1.1
 	rustls-platform-verifier@0.7.0
-	rustls-webpki@0.103.15
+	rustls-webpki@0.103.16
 	rustls@0.23.46
 	rustversion@1.0.23
 	ryu@1.0.23
@@ -376,7 +376,7 @@ CRATES="
 	wasm-bindgen@0.2.128
 	web-sys@0.3.105
 	web-time@1.1.0
-	webpki-root-certs@1.0.9
+	webpki-root-certs@1.0.10
 	weezl@0.1.12
 	wezterm-bidi@0.2.3
 	wezterm-blob-leases@0.1.1
@@ -426,7 +426,7 @@ RUST_MIN_VER="1.88.0"
 
 inherit cargo
 
-DESCRIPTION="TUI and CLI to stop bad bots in NGINX or Apache and the firewall"
+DESCRIPTION="TUI and CLI to stop bad bots in NGINX, Apache or Traefik and the firewall"
 HOMEPAGE="https://github.com/ivankovic/stop-bots"
 SRC_URI="
 	https://github.com/ivankovic/stop-bots/archive/v${PV}.tar.gz -> ${P}.tar.gz

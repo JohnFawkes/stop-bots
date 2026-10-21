@@ -37,8 +37,8 @@ use stop_bots::protection::Detector;
 mod common;
 use common::stop_bots_bin;
 
-const RELEASES: [&str; 7] = [
-    "0.1.0", "0.1.1", "0.2.0", "0.2.1", "0.3.0", "0.4.0", "0.5.0",
+const RELEASES: [&str; 8] = [
+    "0.1.0", "0.1.1", "0.2.0", "0.2.1", "0.3.0", "0.4.0", "0.5.0", "0.6.0",
 ];
 
 const BEGIN: &str = "# BEGIN stop-bots";

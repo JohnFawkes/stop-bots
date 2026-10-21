@@ -92,6 +92,7 @@ pub fn check_label(check: &Check) -> &'static str {
         "log-sources" => "logs",
         "port-scan-sources" => "port scans",
         "access-log-format" => "log format",
+        "access-log-user-agents" => "user agents",
         "access-log-clients" => "clients",
         "cdn-edges" => "cdn",
         "nginx-deployment" => "runtime",

@@ -418,7 +418,14 @@ pub fn app_probes(db: &Db) -> Result<crate::webapps::AppProbes> {
     }
     // Unit tests never read the host's own config: there, the root is
     // the stock one, and nothing points it elsewhere.
-    let global = if cfg!(test) {
+    let global = if server == crate::webserver::WebServer::Traefik {
+        // Traefik learns sites from Docker labels no file here names, so a
+        // request for one of those is judged against the whole host, and
+        // nothing says what any of its applications is.
+        crate::webapps::Verdicts::unknown(
+            "Traefik can serve sites no file under its root names, from Docker labels",
+        )
+    } else if cfg!(test) {
         crate::webapps::Verdicts::default()
     } else {
         global_config(server, &server.global_conf_dir(&host.root(None)))

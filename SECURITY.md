@@ -30,8 +30,8 @@ maintainer, so please treat that as the honest figure rather than a service leve
 
 ## What counts as a vulnerability here
 
-This tool writes firewall scripts and NGINX or Apache configuration on a server it has
-root-ish access to, and it runs unattended from cron. The interesting failures are therefore
+This tool writes firewall scripts and NGINX, Apache or Traefik configuration on a server it
+has root-ish access to, and it runs unattended from cron. The interesting failures are therefore
 mostly *integrity* failures, not memory safety:
 
 - **Lockout and denial of service against the operator.** A rule that blocks the
@@ -41,7 +41,7 @@ mostly *integrity* failures, not memory safety:
   way around one is in scope.
 - **Injection into generated config.** A bot name, user agent, hostname or IP address
   from a downloaded list or from a parsed log that escapes quoting and becomes a directive
-  in the generated NGINX or Apache config or firewall script. Both parsers are fed
+  in the generated NGINX, Apache or Traefik config or firewall script. Every parser is fed
   untrusted input by design.
 - **Trusting a compromised upstream list.** The bot lists and IP-range feeds are fetched
   over the network from third parties. A response that causes something worse than a bad

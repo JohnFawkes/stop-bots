@@ -133,6 +133,16 @@ pub fn apache_real_ip_config() -> String {
     )
 }
 
+/// The same for Traefik: the edges as an entrypoint's trusted proxies,
+/// from which it takes `X-Forwarded-For` as the client its access log
+/// names. Set on each entrypoint.
+pub fn traefik_real_ip_config() -> String {
+    format!(
+        "`forwardedHeaders: {{ trustedIPs: [{}] }}`",
+        RANGES.join(", ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

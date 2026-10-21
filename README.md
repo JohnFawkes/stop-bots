@@ -5,7 +5,7 @@
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](https://github.com/ivankovic/stop-bots/blob/main/LICENSE)
 
 A TUI and a CLI that help you configure your server to stop bad bots without hiding behind a
-CDN. It is a fancy UI for your existing web server (nginx or Apache) and your
+CDN. It is a fancy UI for your existing web server (nginx, Apache or Traefik) and your
 firewall (nftables or iptables). For those of us that don't want to hide behind Cloudflare and give
 one company the keys to all kingdoms.
 
@@ -51,6 +51,7 @@ And this is what gets written where:
 |---|---|
 | The blocking rule | inside each site's `server` block, between `# BEGIN stop-bots` and `# END stop-bots` |
 | Files the rule needs, when a setting needs one (`robots.txt`, rate limiting) | `/etc/stop-bots/nginx/` and NGINX's `conf.d` (for Apache, `/etc/stop-bots/apache/` and `conf-enabled`) |
+| On Traefik, both of those | one file of its own, `stop-bots.yml`, in the directory Traefik's file provider reads; no file of yours is edited |
 | The firewall script | `/etc/stop-bots/firewall.next.nft` (or `.next.sh` for iptables), copied to `firewall.nft` once applied; it only touches its own `inet stop_bots` table |
 | Settings, blocks and why each exists | `/var/lib/stop-bots/db.sqlite3` |
 
@@ -112,8 +113,8 @@ each with a checksum and a build provenance attestation
 ([verifying a download](https://github.com/ivankovic/stop-bots/blob/main/RELEASING.md#verifying-a-download)).
 Installing starts nothing.
 
-It is tested on **Debian and Ubuntu with systemd, and NGINX or Apache**. It needs `nft`, or
-`iptables-restore` and `ip6tables-restore`, for the firewall. Caddy is not supported.
+It is tested on **Debian and Ubuntu with systemd, and NGINX, Apache or Traefik**. It needs
+`nft`, or `iptables-restore` and `ip6tables-restore`, for the firewall. Caddy is not supported.
 
 NGINX is the default. On an Apache host, say so once, and enable `mod_rewrite`, which the
 blocks are written in:
@@ -125,6 +126,37 @@ sudo a2enmod rewrite
 
 Apache support is newer than NGINX's and has been tested on the Debian and Ubuntu layout
 (`/etc/apache2`). A few features are NGINX-only, rate limiting among them.
+
+On a Traefik 3 host, point it at the directory Traefik's file provider reads, and tell
+Traefik's access log to keep the user agent, which it drops by default and most detectors
+need:
+
+```
+sudo stop-bots set-web-server traefik --root /etc/traefik/dynamic
+sudo stop-bots set-log-paths --access-log /var/log/traefik/access.log
+```
+
+```yaml
+# In Traefik's static config
+accessLog:
+  filePath: /var/log/traefik/access.log
+  fields:
+    headers:
+      names:
+        User-Agent: keep
+        Referer: keep
+```
+
+It writes high-priority routers that answer a blocked request with a 403 before any site's own
+router sees it. Traefik reads the file by itself, so no reload is run. Sites from Docker labels
+get the host-wide settings; a site gets settings of its own only when its router is in a file
+under that directory. Traefik can only answer 403, and cannot serve the generated `robots.txt`
+or rate limit.
+
+**Apache and Traefik are less well tested than NGINX.** I run NGINX myself, so that is the
+backend with real traffic behind it. Apache and Traefik are tested in containers against the
+real servers, but not in daily use. If something looks wrong on either, please
+[open an issue](https://github.com/ivankovic/stop-bots/issues).
 
 ## Try it without a server
 
@@ -262,7 +294,7 @@ Each detector is a separate switch, and each block is timed and records the log 
 | Fetches no assets | off | many pages, and never a stylesheet, script or image |
 | Rotating user agent | off | many user agents from one address |
 | Crawls with no referer | off | many deep pages, never with a `Referer` |
-| Request rate | off | more than 120 requests a minute kept up for an hour, or many refusals from NGINX's rate limit; the only rate defence on Apache |
+| Request rate | off | more than 120 requests a minute kept up for an hour, or many refusals from NGINX's rate limit; the only rate defence on Apache and Traefik |
 
 The last four can catch real people, which is why they are off, and none of them ever
 blocks a verified search engine. The honeypot and robots.txt violators need the generated
@@ -317,10 +349,10 @@ The firewall script hooks `forward` as well as `input` (and `DOCKER-USER` with i
 its blocks also cover a container's published ports. `sudo stop-bots status` says whether the
 ruleset that is actually loaded does.
 
-### Caddy, Traefik, HAProxy?
+### Caddy, HAProxy?
 
 Not supported, and not on the [roadmap](https://github.com/ivankovic/stop-bots/blob/main/ROADMAP.md).
-NGINX and Apache are the two it writes config for.
+NGINX, Apache and Traefik are the three it writes config for.
 
 ### I'm behind Cloudflare, or another reverse proxy.
 

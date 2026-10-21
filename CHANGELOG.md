@@ -8,6 +8,41 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+Traefik, beside NGINX and Apache.
+
+**Going back to 0.5.0.** An NGINX or an Apache host can. A Traefik host cannot by installing
+the older release: 0.5.0 refuses a `/etc/stop-bots/host.conf` that names Traefik. First run
+`sudo stop-bots uninstall web-server` with this release, which deletes the routers file, then
+delete the `web_server` and `traefik_*` lines from `host.conf`, then install 0.5.0.
+
+### Added
+
+- **Traefik 3, beside NGINX and Apache.** `sudo stop-bots set-web-server traefik` reads the
+  routers in the directory Traefik's file provider reads (`/etc/traefik/dynamic`, or
+  `--root`) and writes `stop-bots.yml` there. That file holds routers of its own, at the
+  highest priority a router may have, which answer a blocked request with a 403 before any
+  site's router is asked. No file of yours is written, and no command is run: Traefik reads
+  the file by itself. Tested against Traefik 3.5, with the full downloaded bot lists.
+  - Sites Traefik learns from Docker labels are protected by the host-wide routers. A site
+    has settings of its own when its router is in a file under the root.
+  - Traefik cannot send any response but 403, serve the generated `robots.txt`, or rate
+    limit, and `set-robots-txt` and `set-rate-limit` refuse to turn those on. An apply
+    refuses a site with the HTTP/1.x or the old-TLS rule on, which no Traefik rule can
+    express. The bare-address rule needs nothing: Traefik answers a request for an address
+    with a 404 of its own.
+  - Both of Traefik's access log formats are read. Traefik drops the user agent and the
+    referer from them until told to keep them
+    (`accessLog.fields.headers.names.User-Agent: keep`).
+- **`status` warns when the access log names no user agent.** Not one of many recent
+  requests naming one means no bot list and no detector that reads one can see anything,
+  from a log that otherwise reads fine. It says how to fix it on each server.
+
+### Changed
+
+- **On Traefik, a request for an absent application's path is never a probe.** No file
+  says which application answers behind a router, and sites from Docker labels are in no
+  file at all, so `/wp-login.php` is never taken for a scan there.
+
 ## [0.5.0] — 2026-10-20
 
 Checked against what attacks look like elsewhere: a month of public honeypot traffic and two

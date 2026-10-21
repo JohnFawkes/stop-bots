@@ -1,0 +1,24 @@
+# The sites' routers, as an operator writes them for Traefik's file
+# provider: `test.example` over HTTP and HTTPS (on Traefik's default
+# certificate), and `api.example` over HTTP. Both hand requests to whoami
+# on 8001.
+http:
+  routers:
+    test:
+      rule: "Host(`test.example`)"
+      entryPoints: [web]
+      service: whoami
+    test-tls:
+      rule: "Host(`test.example`)"
+      entryPoints: [websecure]
+      service: whoami
+      tls: {}
+    api:
+      rule: "Host(`api.example`)"
+      entryPoints: [web]
+      service: whoami
+  services:
+    whoami:
+      loadBalancer:
+        servers:
+          - url: "http://127.0.0.1:8001"

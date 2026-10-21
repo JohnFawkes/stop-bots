@@ -5301,3 +5301,459 @@ fn apache_turns_away_old_browsers_once_the_list_is_on() {
         );
     }
 }
+
+// ---- Traefik ----
+//
+// A real Traefik 3 reading the routers file stop-bots writes, through its
+// file provider: what the generated rules turn away and let through, that
+// Traefik loads every router of them, and that its log feeds the
+// detectors. `Dockerfile.traefik` says how it is set up.
+
+fn traefik_image() -> String {
+    tagged("stop-bots-traefik")
+}
+
+fn build_traefik_image() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        with_build_lock(|| {
+            build_unless_current(&traefik_image(), || {
+                let ctx = stage_binary();
+                let out = Command::new(runtime())
+                    .args(["build", "-q", "-f", &format!("{ctx}/Dockerfile.traefik")])
+                    .args(["-t", &traefik_image(), &ctx])
+                    .output()
+                    .expect("failed to run the image build");
+                assert!(
+                    out.status.success(),
+                    "{} build (Traefik image) failed:\n{}",
+                    runtime(),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            })
+        })
+    });
+}
+
+/// A running Traefik with two sites, `test.example` over HTTP and HTTPS
+/// and `api.example` over HTTP, and stop-bots told it is Traefik's.
+/// Removed on drop.
+struct Traefik {
+    name: String,
+}
+
+/// The sites' own file, which stop-bots never writes.
+const TRAEFIK_SITES: &str = "/etc/traefik/dynamic/sites.yml";
+
+/// The file stop-bots writes.
+const TRAEFIK_ROUTERS: &str = "/etc/traefik/dynamic/stop-bots.yml";
+
+impl Traefik {
+    fn start(name: &str) -> Traefik {
+        build_traefik_image();
+        let name = scoped(name);
+        remove_container(&name);
+        let out = Command::new(runtime())
+            .args(["run", "-d", "--name", &name, &traefik_image()])
+            .output()
+            .expect("failed to start the container");
+        assert!(
+            out.status.success(),
+            "{} run failed:\n{}",
+            runtime(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let traefik = Traefik { name };
+        traefik.sh(
+            "setsid nohup whoami --port 8001 >/dev/null 2>&1 < /dev/null &\n\
+             setsid nohup traefik >/var/log/traefik/traefik.log 2>&1 < /dev/null &",
+        );
+        traefik.wait_until_serving();
+        let chosen = traefik.stop_bots("set-web-server traefik");
+        assert!(chosen.contains("Traefik"), "set-web-server said:\n{chosen}");
+        traefik.stop_bots("set-log-paths --access-log /var/log/traefik/access.log");
+        // One site per router: `test.example` has two.
+        let scanned = traefik.stop_bots("scan-sites");
+        assert!(
+            scanned.contains("Discovered 3 site(s)"),
+            "scan-sites said:\n{scanned}"
+        );
+        traefik
+    }
+
+    fn run(&self, cmd: &str) -> (bool, String, String) {
+        exec_in(&self.name, cmd)
+    }
+
+    fn sh(&self, cmd: &str) -> String {
+        sh_in(&self.name, cmd)
+    }
+
+    fn stop_bots(&self, args: &str) -> String {
+        self.sh(&format!("stop-bots {args} --db /tmp/db.sqlite3"))
+    }
+
+    /// Blocked bots, one per pattern, through the real bot-list parser:
+    /// `patterns` are JSON string bodies, escapes and all.
+    fn seed_bots(&self, patterns: &[&str]) {
+        let accepted: Vec<String> = patterns.iter().map(|p| format!("\"{p}\"")).collect();
+        let json = format!(
+            r#"[{{"id":"listed","categories":["ai"],"pattern":{{"accepted":[{}],"forbidden":[]}},"url":"https://example.invalid/listed"}}]"#,
+            accepted.join(",")
+        );
+        self.sh(&format!("cat > /tmp/bots.json <<'JSON'\n{json}\nJSON"));
+        self.stop_bots("update-bot-lists --source /tmp/bots.json");
+    }
+
+    /// `apply-blocks` as an operator runs it, and then the wait for
+    /// Traefik to read the file, which it does by itself and a moment
+    /// later.
+    fn apply(&self) -> String {
+        let said = self.stop_bots("apply-blocks");
+        self.wait_for_routers();
+        said
+    }
+
+    fn wait_until_serving(&self) {
+        for _ in 0..100 {
+            if self.status("test.example", "/", "") == "200" {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let log = self.run("cat /var/log/traefik/traefik.log").1;
+        panic!("Traefik never served test.example:\n{log}");
+    }
+
+    /// Every router Traefik has loaded from stop-bots' file, as `(name,
+    /// status, errors)`, from its API.
+    fn loaded_routers(&self) -> Vec<(String, String, String)> {
+        let (_, out, _) =
+            self.run("curl -s 'http://127.0.0.1:8080/api/http/routers?per_page=1000'");
+        let Ok(routers) = serde_json::from_str::<Vec<serde_json::Value>>(&out) else {
+            return Vec::new();
+        };
+        routers
+            .iter()
+            .filter_map(|router| {
+                let name = router["name"].as_str()?;
+                name.starts_with("stop-bots").then(|| {
+                    (
+                        name.to_string(),
+                        router["status"].as_str().unwrap_or_default().to_string(),
+                        router["error"].to_string(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Waits until the routers Traefik has loaded are the ones the file
+    /// names now, and fails unless every one of them is enabled: a router
+    /// Traefik could not read is switched off, quietly, and blocks nothing.
+    fn wait_for_routers(&self) {
+        // The names under `routers:` only: the middleware and the service
+        // are named alike, at the same depth.
+        let (_, written, _) = self.run(&format!(
+            "awk '/^  [a-z]/ {{ routers = ($1 == \"routers:\") }} \
+             routers && /^    stop-bots[^ ]*:$/ {{ sub(\":\", \"\", $1); print $1 }}' {TRAEFIK_ROUTERS}"
+        ));
+        let mut written: Vec<String> = written
+            .lines()
+            .map(|name| format!("{}@file", name.trim()))
+            .collect();
+        written.sort();
+        let mut loaded = Vec::new();
+        for _ in 0..100 {
+            loaded = self.loaded_routers();
+            let mut names: Vec<String> = loaded.iter().map(|(name, ..)| name.clone()).collect();
+            names.sort();
+            if names == written {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let names: Vec<&str> = loaded.iter().map(|(name, ..)| name.as_str()).collect();
+        assert_eq!(
+            names.len(),
+            written.len(),
+            "Traefik loaded {loaded:?}, the file names {written:?}"
+        );
+        for (name, status, error) in &loaded {
+            assert_eq!(status, "enabled", "Traefik could not use {name}: {error}");
+        }
+    }
+
+    /// The status `host` answers `path` with over HTTP, `000` for no
+    /// answer.
+    fn status(&self, host: &str, path: &str, curl_args: &str) -> String {
+        let (_, stdout, _) = self.run(&format!(
+            "curl -s -o /dev/null -w '%{{http_code}}' -H 'Host: {host}' {curl_args} http://127.0.0.1{path}"
+        ));
+        stdout.trim().to_string()
+    }
+
+    /// The same over HTTPS, on Traefik's own certificate.
+    fn status_tls(&self, host: &str, path: &str, curl_args: &str) -> String {
+        let (_, stdout, _) = self.run(&format!(
+            "curl -sk -o /dev/null -w '%{{http_code}}' --resolve {host}:443:127.0.0.1 \
+             {curl_args} https://{host}{path}"
+        ));
+        stdout.trim().to_string()
+    }
+}
+
+impl Drop for Traefik {
+    fn drop(&mut self) {
+        remove_container(&self.name);
+    }
+}
+
+#[test]
+fn traefik_turns_away_a_blocked_bot_and_serves_everyone_else() {
+    if !enabled() {
+        return;
+    }
+    let traefik = Traefik::start("sb-traefik-blocks");
+    let sites = traefik.sh(&format!("cat {TRAEFIK_SITES}"));
+    traefik.seed_bots(&["EvilBot"]);
+    traefik.apply();
+
+    let cases = [
+        ("test.example", BAD_AGENT, "403", "a listed bot"),
+        (
+            "test.example",
+            "-A 'evilbot'",
+            "403",
+            "case-insensitive, as NGINX's `~*` is",
+        ),
+        ("test.example", BROWSER, "200", "a browser"),
+        ("api.example", BAD_AGENT, "403", "the other site"),
+        ("nobody.example", BAD_AGENT, "403", "a host no file names"),
+        (
+            "nobody.example",
+            BROWSER,
+            "404",
+            "nor is anything else changed there",
+        ),
+    ];
+    for (host, agent, expected, what) in cases {
+        assert_eq!(traefik.status(host, "/", agent), expected, "{what}");
+    }
+    assert_eq!(
+        traefik.status_tls("test.example", "/", BAD_AGENT),
+        "403",
+        "over TLS"
+    );
+    assert_eq!(
+        traefik.status_tls("test.example", "/", BROWSER),
+        "200",
+        "a browser over TLS"
+    );
+    assert_eq!(
+        traefik.sh(&format!("cat {TRAEFIK_SITES}")),
+        sites,
+        "the sites' own file was written"
+    );
+}
+
+/// What Traefik turns away it also logs, with the user agent, which is
+/// what the detectors and the tally of who was turned away read. And a
+/// probe in that log is blocked, through Traefik's own `X-Forwarded-For`
+/// handling; see `Dockerfile.traefik`.
+#[test]
+fn traefik_access_log_is_read_by_the_detectors() {
+    if !enabled() {
+        return;
+    }
+    let traefik = Traefik::start("sb-traefik-log");
+    traefik.seed_bots(&["EvilBot"]);
+    traefik.apply();
+    let from = |address: &str| format!("-H 'X-Forwarded-For: {address}'");
+    traefik.status(
+        "test.example",
+        "/",
+        &format!("{} {BAD_AGENT}", from("203.0.113.8")),
+    );
+    traefik.status(
+        "test.example",
+        "/",
+        &format!("{} -A 'TraefikLogProbe/1.0'", from("203.0.113.9")),
+    );
+    traefik.status("test.example", "/.env", &from("203.0.113.10"));
+
+    let log = traefik.sh("cat /var/log/traefik/access.log");
+    assert!(
+        log.lines().any(|line| line.contains("203.0.113.8")
+            && line.contains(" 403 ")
+            && line.contains("EvilBot")),
+        "the refusal is not in the log:\n{log}"
+    );
+    let recorded = traefik.stop_bots("record-access-stats");
+    let stats = traefik.stop_bots("list-access-stats");
+    assert!(
+        stats.contains("TraefikLogProbe/1.0"),
+        "record-access-stats said:\n{recorded}\nlist-access-stats said:\n{stats}"
+    );
+    let detected = traefik.stop_bots("run-detector probe-paths");
+    let rules = traefik.stop_bots("list-firewall-rules");
+    assert!(
+        rules.contains("203.0.113.10") && !rules.contains("203.0.113.9"),
+        "run-detector probe-paths said:\n{detected}\nlist-firewall-rules said:\n{rules}"
+    );
+}
+
+/// A site with settings of its own gets routers of its own, and the
+/// host-wide ones leave it to them.
+#[test]
+fn traefik_exempts_a_path_on_one_site_only() {
+    if !enabled() {
+        return;
+    }
+    let traefik = Traefik::start("sb-traefik-exempt");
+    traefik.seed_bots(&["EvilBot"]);
+    traefik.stop_bots("add-exempt-path --site test.example --path /open/");
+    traefik.apply();
+
+    let cases = [
+        ("test.example", "/open/x", "200", "the exempt path"),
+        (
+            "test.example",
+            "/OPEN/x",
+            "200",
+            "ignoring case, as NGINX's exemption does",
+        ),
+        ("test.example", "/", "403", "the rest of the site"),
+        (
+            "api.example",
+            "/open/x",
+            "403",
+            "the same path on the other site",
+        ),
+    ];
+    for (host, path, expected, what) in cases {
+        assert_eq!(traefik.status(host, path, BAD_AGENT), expected, "{what}");
+    }
+    assert_eq!(
+        traefik.status_tls("test.example", "/open/x", BAD_AGENT),
+        "200",
+        "the exempt path over TLS"
+    );
+    let status = traefik.stop_bots("status");
+    assert!(
+        status.contains("[OK] Traefik routers are applied"),
+        "status said:\n{status}"
+    );
+}
+
+#[test]
+fn traefik_turns_away_a_request_without_a_user_agent_where_asked() {
+    if !enabled() {
+        return;
+    }
+    let traefik = Traefik::start("sb-traefik-rules");
+    traefik.stop_bots("set-site-rule --site test.example --rule no-user-agent --enabled true");
+    traefik.apply();
+
+    let without = "-H 'User-Agent:'";
+    assert_eq!(traefik.status("test.example", "/", without), "403");
+    assert_eq!(traefik.status("test.example", "/", BROWSER), "200");
+    assert_eq!(
+        traefik.status("api.example", "/", without),
+        "200",
+        "the other site"
+    );
+    // ACME's path stays open whatever the rule: whoami answers it.
+    assert_eq!(
+        traefik.status("test.example", "/.well-known/acme-challenge/x", without),
+        "200"
+    );
+}
+
+/// Patterns with what YAML, Traefik's rule parser or Go's regular
+/// expressions read differently from PCRE: each loads, and each turns away
+/// exactly the client it names. One router Traefik could not read would
+/// turn away nobody. (A bare `"` never gets this far: the fetch leaves it
+/// out for every server.)
+#[test]
+fn traefik_reads_every_character_a_pattern_carries() {
+    if !enabled() {
+        return;
+    }
+    let traefik = Traefik::start("sb-traefik-hostile");
+    traefik.seed_bots(&[
+        "It's\\\\ a\\\\ Bot",
+        "Back`tick",
+        "caf\\\\é",
+        "Dollar\\\\$Bot",
+        "Brace\\\\{Bot",
+        "Repeat{2}Bot",
+    ]);
+    traefik.apply();
+    let cases = [
+        ("It's a Bot/1", "403"),
+        ("Back`tick/1", "403"),
+        ("CAFÉ/1", "403"),
+        ("Dollar$Bot/1", "403"),
+        ("Brace{Bot/1", "403"),
+        ("RepeattBot/1", "403"),
+        ("RepeatBot/1", "200"),
+        ("Mozilla/5.0 Firefox/130.0", "200"),
+    ];
+    for (agent, expected) in cases {
+        assert_eq!(
+            traefik.status("test.example", "/", &format!("-A {}", sh_quoted(agent))),
+            expected,
+            "{agent}"
+        );
+    }
+}
+
+/// The same under a real Traefik, through Go's regular expressions.
+#[test]
+fn traefik_turns_away_old_browsers_once_the_list_is_on() {
+    if !enabled() {
+        return;
+    }
+    let traefik = Traefik::start("sb-traefik-old-browsers");
+    traefik.stop_bots("set-old-browsers --enabled true");
+    traefik.apply();
+
+    for (user_agent, expected, what) in OLD_AND_NEW {
+        assert_eq!(
+            traefik.status(
+                "test.example",
+                "/",
+                &format!("-A {}", sh_quoted(user_agent))
+            ),
+            expected,
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn traefik_uninstall_takes_the_routers_away() {
+    if !enabled() {
+        return;
+    }
+    let traefik = Traefik::start("sb-traefik-uninstall");
+    traefik.seed_bots(&["EvilBot"]);
+    traefik.apply();
+    assert_eq!(traefik.status("test.example", "/", BAD_AGENT), "403");
+
+    let said = traefik.stop_bots("uninstall web-server");
+
+    traefik.sh(&format!("test ! -e {TRAEFIK_ROUTERS}"));
+    for _ in 0..100 {
+        if traefik.loaded_routers().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        traefik.status("test.example", "/", BAD_AGENT),
+        "200",
+        "uninstall said:\n{said}"
+    );
+}

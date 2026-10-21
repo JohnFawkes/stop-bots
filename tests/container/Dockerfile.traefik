@@ -1,0 +1,31 @@
+# A real Traefik, for the Traefik backend's tests: the same idea as
+# `Dockerfile`, which does this for NGINX. Ubuntu 24.04 for the same reason
+# — the binary is built on the host and copied in — with Traefik's own
+# binary, and a backend for its routers to hand requests to, copied from
+# their images.
+FROM docker.io/library/traefik:v3.5 AS traefik
+FROM docker.io/traefik/whoami:v1.11 AS whoami
+FROM ubuntu:24.04
+
+RUN apt-get update -qq && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=traefik /usr/local/bin/traefik /usr/local/bin/traefik
+COPY --from=whoami /whoami /usr/local/bin/whoami
+
+# Traefik as an operator runs it: a file provider directory for the
+# routers, and an access log that keeps the two headers the detectors read,
+# which Traefik drops unless told. It trusts loopback's `X-Forwarded-For`,
+# as it would a proxy's, so a test can make it log a public client: every
+# request here comes from loopback, which the detectors rightly never
+# count. The API answers on 8080, which is how a test learns that Traefik
+# has read a file, and whether it could.
+COPY traefik.yml /etc/traefik/traefik.yml
+COPY traefik-sites.yml /etc/traefik/dynamic/sites.yml
+RUN mkdir -p /var/log/traefik /etc/stop-bots
+
+COPY stop-bots /usr/local/bin/stop-bots
+
+CMD ["sleep", "infinity"]

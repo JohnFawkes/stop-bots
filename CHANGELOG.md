@@ -8,7 +8,15 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-10-21
+
 Traefik, beside NGINX and Apache.
+
+**Before upgrading:** nothing to do. The database schema is unchanged, and an NGINX or Apache
+host is configured as before.
+
+**After upgrading:** `stop-bots status` has one new check, which warns when the access log
+names no user agent. Nothing else changes on an NGINX or Apache host.
 
 **Going back to 0.5.0.** An NGINX or an Apache host can. A Traefik host cannot by installing
 the older release: 0.5.0 refuses a `/etc/stop-bots/host.conf` that names Traefik. First run
@@ -2692,7 +2700,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ivankovic/stop-bots/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ivankovic/stop-bots/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ivankovic/stop-bots/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ivankovic/stop-bots/compare/v0.2.1...v0.3.0

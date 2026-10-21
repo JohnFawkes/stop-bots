@@ -201,7 +201,9 @@ fn json_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Op
 }
 
 /// Parses a line written by a JSON `log_format`, keyed by the NGINX
-/// variable names such a format is built from.
+/// variable names such a format is built from — or by Traefik's JSON
+/// access log, whose keys are its own (`ClientHost`, `DownstreamStatus`,
+/// `RequestPath`, `request_User-Agent`) and fixed.
 ///
 /// There is no configuration for the key names, and that is a judgement
 /// rather than an omission: a JSON `log_format` is written by naming
@@ -216,8 +218,16 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
     let LogObject(fields) = serde_json::from_str(line).ok()?;
     let obj = &fields;
 
-    let ip: IpAddr = json_field(obj, "remote_addr")?.parse().ok()?;
-    let status: u16 = json_field(obj, "status")?.parse().ok()?;
+    let ip: IpAddr = json_field(obj, "remote_addr")
+        .or_else(|| json_field(obj, "ClientHost"))?
+        .parse()
+        .ok()?;
+    // What the client was sent: Traefik's `OriginStatus` is what the
+    // service behind it answered, which a refused request never reached.
+    let status: u16 = json_field(obj, "status")
+        .or_else(|| json_field(obj, "DownstreamStatus"))?
+        .parse()
+        .ok()?;
 
     // Three variables can carry the request target, in descending order of
     // faithfulness. `$request_uri` is the original target, query and all.
@@ -231,21 +241,32 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
             json_field(obj, "request")
                 .and_then(|request| request.split_whitespace().nth(1).map(str::to_string))
         })
-        .or_else(|| json_field(obj, "uri"))?;
+        .or_else(|| json_field(obj, "uri"))
+        // Traefik's: the target as sent, query and all.
+        .or_else(|| json_field(obj, "RequestPath"))?;
     // Strip the query for the same reason as the combined parser: `/foo?a=1`
     // and `/foo?a=2` are one path as far as "is this a real URL here" goes.
     let path = target.split('?').next().unwrap_or(&target).to_string();
     // `$request_method`, or the first word of a `$request` that has the
     // whole triple. A format with neither cannot say, which is `None`.
-    let method = json_field(obj, "request_method").or_else(|| {
-        let request = json_field(obj, "request")?;
-        let mut words = request.split_whitespace();
-        let method = words.next()?;
-        words.next().is_some().then(|| method.to_string())
-    });
-    // `$request` when the format has it; otherwise the target alone, which
-    // is where nearly every payload is anyway.
-    let request = json_field(obj, "request").unwrap_or_else(|| target.clone());
+    let method = json_field(obj, "request_method")
+        .or_else(|| json_field(obj, "RequestMethod"))
+        .or_else(|| {
+            let request = json_field(obj, "request")?;
+            let mut words = request.split_whitespace();
+            let method = words.next()?;
+            words.next().is_some().then(|| method.to_string())
+        });
+    // `$request` when the format has it; Traefik's three parts of it when
+    // that is what is logged; otherwise the target alone, which is where
+    // nearly every payload is anyway.
+    let request = json_field(obj, "request")
+        .or_else(|| {
+            let method = json_field(obj, "RequestMethod")?;
+            let protocol = json_field(obj, "RequestProtocol")?;
+            Some(format!("{method} {target} {protocol}"))
+        })
+        .unwrap_or_else(|| target.clone());
 
     Some(ParsedLine {
         ip,
@@ -254,28 +275,35 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
         path,
         method,
         request,
-        referer: json_field(obj, "http_referer"),
+        // Traefik names a header it keeps `request_<Header>`, and keeps
+        // none it is not told to.
+        referer: json_field(obj, "http_referer").or_else(|| json_field(obj, "request_Referer")),
         // An absent user agent is an empty one for every caller here, so
         // unlike the referer this needs no third state: nothing draws a
         // conclusion from "the format doesn't log it" that differs from
         // what it does with "the client didn't send one".
-        user_agent: json_field(obj, "http_user_agent").unwrap_or_default(),
+        user_agent: json_field(obj, "http_user_agent")
+            .or_else(|| json_field(obj, "request_User-Agent"))
+            .unwrap_or_default(),
         // `$time_iso8601` or `$time_local`, whichever the format logs.
         // Neither is required: a line without one parses, undated.
         time: json_field(obj, "time_iso8601")
             .and_then(|t| crate::logtime::iso8601(&t))
             .or_else(|| {
                 json_field(obj, "time_local").and_then(|t| crate::logtime::nginx_time_local(&t))
-            }),
+            })
+            .or_else(|| json_field(obj, "StartUTC").and_then(|t| crate::logtime::iso8601(&t))),
         // `$host` or `$http_host`, when the format logs either: what tells
         // which site a request was for (see [`crate::services::Hosted`]).
-        host: json_field(obj, "host").or_else(|| json_field(obj, "http_host")),
+        host: json_field(obj, "host")
+            .or_else(|| json_field(obj, "http_host"))
+            .or_else(|| json_field(obj, "RequestHost")),
         trailing: Vec::new(),
     })
 }
 
 /// Every key [`parse_json_line`] reads.
-const JSON_FIELDS: [&str; 12] = [
+const JSON_FIELDS: [&str; 21] = [
     "remote_addr",
     "status",
     "request_uri",
@@ -288,6 +316,15 @@ const JSON_FIELDS: [&str; 12] = [
     "time_local",
     "host",
     "http_host",
+    "ClientHost",
+    "DownstreamStatus",
+    "RequestPath",
+    "RequestMethod",
+    "RequestProtocol",
+    "request_Referer",
+    "request_User-Agent",
+    "StartUTC",
+    "RequestHost",
 ];
 
 /// A JSON log line's top-level object, refused if it names any of
@@ -1505,6 +1542,10 @@ pub struct Survey {
     /// Of `public`, lines from a CDN's edge addresses (see [`crate::cdn`]):
     /// most of them means NGINX is logging the CDN, not the visitor.
     pub cdn: usize,
+    /// Parsed lines that name a user agent. None of many means the log
+    /// does not record one — Traefik's, until told to keep the header —
+    /// and every detector and tally that reads one is blind.
+    pub with_user_agent: usize,
     /// The first line that did not parse, as it is safe to show.
     pub unparsed_sample: Option<String>,
     /// Per agent, per address: `(refused, served)`. Kept by address until
@@ -1555,6 +1596,9 @@ impl Survey {
             return;
         };
         self.counts.parsed += 1;
+        if !line.user_agent.is_empty() && line.user_agent != "-" {
+            self.with_user_agent += 1;
+        }
         if is_local_or_private(&line.ip) {
             return;
         }
@@ -1801,6 +1845,36 @@ mod tests {
         assert_eq!(parsed.path, "/wp-login.php");
         assert_eq!(parsed.referer.as_deref(), Some("https://ref.example/from"));
         assert_eq!(parsed.user_agent, "Mozilla/5.0");
+    }
+
+    /// Both of Traefik's formats, as Traefik 3.5 wrote them for one request
+    /// a router of this project's refused, with the user agent and the
+    /// referer kept.
+    #[test]
+    fn traefik_logs_parse_in_either_of_its_formats() {
+        let common = "203.0.113.5 - - [21/Oct/2026:13:47:35 +0000] \"GET /x?a=1 HTTP/1.1\" 403 9 \
+                      \"https://ref.example/\" \"BadBot\" 2 \"stop-bots@file\" \"-\" 0ms";
+        let json = r#"{"ClientAddr":"203.0.113.5:39292","ClientHost":"203.0.113.5","ClientPort":"39292","ClientUsername":"-","DownstreamContentSize":9,"DownstreamStatus":403,"Duration":37485,"OriginContentSize":0,"OriginDuration":0,"OriginStatus":0,"RequestAddr":"a.example","RequestCount":2,"RequestHost":"a.example","RequestMethod":"GET","RequestPath":"/x?a=1","RequestPort":"-","RequestProtocol":"HTTP/1.1","RequestScheme":"http","RouterName":"stop-bots@file","StartLocal":"2026-10-21T13:47:35.051139665Z","StartUTC":"2026-10-21T13:47:35.051139665Z","entryPointName":"web","level":"info","msg":"","request_Referer":"https://ref.example/","request_User-Agent":"BadBot","time":"2026-10-21T13:47:35Z"}"#;
+        let expected = |host: Option<&str>, trailing: &[&str]| ParsedLine {
+            ip: "203.0.113.5".parse().unwrap(),
+            status: 403,
+            query: true,
+            path: "/x".to_string(),
+            method: Some("GET".to_string()),
+            request: "GET /x?a=1 HTTP/1.1".to_string(),
+            referer: Some("https://ref.example/".to_string()),
+            user_agent: "BadBot".to_string(),
+            time: crate::logtime::iso8601("2026-10-21T13:47:35Z"),
+            host: host.map(str::to_string),
+            trailing: trailing.iter().map(|f| f.to_string()).collect(),
+        };
+        let cases = [
+            ("common", common, expected(None, &["stop-bots@file", "-"])),
+            ("json", json, expected(Some("a.example"), &[])),
+        ];
+        for (what, line, expected) in cases {
+            assert_eq!(parse_line(line), Some(expected), "{what}: {line}");
+        }
     }
 
     #[test]

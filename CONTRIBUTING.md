@@ -423,9 +423,10 @@ Some directories don't exist yet but should be created if the need arises.
         |                    compiled-in list of old browser agents behind its own switch
         |- fetch.rs       <- The one place an outbound HTTP request is made
         |- refresh.rs     <- "Update everything": every downloadable list as fetch-then-store, one at a time
-        |- webserver.rs   <- What NGINX and Apache share: the policy, the apply (test, put back, reload), uninstall
+        |- webserver.rs   <- What the web servers share: the policy, the apply (test, put back, reload), uninstall
         |- nginx.rs       <- NGINX: finding server blocks, rendering and placing its blocks and generated files
         |- apache.rs      <- Apache: finding <VirtualHost>s, its mod_rewrite blocks, trust file and robots.txt
+        |- traefik.rs     <- Traefik: finding routers' hosts, and the routers file it writes beside them
         |- hostconf.rs    <- /etc/stop-bots/host.conf: the web server, its commands and root, the logs
         |- logpaths.rs    <- Where this host's SSH and access logs are, remembered
         |- logscan.rs     <- One pass over the logs: plan, read (no Db), store
@@ -435,7 +436,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- evidence.rs    <- What each detector counts, and the one decision over it
         |- sshlog.rs      <- SSH log parsing and scan detection
         |- portscan.rs    <- The port-scan detector: trap ports, what listens, the kernel log's lines
-        |- accesslog.rs   <- Access log parsing (NGINX's and Apache's), the web-log detectors, UA tallying
+        |- accesslog.rs   <- Access log parsing (NGINX's, Apache's and Traefik's), the web-log detectors, UA tallying
         |- injection.rs   <- Recognising an exploit payload in a logged request
         |- protocol.rs    <- Recognising a request that is not for a page: another protocol, or a proxy
         |- accessstats.rs <- What one pass tallied into the access-log UA stats

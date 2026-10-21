@@ -1828,6 +1828,15 @@ fn cloud_port_80_line(open: bool) -> &'static str {
 
 fn set_robots_txt(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
     let db = open_db(db_path)?;
+    // Refused rather than stored where nothing would serve it, as a rate
+    // limit is.
+    if let Some(why) = host_settings()?
+        .web_server()
+        .without_robots_txt()
+        .filter(|_| enabled)
+    {
+        anyhow::bail!("{why}");
+    }
     db.set_serve_robots_txt(enabled)?;
     say!(
         "robots.txt generation {}",
@@ -2852,6 +2861,11 @@ fn store_server_settings(
             &mut host.apache_reload_command,
             &mut host.apache_root,
         ),
+        webserver::WebServer::Traefik => (
+            &mut host.traefik_test_command,
+            &mut host.traefik_reload_command,
+            &mut host.traefik_root,
+        ),
     };
 
     if reset {
@@ -2896,8 +2910,14 @@ fn store_server_settings(
 /// The commands and root `host` resolves for its web server.
 fn print_server_settings(host: &stop_bots::hostconf::HostConf) -> Result<()> {
     let commands = webserver::ServerCommands::from_host(host)?;
-    say!("Test command:   {}", commands.test.join(" "));
-    say!("Reload command: {}", commands.reload.join(" "));
+    // Traefik's defaults: it has no config test, and reads its file
+    // provider's directory again by itself.
+    let shown = |argv: &[String]| match argv {
+        [] => "(none)".to_string(),
+        argv => argv.join(" "),
+    };
+    say!("Test command:   {}", shown(&commands.test));
+    say!("Reload command: {}", shown(&commands.reload));
     say!("Config root:    {}", host.root(None).display());
     Ok(())
 }
@@ -2907,6 +2927,13 @@ fn set_block_response(db_path: Option<PathBuf>, response: BlockResponseArg) -> R
     let response: stop_bots::db::BlockResponse = response.into();
     db.set_block_response(response)?;
     say!("Block response set to {}", response.label());
+    let server = host_settings()?.web_server();
+    if let Some(code) = server.instead_of(response) {
+        say!(
+            "{} cannot send that: a blocked request gets a plain {code} there.",
+            server.label()
+        );
+    }
     // Nothing on disk has changed yet, and silently leaving that implicit
     // is exactly how an admin ends up believing 444 is live while every
     // site still returns 403.

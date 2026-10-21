@@ -4472,6 +4472,219 @@ fn apache_uninstall_takes_a_prefix_back_to_how_it_was() {
     }
 }
 
+// ---- Traefik ----
+//
+// The same binary driving a fake Traefik file provider directory: what is
+// written, that nothing is run, and what is refused. The container suite
+// runs the real Traefik.
+
+/// Two routers of a file provider's, one for `a.example` and one for
+/// `b.example` and its `www`.
+const TRAEFIK_SITES: &str = "http:\n  routers:\n    a:\n      rule: \"Host(`a.example`)\"\n      service: app\n    b:\n      rule: \"Host(`b.example`) || Host(`www.b.example`)\"\n      service: app\n";
+
+impl Fixture {
+    /// A Traefik file provider directory in this fixture, holding
+    /// [`TRAEFIK_SITES`] as `sites.yml`, and Traefik chosen in its host
+    /// settings. Returns the root and the sites file.
+    fn traefik(&self) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = self._tmp.path().join("traefik/dynamic");
+        fs::create_dir_all(&root).unwrap();
+        let sites = root.join("sites.yml");
+        fs::write(&sites, TRAEFIK_SITES).unwrap();
+        fs::write(
+            self.host_conf(),
+            format!("web_server = traefik\ntraefik_root = {}\n", root.display()),
+        )
+        .unwrap();
+        (root, sites)
+    }
+}
+
+/// Traefik reads its file provider's directory again by itself: an apply
+/// writes the routers file beside the sites and runs nothing, and the
+/// operator's own file is left as it was.
+#[test]
+fn traefik_apply_writes_its_routers_file_and_runs_nothing() {
+    let fx = Fixture::new();
+    let (root, sites) = fx.traefik();
+    let (bin, calls) = fake_tools(fx._tmp.path());
+    fx.seed_bots();
+    fx.run(&["scan-sites"])
+        .stdout(predicate::str::contains("Discovered 2 site(s)"));
+
+    let out = fx.apply_with(&bin).success().get_output().stdout.clone();
+
+    let routers = fs::read_to_string(root.join("stop-bots.yml")).unwrap_or_default();
+    assert!(
+        routers.contains("    stop-bots:\n      rule: '")
+            && routers.contains("|zmap-proxy-probe)`"),
+        "the host-wide router should carry the bot list; routers file was:\n{routers}"
+    );
+    assert_eq!(fs::read_to_string(&sites).unwrap(), TRAEFIK_SITES);
+    let log = fs::read_to_string(&calls).unwrap_or_default();
+    assert!(log.is_empty(), "ran: {log}");
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains("NGINX"), "apply printed:\n{out}");
+}
+
+#[test]
+fn traefik_preview_names_traefik_and_its_routers_file() {
+    let fx = Fixture::new();
+    let (root, _) = fx.traefik();
+    fx.seed_bots();
+    fx.run(&["scan-sites"]);
+
+    let preview = fx
+        .run(&["apply-blocks", "--dry-run"])
+        .get_output()
+        .stdout
+        .clone();
+
+    let preview = String::from_utf8(preview).unwrap();
+    let routers = root.join("stop-bots.yml");
+    assert!(
+        preview.contains("Traefik: 1 file(s) would change")
+            && preview.contains(routers.to_str().unwrap())
+            && !preview.contains("NGINX"),
+        "preview was:\n{preview}"
+    );
+    assert!(!routers.exists(), "a dry run wrote the routers file");
+}
+
+#[test]
+fn traefik_refuses_what_it_cannot_do() {
+    let fx = Fixture::new();
+    fx.traefik();
+    for (args, expected) in [
+        (
+            &["set-rate-limit", "--enabled", "true"][..],
+            "Traefik limits rates only in a middleware",
+        ),
+        (
+            &["set-robots-txt", "--enabled", "true"],
+            "Traefik serves no files",
+        ),
+    ] {
+        fx.cmd(args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(expected));
+    }
+    fx.run(&["set-robots-txt", "--enabled", "false"]);
+    fx.run(&["set-block-response", "--response", "teapot"])
+        .stdout(predicate::str::contains(
+            "Traefik cannot send that: a blocked request gets a plain 403 there",
+        ));
+}
+
+/// No Traefik rule can tell HTTP versions apart, so a site with the
+/// HTTP/1.x rule on would be told it is protected by a rule that does
+/// nothing.
+#[test]
+fn traefik_refuses_a_site_with_a_rule_it_cannot_express() {
+    let fx = Fixture::new();
+    let (root, _) = fx.traefik();
+    fx.seed_bots();
+    fx.run(&["scan-sites"]);
+    fx.run(&[
+        "set-site-rule",
+        "--site",
+        "b.example",
+        "--rule",
+        "http-1x",
+        "--enabled",
+        "true",
+    ]);
+
+    fx.cmd(&["apply-blocks"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("b.example"))
+        .stderr(predicate::str::contains("Switch it off for the site"));
+    assert!(!root.join("stop-bots.yml").exists());
+}
+
+#[test]
+fn set_web_server_traefik_shows_that_it_runs_no_command() {
+    let fx = Fixture::new();
+    let root = fx._tmp.path().join("dynamic");
+    fs::create_dir_all(&root).unwrap();
+    fx.run(&[
+        "set-web-server",
+        "traefik",
+        "--root",
+        root.to_str().unwrap(),
+    ])
+    .stdout(predicate::str::contains("Web server:     Traefik"))
+    .stdout(predicate::str::contains("Test command:   (none)"))
+    .stdout(predicate::str::contains("Reload command: (none)"));
+    let host = fs::read_to_string(fx.host_conf()).unwrap();
+    assert!(
+        host.contains("web_server = traefik") && host.contains("traefik_root = "),
+        "host.conf:\n{host}"
+    );
+}
+
+/// `uninstall web-server` on a Traefik host deletes the routers file and
+/// nothing else of the directory. Under `--prefix`, which runs no system
+/// program.
+#[test]
+fn traefik_uninstall_takes_the_routers_file_away() {
+    let tmp = tempfile::tempdir().unwrap();
+    let prefix = tmp.path();
+    let host_conf = prefix.join("etc/stop-bots/host.conf");
+    let db = prefix.join("var/lib/stop-bots/db.sqlite3");
+    let run = |args: &[&str]| {
+        stop_bots_bin()
+            .env("STOP_BOTS_HOST_CONF", &host_conf)
+            .args(args)
+            .args(["--db", db.to_str().unwrap()])
+            .assert()
+            .success()
+    };
+    let root = prefix.join("etc/traefik/dynamic");
+    fs::create_dir_all(&root).unwrap();
+    let sites = root.join("sites.yml");
+    fs::write(&sites, TRAEFIK_SITES).unwrap();
+    fs::create_dir_all(host_conf.parent().unwrap()).unwrap();
+    fs::write(
+        &host_conf,
+        "web_server = traefik\ntraefik_root = /etc/traefik/dynamic\n",
+    )
+    .unwrap();
+    run(&[
+        "update-bot-lists",
+        "--source",
+        "tests/fixtures/botlists/well-known-bots-sample.json",
+    ]);
+    run(&[
+        "apply-blocks",
+        "--root",
+        root.to_str().unwrap(),
+        "--no-reload",
+    ]);
+    let routers = root.join("stop-bots.yml");
+    assert!(routers.exists(), "nothing was applied");
+
+    let out = run(&[
+        "uninstall",
+        "web-server",
+        "--prefix",
+        prefix.to_str().unwrap(),
+    ]);
+
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert!(
+        !routers.exists(),
+        "the routers file is still there:\n{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(&sites).unwrap(),
+        TRAEFIK_SITES,
+        "{stdout}"
+    );
+}
+
 // ---- auto-apply ----
 
 /// The switch itself: off by default, settable, and readable back.

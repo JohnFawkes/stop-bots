@@ -33,6 +33,12 @@ eventually ask for, with the reason it isn't there.
   default and the manual `c` toggle.
 * **No quit confirmation.** `q` on the Dashboard exits immediately, which is
   what the README promises.
+* **Nothing checks that Traefik reads the root.** `status` says the routers are
+  applied once `stop-bots.yml` is current, whether or not the file provider's
+  `directory` is that root: Traefik's static config is rarely on this host's
+  path (it is in a container), and its API, which would say, is often off.
+* **A Traefik site from a Docker label has no settings of its own** unless the
+  file with the label is under the root. The host-wide routers protect it.
 
 ## Blocked on machinery this codebase doesn't have
 

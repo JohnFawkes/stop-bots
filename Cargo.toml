@@ -13,7 +13,7 @@ authors = ["Marko Ivankovic <marko@ivankovic.me>"]
 # "only" to match the header on every source file, which grants
 # "version 3 of the License" and no later version.
 license = "AGPL-3.0-only"
-description = "A TUI and CLI that help you configure your server to stop bad bots without hiding behind a CDN. Works with NGINX or Apache, and nftables or iptables."
+description = "A TUI and CLI that help you configure your server to stop bad bots without hiding behind a CDN. Works with NGINX, Apache or Traefik, and nftables or iptables."
 repository = "https://github.com/ivankovic/stop-bots"
 homepage = "https://github.com/ivankovic/stop-bots"
 readme = "README.md"
@@ -64,10 +64,10 @@ priority = "optional"
 extended-description = """\
 A TUI and a CLI that help you configure your server to stop bad bots \
 without hiding behind a CDN. It classifies known bots by category and \
-blocks them in your NGINX or Apache config, and writes an nftables or iptables \
+blocks them in your NGINX, Apache or Traefik config, and writes an nftables or iptables \
 script that blocks countries, datacenter ranges and addresses caught scanning \
 your logs, recording why each one is blocked. For Debian and Ubuntu with \
-systemd, and NGINX or Apache. Nothing is applied without being asked."""
+systemd, and NGINX, Apache or Traefik. Nothing is applied without being asked."""
 
 # Empty, not "$auto". The release build targets musl and links statically, so
 # there is no libc6 to depend on -- which is the whole reason for that target:
@@ -119,7 +119,7 @@ assets = [
 ratatui = "0.30"
 crossterm = { version = "0.29", features = ["event-stream"] }
 
-# For walking the NGINX and Apache config trees
+# For walking the NGINX, Apache and Traefik config trees
 walkdir = "2"
 
 # For error handling

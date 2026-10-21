@@ -71,13 +71,14 @@ falling back to a per-user location if that is not writable";
 
 /// Help text shared by every `--root` flag.
 pub(crate) const ROOT_HELP: &str = "The web server's config root. Defaults to the one stored by \
-`set-web-server --root`, else /etc/nginx, or /etc/apache2 for Apache";
+`set-web-server --root`, else /etc/nginx, /etc/apache2 for Apache, or /etc/traefik/dynamic for \
+Traefik's file provider";
 
 /// Help text shared by every detector subcommand's `--access-log`.
 pub(crate) const ACCESS_LOG_HELP: &str = "Read only this access log. Without it, the stored one \
-(`set-log-paths`) is read, else /var/log/nginx/access.log, or for Apache \
-/var/log/apache2/access.log (/var/log/httpd/access_log in RHEL's /etc/httpd), and with it \
-every other access log the web server's config names";
+(`set-log-paths`) is read, else /var/log/nginx/access.log, for Apache \
+/var/log/apache2/access.log (/var/log/httpd/access_log in RHEL's /etc/httpd), or for Traefik \
+/var/log/traefik/access.log, and with it every other access log the web server's config names";
 
 /// Help text shared by `status --json` and every `list-* --json`.
 pub(crate) const JSON_HELP: &str =
@@ -108,7 +109,7 @@ pub(crate) const TTL_HELP: &str =
 /// is the order to read it in, for someone who has just installed it.
 pub(crate) const GETTING_STARTED: &str = "\
 Getting started:
-  sudo stop-bots set-web-server apache    Only on an Apache host; NGINX is the default
+  sudo stop-bots set-web-server apache    Only on an Apache (or a Traefik) host; NGINX is the default
   sudo stop-bots batch --dry-run --diff   Show what a full pass would change, change nothing
   sudo stop-bots batch --apply            Fetch the lists, scan the logs, apply both
   sudo stop-bots install firewall         Load the applied firewall script at boot
@@ -125,7 +126,7 @@ more about one command.";
 #[command(
     name = "stop-bots",
     version,
-    about = "Configure your server to stop bad bots, in NGINX or Apache and the firewall",
+    about = "Configure your server to stop bad bots, in NGINX, Apache or Traefik and the firewall",
     after_help = GETTING_STARTED
 )]
 pub(crate) struct Cli {
@@ -850,8 +851,9 @@ pub(crate) enum Command {
     /// visitors, and unlike a bot-pattern block there's no user agent to
     /// inspect afterwards to work out who was caught.
     ///
-    /// NGINX only: Apache has no request-rate limit of its own, and on an
-    /// Apache host this setting writes nothing.
+    /// NGINX only: Apache has no request-rate limit of its own, and
+    /// Traefik's is a middleware only each site's own router can carry, so
+    /// on either it is refused.
     SetRateLimit {
         /// Whether rate limiting is written into the site configs
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
@@ -927,7 +929,8 @@ pub(crate) enum Command {
     ///
     /// Off by default, because it *replaces* whatever the site already
     /// serves at /robots.txt — which may be hand-written and carry rules
-    /// this tool knows nothing about.
+    /// this tool knows nothing about. Refused on Traefik, which serves no
+    /// files.
     ///
     /// This is the polite layer under the 403, for the crawlers that
     /// honour it, and it is also what makes the honeypot work at all.
@@ -960,7 +963,8 @@ pub(crate) enum Command {
     /// Separate from `set-auto-apply`, and separately off by default,
     /// because the risks are not comparable: a bad web server config is
     /// caught by its config test (`nginx -t`, `apache2ctl configtest`) and
-    /// costs a failed reload, while a bad firewall
+    /// costs a failed reload (Traefik switches off only the router it
+    /// cannot read), while a bad firewall
     /// ruleset locks you out of the host and no care taken here can undo
     /// that remotely.
     ///
@@ -1063,7 +1067,7 @@ pub(crate) enum Command {
     /// connection open — and one of yours.
     ///
     /// "teapot", "close" and "tarpit" are NGINX's: on Apache each is a
-    /// 403.
+    /// 403. Traefik sends nothing but a 403.
     ///
     /// Host-wide, and only changes what *would* be written: run
     /// `apply-blocks` afterwards to get the new response into the site
@@ -1079,7 +1083,8 @@ pub(crate) enum Command {
     /// containerised web server. A container that
     /// bind-mounts its log directory writes the access log somewhere that
     /// is not /var/log/nginx/access.log (or /var/log/apache2/access.log) on
-    /// the host, and `--access-log` on a
+    /// the host, and Traefik's goes wherever its `accessLog.filePath` says
+    /// — and `--access-log` on a
     /// single command cannot reach the two things that actually run the
     /// detectors: `stop-bots tick` and the TUI take no arguments for it, so
     /// the schedule reads the default and finds nothing.
@@ -1091,8 +1096,9 @@ pub(crate) enum Command {
     /// The access logs the web server's config names (`access_log`,
     /// `CustomLog`) are read as well as the one stored here, unless the
     /// server runs in a container (`set-web-server --test`), whose paths
-    /// are its own. A command's `--access-log` reads only the file it
-    /// names.
+    /// are its own. Traefik's dynamic config names none, so on Traefik the
+    /// one stored here is the one read. A command's `--access-log` reads
+    /// only the file it names.
     SetLogPaths {
         /// The web server's main access log, which every web-side detector
         /// reads, beside the ones its config names.
@@ -1109,7 +1115,7 @@ pub(crate) enum Command {
     /// Set the commands used to test and reload NGINX, and its config root.
     ///
     /// NGINX only. `set-web-server` takes the same flags for either
-    /// server, Apache included.
+    /// server, Apache and Traefik included.
     ///
     /// Defaults are `nginx -t` and `systemctl reload nginx`, which is what
     /// a normal host install needs. Change them when NGINX is not a
@@ -1155,6 +1161,20 @@ pub(crate) enum Command {
     /// apache2`. Stored in the host settings, so every command and the TUI
     /// follow it.
     ///
+    /// `traefik` (version 3) reads the routers in the directory Traefik's
+    /// file provider reads, /etc/traefik/dynamic unless `--root` says
+    /// otherwise, and writes `stop-bots.yml` there: routers of its own that
+    /// turn bots away with a 403 before any site's router is asked. No
+    /// file of yours is edited. Traefik reloads the directory itself, so no
+    /// command is run unless you give one. Sites from Docker labels are
+    /// protected too, with the host-wide settings. Tell Traefik's access log
+    /// to keep the `User-Agent` and `Referer` headers, which it drops by
+    /// default, and store where it writes the log:
+    ///
+    ///   set-web-server traefik --root /srv/traefik/dynamic
+    ///
+    ///   set-log-paths --access-log /srv/traefik/logs/access.log
+    ///
     /// Also takes the server's own commands and config root, for a server
     /// that is not where a stock install puts it. On RHEL and its relatives, whose Apache
     /// reads conf.d and logs to /var/log/httpd:
@@ -1168,7 +1188,7 @@ pub(crate) enum Command {
     ///
     /// Pass no server to print what is in effect.
     SetWebServer {
-        /// `nginx` or `apache`.
+        /// `nginx`, `apache` or `traefik`.
         #[arg(value_parser = parse_web_server)]
         server: Option<webserver::WebServer>,
         /// The config check. Must exit non-zero on a bad config.
@@ -1343,7 +1363,8 @@ pub(crate) enum Command {
     /// Stops and removes every unit it installed, deletes the live nft table or
     /// iptables chain, takes the injected blocks out of every site of the
     /// web server the host settings choose (tested with `nginx -t` or
-    /// `apache2ctl configtest`, put back if that fails, then reloaded), and
+    /// `apache2ctl configtest`, put back if that fails, then reloaded; on
+    /// Traefik, its routers file is deleted), and
     /// deletes the generated web server files and firewall scripts. Every
     /// step is reported, a failed one does not stop the rest, and any
     /// failure makes the exit status non-zero.
@@ -1354,7 +1375,7 @@ pub(crate) enum Command {
     /// --prefix. Run it with --dry-run first.
     Uninstall {
         /// What to remove: `nginx` (also spelled `web-server`, and on an
-        /// Apache host it is Apache's blocks it removes), `firewall`, `cron`,
+        /// Apache or a Traefik host it is that server's it removes), `firewall`, `cron`,
         /// or `all` (the default), which is all three plus /etc/stop-bots
         /// itself.
         #[arg(value_enum, default_value = "all")]
@@ -1438,8 +1459,8 @@ pub(crate) enum InstallTarget {
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum UninstallTarget {
     /// The blocks in every site, the generated conf.d (or Apache's
-    /// conf-enabled) files and /etc/stop-bots/nginx (or apache), for the
-    /// web server the host settings choose.
+    /// conf-enabled) files and /etc/stop-bots/nginx (or apache), or
+    /// Traefik's routers file, for the web server the host settings choose.
     #[value(alias = "web-server")]
     Nginx,
     /// The live nft table or iptables chain, the boot unit and the

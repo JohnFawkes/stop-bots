@@ -22,8 +22,9 @@
 //! `nftables`/`iptables`): this module owns the policy ([`BlockConfig`]),
 //! the transaction every apply runs in (lock, [`Snapshot`], write, test,
 //! put back on a failure, reload), the generated files' lifecycle, and
-//! taking everything out again. A backend module — [`crate::nginx`] —
-//! owns only what is spelled in its own config language: finding sites,
+//! taking everything out again. A backend module — [`crate::nginx`],
+//! [`crate::apache`], [`crate::traefik`] — owns only what is spelled in its
+//! own config language: finding sites,
 //! rendering and placing the sentinel block, and the generated files'
 //! bodies. [`WebServer`] is the one place that dispatches between them.
 //!
@@ -34,7 +35,7 @@
 
 use crate::db::BlockResponse;
 pub use crate::dirfd::DirFile;
-use crate::{apache, nginx};
+use crate::{apache, nginx, traefik};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -47,16 +48,18 @@ pub enum WebServer {
     #[default]
     Nginx,
     Apache,
+    Traefik,
 }
 
 impl WebServer {
-    pub const ALL: [WebServer; 2] = [WebServer::Nginx, WebServer::Apache];
+    pub const ALL: [WebServer; 3] = [WebServer::Nginx, WebServer::Apache, WebServer::Traefik];
 
     /// The value in `host.conf`'s `web_server`. Stored, so never renamed.
     pub fn id(self) -> &'static str {
         match self {
             WebServer::Nginx => "nginx",
             WebServer::Apache => "apache",
+            WebServer::Traefik => "traefik",
         }
     }
 
@@ -79,6 +82,7 @@ impl WebServer {
         match self {
             WebServer::Nginx => "NGINX",
             WebServer::Apache => "Apache",
+            WebServer::Traefik => "Traefik",
         }
     }
 
@@ -87,40 +91,54 @@ impl WebServer {
         match self {
             WebServer::Nginx => nginx::DEFAULT_ROOT,
             WebServer::Apache => apache::DEFAULT_ROOT,
+            WebServer::Traefik => traefik::DEFAULT_ROOT,
         }
     }
 
-    /// How to test its config on a stock install.
+    /// How to test its config on a stock install. Empty for Traefik,
+    /// which has no config test: it checks what it reads as it reads it.
     pub fn default_test(self) -> &'static str {
         match self {
             WebServer::Nginx => "nginx -t",
             WebServer::Apache => "apache2ctl configtest",
+            WebServer::Traefik => "",
         }
     }
 
-    /// How to reload it on a stock install.
+    /// How to reload it on a stock install. Empty for Traefik, whose file
+    /// provider reloads its directory by itself.
     pub fn default_reload(self) -> &'static str {
         match self {
             WebServer::Nginx => "systemctl reload nginx",
             WebServer::Apache => "systemctl reload apache2",
+            WebServer::Traefik => "",
         }
     }
 
-    /// Where its access log is on a stock install. Both write the same
-    /// `combined` format by default, which is what the detectors read.
+    /// Where its access log is on a stock install. NGINX and Apache write
+    /// the `combined` format by default, and Traefik its `common` one,
+    /// which reads the same way: what the detectors read.
     pub fn default_access_log(self) -> &'static str {
         match self {
             WebServer::Nginx => crate::accesslog::DEFAULT_LOG_PATH,
             WebServer::Apache => "/var/log/apache2/access.log",
+            WebServer::Traefik => traefik::DEFAULT_ACCESS_LOG,
         }
     }
 
-    /// [`Self::default_test`] and [`Self::default_reload`], split.
+    /// [`Self::default_test`] and [`Self::default_reload`], split. An
+    /// empty one is no command at all.
     pub fn default_commands(self) -> ServerCommands {
+        let split = |command: &str| {
+            if command.is_empty() {
+                Vec::new()
+            } else {
+                split_command(command).expect("the default commands parse")
+            }
+        };
         ServerCommands {
-            test: split_command(self.default_test()).expect("the default test command parses"),
-            reload: split_command(self.default_reload())
-                .expect("the default reload command parses"),
+            test: split(self.default_test()),
+            reload: split(self.default_reload()),
         }
     }
 
@@ -129,7 +147,7 @@ impl WebServer {
     /// a default that names `apache2ctl` on RHEL fails every apply.
     pub fn default_test_at(self, root: &Path) -> &'static str {
         match self {
-            WebServer::Nginx => self.default_test(),
+            WebServer::Nginx | WebServer::Traefik => self.default_test(),
             WebServer::Apache => apache::layout(root).test(),
         }
     }
@@ -137,7 +155,7 @@ impl WebServer {
     /// [`Self::default_reload`] for the config under `root`, likewise.
     pub fn default_reload_at(self, root: &Path) -> &'static str {
         match self {
-            WebServer::Nginx => self.default_reload(),
+            WebServer::Nginx | WebServer::Traefik => self.default_reload(),
             WebServer::Apache => apache::layout(root).reload(),
         }
     }
@@ -145,7 +163,7 @@ impl WebServer {
     /// [`Self::default_access_log`] for the config under `root`, likewise.
     pub fn default_access_log_at(self, root: &Path) -> &'static str {
         match self {
-            WebServer::Nginx => self.default_access_log(),
+            WebServer::Nginx | WebServer::Traefik => self.default_access_log(),
             WebServer::Apache => apache::layout(root).access_log(),
         }
     }
@@ -156,6 +174,7 @@ impl WebServer {
         match self {
             WebServer::Nginx => nginx::discover_sites(root),
             WebServer::Apache => apache::discover_sites(root),
+            WebServer::Traefik => traefik::discover_sites(root),
         }
     }
 
@@ -168,6 +187,7 @@ impl WebServer {
         match self {
             WebServer::Nginx => nginx::access_logs(root),
             WebServer::Apache => apache::access_logs(root),
+            WebServer::Traefik => traefik::access_logs(root),
         }
     }
 
@@ -177,6 +197,7 @@ impl WebServer {
         match self {
             WebServer::Nginx => nginx::site_listens(root),
             WebServer::Apache => apache::site_listens(root),
+            WebServer::Traefik => traefik::site_listens(root),
         }
     }
 
@@ -213,6 +234,7 @@ impl WebServer {
             WebServer::Apache => {
                 apache::blocks_for_file(content, config_path, root, site_configs, default_config)
             }
+            WebServer::Traefik => traefik::blocks_for_file(content, site_configs),
         }
     }
 
@@ -239,6 +261,7 @@ impl WebServer {
             WebServer::Apache => {
                 apache::block_for_site(content, config_path, root, server_name, config)
             }
+            WebServer::Traefik => traefik::block_for_site(content, server_name, config),
         }
     }
 
@@ -273,6 +296,9 @@ impl WebServer {
                 }
             }
             WebServer::Apache => apache::site_apply_status(config_path, server_name, config, root),
+            WebServer::Traefik => {
+                traefik::site_apply_status(config_path, server_name, config, root)
+            }
         }
     }
 
@@ -281,6 +307,8 @@ impl WebServer {
         match self {
             WebServer::Nginx => nginx::without_injected_blocks(content),
             WebServer::Apache => apache::without_injected_blocks(content),
+            // Nothing is injected into an operator's file on Traefik.
+            WebServer::Traefik => content.to_string(),
         }
     }
 
@@ -294,6 +322,7 @@ impl WebServer {
         match self {
             WebServer::Nginx => nginx::planned_managed_files(db, root),
             WebServer::Apache => apache::planned_managed_files(db, root),
+            WebServer::Traefik => traefik::planned_managed_files(db, root),
         }
     }
 
@@ -307,6 +336,7 @@ impl WebServer {
         match self {
             WebServer::Nginx => nginx::fallback_unused_managed_files(db, root),
             WebServer::Apache => apache::fallback_unused_managed_files(db, root),
+            WebServer::Traefik => traefik::fallback_unused_managed_files(db, root),
         }
     }
 
@@ -316,6 +346,7 @@ impl WebServer {
         match self {
             WebServer::Nginx => nginx::managed_directories(root),
             WebServer::Apache => apache::managed_directories(root),
+            WebServer::Traefik => traefik::managed_directories(root),
         }
     }
 
@@ -325,6 +356,7 @@ impl WebServer {
         match self {
             WebServer::Nginx => nginx::server_names_for(config_path, server_name),
             WebServer::Apache => apache::server_names_for(config_path, server_name),
+            WebServer::Traefik => traefik::server_names_for(config_path, server_name),
         }
     }
 
@@ -338,6 +370,7 @@ impl WebServer {
         match self {
             WebServer::Nginx => nginx::site_service(config_path, server_name),
             WebServer::Apache => apache::site_service(config_path, server_name),
+            WebServer::Traefik => traefik::site_service(config_path, server_name),
         }
     }
 
@@ -352,17 +385,20 @@ impl WebServer {
         match self {
             WebServer::Nginx => nginx::site_directives(config_path, server_name),
             WebServer::Apache => apache::site_directives(config_path, server_name),
+            WebServer::Traefik => traefik::site_directives(config_path, server_name),
         }
     }
 
     /// The directory of server-wide config every site inherits: NGINX's
     /// `conf.d`, Apache's `conf-enabled`. An `Alias /phpmyadmin` there,
     /// which Debian's phpMyAdmin package puts in Apache's, serves the path
-    /// on every site.
+    /// on every site. Traefik's root, whose files every router is read
+    /// from alike.
     pub fn global_conf_dir(self, root: &Path) -> PathBuf {
         match self {
             WebServer::Nginx => nginx::conf_d_dir(root),
             WebServer::Apache => apache::conf_enabled_dir(root),
+            WebServer::Traefik => root.to_path_buf(),
         }
     }
 
@@ -372,6 +408,7 @@ impl WebServer {
         match self {
             WebServer::Nginx => nginx::console_site_path(root),
             WebServer::Apache => apache::console_site_path(root),
+            WebServer::Traefik => traefik::console_site_path(root),
         }
     }
 
@@ -381,6 +418,7 @@ impl WebServer {
         match self {
             WebServer::Nginx => "`server` block",
             WebServer::Apache => "<VirtualHost>",
+            WebServer::Traefik => "router",
         }
     }
 
@@ -396,7 +434,40 @@ impl WebServer {
                 "Apache has no rate limiting of its own, so stop-bots writes none there: \
                  turning it on would limit nothing.",
             ),
+            WebServer::Traefik => Some(
+                "Traefik limits rates only in a middleware on each site's own router, which \
+                 stop-bots does not write, so turning it on would limit nothing.",
+            ),
         }
+    }
+
+    /// Why the generated `robots.txt` is served by nothing on this server,
+    /// if it is not: Traefik serves no files. Asked before the setting is
+    /// offered, as [`Self::without_rate_limiting`] is.
+    pub fn without_robots_txt(self) -> Option<&'static str> {
+        match self {
+            WebServer::Nginx | WebServer::Apache => None,
+            WebServer::Traefik => Some(
+                "Traefik serves no files, so nothing would serve the generated robots.txt: \
+                 turning it on would publish nothing.",
+            ),
+        }
+    }
+
+    /// What a blocked request gets instead, when this server cannot send
+    /// `response`: Apache sends no `444`, no `418` and no tarpit, and
+    /// Traefik nothing but a plain `403` (see each one's module docs).
+    /// `None` when it sends `response` itself.
+    pub fn instead_of(self, response: BlockResponse) -> Option<u16> {
+        let exact = match self {
+            WebServer::Nginx => true,
+            WebServer::Apache => !matches!(
+                response,
+                BlockResponse::Close | BlockResponse::Teapot | BlockResponse::Tarpit
+            ),
+            WebServer::Traefik => response == BlockResponse::Forbidden,
+        };
+        (!exact).then_some(403)
     }
 
     /// The verb that stores this server's commands and config root.
@@ -404,6 +475,7 @@ impl WebServer {
         match self {
             WebServer::Nginx => "set-web-server nginx",
             WebServer::Apache => "set-web-server apache",
+            WebServer::Traefik => "set-web-server traefik",
         }
     }
 }
@@ -920,14 +992,17 @@ pub enum ManagedKind {
     RobotsTxt,
     /// `stop-bots-trusted.conf`, which the untrusted zone reads.
     Trusted,
+    /// Traefik's `stop-bots.yml`, which nothing of anyone else's reads.
+    TraefikRouters,
 }
 
 impl ManagedKind {
-    const ALL: [ManagedKind; 4] = [
+    const ALL: [ManagedKind; 5] = [
         ManagedKind::UntrustedLimits,
         ManagedKind::Limits,
         ManagedKind::RobotsTxt,
         ManagedKind::Trusted,
+        ManagedKind::TraefikRouters,
     ];
 
     /// The id in `managed_files.kind`. Stored, so never renamed.
@@ -937,6 +1012,7 @@ impl ManagedKind {
             ManagedKind::Limits => "nginx-limits",
             ManagedKind::RobotsTxt => "nginx-robots-txt",
             ManagedKind::Trusted => "nginx-trusted",
+            ManagedKind::TraefikRouters => "traefik-routers",
         }
     }
 
@@ -955,6 +1031,7 @@ impl ManagedKind {
                 ManagedKind::Limits => nginx::rate_limit_conf_path(conf_d),
                 ManagedKind::RobotsTxt => PathBuf::from("robots.txt"),
                 ManagedKind::Trusted => nginx::trusted_conf_path(conf_d),
+                ManagedKind::TraefikRouters => traefik::routers_path(conf_d),
             };
             own.as_os_str() == name
         })
@@ -1749,7 +1826,7 @@ pub fn apply_all_sites_and_reload(
     test_or_restore(server, &snapshot, commands)?;
     reload(server, commands).context("the new config passed the test, but the reload failed")?;
     Ok(ApplyAllOutcome {
-        reloaded: true,
+        reloaded: commands.reloads(),
         ..outcome
     })
 }
@@ -1859,7 +1936,7 @@ pub fn apply_site_and_reload(
     };
     test_or_restore(server, &snapshot, commands)?;
     reload(server, commands).context("the new config passed the test, but the reload failed")?;
-    Ok((changed, true))
+    Ok((changed, commands.reloads()))
 }
 
 /// Whether `path` is the web console's own site file, as the `Web Access`
@@ -1897,6 +1974,7 @@ fn generated_file_places(server: WebServer, root: &Path) -> Vec<PathBuf> {
             ]
         }
         WebServer::Apache => vec![apache::trusted_conf_path(&apache::conf_enabled_dir(root))],
+        WebServer::Traefik => vec![traefik::routers_path(root)],
     }
 }
 
@@ -2042,7 +2120,7 @@ pub fn remove_everything(
     test_or_restore(server, &snapshot, commands)?;
     reload(server, commands)
         .context("the config without stop-bots passed the test, but the reload failed")?;
-    removal.reloaded = true;
+    removal.reloaded = commands.reloads();
     Ok(removal)
 }
 
@@ -2241,8 +2319,9 @@ pub fn test_or_restore(
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ServerCommands {
     /// Argv for the config check. Must exit non-zero on a bad config.
+    /// Empty for none, which is Traefik's default.
     pub test: Vec<String>,
-    /// Argv for the reload.
+    /// Argv for the reload, or empty for none, likewise.
     pub reload: Vec<String>,
 }
 
@@ -2257,6 +2336,12 @@ impl ServerCommands {
     /// The same, from the host's settings — see [`crate::hostconf`].
     pub fn from_host(host: &crate::hostconf::HostConf) -> Result<Self> {
         host.commands()
+    }
+
+    /// Whether running these reloads anything: not when the reload is no
+    /// command, as on a Traefik host, which reads what changed by itself.
+    pub fn reloads(&self) -> bool {
+        !self.reload.is_empty()
     }
 }
 
@@ -2325,14 +2410,17 @@ pub fn split_command(input: &str) -> Result<Vec<String>> {
     Ok(argv)
 }
 
-/// Runs `argv`, returning its stderr on a non-zero exit.
+/// Runs `argv`, returning its stderr on a non-zero exit. An empty `argv`
+/// is no command, and runs nothing: Traefik's default test and reload.
 ///
 /// `output`, not `status`: `status` inherits stdout and stderr, so anything
 /// the command says lands directly on the TUI's alternate screen and
 /// corrupts it. Run non-root, `systemctl` additionally pulls in a polkit
 /// agent, which takes over the terminal outright to ask for a password.
 fn run(server: WebServer, argv: &[String], what: &str) -> Result<()> {
-    let (program, args) = argv.split_first().expect("argv is never empty");
+    let Some((program, args)) = argv.split_first() else {
+        return Ok(());
+    };
     let output = std::process::Command::new(program)
         .args(args)
         .output()

@@ -131,6 +131,8 @@ pub mod sshlog;
 #[cfg(test)]
 mod testing;
 #[doc(hidden)]
+pub mod traefik;
+#[doc(hidden)]
 pub mod trigger;
 #[doc(hidden)]
 pub mod tui;

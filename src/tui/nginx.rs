@@ -376,6 +376,7 @@ impl Nginx {
     /// list. Only highlights its selection while it actually has focus, so
     /// there's never a second reversed row competing with the site list's.
     fn render_settings(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
+        let unavailable = format!("none on {}", self.server.label());
         let rate_limit_label = if self.server.without_rate_limiting().is_some() {
             format!("none on {}", self.server.label())
         } else if self.rate_limit_enabled {
@@ -391,6 +392,9 @@ impl Nginx {
             .map(|setting| {
                 let value = match setting {
                     NginxSetting::Response => self.block_response.label(),
+                    NginxSetting::RobotsTxt if self.server.without_robots_txt().is_some() => {
+                        &unavailable
+                    }
                     NginxSetting::RobotsTxt => {
                         if self.serve_robots_txt {
                             "generated"
@@ -465,17 +469,25 @@ impl Nginx {
                             "{}: {}",
                             self.block_response.label(),
                             self.block_response.rationale()
-                        )),
+                        ))
+                        .warn_if(self.server.instead_of(self.block_response).map(|code| {
+                            format!(
+                                "{server} cannot send that: a blocked request gets a plain \
+                                 {code} there."
+                            )
+                        })),
                     NginxSetting::RobotsTxt => Explanation::new("robots.txt")
                         .para(
                             "Serves a generated /robots.txt on every site that asks every bot \
                              you block to stay away: the polite request, before the block. It \
                              also publishes the Honeypot detector's trap path.",
                         )
-                        .now(if self.serve_robots_txt {
-                            "generated, replacing each site's own robots.txt."
+                        .now(if self.server.without_robots_txt().is_some() {
+                            format!("not available on {server}, which serves no files.")
+                        } else if self.serve_robots_txt {
+                            "generated, replacing each site's own robots.txt.".to_string()
                         } else {
-                            "off: each site's own robots.txt, if any, is left alone."
+                            "off: each site's own robots.txt, if any, is left alone.".to_string()
                         })
                         .warn(
                             "It replaces a robots.txt a site already serves. Leave it off if \
@@ -584,6 +596,7 @@ impl Nginx {
                 match self.server {
                     WebServer::Nginx => "NGINX settings",
                     WebServer::Apache => "Apache settings",
+                    WebServer::Traefik => "Traefik settings",
                 },
                 vec![
                     ("\u{2191}\u{2193}", "move"),
@@ -854,12 +867,16 @@ impl Nginx {
                     .settings_state
                     .selected()
                     .and_then(|i| NginxSetting::ALL.get(i).copied());
-                // Not offered where it would store a limit nothing writes.
-                match self.server.without_rate_limiting() {
-                    Some(why) if focused == Some(NginxSetting::RateLimit) => {
-                        *message = Some(why.to_string());
-                    }
-                    _ => self.open_setting_popup(),
+                // Not offered where it would store a limit nothing writes,
+                // or a robots.txt nothing serves.
+                let unavailable = match focused {
+                    Some(NginxSetting::RateLimit) => self.server.without_rate_limiting(),
+                    Some(NginxSetting::RobotsTxt) => self.server.without_robots_txt(),
+                    _ => None,
+                };
+                match unavailable {
+                    Some(why) => *message = Some(why.to_string()),
+                    None => self.open_setting_popup(),
                 }
                 KeyOutcome::Consumed
             }
@@ -1197,6 +1214,17 @@ impl Nginx {
         // for the apply not having done anything.
         if managed_changed > 0 {
             message.push_str(&format!("; updated {managed_changed} generated file(s)"));
+        }
+        // Traefik's sites are never written: their blocks are its routers
+        // file, which is the one thing an apply there changes.
+        if self.server == WebServer::Traefik && failures.is_empty() {
+            message = if managed_changed > 0 {
+                format!(
+                    "Updated the Traefik routers for {total} site(s); Traefik reads them itself"
+                )
+            } else {
+                "The Traefik routers were already up to date".to_string()
+            };
         }
         (message, applied > 0 || managed_changed > 0)
     }
@@ -2290,7 +2318,12 @@ mod tests {
 
     /// What an Apache host's screen draws, as one string.
     fn apache_screen_text(db: &Db) -> String {
-        let mut screen = Nginx::new(WebServer::Apache, PathBuf::from("tests/fixtures/nginx"));
+        screen_text(WebServer::Apache, db)
+    }
+
+    /// What `server`'s host's screen draws, as one string.
+    fn screen_text(server: WebServer, db: &Db) -> String {
+        let mut screen = Nginx::new(server, PathBuf::from("tests/fixtures/nginx"));
         screen.refresh(db).unwrap();
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         terminal
@@ -2341,6 +2374,36 @@ mod tests {
             content.contains("Apache settings"),
             "content was:\n{content}"
         );
+    }
+
+    #[test]
+    fn a_traefik_host_shows_no_robots_txt_or_rate_limit_even_ones_stored_earlier() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_rate_limit_enabled(true).unwrap();
+        db.set_serve_robots_txt(true).unwrap();
+        let content = screen_text(WebServer::Traefik, &db);
+        assert!(
+            content.contains("Traefik settings") && content.matches("none on Traefik").count() == 2,
+            "content was:\n{content}"
+        );
+        assert!(!content.contains("generated"), "content was:\n{content}");
+    }
+
+    #[test]
+    fn a_traefik_host_says_why_instead_of_offering_a_robots_txt() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = Nginx::new(WebServer::Traefik, PathBuf::from("tests/fixtures/nginx"));
+        screen.refresh(&db).unwrap();
+        let mut message = None;
+        for key in [KeyCode::Tab, KeyCode::Down, KeyCode::Enter] {
+            screen
+                .handle_key(KeyEvent::from(key), &db, &mut message)
+                .unwrap();
+        }
+        assert!(screen.setting_popup.is_none(), "a robots.txt was offered");
+        let said = message.unwrap_or_default();
+        assert!(said.contains("serves no files"), "said: {said}");
+        assert!(!db.get_serve_robots_txt().unwrap());
     }
 
     #[test]

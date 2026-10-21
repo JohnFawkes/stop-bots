@@ -178,6 +178,7 @@ impl Plan {
         let stored_root = match server {
             webserver::WebServer::Nginx => &host.nginx_root,
             webserver::WebServer::Apache => &host.apache_root,
+            webserver::WebServer::Traefik => &host.traefik_root,
         };
         let nginx_root = match (root_flag, stored_root) {
             (Some(flag), _) => flag.to_path_buf(),
@@ -187,11 +188,13 @@ impl Plan {
             (None, None) => base.join(server.default_root().trim_start_matches('/')),
         };
         let output_dir = base.join("etc/stop-bots");
+        // Traefik's has nothing in it, ever: it serves no robots.txt.
         let (managed_env, managed_name) = match server {
-            webserver::WebServer::Nginx => (nginx::MANAGED_DIR_ENV, "nginx"),
-            webserver::WebServer::Apache => (crate::apache::MANAGED_DIR_ENV, "apache"),
+            webserver::WebServer::Nginx => (Some(nginx::MANAGED_DIR_ENV), "nginx"),
+            webserver::WebServer::Apache => (Some(crate::apache::MANAGED_DIR_ENV), "apache"),
+            webserver::WebServer::Traefik => (None, "traefik"),
         };
-        let managed_dir = match std::env::var_os(managed_env) {
+        let managed_dir = match managed_env.and_then(std::env::var_os) {
             Some(dir) => PathBuf::from(dir),
             None => output_dir.join(managed_name),
         };
@@ -209,6 +212,8 @@ impl Plan {
                 nginx_root.join("conf.d"),
                 base.join(crate::apache::CONF_ENABLED_DIR.trim_start_matches('/')),
             ],
+            // The routers file is in the root itself.
+            webserver::WebServer::Traefik => vec![nginx_root.clone()],
         };
         conf_d_dirs.dedup();
 
@@ -636,6 +641,9 @@ fn generated_nginx_files(plan: &Plan) -> Vec<webserver::DirFile> {
         known.push(nginx::trusted_conf_path(conf_d));
     }
     known.push(plan.managed_dir.join("robots.txt"));
+    if plan.server == webserver::WebServer::Traefik {
+        known.push(crate::traefik::routers_path(&plan.nginx_root));
+    }
     if webserver::is_console_site_file(&console) {
         known.push(console);
     }

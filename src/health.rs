@@ -260,6 +260,11 @@ pub struct Probe {
     /// from a CDN's edge addresses. `None` when the log could not be read.
     #[serde(default)]
     pub access_log_cdn: Option<usize>,
+    /// Of the parsed lines in [`Self::access_log_lines`], how many name a
+    /// user agent. `None` when the log could not be read, and in a probe
+    /// from before this was counted.
+    #[serde(default)]
+    pub access_log_user_agents: Option<usize>,
     /// The NGINX test and reload commands the host settings name, for
     /// [`nginx_deployment`] to check against where NGINX runs. `None` from
     /// a probe taken before they were carried here, or when the setting
@@ -455,6 +460,7 @@ pub fn probe(
         access_log_lines: access_readable.then_some((survey.counts.lines, survey.counts.parsed)),
         access_log_unparsed_sample: survey.unparsed_sample.clone(),
         access_log_cdn: access_readable.then_some(survey.cdn),
+        access_log_user_agents: access_readable.then_some(survey.with_user_agent),
         nginx_home,
         managed_dir_in_container: container.as_ref().map(|name| {
             // `test -d` inside the container, at the path the generated
@@ -938,6 +944,9 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
         checks.push(check);
     }
     checks.push(access_log_format(probe));
+    if let Some(check) = access_log_user_agents(probe) {
+        checks.push(check);
+    }
     checks.push(access_log_clients(probe));
     if let Some(check) = cdn_edges(probe) {
         checks.push(check);
@@ -1502,6 +1511,7 @@ fn nginx_applied(db: &Db, probe: &Probe) -> Result<Check> {
         title: match probe.web_server {
             webserver::WebServer::Nginx => "NGINX blocks are applied",
             webserver::WebServer::Apache => "Apache blocks are applied",
+            webserver::WebServer::Traefik => "Traefik routers are applied",
         },
         level,
         detail,
@@ -1678,6 +1688,7 @@ fn access_log_clients(probe: &Probe) -> Check {
             Some(match probe.web_server {
                 webserver::WebServer::Nginx => "NGINX is logging its proxy's address, not the client's. If it runs behind a container port mapping, a load balancer or a CDN, set `set_real_ip_from` and `real_ip_header` so $remote_addr is the visitor again.",
                 webserver::WebServer::Apache => "Apache is logging its proxy's address, not the client's. If it runs behind a container port mapping, a load balancer or a CDN, enable mod_remoteip (`sudo a2enmod remoteip`), set `RemoteIPHeader` and `RemoteIPTrustedProxy`, and log `%a` in place of `%h` so the log names the visitor again.",
+                webserver::WebServer::Traefik => "Traefik is logging its proxy's address, not the client's. Behind a load balancer or a CDN, list its addresses in each entrypoint's `forwardedHeaders.trustedIPs`, and Traefik logs the visitor from `X-Forwarded-For`. In rootless Docker or a Swarm, publish its ports in `host` mode so connections reach it from the visitor.",
             }
             .to_string()),
         ),
@@ -1746,6 +1757,12 @@ fn cdn_edges(probe: &Probe) -> Option<Check> {
                 crate::cdn::NAME,
                 crate::cdn::apache_real_ip_config()
             ),
+            webserver::WebServer::Traefik => format!(
+                "Tell Traefik to log the visitor's address, from the `X-Forwarded-For` {} \
+                 sends, by trusting its edges on each entrypoint: {}",
+                crate::cdn::NAME,
+                crate::cdn::traefik_real_ip_config()
+            ),
         }),
     })
 }
@@ -1795,6 +1812,13 @@ fn access_log_format(probe: &Probe) -> Check {
                             "log in Apache's `combined` format (`CustomLog <path> combined`), \
                              which is the format the detectors read"
                         }
+                        // Either of Traefik's own formats reads; anything
+                        // else in the file is someone else's.
+                        webserver::WebServer::Traefik => {
+                            "point stop-bots at the file Traefik's `accessLog.filePath` names, \
+                             in either of its formats (`common` or `json`): `stop-bots \
+                             set-log-paths --access-log <file>`"
+                        }
                     }
                     .to_string(),
                 ),
@@ -1813,6 +1837,47 @@ fn access_log_format(probe: &Probe) -> Check {
         detail,
         fix,
     }
+}
+
+/// Fewer parsed lines than this say too little about a log to call its
+/// format blind to user agents: a host that has served three health checks
+/// with no user agent has not shown anything.
+const ACCESS_LOG_MIN_FOR_USER_AGENTS: usize = 20;
+
+/// Whether the access log records the user agent, when it plainly does
+/// not: not one of many parsed lines names one. Every bot list's pattern,
+/// the forged-crawler and rotating-agent detectors and the tally of who was
+/// turned away all read it, and all of them see nothing — silently, from a
+/// log that parses perfectly. Traefik's does exactly this until it is told
+/// to keep the header.
+fn access_log_user_agents(probe: &Probe) -> Option<Check> {
+    let (_, parsed) = probe.access_log_lines?;
+    let named = probe.access_log_user_agents?;
+    if parsed < ACCESS_LOG_MIN_FOR_USER_AGENTS || named > 0 {
+        return None;
+    }
+    Some(Check {
+        id: "access-log-user-agents",
+        title: "Access log records user agents",
+        level: Level::Warn,
+        detail: format!(
+            "none of {parsed} recent request(s) in the log names a user agent, so no bot list \
+             and no detector that reads one can see anything"
+        ),
+        fix: Some(
+            match probe.web_server {
+                webserver::WebServer::Traefik => {
+                    "tell Traefik's access log to keep the headers the detectors read: \
+                     `accessLog.fields.headers.names.User-Agent: keep` and `Referer: keep` \
+                     (`--accesslog.fields.headers.names.User-Agent=keep` as a flag)"
+                }
+                webserver::WebServer::Nginx | webserver::WebServer::Apache => {
+                    "log in the `combined` format, which records the user agent and the referer"
+                }
+            }
+            .to_string(),
+        ),
+    })
 }
 
 /// Which addresses currently cannot be blocked, and why.
@@ -2013,6 +2078,11 @@ fn exposed_files(probe: &Probe) -> Option<Check> {
             (true, webserver::WebServer::Apache) => {
                 "deny dotfiles, `<LocationMatch \"/\\.(?!well-known)\"> Require all denied </LocationMatch>`, move dumps and backups out of the document root, and change every secret that was served"
             }
+            // Traefik serves no files: what answered is the application
+            // behind a router.
+            (true, webserver::WebServer::Traefik) => {
+                "the application behind the site served them: deny dotfiles there, move dumps and backups out of its web root, and change every secret that was served"
+            }
             (false, _) => "delete them from the web root: they describe the server to whoever asks",
         };
         return Some(check(
@@ -2148,7 +2218,10 @@ fn hosting_asns_not_fetched(db: &Db) -> Result<Option<Check>> {
 ///
 /// Absent when there is nothing, like its neighbours.
 fn skipped_entries(db: &Db, server: webserver::WebServer) -> Result<Option<Check>> {
-    let skipped = crate::nginx::skipped_entries(db)?;
+    let mut skipped = crate::nginx::skipped_entries(db)?;
+    if server == webserver::WebServer::Traefik {
+        skipped.extend(crate::traefik::skipped_entries(db)?);
+    }
     if skipped.is_empty() {
         return Ok(None);
     }
@@ -2164,6 +2237,7 @@ fn skipped_entries(db: &Db, server: webserver::WebServer) -> Result<Option<Check
         title: match server {
             webserver::WebServer::Nginx => "Entries left out of the NGINX config",
             webserver::WebServer::Apache => "Entries left out of the Apache config",
+            webserver::WebServer::Traefik => "Entries left out of the Traefik routers",
         },
         level: Level::Warn,
         detail: format!(
@@ -2318,6 +2392,7 @@ fn log_sources(probe: &Probe) -> Check {
             match probe.web_server {
                 webserver::WebServer::Nginx => "the NGINX access log",
                 webserver::WebServer::Apache => "the Apache access log",
+                webserver::WebServer::Traefik => "the Traefik access log",
             },
         ),
     ]
@@ -2557,6 +2632,7 @@ mod tests {
             access_log_lines: Some((41, 41)),
             access_log_unparsed_sample: None,
             access_log_cdn: Some(0),
+            access_log_user_agents: Some(41),
             // The ordinary host: NGINX is a unit here, and the two
             // container fields have nothing to answer. Every
             // container-arrangement test below states its own.
@@ -4526,6 +4602,34 @@ mod tests {
     fn a_few_edge_addresses_are_not_a_cdn_in_front() {
         for (edge, direct, why) in [(10, 190, "mostly direct"), (20, 0, "too few lines")] {
             assert!(cdn_edges(&cdn_probe(edge, direct)).is_none(), "{why}");
+        }
+    }
+
+    /// Traefik's log, as it is until told to keep the header: every line
+    /// parses, and not one names a user agent.
+    #[test]
+    fn a_log_that_names_no_user_agent_says_how_traefik_keeps_it() {
+        let probe = |named: usize, parsed: usize| Probe {
+            web_server: webserver::WebServer::Traefik,
+            access_log_lines: Some((parsed, parsed)),
+            access_log_user_agents: Some(named),
+            ..Probe::default()
+        };
+
+        let check = access_log_user_agents(&probe(0, 100)).expect("a warning");
+
+        assert_eq!(check.level, Level::Warn);
+        let fix = check.fix.clone().unwrap_or_default();
+        assert!(
+            fix.contains("accessLog.fields.headers.names.User-Agent: keep"),
+            "{fix}"
+        );
+        assert_eq!(crate::present::check_label(&check), "user agents");
+        for (named, parsed, why) in [(1, 100, "one names one"), (0, 5, "too few lines")] {
+            assert!(
+                access_log_user_agents(&probe(named, parsed)).is_none(),
+                "{why}"
+            );
         }
     }
 

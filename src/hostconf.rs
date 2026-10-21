@@ -83,6 +83,9 @@ const NGINX_ROOT: &str = "nginx_root";
 const APACHE_TEST: &str = "apache_test_command";
 const APACHE_RELOAD: &str = "apache_reload_command";
 const APACHE_ROOT: &str = "apache_root";
+const TRAEFIK_TEST: &str = "traefik_test_command";
+const TRAEFIK_RELOAD: &str = "traefik_reload_command";
+const TRAEFIK_ROOT: &str = "traefik_root";
 const ACCESS_LOG: &str = "access_log";
 const SSH_LOG: &str = "ssh_log";
 const KERNEL_LOG: &str = "kernel_log";
@@ -107,6 +110,14 @@ pub struct HostConf {
     pub apache_reload_command: Option<String>,
     /// Where Apache's config lives.
     pub apache_root: Option<PathBuf>,
+    /// How to check Traefik's config, the same way as NGINX's. Traefik has
+    /// no config test, so by default nothing is run.
+    pub traefik_test_command: Option<String>,
+    /// How to make Traefik read its config again. Its file provider does
+    /// that by itself, so by default nothing is run.
+    pub traefik_reload_command: Option<String>,
+    /// The directory Traefik's file provider reads.
+    pub traefik_root: Option<PathBuf>,
     /// The NGINX access log.
     pub access_log: Option<PathBuf>,
     /// The SSH log, which the lockout guard reads.
@@ -168,6 +179,9 @@ impl HostConf {
                 APACHE_TEST => conf.apache_test_command = value,
                 APACHE_RELOAD => conf.apache_reload_command = value,
                 APACHE_ROOT => conf.apache_root = value.map(PathBuf::from),
+                TRAEFIK_TEST => conf.traefik_test_command = value,
+                TRAEFIK_RELOAD => conf.traefik_reload_command = value,
+                TRAEFIK_ROOT => conf.traefik_root = value.map(PathBuf::from),
                 ACCESS_LOG => conf.access_log = value.map(PathBuf::from),
                 SSH_LOG => conf.ssh_log = value.map(PathBuf::from),
                 KERNEL_LOG => conf.kernel_log = value.map(PathBuf::from),
@@ -189,6 +203,8 @@ impl HostConf {
             &self.nginx_reload_command,
             &self.apache_test_command,
             &self.apache_reload_command,
+            &self.traefik_test_command,
+            &self.traefik_reload_command,
         ]
         .into_iter()
         .flatten()
@@ -199,6 +215,7 @@ impl HostConf {
         for path in [
             &self.nginx_root,
             &self.apache_root,
+            &self.traefik_root,
             &self.access_log,
             &self.ssh_log,
             &self.kernel_log,
@@ -236,6 +253,9 @@ impl HostConf {
             (APACHE_TEST, self.apache_test_command.clone()),
             (APACHE_RELOAD, self.apache_reload_command.clone()),
             (APACHE_ROOT, path_text(&self.apache_root)),
+            (TRAEFIK_TEST, self.traefik_test_command.clone()),
+            (TRAEFIK_RELOAD, self.traefik_reload_command.clone()),
+            (TRAEFIK_ROOT, path_text(&self.traefik_root)),
             (ACCESS_LOG, path_text(&self.access_log)),
             (SSH_LOG, path_text(&self.ssh_log)),
             (KERNEL_LOG, path_text(&self.kernel_log)),
@@ -260,9 +280,13 @@ impl HostConf {
         self.web_server.unwrap_or_default()
     }
 
-    /// The web server's commands, each falling back to its default.
+    /// The web server's commands, each falling back to its default. An
+    /// empty default is no command, as Traefik's are.
     pub fn commands(&self) -> Result<ServerCommands> {
         let command = |raw: &Option<String>, key: &str, fallback: &str| -> Result<Vec<String>> {
+            if raw.is_none() && fallback.is_empty() {
+                return Ok(Vec::new());
+            }
             crate::webserver::split_command(raw.as_deref().unwrap_or(fallback))
                 .with_context(|| format!("the host setting `{key}` is not a valid command"))
         };
@@ -275,6 +299,10 @@ impl HostConf {
             WebServer::Apache => (
                 (&self.apache_test_command, APACHE_TEST),
                 (&self.apache_reload_command, APACHE_RELOAD),
+            ),
+            WebServer::Traefik => (
+                (&self.traefik_test_command, TRAEFIK_TEST),
+                (&self.traefik_reload_command, TRAEFIK_RELOAD),
             ),
         };
         let root = self.root(None);
@@ -291,6 +319,7 @@ impl HostConf {
         let stored = match server {
             WebServer::Nginx => &self.nginx_root,
             WebServer::Apache => &self.apache_root,
+            WebServer::Traefik => &self.traefik_root,
         };
         flag.map(Path::to_path_buf)
             .or_else(|| stored.clone())
@@ -299,12 +328,14 @@ impl HostConf {
 
     /// The stored config root of the web server this host runs — the
     /// setting [`Self::root`] reads — for a command that stores one.
-    /// `nginx_root` on an NGINX host, `apache_root` on an Apache one: a
-    /// root written to the other server's key is never read by anything.
+    /// `nginx_root` on an NGINX host, `apache_root` on an Apache one,
+    /// `traefik_root` on a Traefik one: a root written to another server's
+    /// key is never read by anything.
     pub fn root_setting_mut(&mut self) -> &mut Option<PathBuf> {
         match self.web_server() {
             WebServer::Nginx => &mut self.nginx_root,
             WebServer::Apache => &mut self.apache_root,
+            WebServer::Traefik => &mut self.traefik_root,
         }
     }
 
@@ -325,10 +356,15 @@ impl HostConf {
     /// set up (see `set-web-server --test`): its config names the paths it
     /// has inside the container, and a file of the same name here says
     /// nothing about it.
+    ///
+    /// Never on Traefik, which has no test command to tell by and is in a
+    /// container far more often than not; nor does its dynamic config name
+    /// a document root or a log for this to matter to.
     pub fn config_paths_are_here(&self) -> bool {
         match self.web_server() {
             WebServer::Nginx => self.nginx_test_command.is_none(),
             WebServer::Apache => self.apache_test_command.is_none(),
+            WebServer::Traefik => false,
         }
     }
 }
@@ -671,6 +707,9 @@ mod tests {
             // wherever this runs: one in RHEL's tree gets RHEL's (see
             // `an_apache_root_in_rhels_tree_gets_rhels_defaults`).
             apache_root: Some("/srv/web apache".into()),
+            traefik_test_command: None,
+            traefik_reload_command: Some("docker restart traefik".into()),
+            traefik_root: Some("/srv/traefik/dynamic".into()),
             access_log: Some("/srv/logs/access.log".into()),
             ssh_log: None,
             kernel_log: Some("/srv/logs/kern.log".into()),
@@ -691,6 +730,28 @@ mod tests {
         assert_eq!(
             nginx.commands().unwrap().test,
             ["docker", "exec", "my web", "nginx", "-t"]
+        );
+    }
+
+    #[test]
+    fn traefik_runs_no_command_unless_given_one() {
+        let traefik = HostConf {
+            web_server: Some(WebServer::Traefik),
+            ..HostConf::default()
+        };
+        let commands = traefik.commands().unwrap();
+        assert!(
+            commands.test.is_empty() && commands.reload.is_empty(),
+            "Traefik reloads its file provider itself, but got {commands:?}"
+        );
+        assert_eq!(traefik.root(None), PathBuf::from("/etc/traefik/dynamic"));
+        let restarted = HostConf {
+            traefik_reload_command: Some("docker restart traefik".into()),
+            ..traefik
+        };
+        assert_eq!(
+            restarted.commands().unwrap().reload,
+            ["docker", "restart", "traefik"]
         );
     }
 

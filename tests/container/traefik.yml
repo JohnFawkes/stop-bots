@@ -1,0 +1,27 @@
+# Traefik's static config for Dockerfile.traefik.
+entryPoints:
+  web:
+    address: ":80"
+    forwardedHeaders:
+      trustedIPs:
+        - 127.0.0.1/32
+  websecure:
+    address: ":443"
+    forwardedHeaders:
+      trustedIPs:
+        - 127.0.0.1/32
+  traefik:
+    address: ":8080"
+providers:
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+accessLog:
+  filePath: /var/log/traefik/access.log
+  fields:
+    headers:
+      names:
+        User-Agent: keep
+        Referer: keep
+api:
+  insecure: true

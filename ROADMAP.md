@@ -8,7 +8,7 @@ read.
 
 ## What the project is for
 
-A single operator with one or a few NGINX or Apache servers who wants bad bots gone
+A single operator with one or a few NGINX, Apache or Traefik servers who wants bad bots gone
 **without putting a CDN in front**. It classifies known bots, reads the host's own logs to
 catch the ones no list knows yet, and turns both into web server config and a firewall
 script. Three

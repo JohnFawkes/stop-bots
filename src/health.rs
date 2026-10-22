@@ -1804,7 +1804,7 @@ fn access_log_format(probe: &Probe) -> Check {
                             "log in NGINX's `combined` format, or a JSON `log_format ... \
                              escape=json` keyed by the variable names (remote_addr, status, \
                              request_uri or request, http_referer, http_user_agent, time_local \
-                             or time_iso8601)"
+                             or time_iso8601); NPMplus's own access.log format also reads"
                         }
                         // The JSON form is NGINX's `log_format` variables;
                         // Apache's stock format is the one to point at.

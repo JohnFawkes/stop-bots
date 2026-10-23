@@ -135,16 +135,23 @@ fn parse_combined_line(line: &str) -> Option<ParsedLine> {
 }
 
 /// Parses a line of NPMplus's `alog` format, the only one its
-/// `access.log` is written in:
+/// `access.log` is written in, in either of the two versions it has had:
 ///
 /// ```text
 /// [$time_local] $host$is_request_port$request_port $remote_addr $request_time "$request"
 ///     $status $bytes_sent "$http_referer" "$http_user_agent" "$remote_user"
 ///     "$sent_http_content_type" $ssl_protocol $ssl_cipher $ssl_curve $upstream_cache_status
+///
+/// [$time_local] $host$is_request_port$request_port $remote_addr $request_time "$request"
+///     $status $body_bytes_sent $bytes_sent $http_referer $http_user_agent
 /// ```
 ///
-/// From the request on it is the combined format's tail with more quoted
-/// fields after the user agent, so it is read the same way.
+/// From the request on, the first is the combined format's tail with more
+/// quoted fields after the user agent, so it is read the same way. The
+/// second, which NPMplus's releases write, quotes neither header: see
+/// [`parse_unquoted_tail`]. NGINX writes a `"` in a header as `\x22`, so
+/// a `"` after the request is the first format, and its absence the
+/// second.
 ///
 /// The address is taken counting back from the request, never forward
 /// from the time. The `Host` before it is the client's to write, and
@@ -160,7 +167,13 @@ fn parse_npmplus_line(line: &str) -> Option<ParsedLine> {
     words.next_back()?.parse::<f64>().ok()?;
     let ip: IpAddr = words.next_back()?.parse().ok()?;
     let host = words.collect::<Vec<_>>().join(" ");
-    let parsed = parse_from_request(ip, crate::logtime::nginx_time_local(stamp), rest)?;
+    let time = crate::logtime::nginx_time_local(stamp);
+    let (request, tail) = rest.split_once('"')?;
+    let parsed = if tail.contains('"') {
+        parse_from_request(ip, time, rest)?
+    } else {
+        parse_unquoted_tail(ip, time, request, tail)?
+    };
     Some(ParsedLine {
         host: (!host.is_empty()).then_some(host),
         // `$remote_user` and the content type: never a site's name, and
@@ -170,24 +183,46 @@ fn parse_npmplus_line(line: &str) -> Option<ParsedLine> {
     })
 }
 
+/// What follows the request in NPMplus's released format: `<status>
+/// <body_bytes> <bytes> <referer> <user_agent>`, the headers unquoted.
+///
+/// The user agent is everything after the referer, spaces and all. The
+/// referer is one word, which it nearly always is: NGINX writes `-` for
+/// none. A client that sends one with a space in it moves the rest into
+/// its own user agent, on its own line; the address is read before the
+/// request, where nothing it sends can reach.
+fn parse_unquoted_tail(
+    ip: IpAddr,
+    time: Option<i64>,
+    request: &str,
+    tail: &str,
+) -> Option<ParsedLine> {
+    fn word(text: &str) -> (&str, &str) {
+        let text = text.trim_start();
+        text.split_once(' ').unwrap_or((text, ""))
+    }
+    let (status, rest) = word(tail);
+    let status: u16 = status.parse().ok()?;
+    let (body_bytes, rest) = word(rest);
+    let (bytes, rest) = word(rest);
+    body_bytes.parse::<u64>().ok()?;
+    bytes.parse::<u64>().ok()?;
+    let (referer, user_agent) = word(rest);
+    if referer.is_empty() {
+        return None;
+    }
+    Some(ParsedLine {
+        referer: Some(referer.to_string()),
+        user_agent: user_agent.trim().to_string(),
+        ..request_line(ip, time, request, status)
+    })
+}
+
 /// The rest of a combined-style line, from just inside the quote that
 /// opens the request: `<method> <target> <proto>" <status> <bytes>
 /// "<referer>" "<user_agent>"`, then any further quoted fields.
 fn parse_from_request(ip: IpAddr, time: Option<i64>, rest: &str) -> Option<ParsedLine> {
     let (request, after_request) = rest.split_once('"')?;
-
-    // A request line with no target is not HTTP, and is read anyway, with
-    // no path: what it is instead is the protocol-probe detector's
-    // business (see `crate::protocol`). An empty one is `""`, NGINX's
-    // record of a connection closed before it sent anything.
-    let mut request_parts = request.split_whitespace();
-    let method = request_parts.next().unwrap_or_default().to_string();
-    let target = request_parts.next().unwrap_or_default();
-    // Strip any query string: `/foo?a=1` and `/foo?a=2` are the same path
-    // as far as "is this a valid URL on this site" goes, and counting them
-    // as distinct would let a real, repeatedly-hit-with-varying-params 404
-    // endpoint masquerade as many different invalid URLs.
-    let path = target.split('?').next().unwrap_or(target).to_string();
 
     // `after_request` is ` <status> <bytes> "<referer>" "<user_agent>"`;
     // splitting it on `"` yields [status/bytes, referer, the space between
@@ -211,19 +246,43 @@ fn parse_from_request(ip: IpAddr, time: Option<i64>, rest: &str) -> Option<Parse
         .collect();
 
     Some(ParsedLine {
+        referer,
+        user_agent,
+        trailing,
+        ..request_line(ip, time, request, status)
+    })
+}
+
+/// A line's request and status, with no header and no host.
+fn request_line(ip: IpAddr, time: Option<i64>, request: &str, status: u16) -> ParsedLine {
+    // A request line with no target is not HTTP, and is read anyway, with
+    // no path: what it is instead is the protocol-probe detector's
+    // business (see `crate::protocol`). An empty one is `""`, NGINX's
+    // record of a connection closed before it sent anything.
+    let mut request_parts = request.split_whitespace();
+    let method = request_parts.next().unwrap_or_default().to_string();
+    let target = request_parts.next().unwrap_or_default();
+    // Strip any query string: `/foo?a=1` and `/foo?a=2` are the same path
+    // as far as "is this a valid URL on this site" goes, and counting them
+    // as distinct would let a real, repeatedly-hit-with-varying-params 404
+    // endpoint masquerade as many different invalid URLs.
+    let path = target.split('?').next().unwrap_or(target).to_string();
+
+    ParsedLine {
         ip,
         status,
         query: target.contains('?'),
         path,
         method: Some(method),
         request: request.to_string(),
-        referer,
-        user_agent,
+        // Each format says for itself whether it records the referer.
+        referer: None,
+        user_agent: String::new(),
         time,
         // The combined format does not log the `Host`.
         host: None,
-        trailing,
-    })
+        trailing: Vec::new(),
+    }
 }
 
 /// Reads one field as text, whether the format quoted it or not.
@@ -1967,6 +2026,40 @@ mod tests {
             probe_path_ips(&log, &["/.git/config".to_string()]),
             vec![("203.0.113.9".to_string(), "/.git/config".to_string())],
             "log was:\n{log}"
+        );
+    }
+
+    /// As NPMplus 2.15.1 wrote it, for a request with a referer and a
+    /// user agent with a `"` in it, which NGINX escapes.
+    #[test]
+    fn parse_line_reads_every_field_from_an_npmplus_release_line() {
+        let line = r#"[23/Oct/2026:08:03:35 +0000] a.example 203.0.113.5 0.003 "GET /p?q=1 HTTP/1.1" 404 335 718 https://ref.example/ Mozilla/5.0 (X11; Linux) \x22quoted\x22"#;
+        let expected = ParsedLine {
+            ip: "203.0.113.5".parse().unwrap(),
+            status: 404,
+            query: true,
+            path: "/p".to_string(),
+            method: Some("GET".to_string()),
+            request: "GET /p?q=1 HTTP/1.1".to_string(),
+            referer: Some("https://ref.example/".to_string()),
+            user_agent: r"Mozilla/5.0 (X11; Linux) \x22quoted\x22".to_string(),
+            time: crate::logtime::nginx_time_local("23/Oct/2026:08:03:35 +0000"),
+            host: Some("a.example".to_string()),
+            trailing: Vec::new(),
+        };
+        assert_eq!(parse_line(line), Some(expected), "{line}");
+    }
+
+    /// NGINX writes `-` for a header the request did not carry, which is
+    /// what the referer-less detector counts.
+    #[test]
+    fn an_npmplus_release_line_without_headers_reads_them_as_nginx_wrote_them() {
+        let line = r#"[23/Oct/2026:08:03:35 +0000] a.example 203.0.113.5 0.000 "GET / HTTP/1.1" 200 5 300 - -"#;
+        let parsed = parse_line(line).expect("should parse");
+        assert_eq!(
+            (parsed.referer.as_deref(), parsed.user_agent.as_str()),
+            (Some("-"), "-"),
+            "{line}"
         );
     }
 

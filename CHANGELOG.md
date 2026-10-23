@@ -8,6 +8,23 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Added
+
+- **NPMplus, beside NGINX, Apache and Traefik.** `sudo stop-bots set-web-server npmplus`
+  reads the hosts NPMplus renders under its data directory (`/opt/npmplus`, or `--root`) and
+  never writes them, since NPMplus rewrites a host's file whenever it is saved. It writes
+  one marked block into `custom_nginx/server_http.conf`, which every proxy, redirection and
+  404 host includes, and one include line into `custom_nginx/http_top.conf`; the rest of
+  each file is left as it was, and `uninstall web-server` takes both out again. The trusted
+  clients, the rate-limit zones and `robots.txt` go in `custom_nginx/stop-bots/`. It tests
+  and reloads with `docker exec npmplus nginx -t` and `docker exec npmplus nginx -s reload`.
+  Tested against NPMplus 2.15.1.
+  - Every host gets the host-wide settings. An apply refuses a site with settings of its
+    own, which includes the request-shape rules, since those are per-site only.
+- **NPMplus's access log is read**, in both the format its releases write (the referer and
+  the user agent unquoted) and the one its development branch writes (both quoted).
+  NPMplus writes it only with `LOGROTATE=true`, to `/opt/npmplus/nginx/logs/access.log`.
+
 ## [0.7.0] — 2026-10-25
 
 **Before upgrading:** nothing to do. The database schema is unchanged.

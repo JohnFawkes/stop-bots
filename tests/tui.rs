@@ -259,6 +259,15 @@ fn seed_cron_state(db_path: &Path) {
         db.set_cron_last_run(job.id(), now, "skipped for test")
             .expect("failed to seed cron state");
     }
+    // Every screen, unless the test chose: the tests here were written
+    // against them, and a new database would open the simple one.
+    if db
+        .get_text_setting(stop_bots::db::keys::UI_MODE)
+        .unwrap()
+        .is_none()
+    {
+        db.set_ui_mode(stop_bots::db::UiMode::Advanced).unwrap();
+    }
 }
 
 fn spawn_tui_with_args(db_path: &Path, extra_args: &[&str]) -> PtySession {
@@ -1153,6 +1162,35 @@ fn site_detail_searches_for_a_bot_and_overrides_it_for_one_site() {
     send_escape(&mut session);
     send_key(&mut session, "q");
     session.exp_string("Automatic").unwrap();
+}
+
+/// The simple screen, and `v` to every screen and back. `--root` is an
+/// empty directory because the simple screen looks for sites when it
+/// starts with none, and the machine running this has its own.
+#[test]
+fn the_simple_screen_and_v_to_every_screen_and_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    stop_bots::db::Db::open(&db_path)
+        .unwrap()
+        .set_ui_mode(stop_bots::db::UiMode::Simple)
+        .unwrap();
+    let root = tmp.path().join("nginx");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut session = spawn_tui_with_root(&db_path, &root);
+    session.exp_string("Overview").unwrap();
+    session.exp_string("Who").unwrap();
+
+    send_key(&mut session, "v");
+    session.exp_string("Automatic").unwrap();
+
+    send_key(&mut session, "v");
+    session.exp_string("Running").unwrap();
+
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the simple screen");
 }
 
 #[test]

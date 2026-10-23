@@ -4714,6 +4714,21 @@ fn auto_apply_is_off_until_it_is_turned_on() {
     assert!(db.get_auto_apply().unwrap());
 }
 
+/// A new database opens the TUI on the simple screen; `set-ui-mode`
+/// changes that for the next start, as `v` in the TUI does.
+#[test]
+fn set_ui_mode_is_what_the_next_tui_opens_on() {
+    let fixture = Fixture::new();
+    for mode in ["advanced", "simple"] {
+        fixture
+            .run(&["set-ui-mode", "--mode", mode])
+            .stdout(predicate::str::contains(format!("its {mode} mode")));
+
+        let db = stop_bots::db::Db::open(&fixture.db).unwrap();
+        assert_eq!(db.get_ui_mode().unwrap().as_str(), mode);
+    }
+}
+
 /// Turning the switch on must not, by itself, apply anything: the CLI sets
 /// a flag, and the schedule (`tick`, or the TUI) is what acts on it. A `set-` command that quietly reloaded NGINX would be the worst
 /// possible surprise from a subcommand whose name says "set".

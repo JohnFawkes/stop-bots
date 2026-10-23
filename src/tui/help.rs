@@ -41,7 +41,7 @@ const MAX_LINES: usize = 26;
 /// a key sits in the columns before the description.
 const LINES: [&str; MAX_LINES] = [
     "Navigation",
-    "  1-5, d b f n x     jump to a screen (Left/Right and h/l step through them)",
+    "  1-5, d b f n x / v jump to a screen (Left/Right, h/l step through them) / simple or every screen",
     "  :                  command palette: every action here by name, fuzzy-matched",
     "  Tab, Shift+Tab     next / previous panel on this screen",
     "  Up/Down, j/k       move selection (it also flows from one panel into the next)",

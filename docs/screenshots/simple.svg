@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 931 528" width="931" height="528" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-size="14">
+<rect width="100%" height="100%" rx="8" fill="#12161c"/>
+<rect x="20.4" y="174.0" width="126.0" height="18.0" fill="#10262a"/>
+<rect x="146.4" y="174.0" width="58.8" height="18.0" fill="#10262a"/>
+<rect x="205.2" y="174.0" width="252.0" height="18.0" fill="#10262a"/>
+<text x="12.0" y="25.5" fill="#2ee6d6" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">stop-bots</text>
+<text x="87.6" y="25.5" fill="#6b7c8c" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 0.6.0  web-01</text>
+<text x="12.0" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">1</text>
+<text x="28.8" y="43.5" fill="#2ee6d6" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Overview</text>
+<text x="121.2" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">5</text>
+<text x="138.0" y="43.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Blocks</text>
+<text x="213.6" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">?</text>
+<text x="230.4" y="43.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Help</text>
+<text x="835.2" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">v</text>
+<text x="843.6" y="43.5" fill="#6b7c8c" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> advanced</text>
+<text x="12.0" y="79.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌ Status ──────────────────────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="12.0" y="97.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="97.5" fill="#d18f52" textLength="184.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> ▲ Changes not applied</text>
+<text x="910.8" y="97.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="115.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="115.5" fill="#c8d0da" textLength="890.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   Press a to see what would change, and apply it.                                                        </text>
+<text x="910.8" y="115.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="133.5" fill="#6b7c8c" textLength="630.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│   5 address(es) blocked now, 5 of them in the last day · checked just now</text>
+<text x="910.8" y="133.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="151.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="169.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
+<text x="20.4" y="169.5" fill="#2ee6d6" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Who can visit </text>
+<text x="146.4" y="169.5" fill="#2ee6d6" textLength="319.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">─────────────────────────────────────┐</text>
+<text x="465.6" y="169.5" fill="#6b7c8c" textLength="453.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌ Countries · these are blocked ─────────────────────┐</text>
+<text x="12.0" y="187.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="187.5" fill="#c8d0da" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">▎Humans only   </text>
+<text x="146.4" y="187.5" fill="#c8d0da" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold" opacity="0.55">[ off ]</text>
+<text x="457.2" y="187.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="465.6" y="187.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="474.0" y="187.5" fill="#c8d0da" textLength="436.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Enter to add a country, m to change mode           </text>
+<text x="910.8" y="187.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="205.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="205.5" fill="#c8d0da" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Scanners      </text>
+<text x="146.4" y="205.5" fill="#e05561" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
+<text x="457.2" y="205.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="465.6" y="205.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="474.0" y="205.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> CN      </text>
+<text x="549.6" y="205.5" fill="#e05561" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
+<text x="658.8" y="205.5" fill="#c8d0da" textLength="252.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 4312 range(s)                </text>
+<text x="910.8" y="205.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="223.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="223.5" fill="#c8d0da" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Search bots   </text>
+<text x="146.4" y="223.5" fill="#8cc265" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ ALLOWED ] </text>
+<text x="457.2" y="223.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="465.6" y="223.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="474.0" y="223.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> RU      </text>
+<text x="549.6" y="223.5" fill="#e05561" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
+<text x="658.8" y="223.5" fill="#c8d0da" textLength="252.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 2190 range(s)                </text>
+<text x="910.8" y="223.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="241.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="241.5" fill="#c8d0da" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> AI bots       </text>
+<text x="146.4" y="241.5" fill="#e05561" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
+<text x="457.2" y="241.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="465.6" y="241.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="910.8" y="241.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="259.5" fill="#2ee6d6" textLength="453.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└────────────────────────────────────────────────────┘</text>
+<text x="465.6" y="259.5" fill="#6b7c8c" textLength="453.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="277.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌ Running ─────────────────────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="12.0" y="295.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="295.5" fill="#c8d0da" textLength="210.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Block attackers in logs </text>
+<text x="230.4" y="295.5" fill="#8cc265" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">[ ON  ]</text>
+<text x="289.2" y="295.5" fill="#6b7c8c" textLength="243.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  7 of 14 checks; v to change</text>
+<text x="910.8" y="295.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="313.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="313.5" fill="#c8d0da" textLength="210.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Keep running by itself  </text>
+<text x="230.4" y="313.5" fill="#c8d0da" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">[ off ]</text>
+<text x="289.2" y="313.5" fill="#6b7c8c" textLength="294.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  finds attackers; you apply with a</text>
+<text x="910.8" y="313.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="331.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="349.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌ Log ─────────────────────────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="12.0" y="367.5" fill="#6b7c8c" textLength="168.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│ No recent actions.</text>
+<text x="910.8" y="367.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="385.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="910.8" y="385.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="403.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="910.8" y="403.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="421.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="910.8" y="421.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="439.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="910.8" y="439.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="457.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="910.8" y="457.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="475.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="910.8" y="475.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="493.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="511.5" fill="#2ee6d6" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Who can visit</text>
+<text x="138.0" y="511.5" fill="#2ee6d6" textLength="42.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Enter</text>
+<text x="188.4" y="511.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">change</text>
+<text x="255.6" y="511.5" fill="#2ee6d6" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Tab</text>
+<text x="289.2" y="511.5" fill="#6b7c8c" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">next panel</text>
+<text x="390.0" y="511.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">a</text>
+<text x="406.8" y="511.5" fill="#6b7c8c" textLength="42.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">apply</text>
+<text x="465.6" y="511.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">x</text>
+<text x="482.4" y="511.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">blocks</text>
+<text x="549.6" y="511.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">?</text>
+<text x="566.4" y="511.5" fill="#6b7c8c" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">explain</text>
+<text x="642.0" y="511.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">q</text>
+<text x="658.8" y="511.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">quit</text>
+</svg>

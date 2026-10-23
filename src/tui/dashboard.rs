@@ -126,6 +126,8 @@ use ratatui::{
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod simple;
+
 /// A source is considered stale (needs updating) if it's never been fetched,
 /// or wasn't fetched in the last week.
 const STALE_AFTER_SECS: i64 = 7 * 24 * 60 * 60;
@@ -150,6 +152,10 @@ enum Focus {
     /// The three published crawler ranges, under Geo.
     Crawlers,
     Protection,
+    /// The simple screen's last panel: what the detectors do, and whether
+    /// it keeps running by itself (see `simple`). Never focused on the
+    /// advanced one.
+    Essentials,
 }
 
 /// The rows of the "Automatic blocking" list, in display order. Each is a
@@ -328,6 +334,12 @@ enum Confirm {
     GeoMode(usize),
     /// Switching auto-apply of the firewall script on.
     AutoApplyFirewall,
+    /// Switching humans only on, from the simple screen: it takes the
+    /// site out of search engines, which nothing else on that screen does.
+    HumansOnly,
+    /// The simple screen's "Keep running by itself", switched on: a cron
+    /// file written as root, and both auto-applies.
+    KeepRunning,
 }
 
 #[derive(Debug, Default)]
@@ -411,6 +423,21 @@ pub struct Dashboard {
     /// The last health probe, re-assessed on every refresh. `None` until
     /// the internal cron has taken one — see [`crate::health`].
     health: Option<(crate::health::Report, i64)>,
+    /// Whether this is the simple screen (see `simple`) rather than every
+    /// panel. `App` owns the choice, which is stored in the database, and
+    /// sets it with [`Self::set_simple`].
+    simple: bool,
+    /// The simple screen's Essentials list.
+    essentials_state: ListState,
+    /// `Db::get_auto_apply`, the web-server half of keeping running.
+    auto_apply: bool,
+    /// Whether `/etc/cron.d/stop-bots` was there at the last health probe;
+    /// `None` before the first.
+    cron_installed: Option<bool>,
+    /// Addresses the firewall blocks now, by rule, and how many of those
+    /// blocks are from the last day: the simple screen's status line.
+    blocked_now: usize,
+    blocked_today: usize,
 }
 
 impl Dashboard {
@@ -451,6 +478,27 @@ impl Dashboard {
         self.cron_status = crate::cron::status(db)?;
         self.script_state = crate::firewall::script_state(db)?;
         self.rule_count = crate::firewall::all_rules(db)?.len();
+        self.auto_apply = db.get_auto_apply()?;
+        self.cron_installed =
+            crate::health::cached_probe(db)?.and_then(|(probe, _)| probe.cron_installed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let blocking: Vec<crate::db::FirewallRule> = db
+            .list_firewall_rules()?
+            .into_iter()
+            .filter(|rule| {
+                rule.enabled
+                    && rule.action == crate::db::FirewallAction::Block
+                    && rule.expires_at.is_none_or(|at| at > now)
+            })
+            .collect();
+        self.blocked_now = blocking.len();
+        self.blocked_today = blocking
+            .iter()
+            .filter(|rule| rule.created_at.is_some_and(|at| at > now - 24 * 60 * 60))
+            .count();
         if self.list_state.selected().is_none() {
             self.list_state.select(Some(0));
         }
@@ -462,6 +510,9 @@ impl Dashboard {
         }
         if self.protection_state.selected().is_none() {
             self.protection_state.select(Some(0));
+        }
+        if self.essentials_state.selected().is_none() {
+            self.essentials_state.select(Some(0));
         }
         // Removing a country shrinks `selected_countries`; without this the
         // selection could be left pointing past the new last row (stale
@@ -548,6 +599,9 @@ impl Dashboard {
                 ],
             );
         }
+        if self.simple {
+            return self.simple_hints();
+        }
         let host = [
             ("Tab", "next panel"),
             ("u", "update all"),
@@ -572,7 +626,7 @@ impl Dashboard {
                 "Crawler ranges",
                 vec![("\u{2191}\u{2193}", "move"), ("Enter", "download")],
             ),
-            Focus::Protection => (
+            Focus::Protection | Focus::Essentials => (
                 "Automatic",
                 vec![
                     ("\u{2191}\u{2193}", "move"),
@@ -586,6 +640,9 @@ impl Dashboard {
 
     /// What the row under the cursor is, for `?`.
     pub fn explain(&self) -> Explanation {
+        if self.simple {
+            return self.explain_simple();
+        }
         match self.focus {
             Focus::Categories => match self.list_state.selected().unwrap_or(0) {
                 0 => self.explain_humans_only(),
@@ -624,7 +681,7 @@ impl Dashboard {
                 Some(source) => self.explain_crawler(source),
                 None => Explanation::new("Crawler IP ranges"),
             },
-            Focus::Protection => match self
+            Focus::Protection | Focus::Essentials => match self
                 .protection_state
                 .selected()
                 .and_then(|i| self.protection_rows().get(i).copied())
@@ -1001,6 +1058,13 @@ impl Dashboard {
         log: &[(i64, String)],
         running_jobs: &std::collections::HashSet<crate::app::Job>,
     ) {
+        if self.simple {
+            self.render_simple(frame, area, theme, log);
+            if let Some(popup) = self.popup.clone() {
+                self.render_popup(frame, area, popup, theme);
+            }
+            return;
+        }
         // Two columns over a log. The left column is *policy* — what this
         // host blocks by category, by country, and the script those become —
         // with the schedule that writes and applies it under it; the right
@@ -1081,15 +1145,18 @@ impl Dashboard {
         // The *mode* is in the title and nothing else is: Allowlist turns
         // the host into default-deny, so it must never be what a narrow
         // panel truncates away.
-        let mode_label = match self.geo_choice() {
-            GEO_BLOCKLIST => "blocklist".to_string(),
-            GEO_ALLOWLIST => "allowlist".to_string(),
+        let mode_label = match (self.geo_choice(), self.simple) {
+            (GEO_BLOCKLIST, false) => "blocklist".to_string(),
+            (GEO_ALLOWLIST, false) => "allowlist".to_string(),
+            (GEO_BLOCKLIST, true) => "these are blocked".to_string(),
+            (GEO_ALLOWLIST, true) => "only these are allowed".to_string(),
             _ => format!("only trusted IPs ({})", self.trusted_addresses),
         };
         let focused = self.focus == Focus::Countries;
+        let title = if self.simple { "Countries" } else { "Geo" };
         let list = crate::tui::select_in(
             List::new(items).block(crate::tui::panel(
-                format!("Geo \u{00b7} {mode_label}"),
+                format!("{title} \u{00b7} {mode_label}"),
                 focused,
                 theme,
             )),
@@ -1737,36 +1804,6 @@ impl Dashboard {
             return Ok(KeyOutcome::PreviewApplyEverything);
         }
 
-        // Tab always means "next panel" on this screen (BackTab the
-        // previous), so it means the same thing it does on NGINX
-        // and Firewall. Up/Down still flow across the panels
-        // too, for hands that never learned Tab.
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            let forward = key.code == KeyCode::Tab;
-            self.focus = match (self.focus, forward) {
-                (Focus::Categories, true) | (Focus::Crawlers, false) => Focus::Countries,
-                (Focus::Countries, true) | (Focus::Protection, false) => Focus::Crawlers,
-                (Focus::Crawlers, true) | (Focus::Categories, false) => Focus::Protection,
-                (Focus::Protection, true) | (Focus::Countries, false) => Focus::Categories,
-            };
-            match self.focus {
-                Focus::Categories if self.list_state.selected().is_none() => {
-                    self.list_state.select(Some(0));
-                }
-                Focus::Countries if self.countries_state.selected().is_none() => {
-                    self.countries_state.select(Some(0));
-                }
-                Focus::Crawlers if self.crawlers_state.selected().is_none() => {
-                    self.crawlers_state.select(Some(0));
-                }
-                Focus::Protection if self.protection_state.selected().is_none() => {
-                    self.protection_state.select(Some(0));
-                }
-                _ => {}
-            }
-            return Ok(KeyOutcome::Consumed);
-        }
-
         // Capital F: it writes to the host. Lower-case `f` is "filter" on
         // every screen that has a list worth filtering, and this one does
         // not, so the key is free rather than overloaded.
@@ -1786,6 +1823,45 @@ impl Dashboard {
                 apply_after_write: false,
                 error: None,
             });
+            return Ok(KeyOutcome::Consumed);
+        }
+
+        // The rest is per panel, and the simple screen has panels of its
+        // own; the host-wide keys above are the same on both.
+        if self.simple {
+            return self.handle_simple_key(key, db, message);
+        }
+
+        // Tab always means "next panel" on this screen (BackTab the
+        // previous), so it means the same thing it does on NGINX
+        // and Firewall. Up/Down still flow across the panels
+        // too, for hands that never learned Tab.
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            let forward = key.code == KeyCode::Tab;
+            self.focus = match (self.focus, forward) {
+                (Focus::Categories, true) | (Focus::Crawlers, false) => Focus::Countries,
+                (Focus::Countries, true) | (Focus::Protection, false) => Focus::Crawlers,
+                (Focus::Crawlers, true) | (Focus::Categories, false) => Focus::Protection,
+                (Focus::Protection | Focus::Essentials, true) | (Focus::Countries, false) => {
+                    Focus::Categories
+                }
+                (Focus::Essentials, false) => Focus::Protection,
+            };
+            match self.focus {
+                Focus::Categories if self.list_state.selected().is_none() => {
+                    self.list_state.select(Some(0));
+                }
+                Focus::Countries if self.countries_state.selected().is_none() => {
+                    self.countries_state.select(Some(0));
+                }
+                Focus::Crawlers if self.crawlers_state.selected().is_none() => {
+                    self.crawlers_state.select(Some(0));
+                }
+                Focus::Protection if self.protection_state.selected().is_none() => {
+                    self.protection_state.select(Some(0));
+                }
+                _ => {}
+            }
             return Ok(KeyOutcome::Consumed);
         }
 
@@ -1894,6 +1970,8 @@ impl Dashboard {
                 KeyCode::Char(' ') => return self.toggle_protection_row(db, message),
                 _ => return Ok(KeyOutcome::Ignored),
             },
+            // The simple screen's; `set_simple` moves focus off it.
+            Focus::Essentials => return Ok(KeyOutcome::Ignored),
         }
         Ok(KeyOutcome::Consumed)
     }
@@ -2644,6 +2722,8 @@ impl Dashboard {
                     Confirm::AutoApplyFirewall => {
                         self.commit_auto_apply_firewall(db, true, message)
                     }
+                    Confirm::HumansOnly => self.commit_humans_only(db, true, message),
+                    Confirm::KeepRunning => Ok(KeyOutcome::KeepRunning(true)),
                 };
             }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char(' ') => {
@@ -2747,6 +2827,39 @@ impl Dashboard {
                 [
                     "Turn auto-apply on".to_string(),
                     "Keep applying by hand".to_string(),
+                ],
+            ),
+            Confirm::HumansOnly => (
+                "Serve humans only?".to_string(),
+                vec![
+                    "Every bot is turned away, search engines among them: your sites drop out \
+                     of Google and Bing, and link previews and uptime monitors stop working."
+                        .into(),
+                    "".into(),
+                    "Let's Encrypt is still let in, so certificates keep renewing. Turning this \
+                     off brings back the settings below as they were."
+                        .into(),
+                ],
+                ["Turn humans only on".to_string(), "Keep it off".to_string()],
+            ),
+            Confirm::KeepRunning => (
+                "Keep running by itself?".to_string(),
+                vec![
+                    format!(
+                        "This writes /etc/cron.d/{}, which runs stop-bots every minute, \
+                         whether this screen is open or not.",
+                        crate::install::CRON_FILE
+                    )
+                    .into(),
+                    "".into(),
+                    "What it finds, and what you change here, is then applied on its own: \
+                     the web server's config, and the firewall. Every firewall apply is \
+                     checked first, and refused if it would block anyone who logs in over SSH."
+                        .into(),
+                ],
+                [
+                    "Keep it running".to_string(),
+                    "Only while this screen is open".to_string(),
                 ],
             ),
         }
@@ -2994,23 +3107,38 @@ impl Dashboard {
             return Ok(KeyOutcome::Mutated);
         }
         if self.list_state.selected() == Some(0) {
-            let on = !self.humans_only;
-            db.set_humans_only(on)?;
-            *message = Some(if on {
-                format!(
-                    "Humans only is on: every catalogued bot is blocked except Let's Encrypt, \
-                     and fetching /robots.txt now earns a one-day block. Apply on the {} \
-                     screen to enforce it.",
-                    crate::webserver::WebServer::configured().label()
-                )
-            } else {
-                "Humans only is off. The category policies you had before are back in force."
-                    .to_string()
-            });
-            return Ok(KeyOutcome::Mutated);
+            return self.commit_humans_only(db, !self.humans_only, message);
         }
         self.open_category_popup(message);
         Ok(KeyOutcome::Consumed)
+    }
+
+    /// Stores humans only, and says what it now does.
+    fn commit_humans_only(
+        &mut self,
+        db: &Db,
+        on: bool,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        db.set_humans_only(on)?;
+        let apply = if self.simple {
+            "Press a to apply it.".to_string()
+        } else {
+            format!(
+                "Apply on the {} screen to enforce it.",
+                crate::webserver::WebServer::configured().label()
+            )
+        };
+        *message = Some(if on {
+            format!(
+                "Humans only is on: every catalogued bot is blocked except Let's Encrypt, and \
+                 fetching /robots.txt now earns a one-day block. {apply}"
+            )
+        } else {
+            "Humans only is off. The category policies you had before are back in force."
+                .to_string()
+        });
+        Ok(KeyOutcome::Mutated)
     }
 
     fn open_category_popup(&mut self, message: &mut Option<String>) {

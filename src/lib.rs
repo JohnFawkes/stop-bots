@@ -104,6 +104,7 @@ pub mod logtime;
 pub mod nftables;
 #[doc(hidden)]
 pub mod nginx;
+#[doc(hidden)]
 pub mod npmplus;
 #[doc(hidden)]
 pub mod output;

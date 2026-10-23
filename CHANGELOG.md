@@ -8,6 +8,13 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+**Going back to 0.6.0.** An NGINX, Apache or Traefik host can. An NPMplus host cannot by
+installing the older release: 0.6.0 refuses a `/etc/stop-bots/host.conf` that names NPMplus.
+First run `sudo stop-bots uninstall web-server` with this release, which takes the blocks out
+of `custom_nginx/server_http.conf` and `custom_nginx/http_top.conf` and deletes
+`custom_nginx/stop-bots/`, then delete the `web_server` and `npmplus_*` lines from
+`host.conf`, then install 0.6.0.
+
 ### Added
 
 - **NPMplus, beside NGINX, Apache and Traefik.** `sudo stop-bots set-web-server npmplus`

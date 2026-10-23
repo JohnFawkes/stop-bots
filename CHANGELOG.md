@@ -8,6 +8,15 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Fixed
+
+- **A config root holding logs no longer takes the host's memory.** Finding sites read
+  every file under the web server's config root whole. A root that also holds logs, such as
+  a container's bind-mounted directory with its config and its access logs side by side, had
+  them read whole on every `tick`, `status` and apply, and before `set-web-server` would
+  switch away: a 1 GB log took 82 seconds of CPU and 7.7 GB of memory. A file over 4 MiB is
+  now skipped by its size, unread; no file that declares a site comes near that.
+
 ## [0.6.0] — 2026-10-21
 
 Traefik, beside NGINX and Apache.

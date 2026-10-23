@@ -68,8 +68,9 @@ pub(super) struct Verdict {
     pub advice: String,
 }
 
-/// What the status says, from the last health report and whether the cron
-/// file was there.
+/// What the status says, from the last health report, whether the cron
+/// file was there, and whether it applies by itself
+/// ([`Dashboard::keeps_running`]).
 ///
 /// One state, checked worst first, so that a host with three problems
 /// shows the one that matters: anything critical; then sites that were
@@ -77,7 +78,16 @@ pub(super) struct Verdict {
 /// yet, which `a` fixes; then a schedule that stops when the TUI does;
 /// then any other warning. A check that could not run (`Unknown`, usually
 /// for want of root) says nothing here: the advanced status strip shows it.
-pub(super) fn verdict(report: Option<&Report>, cron_installed: Option<bool>) -> Verdict {
+///
+/// Changes waiting on a host that keeps running are not a warning. Every
+/// new block is one, until the next scheduled render applies it within
+/// minutes, and telling a busy host to press `a` after each would teach
+/// its operator that the status is noise.
+pub(super) fn verdict(
+    report: Option<&Report>,
+    cron_installed: Option<bool>,
+    keeps_running: bool,
+) -> Verdict {
     let Some(report) = report else {
         return Verdict {
             level: Level::Unknown,
@@ -111,7 +121,8 @@ pub(super) fn verdict(report: Option<&Report>, cron_installed: Option<bool>) -> 
                 .to_string(),
         };
     }
-    if warned("script-fresh").is_some() || warned("nginx-applied").is_some() {
+    let waiting = warned("script-fresh").is_some() || warned("nginx-applied").is_some();
+    if waiting && !keeps_running {
         return Verdict {
             level: Level::Warn,
             headline: "Changes not applied".to_string(),
@@ -125,18 +136,47 @@ pub(super) fn verdict(report: Option<&Report>, cron_installed: Option<bool>) -> 
             advice: "Turn on \u{201c}Keep running by itself\u{201d}, below.".to_string(),
         };
     }
-    if let Some(check) = report.checks.iter().find(|c| c.level == Level::Warn) {
+    if let Some(check) = report
+        .checks
+        .iter()
+        .find(|c| c.level == Level::Warn && !matches!(c.id, "script-fresh" | "nginx-applied"))
+    {
         return Verdict {
             level: Level::Warn,
             headline: check.title.to_string(),
-            advice: format!("{}. Press v for every check.", check.detail),
+            advice: format!("{}. Press v for every check.", summary(&check.detail)),
         };
     }
     Verdict {
         level: Level::Ok,
         headline: "Protected".to_string(),
-        advice: String::new(),
+        advice: if waiting {
+            "Some changes are waiting, and are applied by themselves within minutes. a applies \
+             them now."
+                .to_string()
+        } else {
+            String::new()
+        },
     }
+}
+
+/// A check's detail up to its first colon: the checks put what happened
+/// first and the list it is about after, and the list (every user agent,
+/// every site) is for the advanced screen's report, not a one-line status.
+fn summary(detail: &str) -> &str {
+    detail.split_once(": ").map_or(detail, |(head, _)| head)
+}
+
+/// `text` cut to `width` columns, with an ellipsis where it was cut, so
+/// that the status's lines stay one row each and the last of them, the
+/// count of blocks, is never pushed out of its panel.
+fn one_line(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
+    cut.push('\u{2026}');
+    cut
 }
 
 impl Dashboard {
@@ -192,7 +232,13 @@ impl Dashboard {
     }
 
     fn render_status(&self, frame: &mut Frame, area: Rect, theme: Theme) {
-        let verdict = verdict(self.health.as_ref().map(|(r, _)| r), self.cron_installed);
+        let verdict = verdict(
+            self.health.as_ref().map(|(r, _)| r),
+            self.cron_installed,
+            self.keeps_running(),
+        );
+        // Inside the borders.
+        let width = usize::from(area.width.saturating_sub(2));
         let (mark, colour) = match verdict.level {
             Level::Ok => ("\u{25cf}", ratatui::style::Color::Green),
             Level::Warn => ("\u{25b2}", ratatui::style::Color::Yellow),
@@ -204,7 +250,10 @@ impl Dashboard {
             verdict.headline.fg(colour).bold(),
         ])];
         if !verdict.advice.is_empty() {
-            lines.push(Line::from(format!("   {}", verdict.advice)));
+            lines.push(Line::from(one_line(
+                &format!("   {}", verdict.advice),
+                width,
+            )));
         }
         let mut facts = format!(
             "   {} address(es) blocked now, {} of them in the last day",
@@ -213,11 +262,9 @@ impl Dashboard {
         if let Some((_, at)) = &self.health {
             facts.push_str(&format!(" \u{00b7} checked {}", crate::present::ago(*at)));
         }
-        lines.push(Line::from(facts).fg(theme.dim()));
+        lines.push(Line::from(one_line(&facts, width)).fg(theme.dim()));
         frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .block(crate::tui::panel("Status", false, theme)),
+            Paragraph::new(lines).block(crate::tui::panel("Status", false, theme)),
             area,
         );
     }
@@ -544,7 +591,7 @@ mod tests {
             ),
             (
                 "changes waiting",
-                Some(vec![other.clone(), pending]),
+                Some(vec![other.clone(), pending.clone()]),
                 Some(false),
                 "Changes not applied",
             ),
@@ -556,7 +603,7 @@ mod tests {
             ),
             (
                 "another warning",
-                Some(vec![ok.clone(), other]),
+                Some(vec![ok.clone(), pending.clone(), other]),
                 Some(true),
                 "A check",
             ),
@@ -564,8 +611,59 @@ mod tests {
         ];
         for (what, checks, cron, expected) in cases {
             let report = checks.map(report);
-            assert_eq!(verdict(report.as_ref(), cron).headline, expected, "{what}");
+            let keeps_running = cron == Some(true);
+            assert_eq!(
+                verdict(report.as_ref(), cron, keeps_running).headline,
+                expected,
+                "{what}"
+            );
         }
+    }
+
+    /// On a host that keeps running, every new block waits a few minutes
+    /// for the next render: that is the schedule working, not something
+    /// to press `a` about. It still says so, and that `a` does it now.
+    #[test]
+    fn changes_waiting_on_a_host_that_keeps_running_are_not_a_warning() {
+        let report = report(vec![check(
+            "script-fresh",
+            Level::Warn,
+            "the rules changed since the last apply",
+        )]);
+
+        let status = verdict(Some(&report), Some(true), true);
+
+        assert_eq!(
+            (status.level, status.headline.as_str()),
+            (Level::Ok, "Protected"),
+            "{status:?}"
+        );
+        assert!(status.advice.contains("a applies"), "{status:?}");
+    }
+
+    /// A warning whose detail lists every user agent it is about still
+    /// leaves the status's last line, the count of blocks, in its panel.
+    #[test]
+    fn a_long_warning_leaves_the_count_of_blocks_on_screen() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = simple(&db);
+        let agents = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) (231 refused), ".repeat(10);
+        dashboard.health = Some((
+            report(vec![check(
+                "turned-away",
+                Level::Warn,
+                &format!("50 user agent(s) are now being turned away: {agents}"),
+            )]),
+            0,
+        ));
+
+        let content = drawn(&mut dashboard);
+
+        assert!(content.contains("blocked now"), "{content}");
+        assert!(
+            !content.contains("Windows NT"),
+            "the list is in the status:\n{content}"
+        );
     }
 
     /// The four things it is for, and none of the advanced panels.

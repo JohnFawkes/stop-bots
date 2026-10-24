@@ -274,7 +274,7 @@ that upgrade what 0.1.1 actually left on a host rather than a fixture of it. It
 downloads that binary when the image is built, pinned by its published checksum, the
 way every image fetches its packages; no test touches the network.
 
-NPMplus is tested in its own released image, pinned by tag in `tests/container.rs`, and
+NPMplus is tested in its own released image, pinned by digest in `tests/container.rs`, and
 not in one of ours: it is Alpine, on musl, and the point is to run stop-bots where an
 operator does, on the host, against NPMplus's data directory as a bind mount, testing and
 reloading with `<runtime> exec`. The hosts are created through NPMplus's API, so the

@@ -1154,31 +1154,40 @@ pub fn is_generated(file: &DirFile) -> bool {
 /// would decide NGINX had nothing new to read and never reload it.
 ///
 /// A file of no [`ManagedKind`] is one of the operator's that carries a
-/// block, NPMplus's `server_http.conf` (see [`crate::npmplus`]): it keeps
-/// its owner and mode, as a site file does.
+/// block, NPMplus's `server_http.conf` (see [`crate::npmplus`]), and is
+/// written by [`write_operators_file`].
 pub fn write_planned_managed_files(files: &[(PathBuf, String)]) -> Result<usize> {
-    use std::os::unix::fs::MetadataExt;
     let mut changed = 0;
     for (path, body) in files {
         if fs::read_to_string(path).ok().as_deref() != Some(body.as_str()) {
-            let operators = ManagedKind::of(path)
-                .is_none()
-                .then(|| fs::symlink_metadata(path).ok())
-                .flatten()
-                .filter(|meta| meta.is_file());
-            match operators {
-                Some(meta) => write_atomically(
-                    path,
-                    body.as_bytes(),
-                    meta.mode() & 0o7777,
-                    Some((meta.uid(), meta.gid())),
-                )?,
-                None => write_managed(path, body)?,
+            match ManagedKind::of(path) {
+                Some(_) => write_managed(path, body)?,
+                None => write_operators_file(path, body)?,
             }
             changed += 1;
         }
     }
     Ok(changed)
+}
+
+/// Replaces `path`, a file of the operator's that a block is kept in,
+/// keeping its owner and mode, as a site file keeps them.
+///
+/// **Through its directory, following no link** ([`DirFile::exactly`]).
+/// The directory is one another user can write: NPMplus's data directory
+/// is its container's. A link planted at a directory on the way, between
+/// the check that made `path` and this write, fails the write instead of
+/// taking root's write somewhere else, and a link at the file itself is
+/// replaced, not written through.
+fn write_operators_file(path: &Path, body: &str) -> Result<()> {
+    let file =
+        DirFile::exactly(path).with_context(|| format!("refusing to write {}", path.display()))?;
+    let (mode, owner) = match file.mode_and_owner()? {
+        Some((mode, owner)) => (mode, Some(owner)),
+        None => (0o644, None),
+    };
+    file.write_atomically_owned(body.as_bytes(), mode, owner)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 /// Deletes every file this project owns that the current settings no

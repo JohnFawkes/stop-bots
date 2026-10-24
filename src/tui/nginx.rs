@@ -1392,6 +1392,7 @@ pub struct ApplyOutcome {
 /// stopping at the first.
 pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
     let snapshot = webserver::Snapshot::of_apply(
+        plan.server,
         &plan.root,
         plan.managed_writes.iter().map(|(path, _)| path.clone()),
         &plan.managed_removals,
@@ -1400,7 +1401,9 @@ pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
     // Same ordering as the CLI's apply: a managed file has to exist before
     // a config that aliases it is reloaded.
     let managed = match &snapshot {
-        Ok(_) => webserver::write_planned_managed_files(&plan.managed_writes),
+        Ok(_) => {
+            webserver::write_planned_managed_files(plan.server, &plan.root, &plan.managed_writes)
+        }
         Err(err) => Err(anyhow::anyhow!("{err:#}")),
     };
     let results: Vec<SiteResult> = plan

@@ -341,10 +341,13 @@ impl WebServer {
     /// file, and on NPMplus the two of its files every site includes.
     pub fn injected_files(self, root: &Path) -> Result<Vec<PathBuf>> {
         if self == WebServer::Npmplus {
-            return Ok(npmplus::injected_files(root)
-                .into_iter()
-                .filter(|path| path.is_file())
-                .collect());
+            let mut paths = Vec::new();
+            for path in npmplus::injected_files(root) {
+                if under_hostile_root(root, &path)?.is_some_and(|file| file.is_regular()) {
+                    paths.push(path);
+                }
+            }
+            return Ok(paths);
         }
         let mut paths: Vec<PathBuf> = self
             .discover_sites(root)?
@@ -401,9 +404,8 @@ impl WebServer {
     /// included; just `server_name` when the file says otherwise.
     pub fn server_names_for(self, config_path: &Path, server_name: &str) -> Vec<String> {
         match self {
-            WebServer::Nginx | WebServer::Npmplus => {
-                nginx::server_names_for(config_path, server_name)
-            }
+            WebServer::Nginx => nginx::server_names_for(config_path, server_name),
+            WebServer::Npmplus => npmplus::server_names_for(config_path, server_name),
             WebServer::Apache => apache::server_names_for(config_path, server_name),
             WebServer::Traefik => traefik::server_names_for(config_path, server_name),
         }
@@ -417,7 +419,8 @@ impl WebServer {
         server_name: &str,
     ) -> Option<crate::services::Service> {
         match self {
-            WebServer::Nginx | WebServer::Npmplus => nginx::site_service(config_path, server_name),
+            WebServer::Nginx => nginx::site_service(config_path, server_name),
+            WebServer::Npmplus => npmplus::site_service(config_path, server_name),
             WebServer::Apache => apache::site_service(config_path, server_name),
             WebServer::Traefik => traefik::site_service(config_path, server_name),
         }
@@ -432,9 +435,8 @@ impl WebServer {
         server_name: &str,
     ) -> Option<Vec<(String, Vec<String>)>> {
         match self {
-            WebServer::Nginx | WebServer::Npmplus => {
-                nginx::site_directives(config_path, server_name)
-            }
+            WebServer::Nginx => nginx::site_directives(config_path, server_name),
+            WebServer::Npmplus => npmplus::site_directives(config_path, server_name),
             WebServer::Apache => apache::site_directives(config_path, server_name),
             WebServer::Traefik => traefik::site_directives(config_path, server_name),
         }
@@ -525,6 +527,19 @@ impl WebServer {
         (!exact).then_some(403)
     }
 
+    /// Whether someone other than root can write under the config root:
+    /// NPMplus's data directory is its container's.
+    ///
+    /// On such a root nothing below it is reached by path. It is resolved
+    /// once, being the operator's own choice, and every file under it is
+    /// read, written, put back and removed through its directory, opened
+    /// without following a link ([`DirFile`]): a link planted there would
+    /// otherwise take root's write, or the bytes root reads and writes
+    /// back, anywhere on the host. See [`under_hostile_root`].
+    pub fn root_is_hostile(self) -> bool {
+        self == WebServer::Npmplus
+    }
+
     /// The verb that stores this server's commands and config root.
     pub fn commands_verb(self) -> &'static str {
         match self {
@@ -602,6 +617,23 @@ pub(crate) fn config_files(root: &Path) -> impl Iterator<Item = walkdir::DirEntr
         })
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_file())
+}
+
+/// The text of the regular file at `path`, read without following a link
+/// at it or waiting on a FIFO: `None` for anything else, or nothing.
+///
+/// For a file [`config_files`] found, which it found as a regular file
+/// and not a link: read this way, one swapped for a link or a FIFO since
+/// is not followed, and cannot hang the apply that holds the lock.
+pub(crate) fn read_regular_file(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let mut file = crate::db::guard::open_nofollow(path).ok()??;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
 }
 
 /// One address a site is served on, as its config declares it.
@@ -1028,7 +1060,7 @@ pub(crate) fn managed_header() -> String {
 pub fn write_managed_files(server: WebServer, db: &crate::db::Db, root: &Path) -> Result<usize> {
     let files = server.planned_managed_files(db, root)?;
     record_managed_files(db, &files)?;
-    write_planned_managed_files(&files)
+    write_planned_managed_files(server, root, &files)
 }
 
 /// What a generated file is, as the `managed_files` record spells
@@ -1146,6 +1178,94 @@ pub fn is_generated(file: &DirFile) -> bool {
         .is_some_and(|first| first.starts_with('#') && first.contains("Generated by stop-bots"))
 }
 
+/// `path`, under `root`, as it is with `root` resolved: the one place a
+/// link is followed on a root that is hostile
+/// ([`WebServer::root_is_hostile`]).
+fn resolved_under(root: &Path, path: &Path) -> Result<PathBuf> {
+    let resolved = fs::canonicalize(root)
+        .with_context(|| format!("failed to read the config root {}", root.display()))?;
+    let below = path
+        .strip_prefix(root)
+        .or_else(|_| path.strip_prefix(&resolved))
+        .with_context(|| format!("{} is not under {}", path.display(), root.display()))?;
+    Ok(resolved.join(below))
+}
+
+/// `path`, under a `root` someone else can write, held through its
+/// directory: `root` resolved, and everything below it opened without
+/// following a link ([`DirFile::exactly`]). `None` when its directory is
+/// not there, in which case neither is the file; an error when a link is
+/// on the way.
+pub(crate) fn under_hostile_root(root: &Path, path: &Path) -> Result<Option<DirFile>> {
+    let resolved = resolved_under(root, path)?;
+    match DirFile::exactly(&resolved) {
+        Ok(file) => Ok(Some(file)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "refusing to use {}: a link, or something else that is not a directory, is on \
+                 the way to it, under a root another user can write",
+                path.display()
+            )
+        }),
+    }
+}
+
+/// [`under_hostile_root`], creating its directory first if it is not
+/// there, through the directory above it ([`create_dir_nofollow`]).
+fn under_hostile_root_created(root: &Path, path: &Path) -> Result<DirFile> {
+    let resolved = resolved_under(root, path)?;
+    if let Some(dir) = resolved.parent() {
+        crate::dirfd::create_dir_nofollow(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+    under_hostile_root(root, path)?
+        .with_context(|| format!("{} disappeared as it was made", resolved.display()))
+}
+
+/// The text of `path`, a file under `root`, read as `server` must read it,
+/// or `None` when there is none: on a hostile root through its directory,
+/// following no link and never waiting on a FIFO, so that only a regular
+/// file is read at all.
+pub(crate) fn read_under(server: WebServer, root: &Path, path: &Path) -> Result<Option<String>> {
+    if !server.root_is_hostile() {
+        return match fs::read_to_string(path) {
+            Ok(text) => Ok(Some(text)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+        };
+    }
+    let Some(file) = under_hostile_root(root, path)? else {
+        return Ok(None);
+    };
+    let Some((bytes, _)) = file
+        .read()
+        .with_context(|| format!("failed to read {}", path.display()))?
+    else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .with_context(|| format!("{} is not text", path.display()))
+}
+
+/// Writes `content` at `path`, a file under `root`, as `server` must: on a
+/// hostile root through its directory, following no link, keeping the
+/// owner of the file it replaces and none of its setuid, setgid or sticky
+/// bits; otherwise as a site file ([`write_site_file`]).
+fn write_under(server: WebServer, root: &Path, path: &Path, content: &str) -> Result<()> {
+    if !server.root_is_hostile() {
+        return write_site_file(path, root, content);
+    }
+    let file = under_hostile_root_created(root, path)?;
+    let (mode, owner) = match file.mode_and_owner()? {
+        Some((mode, owner)) => (mode & 0o777, Some(owner)),
+        None => (0o644, None),
+    };
+    file.write_atomically_owned(content.as_bytes(), mode, owner)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
 /// Writes what [`planned_managed_files`] resolved. Touches no `Db`.
 ///
 /// Returns how many files it actually changed, because that can be the
@@ -1153,41 +1273,34 @@ pub fn is_generated(file: &DirFile) -> bool {
 /// file and no site's block, and an apply that counted only site files
 /// would decide NGINX had nothing new to read and never reload it.
 ///
-/// A file of no [`ManagedKind`] is one of the operator's that carries a
-/// block, NPMplus's `server_http.conf` (see [`crate::npmplus`]), and is
-/// written by [`write_operators_file`].
-pub fn write_planned_managed_files(files: &[(PathBuf, String)]) -> Result<usize> {
+/// On a root another user can write ([`WebServer::root_is_hostile`]) each
+/// file is compared and written through its directory, following no link
+/// ([`write_under`]): the generated files, and the operator's own that
+/// carry a block, NPMplus's `server_http.conf` and `http_top.conf`, which
+/// keep their owner.
+pub fn write_planned_managed_files(
+    server: WebServer,
+    root: &Path,
+    files: &[(PathBuf, String)],
+) -> Result<usize> {
     let mut changed = 0;
     for (path, body) in files {
-        if fs::read_to_string(path).ok().as_deref() != Some(body.as_str()) {
-            match ManagedKind::of(path) {
-                Some(_) => write_managed(path, body)?,
-                None => write_operators_file(path, body)?,
-            }
-            changed += 1;
+        let current = if server.root_is_hostile() {
+            read_under(server, root, path)?
+        } else {
+            fs::read_to_string(path).ok()
+        };
+        if current.as_deref() == Some(body.as_str()) {
+            continue;
         }
+        if server.root_is_hostile() {
+            write_under(server, root, path, body)?;
+        } else {
+            write_managed(path, body)?;
+        }
+        changed += 1;
     }
     Ok(changed)
-}
-
-/// Replaces `path`, a file of the operator's that a block is kept in,
-/// keeping its owner and mode, as a site file keeps them.
-///
-/// **Through its directory, following no link** ([`DirFile::exactly`]).
-/// The directory is one another user can write: NPMplus's data directory
-/// is its container's. A link planted at a directory on the way, between
-/// the check that made `path` and this write, fails the write instead of
-/// taking root's write somewhere else, and a link at the file itself is
-/// replaced, not written through.
-fn write_operators_file(path: &Path, body: &str) -> Result<()> {
-    let file =
-        DirFile::exactly(path).with_context(|| format!("refusing to write {}", path.display()))?;
-    let (mode, owner) = match file.mode_and_owner()? {
-        Some((mode, owner)) => (mode, Some(owner)),
-        None => (0o644, None),
-    };
-    file.write_atomically_owned(body.as_bytes(), mode, owner)
-        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 /// Deletes every file this project owns that the current settings no
@@ -1252,6 +1365,17 @@ pub fn unused_managed_files(
         .collect();
     let mut files = Vec::new();
     for path in server.fallback_unused_managed_files(db, root)? {
+        // On a hostile root the fixed list is no more trusted than the
+        // record: reached following no link, and removed only if it is
+        // still a file this project generated.
+        if server.root_is_hostile() {
+            if let Some(file) = under_hostile_root(root, &path)? {
+                if file.is_regular() && is_generated(&file) {
+                    files.push(file);
+                }
+            }
+            continue;
+        }
         if let Some(file) = DirFile::locate(&path)
             .with_context(|| format!("failed to open the directory of {}", path.display()))?
         {
@@ -1704,13 +1828,13 @@ pub fn apply_blocks_to_file(
     site_configs: &[(String, BlockConfig)],
     default_config: &BlockConfig,
 ) -> Result<bool> {
-    let before = fs::read_to_string(config_path)
+    let before = read_under(server, root, config_path)?
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let after = server.blocks_for_file(&before, config_path, root, site_configs, default_config)?;
     if after == before {
         return Ok(false);
     }
-    write_site_file(config_path, root, &after)?;
+    write_under(server, root, config_path, &after)?;
     Ok(true)
 }
 
@@ -1746,13 +1870,13 @@ pub fn apply_block_for_site(
     server_name: &str,
     config: &BlockConfig,
 ) -> Result<bool> {
-    let before = fs::read_to_string(config_path)
+    let before = read_under(server, root, config_path)?
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let after = server.block_for_site(&before, config_path, root, server_name, config)?;
     if after == before {
         return Ok(false);
     }
-    write_site_file(config_path, root, &after)?;
+    write_under(server, root, config_path, &after)?;
     Ok(true)
 }
 
@@ -1800,7 +1924,7 @@ pub fn preview_all_sites(
     let sites = server.discover_sites(root)?;
     let mut changes: Vec<FileChange> = Vec::new();
     for (path, body) in server.planned_managed_files(db, root)? {
-        let before = fs::read_to_string(&path).ok();
+        let before = read_under(server, root, &path)?;
         if before.as_deref() != Some(body.as_str()) {
             changes.push(FileChange {
                 path,
@@ -1822,7 +1946,7 @@ pub fn preview_all_sites(
             .filter(|s| Path::new(&s.config_path) == path.as_path())
             .map(|s| Ok((s.server_name.clone(), block_config_for_site(db, s.id)?)))
             .collect::<Result<_>>()?;
-        let before = fs::read_to_string(&path)
+        let before = read_under(server, root, &path)?
             .with_context(|| format!("failed to read {}", path.display()))?;
         let after = server.blocks_for_file(&before, &path, root, &site_configs, &default_config)?;
         if after != before {
@@ -1893,6 +2017,7 @@ pub fn apply_all_sites_and_reload(
     let planned = server.planned_managed_files(db, root)?;
     let unused = unused_managed_files(server, db, root)?;
     let snapshot = Snapshot::of_apply(
+        server,
         root,
         planned.iter().map(|(path, _)| path.clone()),
         &unused,
@@ -1929,7 +2054,7 @@ fn apply_all_sites(
     unused: &[DirFile],
 ) -> Result<ApplyAllOutcome> {
     record_managed_files(db, planned)?;
-    let mut changed = write_planned_managed_files(planned)?;
+    let mut changed = write_planned_managed_files(server, root, planned)?;
     let default_config = default_block_config(db)?;
     // Sites already known to the db (i.e. previously scanned) — the only
     // ones that can carry a per-site override at all.
@@ -1997,6 +2122,7 @@ pub fn apply_site_and_reload(
     let managed = server.planned_managed_files(db, root)?;
     record_managed_files(db, &managed)?;
     let snapshot = Snapshot::of_apply(
+        server,
         root,
         managed.iter().map(|(path, _)| path.clone()),
         &[],
@@ -2004,7 +2130,7 @@ pub fn apply_site_and_reload(
     )?;
 
     let written = (|| -> Result<bool> {
-        let managed_changed = write_planned_managed_files(&managed)?;
+        let managed_changed = write_planned_managed_files(server, root, &managed)?;
         let config = block_config_for_site(db, site.id)?;
         let site_changed =
             apply_block_for_site(server, config_path, root, &site.server_name, &config)?;
@@ -2082,17 +2208,22 @@ fn generated_file_places(server: WebServer, root: &Path) -> Vec<PathBuf> {
 pub fn leftovers(server: WebServer, root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for path in server.injected_files(root).unwrap_or_default() {
-        if fs::read_to_string(&path)
-            .is_ok_and(|content| server.without_injected_blocks(&content) != content)
+        if read_under(server, root, &path)
+            .ok()
+            .flatten()
+            .is_some_and(|content| server.without_injected_blocks(&content) != content)
         {
             found.push(path);
         }
     }
     for path in generated_file_places(server, root) {
-        if let Ok(Some(file)) = DirFile::locate(&path) {
-            if file.is_regular() && is_generated(&file) {
-                found.push(path);
-            }
+        let file = if server.root_is_hostile() {
+            under_hostile_root(root, &path).ok().flatten()
+        } else {
+            DirFile::locate(&path).ok().flatten()
+        };
+        if file.is_some_and(|file| file.is_regular() && is_generated(&file)) {
+            found.push(path);
         }
     }
     let console = server.console_site_path(root);
@@ -2150,7 +2281,7 @@ pub fn remove_everything(
     };
     let mut edits = Vec::new();
     for path in server.injected_files(root)? {
-        let content = fs::read_to_string(&path)
+        let content = read_under(server, root, &path)?
             .with_context(|| format!("failed to read {}", path.display()))?;
         let stripped = server.without_injected_blocks(&content);
         if stripped != content {
@@ -2175,6 +2306,7 @@ pub fn remove_everything(
     }
 
     let snapshot = Snapshot::of_apply(
+        server,
         root,
         [],
         &present,
@@ -2182,7 +2314,7 @@ pub fn remove_everything(
     )?;
     let written = (|| -> Result<()> {
         for (path, content) in &edits {
-            write_site_file(path, root, content)?;
+            write_under(server, root, path, content)?;
         }
         remove_planned_managed_files(&present)?;
         Ok(())
@@ -2213,7 +2345,9 @@ pub fn remove_everything(
 /// descriptor ([`DirFile`]) and put back through it, never through its
 /// path: a path in a directory another user owns can lead somewhere
 /// else by the time a failed test puts it back, and root would write the
-/// held bytes there.
+/// held bytes there. So is every file under a root someone else can
+/// write ([`WebServer::root_is_hostile`]), where that someone also decides
+/// whether the test fails.
 pub struct Snapshot {
     files: Vec<(Place, Option<Held>)>,
 }
@@ -2238,7 +2372,12 @@ impl Place {
     /// else. Opened without following a link or waiting on a FIFO.
     fn read(&self) -> std::io::Result<Option<Held>> {
         match self {
-            Place::Held(file) => file.read(),
+            Place::Held(file) => {
+                let owner = file.mode_and_owner()?.map(|(_, owner)| owner);
+                Ok(file
+                    .read()?
+                    .map(|(bytes, mode)| Held { bytes, mode, owner }))
+            }
             Place::Path(path) => {
                 use std::io::Read;
                 use std::os::unix::fs::MetadataExt;
@@ -2254,16 +2393,24 @@ impl Place {
                 }
                 let mut bytes = Vec::new();
                 file.read_to_end(&mut bytes)?;
-                Ok(Some((bytes, meta.mode() & 0o7777)))
+                Ok(Some(Held {
+                    bytes,
+                    mode: meta.mode() & 0o7777,
+                    owner: None,
+                }))
             }
         }
     }
 
-    fn write(&self, bytes: &[u8], mode: u32) -> Result<()> {
+    /// Puts `held` back. A held file goes back through its directory with
+    /// its owner and without its setuid, setgid or sticky bit: what is
+    /// held is, on a hostile root, a file another user made, and root
+    /// writes it.
+    fn write(&self, held: &Held) -> Result<()> {
         match self {
-            Place::Path(path) => write_atomically(path, bytes, mode, None),
+            Place::Path(path) => write_atomically(path, &held.bytes, held.mode, None),
             Place::Held(file) => file
-                .write_atomically(bytes, mode)
+                .write_atomically_owned(&held.bytes, held.mode & 0o777, held.owner)
                 .with_context(|| format!("failed to write {}", file.path().display())),
         }
     }
@@ -2282,9 +2429,13 @@ impl Place {
     }
 }
 
-/// A regular file's contents and permission bits, as [`Snapshot`] found
-/// them: `(bytes, mode)`.
-type Held = (Vec<u8>, u32);
+/// A regular file as [`Snapshot`] found it: its contents, its permission
+/// bits, and its owner where it is held through its directory.
+struct Held {
+    bytes: Vec<u8>,
+    mode: u32,
+    owner: Option<(u32, u32)>,
+}
 
 impl Snapshot {
     /// Reads every file in `paths`. Fails if one exists and cannot be
@@ -2314,12 +2465,31 @@ impl Snapshot {
     /// it. A site file that cannot be resolved is left out; its write will
     /// fail with the same error, and that failure is what undoes the
     /// apply.
+    ///
+    /// On a root someone else can write ([`WebServer::root_is_hostile`])
+    /// every one of them is held through its directory instead, from the
+    /// resolved root ([`under_hostile_root`]), its directory made first if
+    /// the apply is about to make it: putting back, like writing, then
+    /// goes where the file was, whatever has been linked in since. A link
+    /// already on the way refuses the snapshot, and with it the apply.
     pub fn of_apply<'a>(
+        server: WebServer,
         root: &Path,
         planned: impl IntoIterator<Item = PathBuf>,
         held: &[DirFile],
         site_files: impl IntoIterator<Item = &'a Path>,
     ) -> Result<Snapshot> {
+        if server.root_is_hostile() {
+            let mut places = Vec::new();
+            for path in planned
+                .into_iter()
+                .chain(site_files.into_iter().map(Path::to_path_buf))
+            {
+                places.push(Place::Held(under_hostile_root_created(root, &path)?));
+            }
+            places.extend(held.iter().cloned().map(Place::Held));
+            return Snapshot::take_places(places);
+        }
         Snapshot::take_places(
             planned
                 .into_iter()
@@ -2341,12 +2511,13 @@ impl Snapshot {
         let mut failed = Vec::new();
         for (place, before) in &self.files {
             let restored = match before {
-                Some((bytes, _))
-                    if place.read().ok().flatten().map(|(now, _)| now).as_ref() == Some(bytes) =>
+                Some(held)
+                    if place.read().ok().flatten().map(|now| now.bytes).as_ref()
+                        == Some(&held.bytes) =>
                 {
                     Ok(())
                 }
-                Some((bytes, mode)) => place.write(bytes, *mode),
+                Some(held) => place.write(held),
                 None => place.remove_file(),
             };
             if let Err(err) = restored {

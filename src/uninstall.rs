@@ -634,6 +634,9 @@ fn jumps_into(listing: &str, chain: &str) -> Vec<Vec<String>> {
 /// is removed — and put back, if NGINX refuses the result — is in the
 /// directory that was checked.
 fn generated_nginx_files(plan: &Plan) -> Vec<webserver::DirFile> {
+    if plan.server.root_is_hostile() {
+        return generated_files_under_hostile_root(plan);
+    }
     let console = plan.server.console_site_path(&plan.nginx_root);
     let mut files: Vec<webserver::DirFile> = plan
         .recorded
@@ -662,6 +665,35 @@ fn generated_nginx_files(plan: &Plan) -> Vec<webserver::DirFile> {
     let mut seen = std::collections::HashSet::new();
     files.retain(|file| plan.allows(file.path()) && seen.insert(file.path().to_path_buf()));
     // The order a removal must go in; see `webserver::ManagedKind`.
+    files.sort_by_key(|file| webserver::ManagedKind::of(file.path()));
+    files
+}
+
+/// [`generated_nginx_files`] on a root someone else can write (NPMplus's
+/// data directory): each file the backend may have generated, in its own
+/// directory under the root, reached without following a link
+/// ([`webserver::under_hostile_root`]) and taken only if it is a regular
+/// file that still opens with this project's header. The record is read
+/// the same way: a path in it that is not under the root, or that a link
+/// is on the way to, is left alone.
+fn generated_files_under_hostile_root(plan: &Plan) -> Vec<webserver::DirFile> {
+    let root = &plan.nginx_root;
+    let own = &plan.managed_dir;
+    let known = [
+        nginx::untrusted_rate_limit_conf_path(own),
+        nginx::rate_limit_conf_path(own),
+        nginx::trusted_conf_path(own),
+        own.join("robots.txt"),
+    ];
+    let mut files: Vec<webserver::DirFile> = known
+        .iter()
+        .chain(&plan.recorded)
+        .filter(|path| plan.allows(path))
+        .filter_map(|path| webserver::under_hostile_root(root, path).ok().flatten())
+        .filter(|file| file.is_regular() && webserver::is_generated(file))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|file| seen.insert(file.path().to_path_buf()));
     files.sort_by_key(|file| webserver::ManagedKind::of(file.path()));
     files
 }
@@ -775,6 +807,27 @@ fn remove_nginx(plan: &Plan, options: &Options, report: &mut Report) {
         }
     }
 
+    // Inside another application's data, only what was generated there
+    // was removed above, and the directory goes only if that emptied it:
+    // through its parent, following no link.
+    if plan.server.root_is_hostile() {
+        let dir = plan.managed_dir.clone();
+        let held = webserver::under_hostile_root(&plan.nginx_root, &dir);
+        if plan.allows(&dir) && !matches!(held, Ok(None)) {
+            report.step(
+                options,
+                format!("remove {} if it is empty", dir.display()),
+                || match held? {
+                    Some(file) => file
+                        .remove_empty_dir()
+                        .map(|_| ())
+                        .with_context(|| format!("failed to remove {}", dir.display())),
+                    None => Ok(()),
+                },
+            );
+        }
+        return;
+    }
     // Only the robots.txt the blocks just stopped naming lives here.
     if plan.managed_dir.exists() && plan.allows(&plan.managed_dir) {
         let dir = plan.managed_dir.clone();

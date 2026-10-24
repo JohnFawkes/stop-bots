@@ -59,10 +59,27 @@
 //! stop-bots runs on the host, and NPMplus in its container: the host's
 //! `/opt/npmplus` is the container's `/data`. Files are written at the
 //! first and named in config at the second ([`CONTAINER_OWN_DIR`]).
+//!
+//! ## Root, writing where a container can
+//!
+//! The data directory is the container's to write, and stop-bots writes
+//! there as root. A link the container made would take that write, or the
+//! read of `server_http.conf` whose bytes are written back, somewhere else
+//! on the host: a link to `/etc/shadow` there would have been copied into
+//! a file the container reads. So nothing below the root is followed. The
+//! root itself is resolved once, being the operator's own choice; under
+//! it, a link or anything but a directory or a regular file where these
+//! files go refuses the apply ([`checked_place`]), and the operator's two
+//! files are read and written through their directory, following no link
+//! ([`DirFile`]). The generated files in [`OWN_DIR`] are written by path,
+//! into a directory checked just before: a link swapped in at that moment
+//! could still move them, but they hold only text of stop-bots' own, never
+//! a byte read from anywhere else.
 
 use crate::webserver::*;
 use anyhow::{Context, Result};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 /// Where NPMplus's compose file mounts its data directory on the host.
@@ -275,8 +292,11 @@ pub fn block_for_site(
 /// In the order they may be written: what is read before what reads it,
 /// and the `server` block last.
 pub fn planned_managed_files(db: &crate::db::Db, root: &Path) -> Result<Vec<(PathBuf, String)>> {
-    let root = checked_root(root)?;
+    let root = &fs::canonicalize(checked_root(root)?)
+        .with_context(|| format!("failed to read {}", root.display()))?;
+    checked_place(&root.join(CUSTOM_DIR), true)?;
     let own = own_dir(root);
+    checked_place(&own, true)?;
     let mut files = Vec::new();
     if db.get_serve_robots_txt()? {
         files.push((own.join("robots.txt"), robots_txt_body(db)?));
@@ -300,11 +320,6 @@ pub fn planned_managed_files(db: &crate::db::Db, root: &Path) -> Result<Vec<(Pat
     }
 
     let server_block = block(&default_block_config(db)?);
-    let read = |path: &Path| match fs::read_to_string(path) {
-        Ok(content) => Ok(content),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
-    };
     // The include goes wherever there is a block: its wildcard matches
     // nothing until there is a file, which NGINX allows.
     let http = server_block.as_ref().map(|_| http_block());
@@ -312,13 +327,52 @@ pub fn planned_managed_files(db: &crate::db::Db, root: &Path) -> Result<Vec<(Pat
         (http_file(root), http.as_deref()),
         (server_file(root), server_block.as_deref()),
     ] {
-        let before = read(&path)?;
+        let before = read_operators_file(&path)?;
         let after = with_region(&before, wanted);
         if after != before || wanted.is_some() {
             files.push((path, after));
         }
     }
     Ok(files)
+}
+
+/// `path`, a place under the root stop-bots writes in, refused if it is
+/// a link, or anything but a directory (`dir`) or a regular file. Nothing
+/// there is fine: it is created.
+fn checked_place(path: &Path, dir: bool) -> Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let (fits, what) = if dir {
+        (meta.is_dir(), "a directory")
+    } else {
+        (meta.is_file(), "a regular file")
+    };
+    if !fits {
+        anyhow::bail!(
+            "refusing to write {}: it is a link or something else that is not {what}, in a \
+             directory NPMplus's container can write, and stop-bots runs as root",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// One of the operator's two files, read through its directory without
+/// following a link ([`checked_place`] says why); empty when it is not
+/// there yet.
+fn read_operators_file(path: &Path) -> Result<String> {
+    checked_place(path, false)?;
+    let file =
+        DirFile::exactly(path).with_context(|| format!("refusing to read {}", path.display()))?;
+    let bytes = file
+        .read()
+        .with_context(|| format!("failed to read {}", path.display()))?
+        .map(|(bytes, _)| bytes)
+        .unwrap_or_default();
+    String::from_utf8(bytes).with_context(|| format!("{} is not text", path.display()))
 }
 
 /// Where each generated file the current settings do not call for would
@@ -625,6 +679,39 @@ server {
         ];
         for (what, got, expected) in cases {
             assert_eq!(got, expected, "{what}");
+        }
+    }
+
+    /// The data directory is the container's to write, and stop-bots is
+    /// root: a link planted there is refused rather than followed, and
+    /// what it points at is neither read into the plan nor written.
+    #[test]
+    fn a_link_in_the_data_directory_is_refused_not_followed() {
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("shadow");
+        fs::write(&secret, "root:secret\n").unwrap();
+        let cases = [
+            ("server_http.conf", secret.clone()),
+            ("stop-bots", outside.path().to_path_buf()),
+        ];
+        for (name, target) in cases {
+            let dir = data_dir("");
+            let db = blocking_db();
+            db.set_serve_robots_txt(true).unwrap();
+            let link = dir.path().join(CUSTOM_DIR).join(name);
+            let _ = fs::remove_file(&link);
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+
+            let planned = planned_managed_files(&db, dir.path());
+
+            let err = format!("{:#}", planned.expect_err(name));
+            assert!(err.contains("refusing to write"), "{name}: {err}");
+            assert_eq!(
+                fs::read_to_string(&secret).unwrap(),
+                "root:secret\n",
+                "{name}"
+            );
+            assert!(!outside.path().join("robots.txt").exists(), "{name}");
         }
     }
 

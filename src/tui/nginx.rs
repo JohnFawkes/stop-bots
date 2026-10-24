@@ -1231,9 +1231,9 @@ impl Nginx {
         // every host includes.
         if self.server == WebServer::Npmplus && failures.is_empty() {
             message = if managed_changed > 0 {
-                format!("Updated the rule NPMplus's {total} host(s) include")
+                format!("Updated the rule every NPMplus host includes ({total} host(s))")
             } else {
-                "The rule NPMplus's hosts include was already up to date".to_string()
+                "The rule every NPMplus host includes was already up to date".to_string()
             };
         }
         (message, applied > 0 || managed_changed > 0)

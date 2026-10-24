@@ -78,7 +78,8 @@ Traefik's file provider, or /opt/npmplus for NPMplus's data directory";
 pub(crate) const ACCESS_LOG_HELP: &str = "Read only this access log. Without it, the stored one \
 (`set-log-paths`) is read, else /var/log/nginx/access.log, for Apache \
 /var/log/apache2/access.log (/var/log/httpd/access_log in RHEL's /etc/httpd), for Traefik \
-/var/log/traefik/access.log, or for NPMplus /opt/npmplus/nginx/logs/access.log, and with it every other access log the web server's config names";
+/var/log/traefik/access.log, or for NPMplus /opt/npmplus/nginx/logs/access.log, and with it \
+every other access log the web server's config names";
 
 /// Help text shared by `status --json` and every `list-* --json`.
 pub(crate) const JSON_HELP: &str =

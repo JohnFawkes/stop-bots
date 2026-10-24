@@ -66,15 +66,20 @@
 //! there as root. A link the container made would take that write, or the
 //! read of `server_http.conf` whose bytes are written back, somewhere else
 //! on the host: a link to `/etc/shadow` there would have been copied into
-//! a file the container reads. So nothing below the root is followed. The
-//! root itself is resolved once, being the operator's own choice; under
-//! it, a link or anything but a directory or a regular file where these
-//! files go refuses the apply ([`checked_place`]), and the operator's two
-//! files are read and written through their directory, following no link
-//! ([`DirFile`]). The generated files in [`OWN_DIR`] are written by path,
-//! into a directory checked just before: a link swapped in at that moment
-//! could still move them, but they hold only text of stop-bots' own, never
-//! a byte read from anywhere else.
+//! a file the container reads. The container also decides whether the
+//! config test fails, so whatever puts files back after one is in its
+//! hands too.
+//!
+//! So nothing below the root is followed, by anything that touches it
+//! ([`WebServer::root_is_hostile`]). The root is resolved once, being the
+//! operator's own choice; under it, a link or anything but a directory or
+//! a regular file where these files go refuses the apply
+//! ([`checked_place`]), and every file — the operator's two, the generated
+//! ones, NPMplus's own host files — is read, written, held for putting
+//! back, put back and removed through its directory, opened without
+//! following a link ([`DirFile`], [`crate::webserver::under_hostile_root`]).
+//! A file put back keeps its owner and loses any setuid, setgid or sticky
+//! bit.
 
 use crate::webserver::*;
 use anyhow::{Context, Result};
@@ -203,6 +208,30 @@ pub fn console_site_path(root: &Path) -> PathBuf {
     root.join(CUSTOM_DIR).join("stop-bots-console.conf")
 }
 
+/// Every name on the host that declares `server_name` in `config_path`,
+/// one of NPMplus's own host files, as [`crate::nginx::server_names_for`]
+/// reads them: but read without following a link at it or waiting on a
+/// FIFO, the file being the container's ([`read_regular_file`]).
+pub fn server_names_for(config_path: &Path, server_name: &str) -> Vec<String> {
+    match read_regular_file(config_path) {
+        Some(content) => crate::nginx::server_names_in(&content, server_name),
+        None => vec![server_name.to_string()],
+    }
+}
+
+/// [`crate::nginx::site_directives`], read as [`server_names_for`] reads.
+pub fn site_directives(
+    config_path: &Path,
+    server_name: &str,
+) -> Option<Vec<(String, Vec<String>)>> {
+    crate::nginx::site_directives_in(&read_regular_file(config_path)?, server_name)
+}
+
+/// [`crate::nginx::site_service`], read as [`server_names_for`] reads.
+pub fn site_service(config_path: &Path, server_name: &str) -> Option<crate::services::Service> {
+    crate::services::recognise(&site_directives(config_path, server_name)?)
+}
+
 // ---- writing the block ----
 
 /// The block for `config`, as NGINX in the container is to read it, or
@@ -278,7 +307,7 @@ pub fn block_for_site(
     server_name: &str,
     config: &BlockConfig,
 ) -> Result<String> {
-    let on_disk = fs::read_to_string(server_file(root)).unwrap_or_default();
+    let on_disk = read_under(WebServer::Npmplus, root, &server_file(root))?.unwrap_or_default();
     if let Some(why) = refusal(server_name, config, region(&on_disk)) {
         anyhow::bail!("refusing to apply {server_name}: {why}");
     }
@@ -402,7 +431,12 @@ pub fn fallback_unused_managed_files(db: &crate::db::Db, root: &Path) -> Result<
 /// The directory a recorded file may be removed from: [`own_dir`], its
 /// links resolved, if it exists.
 pub fn managed_directories(root: &Path) -> Vec<PathBuf> {
-    fs::canonicalize(own_dir(root)).into_iter().collect()
+    let unlinked = |path: &Path| fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir());
+    let own = own_dir(root);
+    if !(unlinked(&root.join(CUSTOM_DIR)) && unlinked(&own)) {
+        return Vec::new();
+    }
+    fs::canonicalize(own).into_iter().collect()
 }
 
 /// Whether what is written for every host is what `config` renders to,
@@ -413,17 +447,17 @@ pub fn site_apply_status(
     config: &BlockConfig,
     root: &Path,
 ) -> SiteApplyStatus {
-    if crate::nginx::site_directives(config_path, server_name).is_none() {
+    if site_directives(config_path, server_name).is_none() {
         return SiteApplyStatus::NotFound;
     }
-    let read = |path: PathBuf| fs::read_to_string(path).unwrap_or_default();
-    let server = read(server_file(root));
-    let http = read(http_file(root));
+    let read = |path: PathBuf| read_under(WebServer::Npmplus, root, &path).ok().flatten();
+    let server = read(server_file(root)).unwrap_or_default();
+    let http = read(http_file(root)).unwrap_or_default();
     let expected = block(config);
     let trust_on_disk = config
         .trust
         .as_ref()
-        .and_then(|_| fs::read_to_string(crate::nginx::trusted_conf_path(&own_dir(root))).ok());
+        .and_then(|_| read(crate::nginx::trusted_conf_path(&own_dir(root))));
     let current = region(&server) == expected.as_deref()
         && region(&http) == expected.as_ref().map(|_| http_block()).as_deref()
         && crate::nginx::trust_file_is_current(config, trust_on_disk.as_deref());
@@ -594,8 +628,12 @@ server {
         let dir = data_dir("return 418;\n");
         let db = blocking_db();
         let root = dir.path();
-        crate::webserver::write_planned_managed_files(&planned_managed_files(&db, root).unwrap())
-            .unwrap();
+        crate::webserver::write_planned_managed_files(
+            WebServer::Npmplus,
+            root,
+            &planned_managed_files(&db, root).unwrap(),
+        )
+        .unwrap();
         db.set_bot_status("badbot", crate::db::BotStatus::Allowed)
             .unwrap();
         assert_eq!(
@@ -656,8 +694,12 @@ server {
         let status =
             |name: &str, config: &BlockConfig| site_apply_status(&proxy, name, config, root);
         assert_eq!(status("a.example", &default), SiteApplyStatus::Stale);
-        crate::webserver::write_planned_managed_files(&planned_managed_files(&db, root).unwrap())
-            .unwrap();
+        crate::webserver::write_planned_managed_files(
+            WebServer::Npmplus,
+            root,
+            &planned_managed_files(&db, root).unwrap(),
+        )
+        .unwrap();
         let mut own = default.clone();
         own.patterns.push("OtherBot".to_string());
         let cases = [
@@ -715,6 +757,81 @@ server {
         }
     }
 
+    /// What a failed test puts back is a file the container made, and root
+    /// writes it: it goes back with its bytes, but without the setuid bit
+    /// the container gave it.
+    #[test]
+    fn a_file_put_back_loses_its_setuid_bit() {
+        let dir = data_dir("mine\n");
+        let path = server_file(dir.path());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o4755)).unwrap();
+        let snapshot =
+            Snapshot::of_apply(WebServer::Npmplus, dir.path(), [path.clone()], &[], []).unwrap();
+        fs::write(&path, "changed\n").unwrap();
+
+        snapshot.restore().unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            (fs::read_to_string(&path).unwrap(), mode),
+            ("mine\n".into(), 0o755)
+        );
+    }
+
+    /// A FIFO where `server_http.conf` goes refuses the apply rather than
+    /// hanging it with the apply lock held, and a status read finds nothing
+    /// there rather than waiting.
+    #[test]
+    fn a_fifo_in_the_data_directory_hangs_nothing() {
+        let dir = data_dir("");
+        let path = server_file(dir.path());
+        fs::remove_file(&path).unwrap();
+        crate::testing::mkfifo(&path);
+        let db = blocking_db();
+
+        let planned = planned_managed_files(&db, dir.path());
+        let status = site_apply_status(
+            &dir.path().join("nginx/proxy_host/1.conf"),
+            "a.example",
+            &default_block_config(&db).unwrap(),
+            dir.path(),
+        );
+
+        let err = format!("{:#}", planned.expect_err("a FIFO is not a regular file"));
+        assert!(err.contains("refusing to write"), "{err}");
+        assert_eq!(status, SiteApplyStatus::Stale);
+    }
+
+    /// Cleaning up removes only what stop-bots generated, from its own
+    /// directory, and refuses to look through a link put there.
+    #[test]
+    fn only_generated_files_are_cleaned_up_and_never_through_a_link() {
+        let db = blocking_db();
+        let dir = data_dir("");
+        let own = own_dir(dir.path());
+        fs::create_dir(&own).unwrap();
+        fs::write(own.join("robots.txt"), "User-agent: *\n").unwrap();
+        let unused = crate::webserver::unused_managed_files(WebServer::Npmplus, &db, dir.path());
+        assert_eq!(
+            unused.unwrap().len(),
+            0,
+            "a robots.txt with no header is not ours"
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(
+            outside.path().join("robots.txt"),
+            "# Generated by stop-bots\n",
+        )
+        .unwrap();
+        fs::remove_dir_all(&own).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &own).unwrap();
+        let err = crate::webserver::unused_managed_files(WebServer::Npmplus, &db, dir.path())
+            .expect_err("a link to another directory is not followed");
+        assert!(format!("{err:#}").contains("refusing"), "{err:#}");
+        assert!(outside.path().join("robots.txt").exists());
+    }
+
     /// `server_http.conf` is the operator's, and is replaced keeping its
     /// owner and mode; stop-bots' own files are written as its own.
     #[test]
@@ -724,8 +841,12 @@ server {
         let db = blocking_db();
         db.set_serve_robots_txt(true).unwrap();
         fs::set_permissions(server_file(root), fs::Permissions::from_mode(0o600)).unwrap();
-        crate::webserver::write_planned_managed_files(&planned_managed_files(&db, root).unwrap())
-            .unwrap();
+        crate::webserver::write_planned_managed_files(
+            WebServer::Npmplus,
+            root,
+            &planned_managed_files(&db, root).unwrap(),
+        )
+        .unwrap();
         let mode = |path: PathBuf| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
         assert_eq!(
             (

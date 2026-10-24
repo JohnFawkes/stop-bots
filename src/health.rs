@@ -1826,7 +1826,7 @@ fn access_log_format(probe: &Probe) -> Check {
                              in either of its formats (`common` or `json`): `stop-bots \
                              set-log-paths --access-log <file>`"
                         }
-                        // NPMplus writes one format, which reads.
+                        // Both of the formats NPMplus has written read.
                         webserver::WebServer::Npmplus => {
                             "point stop-bots at the access.log NPMplus writes with \
                              `LOGROTATE=true`, in its data directory's nginx/logs: `stop-bots \

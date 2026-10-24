@@ -5776,10 +5776,14 @@ fn traefik_uninstall_takes_the_routers_away() {
 // Nothing here builds an image. NPMplus's is Alpine's, on musl, which the
 // binary under test would not run in, and running it outside is the point.
 
-/// The NPMplus release these tests run, pinned: a new one can change what
-/// it renders, and that should be a change to this line, not a red build
-/// nobody asked for.
-const NPMPLUS_IMAGE: &str = "docker.io/zoeyvid/npmplus:2026-10-22-r1";
+/// The NPMplus release these tests run, pinned by the digest of its
+/// multi-platform index, as every other image fetches what it fetches by
+/// checksum: a tag can be pushed again. A new release can change what it
+/// renders, and that should be a change to this line, not a red build
+/// nobody asked for. The tag is there to be read; the digest is what is
+/// pulled.
+const NPMPLUS_IMAGE: &str = "docker.io/zoeyvid/npmplus:2026-10-22-r1\
+@sha256:244fbf14f0c8bfb969434bfacba14ba71f8eee9911a2466035e640d64e594178";
 
 /// The admin NPMplus creates on its first start, which the API is driven
 /// as.

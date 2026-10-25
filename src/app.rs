@@ -413,8 +413,88 @@ impl App {
         // row's `enabled` flag.
         crate::ipranges::reputation::register_all_reputation_sources(&app.db)?;
         app.dashboard.installed = Some(crate::firewall::Installed::detect());
+        let simple = app.db.get_ui_mode()? == crate::db::UiMode::Simple;
+        app.dashboard.set_simple(simple);
         app.refresh_all()?;
         Ok(app)
+    }
+
+    /// Switches to the simple screen or to every screen, and remembers it.
+    /// Lands on the Dashboard, the one screen both have, unless this is
+    /// the simple mode and the screen open is Blocks, which it has too.
+    fn set_ui_mode(&mut self, mode: crate::db::UiMode) -> Result<()> {
+        self.db.set_ui_mode(mode)?;
+        let simple = mode == crate::db::UiMode::Simple;
+        self.dashboard.set_simple(simple);
+        if !(simple && Screen::SIMPLE_TABS.contains(&self.screen)) {
+            self.screen = Screen::Dashboard;
+        }
+        self.message = Some(if simple {
+            "The simple screen. v shows every screen again.".to_string()
+        } else {
+            "Every screen. v goes back to the simple one.".to_string()
+        });
+        self.refresh()
+    }
+
+    /// Goes to `screen`, leaving the simple mode first when it does not
+    /// have that screen: a palette command or a key that names one is
+    /// asking for it.
+    fn show(&mut self, screen: Screen) -> Result<()> {
+        if self.dashboard.is_simple()
+            && screen != Screen::Help
+            && !Screen::SIMPLE_TABS.contains(&screen)
+        {
+            self.set_ui_mode(crate::db::UiMode::Advanced)?;
+        }
+        self.screen = screen;
+        Ok(())
+    }
+
+    /// "Keep running by itself" from the simple screen: see
+    /// [`crate::install::keep_running`]. Writing one small file is not
+    /// slow, so this is not a `start_`/`finish_` pair. On success the
+    /// health check runs again at once, so the status stops saying that
+    /// nothing runs the schedule an hour before the next one would.
+    fn set_keep_running(&mut self, on: bool) -> Result<()> {
+        let outcome = if on {
+            self.keep_running_layout().and_then(|layout| {
+                crate::install::keep_running(&self.db, &layout, crate::hint::is_root())
+            })
+        } else {
+            crate::install::stop_keep_running(&self.db)
+        };
+        let started = outcome.is_ok() && on;
+        self.message = Some(match outcome {
+            Ok(message) => message,
+            Err(err) => format!("{err:#}"),
+        });
+        if started {
+            self.start_cron_job(crate::cron::Task::Job(CronJob::HealthCheck))?;
+        }
+        self.refresh()
+    }
+
+    /// Where the cron file goes and what it runs: this binary, against
+    /// this database.
+    fn keep_running_layout(&self) -> Result<crate::install::Layout> {
+        let binary = std::env::current_exe().context("could not tell which binary this is")?;
+        let mut layout = crate::install::Layout::system(binary);
+        layout.db_path = self
+            .db
+            .path()
+            .context("this database is in memory, and cron could not open it")?;
+        Ok(layout)
+    }
+
+    /// On the simple screen, which has no sites screen to scan from: find
+    /// the sites once at start, when none are known. Only the database is
+    /// written; nothing on the host changes until an apply.
+    fn scan_if_simple_and_empty(&mut self) -> Result<()> {
+        if self.dashboard.is_simple() && self.db.list_sites()?.is_empty() {
+            self.start_site_action(crate::tui::nginx::SiteAction::Scan)?;
+        }
+        Ok(())
     }
 
     /// Reloads the screen on display and marks the rest stale, to be
@@ -487,6 +567,7 @@ impl App {
 
     /// Runs the application's main loop.
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
+        self.scan_if_simple_and_empty()?;
         while self.running {
             self.refresh_if_stale()?;
             self.note_message();
@@ -1813,6 +1894,10 @@ impl App {
                 self.start_apply_everything()?;
                 return Ok(());
             }
+            KeyOutcome::KeepRunning(on) => {
+                self.set_keep_running(on)?;
+                return Ok(());
+            }
             KeyOutcome::RereadLogs => {
                 self.ssh_log_read_at = None;
                 self.start_ssh_log_read();
@@ -1836,13 +1921,32 @@ impl App {
                 self.explain = Some(tui::explain::Explain::new(self.explanation(), self.hints()));
             }
             KeyCode::Char(':') => self.palette = Some(tui::palette::Palette::new(self.commands())),
+            // The simple screen, or every screen: see `tui::dashboard::simple`.
+            KeyCode::Char('v') => {
+                let mode = self.db.get_ui_mode()?.toggle();
+                self.set_ui_mode(mode)?;
+            }
             // Digits, as every tabbed terminal tool has them and as the tab
-            // bar shows them; the mnemonic letters stay as aliases.
+            // bar shows them; the mnemonic letters stay as aliases. The
+            // simple mode has two tabs, and the keys for the others are
+            // left alone there rather than leaving it.
             KeyCode::Char('d' | '1') => self.screen = Screen::Dashboard,
+            KeyCode::Char('x' | '5') => self.screen = Screen::Blocks,
+            KeyCode::Char('b' | '2' | 'f' | '3' | 'n' | '4') if self.dashboard.is_simple() => {
+                self.message =
+                    Some("That screen is one of the advanced ones: press v to see it.".to_string());
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Left | KeyCode::Char('h')
+                if self.dashboard.is_simple() =>
+            {
+                self.screen = match self.screen {
+                    Screen::Dashboard => Screen::Blocks,
+                    _ => Screen::Dashboard,
+                };
+            }
             KeyCode::Char('b' | '2') => self.screen = Screen::BotSettings,
             KeyCode::Char('f' | '3') => self.screen = Screen::Firewall,
             KeyCode::Char('n' | '4') => self.screen = Screen::Nginx,
-            KeyCode::Char('x' | '5') => self.screen = Screen::Blocks,
             // Left/Right and their vim h/l aliases cycle screens. Tab is
             // *not* among them any more: it always means "next panel on
             // this screen", so that it means one thing everywhere (it used
@@ -1917,6 +2021,15 @@ impl App {
             ("Rescan for NGINX sites", "r", key(Screen::Nginx, 'r')),
             ("Apply blocking to every site", "A", key(Screen::Nginx, 'A')),
             ("Toggle light/dark theme", "t", Action::Theme),
+            (
+                if self.dashboard.is_simple() {
+                    "Show every screen and setting"
+                } else {
+                    "Go back to the simple screen"
+                },
+                "v",
+                Action::UiMode,
+            ),
             ("Quit", "q", Action::Quit),
         ]
         .into_iter()
@@ -1953,9 +2066,9 @@ impl App {
                 self.before_help = self.screen;
                 self.screen = Screen::Help;
             }
-            Action::Screen(screen) => self.screen = screen,
+            Action::Screen(screen) => self.show(screen)?,
             Action::Key(screen, code) => {
-                self.screen = screen;
+                self.show(screen)?;
                 if screen == Screen::Nginx {
                     // `r` and `A` are keys of the site list, not of the
                     // settings panel above it or of an open site's detail.
@@ -1964,6 +2077,10 @@ impl App {
                 self.handle_key_event(KeyEvent::from(code))?;
             }
             Action::Theme => self.theme = self.theme.toggle(),
+            Action::UiMode => {
+                let mode = self.db.get_ui_mode()?.toggle();
+                self.set_ui_mode(mode)?;
+            }
             Action::Quit => self.events.send(AppEvent::Quit),
             Action::Detector(detector, on) => {
                 detector.set_enabled(&self.db, on)?;
@@ -2029,6 +2146,11 @@ mod tests {
         app.db
             .set_cron_last_run(CronJob::HealthCheck.id(), now_secs(), "skipped for test")
             .unwrap();
+        // Every screen: these tests are about the advanced ones, and the
+        // simple mode a new database opens in has its own below.
+        app.db.set_ui_mode(crate::db::UiMode::Advanced).unwrap();
+        let mut app = app;
+        app.dashboard.set_simple(false);
         app
     }
 
@@ -2054,6 +2176,155 @@ mod tests {
             !labels.iter().any(|label| label.contains("NGINX")),
             "an Apache host's palette names NGINX:\n{labels:#?}"
         );
+    }
+
+    /// `v` goes to the simple screen and back, and the choice outlives
+    /// the TUI: it is in the database the next start reads.
+    #[tokio::test]
+    async fn v_switches_between_the_simple_screen_and_every_screen_and_is_remembered() {
+        let mut app = test_app();
+        app.screen = Screen::Firewall;
+
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('v')))
+            .unwrap();
+
+        assert!(app.dashboard.is_simple());
+        assert_eq!(
+            app.screen,
+            Screen::Dashboard,
+            "Firewall is not a simple tab"
+        );
+        assert_eq!(app.db.get_ui_mode().unwrap(), crate::db::UiMode::Simple);
+
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('v')))
+            .unwrap();
+
+        assert!(!app.dashboard.is_simple());
+        assert_eq!(app.db.get_ui_mode().unwrap(), crate::db::UiMode::Advanced);
+    }
+
+    /// The simple mode's tabs are its own and Blocks. A key for one of
+    /// the others says where it is rather than leaving the simple mode.
+    #[tokio::test]
+    async fn an_advanced_screens_key_on_the_simple_screen_points_at_v() {
+        let mut app = test_app();
+        app.set_ui_mode(crate::db::UiMode::Simple).unwrap();
+
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('3')))
+            .unwrap();
+        assert_eq!(app.screen, Screen::Dashboard);
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|m| m.contains("press v")),
+            "message: {:?}",
+            app.message
+        );
+
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('x')))
+            .unwrap();
+        assert_eq!(app.screen, Screen::Blocks);
+    }
+
+    /// A palette command for a screen the simple mode does not have is
+    /// asking for that screen: it leaves the simple mode to show it.
+    #[tokio::test]
+    async fn the_palette_leaves_the_simple_mode_for_an_advanced_screen() {
+        let mut app = test_app();
+        app.set_ui_mode(crate::db::UiMode::Simple).unwrap();
+
+        app.run_command(tui::palette::Action::Screen(Screen::Firewall))
+            .unwrap();
+
+        assert_eq!(app.screen, Screen::Firewall);
+        assert!(!app.dashboard.is_simple());
+    }
+
+    /// Off needs no root and writes no file: both auto-applies go off.
+    #[tokio::test]
+    async fn keep_running_off_turns_both_auto_applies_off() {
+        let mut app = test_app();
+        app.db.set_auto_apply(true).unwrap();
+        app.db.set_auto_apply_firewall(true).unwrap();
+
+        app.set_keep_running(false).unwrap();
+
+        assert!(!app.db.get_auto_apply().unwrap(), "{:?}", app.message);
+        assert!(
+            !app.db.get_auto_apply_firewall().unwrap(),
+            "{:?}",
+            app.message
+        );
+    }
+
+    /// On that cannot write the cron file says why and switches nothing
+    /// on: an auto-apply with nothing to run it would read as running.
+    /// The test database is in memory, which cron could not open.
+    #[tokio::test]
+    async fn keep_running_on_that_fails_says_why_and_switches_nothing_on() {
+        let mut app = test_app();
+
+        app.set_keep_running(true).unwrap();
+
+        assert!(
+            app.message.as_deref().is_some_and(|m| m.contains("memory")),
+            "message: {:?}",
+            app.message
+        );
+        assert!(!app.db.get_auto_apply().unwrap(), "{:?}", app.message);
+        assert!(
+            !app.db.get_auto_apply_firewall().unwrap(),
+            "{:?}",
+            app.message
+        );
+    }
+
+    /// The simple mode has two tabs, and Left/Right go between them in
+    /// either direction rather than through the screens it does not have.
+    #[tokio::test]
+    async fn left_and_right_on_the_simple_screen_go_between_its_two_tabs() {
+        let mut app = test_app();
+        app.set_ui_mode(crate::db::UiMode::Simple).unwrap();
+
+        for (key, expected) in [
+            (KeyCode::Right, Screen::Blocks),
+            (KeyCode::Right, Screen::Dashboard),
+            (KeyCode::Left, Screen::Blocks),
+            (KeyCode::Char('h'), Screen::Dashboard),
+        ] {
+            app.handle_key_event(KeyEvent::from(key)).unwrap();
+            assert_eq!(app.screen, expected, "after {key:?}");
+        }
+    }
+
+    /// The simple mode has no sites screen to scan from, so it scans at
+    /// start when no site is known; every screen leaves that to the Sites
+    /// screen, as before.
+    #[tokio::test]
+    async fn the_simple_screen_scans_for_sites_at_start_when_none_are_known() {
+        let empty = tempfile::tempdir().unwrap();
+        for (mode, scans) in [
+            (crate::db::UiMode::Simple, true),
+            (crate::db::UiMode::Advanced, false),
+        ] {
+            let db = Db::open_in_memory().unwrap();
+            db.set_ui_mode(mode).unwrap();
+            let mut app = App::new(
+                db,
+                empty.path().to_path_buf(),
+                false,
+                Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),
+            )
+            .unwrap();
+
+            app.scan_if_simple_and_empty().unwrap();
+
+            assert_eq!(
+                app.jobs_in_flight.contains(&Job::ScanSites),
+                scans,
+                "{mode:?}"
+            );
+        }
     }
 
     /// Marks both download jobs just run, so that no test's cron check

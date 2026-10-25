@@ -191,6 +191,15 @@ async fn main() -> Result<()> {
     app.blocks
         .handle_key(KeyEvent::from(KeyCode::Down), &app.db, &mut app.message)?;
 
+    // The simple screen first, as a new database opens on it; then every
+    // screen, as `v` shows them.
+    app.dashboard.set_simple(true);
+    app.screen = Screen::Dashboard;
+    let path = out.join("simple.svg");
+    std::fs::write(&path, render_svg(&mut app, 28)?)?;
+    stop_bots::say!("wrote {}", path.display());
+    app.dashboard.set_simple(false);
+
     // Height per screen rather than one size for all: the Dashboard
     // stacks five panels and needs every row, while the Firewall screen at
     // the same height is two lists floating in eighteen blank lines. The

@@ -168,6 +168,20 @@ fn every_release_s_database_opens_at_the_current_schema_version() {
     }
 }
 
+/// The simple screen is for a new install: a host upgraded from any
+/// release opens on every screen, the ones its operator already knows.
+#[test]
+fn every_release_s_database_opens_the_tui_on_every_screen() {
+    for release in RELEASES {
+        let db = Db::open(UpgradedHost::of(release).db).unwrap();
+        assert_eq!(
+            db.get_ui_mode().unwrap(),
+            stop_bots::db::UiMode::Advanced,
+            "{release}"
+        );
+    }
+}
+
 /// An upgrade starts no detector by itself: one added since a release is
 /// off on that release's database, and marked new, whatever it defaults
 /// to on a new one.

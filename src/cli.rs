@@ -1033,6 +1033,17 @@ pub(crate) enum Command {
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
+    /// Choose which TUI `stop-bots` opens: simple or advanced.
+    ///
+    /// "simple" is one screen: who can visit, which countries, whether it
+    /// keeps running by itself, and a one-line status. "advanced" is every
+    /// screen and setting. `v` in the TUI switches between them too. A new
+    /// database opens in simple; one from before 0.7.0 in advanced.
+    SetUiMode {
+        /// simple or advanced
+        #[arg(long)]
+        mode: UiModeArg,
+    },
     /// Block the user agents of browsers too old for anyone to still run.
     ///
     /// Opera 5 to 12, Firefox 1 to 9, Chrome 1 to 39, Internet Explorer 2
@@ -1487,6 +1498,21 @@ impl From<UninstallTarget> for stop_bots::uninstall::Target {
 pub(crate) enum FirewallBackend {
     Iptables,
     Nftables,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum UiModeArg {
+    Simple,
+    Advanced,
+}
+
+impl From<UiModeArg> for stop_bots::db::UiMode {
+    fn from(arg: UiModeArg) -> Self {
+        match arg {
+            UiModeArg::Simple => stop_bots::db::UiMode::Simple,
+            UiModeArg::Advanced => stop_bots::db::UiMode::Advanced,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]

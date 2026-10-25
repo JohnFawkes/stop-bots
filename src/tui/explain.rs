@@ -127,8 +127,9 @@ pub enum ExplainKey {
 }
 
 /// The keys that work on every screen, below the panel's own.
-const EVERYWHERE: [(&str, &str); 4] = [
+const EVERYWHERE: [(&str, &str); 5] = [
     ("1-5", "go to a screen"),
+    ("v", "simple / all screens"),
     (":", "every action by name"),
     ("t", "light / dark theme"),
     ("Esc", "back, or quit"),

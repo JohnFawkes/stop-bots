@@ -455,6 +455,54 @@ pub fn install_cron(layout: &Layout, options: &Options) -> Result<Steps> {
     Ok(steps)
 }
 
+/// The simple TUI's "Keep running by itself", switched on: [`install_cron`],
+/// then both auto-apply switches on, with the SSH lock-out check on too.
+///
+/// One switch for what is three on the advanced screens, because together
+/// they are the answer to "does this protect me when I am not looking?" and
+/// none of them is on its own. The lock-out check is switched on rather than
+/// left as found: with nobody previewing an apply, it is what stands between
+/// a bad rule and the operator's own SSH session.
+///
+/// Refused, with what to do, when not root: the cron file is root's to
+/// write, and a half-done switch (auto-apply on, nothing to run it) would
+/// read as on. The cron file comes first for the same reason: if it cannot
+/// be written, no setting has changed.
+pub fn keep_running(db: &crate::db::Db, layout: &Layout, root: bool) -> Result<String> {
+    if !root {
+        anyhow::bail!(
+            "Keeping it running writes {} and needs root. Quit, and start stop-bots again \
+             with sudo.",
+            layout.cron_path().display()
+        );
+    }
+    if is_build_artifact(&layout.binary) {
+        anyhow::bail!(
+            "{} is in a build directory, and cron would stop finding it at the next \
+             `cargo clean`. Install the binary first, then switch this on.",
+            layout.binary.display()
+        );
+    }
+    install_cron(layout, &Options::default())?;
+    db.set_auto_apply(true)?;
+    db.set_auto_apply_firewall(true)?;
+    db.set_ssh_lockout_check(true)?;
+    Ok(format!(
+        "Keeps running by itself: {} runs it every minute, and what it finds is applied, \
+         after the SSH lock-out check.",
+        layout.cron_path().display()
+    ))
+}
+
+/// "Keep running by itself", switched off: both auto-apply switches off.
+/// The cron file stays, so the detectors still run and record what they
+/// find, and nothing reaches the web server or the firewall until `a`.
+pub fn stop_keep_running(db: &crate::db::Db) -> Result<String> {
+    db.set_auto_apply(false)?;
+    db.set_auto_apply_firewall(false)?;
+    Ok("No longer applies by itself: it still finds attackers, and you apply with a.".to_string())
+}
+
 /// Whether this process can create a file in `dir`, answered by doing it.
 fn writable(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -1024,6 +1072,80 @@ mod tests {
         let steps = install_cron(&layout, &options).unwrap();
 
         assert!(!layout.cron_path().exists(), "steps: {steps:?}");
+    }
+
+    // ---- keep running ----
+
+    /// The three switches it stands for, and the file that runs them.
+    #[test]
+    fn keeping_it_running_installs_cron_and_turns_on_both_auto_applies_and_the_lockout_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.set_ssh_lockout_check(false).unwrap();
+
+        keep_running(&db, &layout, true).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(layout.cron_path()).unwrap(),
+            cron_file(&layout)
+        );
+        for (what, on) in [
+            ("auto-apply", db.get_auto_apply().unwrap()),
+            ("auto-apply firewall", db.get_auto_apply_firewall().unwrap()),
+            ("lock-out check", db.get_ssh_lockout_check().unwrap()),
+        ] {
+            assert!(on, "{what} is off");
+        }
+    }
+
+    /// Not root: nothing written, nothing switched, and the way out named.
+    #[test]
+    fn keeping_it_running_without_root_says_so_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        let db = crate::db::Db::open_in_memory().unwrap();
+
+        let err = keep_running(&db, &layout, false).unwrap_err();
+
+        assert!(format!("{err:#}").contains("sudo"), "was: {err:#}");
+        assert!(!layout.cron_path().exists());
+        assert!(!db.get_auto_apply().unwrap());
+        assert!(!db.get_auto_apply_firewall().unwrap());
+    }
+
+    /// A cron file that cannot be written leaves the switches as they were,
+    /// so the screen does not say "on" about a host nothing runs.
+    #[test]
+    fn keeping_it_running_on_a_host_without_cron_switches_nothing_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        std::fs::remove_dir(&layout.cron_dir).unwrap();
+        let db = crate::db::Db::open_in_memory().unwrap();
+
+        let err = keep_running(&db, &layout, true).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("apt install cron"),
+            "was: {err:#}"
+        );
+        assert!(!db.get_auto_apply().unwrap());
+        assert!(!db.get_auto_apply_firewall().unwrap());
+    }
+
+    /// Off keeps the schedule finding things, and stops it applying them.
+    #[test]
+    fn stopping_keeps_the_cron_file_and_turns_both_auto_applies_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        let db = crate::db::Db::open_in_memory().unwrap();
+        keep_running(&db, &layout, true).unwrap();
+
+        stop_keep_running(&db).unwrap();
+
+        assert!(layout.cron_path().exists());
+        assert!(!db.get_auto_apply().unwrap());
+        assert!(!db.get_auto_apply_firewall().unwrap());
     }
 
     #[test]

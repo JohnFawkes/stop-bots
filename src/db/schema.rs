@@ -76,7 +76,8 @@ pub const CURRENT_VERSION: u32 = 8;
 ///   (`protection::APP_PROBE_PATHS_INTRODUCED_IN`).
 /// - **4**: the protocol-probe detector
 ///   (`protection::PROTOCOL_PROBES_INTRODUCED_IN`).
-pub const DEFAULTS_GENERATION: u32 = 4;
+/// - **5**: the TUI opens in its simple mode (`db::SIMPLE_UI_INTRODUCED_IN`).
+pub const DEFAULTS_GENERATION: u32 = 5;
 
 /// One step from version `n - 1` to version `n`, where `n` is its position
 /// in [`MIGRATIONS`] counting from one.

@@ -170,6 +170,40 @@ impl GeoMode {
     }
 }
 
+/// Which TUI the operator sees: one screen with the few settings most
+/// hosts need, or every screen there is. See [`Db::get_ui_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiMode {
+    /// Who can visit, countries, and whether it keeps running by itself,
+    /// under a one-line status.
+    Simple,
+    /// Every screen and every setting.
+    Advanced,
+}
+
+impl UiMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UiMode::Simple => "simple",
+            UiMode::Advanced => "advanced",
+        }
+    }
+
+    /// The other one: what `v` switches to.
+    pub fn toggle(self) -> Self {
+        match self {
+            UiMode::Simple => UiMode::Advanced,
+            UiMode::Advanced => UiMode::Simple,
+        }
+    }
+}
+
+/// The defaults generation (see `schema::DEFAULTS_GENERATION`) from which
+/// a database opens the TUI in [`UiMode::Simple`]. An older one opens in
+/// Advanced: its operator already knows those screens, and an upgrade is no
+/// time to take them away.
+pub const SIMPLE_UI_INTRODUCED_IN: u32 = 5;
+
 /// What NGINX should do with a request whose user agent matched the
 /// sentinel block's pattern, or that one of the request-shape rules
 /// caught — the body of the generated `if`.
@@ -1771,6 +1805,24 @@ impl Db {
 
     pub fn set_humans_only(&self, on: bool) -> Result<()> {
         self.set_bool_setting(HUMANS_ONLY_KEY, on)
+    }
+
+    /// Which TUI to open: the operator's choice once they have made one
+    /// (`v` in the TUI, or `set-ui-mode`), and until then Simple on a
+    /// database created from [`SIMPLE_UI_INTRODUCED_IN`] on and Advanced on
+    /// an older one. An unrecognised stored value reads as Advanced, which
+    /// hides nothing.
+    pub fn get_ui_mode(&self) -> Result<UiMode> {
+        Ok(match self.get_raw_setting(keys::UI_MODE)?.as_deref() {
+            Some("simple") => UiMode::Simple,
+            Some(_) => UiMode::Advanced,
+            None if self.defaults_generation()? >= SIMPLE_UI_INTRODUCED_IN => UiMode::Simple,
+            None => UiMode::Advanced,
+        })
+    }
+
+    pub fn set_ui_mode(&self, mode: UiMode) -> Result<()> {
+        self.set_raw_setting(keys::UI_MODE, mode.as_str())
     }
 
     /// Whether the old-browser list ([`crate::botlist::old_browsers`]) is
@@ -7069,6 +7121,30 @@ mod tests {
             !patterns.iter().any(|p| p == "AhrefsSiteAudit"),
             "an uncategorised bot was blocked by category policies alone: {patterns:?}"
         );
+    }
+
+    /// A new database opens the simple TUI; one from before it existed
+    /// opens the screens its operator knows; a choice beats both.
+    #[test]
+    fn the_tui_opens_simple_on_a_new_database_and_advanced_on_an_older_one() {
+        let new = Db::open_in_memory().unwrap();
+        let older = Db::open_in_memory().unwrap();
+        older
+            .set_int_setting(
+                keys::DEFAULTS_GENERATION,
+                i64::from(SIMPLE_UI_INTRODUCED_IN) - 1,
+            )
+            .unwrap();
+        let chosen = Db::open_in_memory().unwrap();
+        chosen.set_ui_mode(UiMode::Advanced).unwrap();
+
+        for (what, db, expected) in [
+            ("a new database", &new, UiMode::Simple),
+            ("an older database", &older, UiMode::Advanced),
+            ("a choice", &chosen, UiMode::Advanced),
+        ] {
+            assert_eq!(db.get_ui_mode().unwrap(), expected, "{what}");
+        }
     }
 
     /// And with the mode on, it is.

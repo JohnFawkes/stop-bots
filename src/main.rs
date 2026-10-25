@@ -440,6 +440,7 @@ async fn run() -> Result<()> {
         Some(Command::SetSshLockoutCheck { enabled }) => set_ssh_lockout_check(db, enabled),
         Some(Command::SetHumansOnly { enabled }) => set_humans_only(db, enabled),
         Some(Command::SetOldBrowsers { enabled }) => set_old_browsers(db, enabled),
+        Some(Command::SetUiMode { mode }) => set_ui_mode(db, mode),
         Some(Command::ShowRobotsTxt) => show_robots_txt(db),
         Some(Command::GenerateDocs { out }) => {
             use clap::CommandFactory;
@@ -1762,6 +1763,17 @@ fn set_old_browsers(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
     say!(
         "Run `stop-bots apply-blocks` to write it into the {} config.",
         server_label()
+    );
+    Ok(())
+}
+
+fn set_ui_mode(db_path: Option<PathBuf>, mode: UiModeArg) -> Result<()> {
+    let db = open_db(db_path)?;
+    let mode: stop_bots::db::UiMode = mode.into();
+    db.set_ui_mode(mode)?;
+    say!(
+        "The TUI opens in its {} mode. `v` in the TUI switches.",
+        mode.as_str()
     );
     Ok(())
 }

@@ -8,6 +8,35 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Added
+
+- **A simple screen, for a self-hoster who is not a sysadmin.** One screen with what most
+  hosts need:
+  - a one-line **Status** that names the worst problem and the one thing to do about it;
+  - **Who can visit**: humans only, scanners, search bots, AI bots;
+  - **Countries**;
+  - **Keep running by itself**.
+
+  Turning on "Keep running by itself" writes `/etc/cron.d/stop-bots` and switches both
+  auto-applies on, with the SSH lock-out check. It says so and changes nothing when the TUI
+  is not running as root.
+
+  Switching humans only on asks first, since it takes the site out of search engines. The
+  log detectors are shown, not switched. On a new database with no sites known, the simple
+  screen looks for them when it starts. `x` is still the Blocks screen, to undo a block.
+
+  "Press 'v' to enable advanced mode", beside its tabs, says how to reach every other
+  screen. `v` switches between the two, and the choice is remembered; so does
+  `stop-bots set-ui-mode --mode simple|advanced`.
+
+**Before upgrading:** nothing to do. The database schema is unchanged.
+
+**After upgrading:** a database created by an earlier release opens on the screens it
+always did; `v` shows the simple one. Only a new database opens on the simple screen.
+
+**Going back to 0.6.0** works: it ignores the one setting this release adds, which
+remembers the screen.
+
 ## [0.6.0] — 2026-10-21
 
 Traefik, beside NGINX and Apache.

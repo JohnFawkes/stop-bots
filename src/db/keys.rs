@@ -143,6 +143,12 @@ pub const HEALTH_PROBE: &str = "health:probe";
 /// When it was taken, in Unix seconds.
 pub const HEALTH_PROBE_AT: &str = "health:probe_at";
 
+// ---- the TUI ----
+
+/// Which TUI the operator chose, `simple` or `advanced` (see
+/// `Db::get_ui_mode`). Unset follows the database's defaults generation.
+pub const UI_MODE: &str = "ui:mode";
+
 /// Every fixed key above. The tests check that each constant in this file
 /// is listed, and that none collide.
 pub const ALL: &[&str] = &[
@@ -189,6 +195,7 @@ pub const ALL: &[&str] = &[
     HEALTH_PROBE,
     HEALTH_PROBE_AT,
     REFRESH_LEASE,
+    UI_MODE,
 ];
 
 // ---- families: one key per detector, cron job or log file ----

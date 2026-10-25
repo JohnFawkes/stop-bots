@@ -232,6 +232,10 @@ impl Screen {
         Screen::Blocks,
     ];
 
+    /// The screens the simple mode has: its own, and Blocks, which is
+    /// where a block is undone. The rest are a `v` away.
+    pub const SIMPLE_TABS: [Screen; 2] = [Screen::Dashboard, Screen::Blocks];
+
     /// The key that jumps straight to this screen, shown in the tab bar.
     pub fn digit(self) -> char {
         match self {
@@ -373,6 +377,11 @@ pub enum KeyOutcome {
     /// reasoning as [`Self::ReloadNginx`] and [`Self::RenderFirewall`] —
     /// `App` performs them.
     ApplyEverything,
+    /// The simple screen's "Keep running by itself": on writes the cron
+    /// file and switches both auto-applies on, off switches them off (see
+    /// `install::keep_running`). On writes to `/etc` as root, so `App` does
+    /// it, for the reason [`Self::ReloadNginx`] gives.
+    KeepRunning(bool),
     /// Firewall's `R`: read the SSH log again now, rather than
     /// when the 30-second cache says so. `App` owns that read (see
     /// `App::start_ssh_log_read`), for the same reason it owns every
@@ -527,7 +536,13 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     // one underlined in the accent. Hand-built rather than `Tabs`, which
     // cannot colour the digit separately from the name.
     let mut tabs: Vec<Span> = Vec::new();
-    for (i, screen) in Screen::TABS.iter().chain([&Screen::Help]).enumerate() {
+    let simple = app.dashboard.is_simple();
+    let shown: &[Screen] = if simple {
+        &Screen::SIMPLE_TABS
+    } else {
+        &Screen::TABS
+    };
+    for (i, screen) in shown.iter().chain([&Screen::Help]).enumerate() {
         if i > 0 {
             tabs.push("   ".into());
         }
@@ -544,16 +559,36 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
                 }),
         );
         tabs.push(" ".into());
-        let title = screen.title(app.nginx.server());
+        let title = match screen {
+            Screen::Dashboard if simple => "Overview",
+            _ => screen.title(app.nginx.server()),
+        };
         tabs.push(if active {
             title.fg(theme.accent()).bold().underlined()
         } else {
             title.fg(theme.dim())
         });
     }
+    // The simple screen's way to everything it leaves out, spelled out
+    // beside its tabs: the person it is for does not yet know there is
+    // more. Every screen has the way back where the tabs end.
+    if simple {
+        tabs.extend([
+            "   Press '".fg(theme.dim()),
+            "v".fg(theme.accent()).bold(),
+            "' to enable advanced mode".fg(theme.dim()),
+        ]);
+    } else {
+        let mode =
+            Line::from(vec!["v".fg(theme.accent()), " simple".fg(theme.dim())]).right_aligned();
+        frame.render_widget(Paragraph::new(mode), tabs_area);
+    }
     frame.render_widget(Paragraph::new(Line::from(tabs)), tabs_area);
 
-    frame.render_widget(Paragraph::new(status_line(app)), status_area);
+    // The simple screen says the same thing once, in its Status panel.
+    if !simple || app.screen != Screen::Dashboard {
+        frame.render_widget(Paragraph::new(status_line(app)), status_area);
+    }
 }
 
 /// One line under the tabs answering "is this host protected", check by
@@ -620,6 +655,11 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     }
     let globals: &[(&str, &str)] = match (overlay, app.screen) {
         (true, _) | (false, Screen::Help) => &[],
+        // Fewer on the simple screen, whose footer has to fit beside its
+        // own keys on a narrow terminal; `:` and `t` still work there.
+        (false, Screen::Dashboard) if app.dashboard.is_simple() => {
+            &[("?", "explain"), ("q", "quit")]
+        }
         _ => &[
             (":", "commands"),
             ("?", "explain"),
@@ -733,8 +773,10 @@ mod tests {
     }
 
     fn app() -> App {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.set_ui_mode(crate::db::UiMode::Advanced).unwrap();
         App::new(
-            crate::db::Db::open_in_memory().unwrap(),
+            db,
             std::path::PathBuf::from("/etc/nginx"),
             false,
             Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),

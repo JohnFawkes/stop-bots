@@ -51,6 +51,8 @@ pub enum Action {
     Quit,
     /// Switch a detector on or off.
     Detector(crate::protection::Detector, bool),
+    /// Switch between the simple screen and every screen, as `v` does.
+    UiMode,
 }
 
 /// One row of the palette.

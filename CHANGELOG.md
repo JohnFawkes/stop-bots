@@ -25,11 +25,17 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   log detectors are shown, not switched. On a new database with no sites known, the simple
   screen looks for them when it starts. `x` is still the Blocks screen, to undo a block.
 
-  `v` switches between it and every screen, and the choice is remembered; so does
-  `stop-bots set-ui-mode simple|advanced`.
+  "Press 'v' to enable advanced mode", beside its tabs, says how to reach every other
+  screen. `v` switches between the two, and the choice is remembered; so does
+  `stop-bots set-ui-mode --mode simple|advanced`.
 
-**Upgrading:** a database created by an earlier release opens on the screens it always did;
-`v` shows the simple one. Only a new database opens on the simple screen.
+**Before upgrading:** nothing to do. The database schema is unchanged.
+
+**After upgrading:** a database created by an earlier release opens on the screens it
+always did; `v` shows the simple one. Only a new database opens on the simple screen.
+
+**Going back to 0.6.0** works: it ignores the one setting this release adds, which
+remembers the screen.
 
 ## [0.6.0] — 2026-10-21
 

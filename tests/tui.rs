@@ -1179,6 +1179,8 @@ fn the_simple_screen_and_v_to_every_screen_and_back() {
     std::fs::create_dir_all(&root).unwrap();
     let mut session = spawn_tui_with_root(&db_path, &root);
     session.exp_string("Overview").unwrap();
+    // "Press 'v' to enable advanced mode", beside the tabs.
+    session.exp_string("enable").unwrap();
     session.exp_string("Who").unwrap();
 
     send_key(&mut session, "v");

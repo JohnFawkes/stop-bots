@@ -10,9 +10,9 @@
 <text x="121.2" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">5</text>
 <text x="138.0" y="43.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Blocks</text>
 <text x="213.6" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">?</text>
-<text x="230.4" y="43.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Help</text>
-<text x="835.2" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">v</text>
-<text x="843.6" y="43.5" fill="#6b7c8c" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> advanced</text>
+<text x="230.4" y="43.5" fill="#6b7c8c" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Help   Press '</text>
+<text x="348.0" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">v</text>
+<text x="356.4" y="43.5" fill="#6b7c8c" textLength="210.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">' to enable advanced mode</text>
 <text x="12.0" y="79.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌ Status ──────────────────────────────────────────────────────────────────────────────────────────────────┐</text>
 <text x="12.0" y="97.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="20.4" y="97.5" fill="#d18f52" textLength="184.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> ▲ Changes not applied</text>

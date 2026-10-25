@@ -569,19 +569,21 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
             title.fg(theme.dim())
         });
     }
+    // The simple screen's way to everything it leaves out, spelled out
+    // beside its tabs: the person it is for does not yet know there is
+    // more. Every screen has the way back where the tabs end.
+    if simple {
+        tabs.extend([
+            "   Press '".fg(theme.dim()),
+            "v".fg(theme.accent()).bold(),
+            "' to enable advanced mode".fg(theme.dim()),
+        ]);
+    } else {
+        let mode =
+            Line::from(vec!["v".fg(theme.accent()), " simple".fg(theme.dim())]).right_aligned();
+        frame.render_widget(Paragraph::new(mode), tabs_area);
+    }
     frame.render_widget(Paragraph::new(Line::from(tabs)), tabs_area);
-    // Which mode this is, and the key to the other, where the tabs end:
-    // the simple screen's way to everything it leaves out.
-    let mode = Line::from(vec![
-        "v".fg(theme.accent()),
-        if simple {
-            " advanced".fg(theme.dim())
-        } else {
-            " simple".fg(theme.dim())
-        },
-    ])
-    .right_aligned();
-    frame.render_widget(Paragraph::new(mode), tabs_area);
 
     // The simple screen says the same thing once, in its Status panel.
     if !simple || app.screen != Screen::Dashboard {

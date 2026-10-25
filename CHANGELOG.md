@@ -8,6 +8,16 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-10-25
+
+**Before upgrading:** nothing to do. The database schema is unchanged.
+
+**After upgrading:** a database created by an earlier release opens on the screens it
+always did; `v` shows the simple one. Only a new database opens on the simple screen.
+
+**Going back to 0.6.0** works: it ignores the one setting this release adds, which
+remembers the screen.
+
 ### Added
 
 - **A simple screen, for a self-hoster who is not a sysadmin.** One screen with what most
@@ -28,14 +38,6 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   "Press 'v' to enable advanced mode", beside its tabs, says how to reach every other
   screen. `v` switches between the two, and the choice is remembered; so does
   `stop-bots set-ui-mode --mode simple|advanced`.
-
-**Before upgrading:** nothing to do. The database schema is unchanged.
-
-**After upgrading:** a database created by an earlier release opens on the screens it
-always did; `v` shows the simple one. Only a new database opens on the simple screen.
-
-**Going back to 0.6.0** works: it ignores the one setting this release adds, which
-remembers the screen.
 
 ## [0.6.0] — 2026-10-21
 
@@ -2735,7 +2737,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/ivankovic/stop-bots/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ivankovic/stop-bots/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ivankovic/stop-bots/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ivankovic/stop-bots/compare/v0.3.0...v0.4.0

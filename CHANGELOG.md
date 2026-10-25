@@ -8,6 +8,62 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+**Before upgrading:** nothing to do. The database gains six empty tables (schemas 9 and
+10), and everything this release adds is off.
+
+**Going back to 0.7.0** does not work once this release has opened the database: 0.7.0
+refuses a schema newer than its own. Move back the copy taken before the upgrade
+(`db.sqlite3.bak-v8`, or `.bak-v9` from a build between) to go back.
+
+### Added
+
+- **Outbound checks: connections to command-and-control servers.** A compromised web app,
+  user account or container calls home, and the firewall can see it.
+  `stop-bots set-egress --mode watch|block` logs, and in Block mode drops, every new
+  connection from this host (the `output` hook) or one of its containers (`forward`, ahead
+  of the private-source accept) to an address an enabled feed lists. Built-in feeds:
+  abuse.ch Feodo Tracker, C2IntelFeeds (servers and domains) and Spamhaus DROP; others by
+  URL with `add-egress-feed`, whose URL (and any key in it) is never shown. Each hit is
+  read back every minute with the user (`log flags skuid`) or the container behind it,
+  shown by `list-egress-hits`, in `status` and on the Dashboard, and printed by `tick`
+  for cron to mail. Feeds update daily.
+- **Never cutting the host off.** Each feed is stored without private and reserved ranges,
+  ranges broader than a /8, and any range holding this host's resolvers, apt mirrors,
+  Let's Encrypt or the feeds' own servers; what was left out is said. Trusted addresses
+  are never stopped.
+- **Containment.** `contain` and `release` by hand, and with `set-containment --auto true`
+  on a hit: a container is cut off both ways and paused (or stopped, or only cut off); a
+  user has every connection it starts cut off (and with `--user-action kill`, its
+  processes killed). Never root, a user logged in now, or anything `--never-contain`
+  names; a breaker stops it after three in an hour or one destination from many sources.
+  Kept in every script rendered, re-applied when a container comes back, and released
+  by `uninstall`.
+- **C&C domains**, through the resolver: `set-egress-dns --target hosts|dnsmasq|unbound`
+  sends listed domains to a sinkhole address, which is checked like a listed one.
+- `status` says when outbound rules that were applied are no longer in the kernel.
+- **Exploit rules in NGINX.** `set-exploit-rules --enabled true` (or the NGINX screen's
+  Exploit rules row) turns away a request carrying an exploit payload before the application
+  sees it: the injection detector's strong signatures (Log4Shell, Shellshock, OGNL and
+  expression injection, PHP-CGI and command injection, `../../`, an encoded NUL), plain,
+  percent-encoded or double-encoded, in the request line, the user agent, the referer,
+  cookies, X-Forwarded-For and X-Api-Version. One generated file in `conf.d` and one `if` per
+  site; exempt paths and trusted clients are let through. A site can choose for itself
+  (`--site`, or its detail view). `preview-exploit-rules` says what they would have turned
+  away in the access log. The firewall is unchanged: a refusal is a line in the access log,
+  and the injection detector blocks the sender from it as before. Not the request body.
+- **ModSecurity**, for request bodies, managed per site: `set-modsecurity --mode
+  off|detect|block` (or the NGINX screen and a site's detail view), once
+  `libnginx-mod-http-modsecurity` and `modsecurity-crs` are installed. Each site gets the
+  Core Rule Set's exclusions for what runs behind it (WordPress, Drupal, Nextcloud), and its
+  own for Immich's uploads. Detect logs what it would block; `list-modsecurity-findings`
+  reads the audit log by site, rule and path, and `exclude-modsecurity-rule` (or `x` on a
+  finding in the TUI) switches a rule off for one path of one site. Nothing is written
+  without the module, and `status` says so. NGINX only, as are the exploit rules.
+- **In the TUI**, the Dashboard's Automatic blocking panel lists its rows under headings (Log
+  detectors, Blocked by address, Outbound C&C checks, Firewall apply), in one column. Under
+  Outbound C&C checks, Space steps the mode through Off, Watch and Block; the C&C feeds and
+  automatic containment are listed under it once it is on.
+
 ## [0.7.0] — 2026-10-25
 
 **Before upgrading:** nothing to do. The database schema is unchanged.

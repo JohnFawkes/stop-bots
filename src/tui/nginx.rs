@@ -115,6 +115,20 @@ fn setting_options(setting: NginxSetting, server: WebServer) -> (&'static str, V
                 ),
             ],
         ),
+        NginxSetting::Exploits => (
+            "Turn away exploit payloads",
+            vec![
+                "Off \u{2014} the detector blocks the sender afterwards".to_string(),
+                "On \u{2014} refused before the application sees them".to_string(),
+            ],
+        ),
+        NginxSetting::Modsecurity => (
+            "ModSecurity on every site that has not chosen",
+            crate::modsecurity::Mode::ALL
+                .iter()
+                .map(|mode| format!("{:<8} {}", mode.as_str(), mode.describe()))
+                .collect(),
+        ),
         NginxSetting::RateLimit => (
             "Rate limit per client address",
             [
@@ -165,6 +179,12 @@ enum NginxSetting {
     RobotsTxt,
     /// Whether NGINX rate-limits requests per client address.
     RateLimit,
+    /// Whether a request carrying an exploit payload is turned away, on
+    /// every site that has not chosen (see [`crate::exploits`]).
+    Exploits,
+    /// ModSecurity's mode on every site that has not chosen (see
+    /// [`crate::modsecurity`]).
+    Modsecurity,
     /// Whether the internal cron re-applies these configs on its own.
     ///
     /// The one row here that does not change the *text* of the generated
@@ -176,10 +196,12 @@ enum NginxSetting {
 }
 
 impl NginxSetting {
-    const ALL: [NginxSetting; 4] = [
+    const ALL: [NginxSetting; 6] = [
         NginxSetting::Response,
         NginxSetting::RobotsTxt,
         NginxSetting::RateLimit,
+        NginxSetting::Exploits,
+        NginxSetting::Modsecurity,
         NginxSetting::AutoApply,
     ];
 
@@ -188,6 +210,8 @@ impl NginxSetting {
             NginxSetting::Response => "Block response",
             NginxSetting::RobotsTxt => "robots.txt",
             NginxSetting::RateLimit => "Rate limit",
+            NginxSetting::Exploits => "Exploit rules",
+            NginxSetting::Modsecurity => "ModSecurity",
             NginxSetting::AutoApply => "Auto-apply",
         }
     }
@@ -245,6 +269,10 @@ pub struct Nginx {
     rate_limit_enabled: bool,
     rate_limit_rps: i64,
     rate_limit_burst: i64,
+    exploits: bool,
+    modsecurity: crate::modsecurity::Mode,
+    /// Why ModSecurity cannot run on this host, when it cannot.
+    modsecurity_missing: Option<String>,
 }
 
 impl Nginx {
@@ -268,6 +296,9 @@ impl Nginx {
             rate_limit_enabled: false,
             rate_limit_rps: 0,
             rate_limit_burst: 0,
+            exploits: false,
+            modsecurity: crate::modsecurity::Mode::Off,
+            modsecurity_missing: None,
         }
     }
 
@@ -278,6 +309,12 @@ impl Nginx {
         self.rate_limit_enabled = db.get_rate_limit_enabled()?;
         self.rate_limit_rps = db.get_rate_limit_rps()?;
         self.rate_limit_burst = db.get_rate_limit_burst()?;
+        self.exploits = crate::exploits::host_enabled(db)?;
+        self.modsecurity = crate::modsecurity::host_mode(db)?;
+        self.modsecurity_missing = match crate::modsecurity::installation(&self.root) {
+            crate::modsecurity::Installation::Missing(why) => Some(why),
+            crate::modsecurity::Installation::Ready { .. } => None,
+        };
         self.sites = db.list_sites()?;
         // The status tags are *not* recomputed here: each one reads that
         // site's config file off disk and re-renders its block to compare,
@@ -403,6 +440,25 @@ impl Nginx {
                         }
                     }
                     NginxSetting::RateLimit => &rate_limit_label,
+                    NginxSetting::Exploits if self.server.without_exploit_rules().is_some() => {
+                        &unavailable
+                    }
+                    NginxSetting::Exploits => {
+                        if self.exploits {
+                            "turned away"
+                        } else {
+                            "off"
+                        }
+                    }
+                    NginxSetting::Modsecurity if self.server.without_exploit_rules().is_some() => {
+                        &unavailable
+                    }
+                    NginxSetting::Modsecurity => match self.modsecurity {
+                        crate::modsecurity::Mode::Off => "off",
+                        _ if self.modsecurity_missing.is_some() => "not installed",
+                        crate::modsecurity::Mode::Detect => "detect",
+                        crate::modsecurity::Mode::Block => "block",
+                    },
                     NginxSetting::AutoApply => {
                         if self.auto_apply {
                             "on \u{2014} hourly"
@@ -492,6 +548,50 @@ impl Nginx {
                         .warn(
                             "It replaces a robots.txt a site already serves. Leave it off if \
                              yours says something you need.",
+                        ),
+                    NginxSetting::Exploits => Explanation::new("Exploit rules")
+                        .para(
+                            "Turns away a request carrying an exploit payload before the \
+                             application sees it: Log4Shell, Shellshock, expression injection, \
+                             PHP-CGI and command injection, ../../ and an encoded NUL byte, plain \
+                             or encoded, in the request line and the headers scanners use. \
+                             Only shapes no person types: a search for /etc/passwd is served.",
+                        )
+                        .now(if self.server.without_exploit_rules().is_some() {
+                            format!("not available on {server} yet.")
+                        } else if self.exploits {
+                            "on for every site that has not chosen.".to_string()
+                        } else {
+                            "off: the injection detector blocks a sender after its first \
+                             payload."
+                                .to_string()
+                        })
+                        .para(
+                            "Not the request body, which the web server's config cannot see. \
+                             A site can choose for itself in its detail view; exempt paths and \
+                             trusted clients are let through.",
+                        ),
+                    NginxSetting::Modsecurity => Explanation::new("ModSecurity")
+                        .para(
+                            "NGINX's web application firewall module, with the OWASP Core Rule \
+                             Set: it checks what the config cannot, request bodies, cookies and \
+                             decoded arguments, and scores each request for SQL injection, XSS, \
+                             remote code execution and the rest.",
+                        )
+                        .now(match (&self.modsecurity_missing, self.modsecurity) {
+                            (_, crate::modsecurity::Mode::Off) => {
+                                "off on every site that has not chosen.".to_string()
+                            }
+                            (Some(why), mode) => {
+                                format!("{}, but not written: {why}.", mode.as_str())
+                            }
+                            (None, mode) => format!("{}: {}.", mode.as_str(), mode.describe()),
+                        })
+                        .para(
+                            "Each site gets the Core Rule Set's exclusions for what runs behind \
+                             it (WordPress, Drupal, Nextcloud), and its own for Immich's uploads. \
+                             Start in detect, read `stop-bots list-modsecurity-findings`, and \
+                             exclude what is wrong in a site's detail view before blocking.",
                         ),
                     NginxSetting::RateLimit => {
                         let explanation = Explanation::new("Rate limit")
@@ -872,6 +972,9 @@ impl Nginx {
                 let unavailable = match focused {
                     Some(NginxSetting::RateLimit) => self.server.without_rate_limiting(),
                     Some(NginxSetting::RobotsTxt) => self.server.without_robots_txt(),
+                    Some(NginxSetting::Exploits | NginxSetting::Modsecurity) => {
+                        self.server.without_exploit_rules()
+                    }
                     _ => None,
                 };
                 match unavailable {
@@ -939,6 +1042,11 @@ impl Nginx {
                 .position(|r| *r == self.block_response)
                 .unwrap_or(0),
             NginxSetting::RobotsTxt => usize::from(self.serve_robots_txt),
+            NginxSetting::Exploits => usize::from(self.exploits),
+            NginxSetting::Modsecurity => crate::modsecurity::Mode::ALL
+                .iter()
+                .position(|m| *m == self.modsecurity)
+                .unwrap_or(0),
             NginxSetting::AutoApply => usize::from(self.auto_apply),
             NginxSetting::RateLimit => {
                 if !self.rate_limit_enabled {
@@ -1030,6 +1138,49 @@ impl Nginx {
                     )
                 } else {
                     "Auto-apply off \u{2014} config changes wait for a/A again".to_string()
+                });
+            }
+            NginxSetting::Modsecurity => {
+                let mode = crate::modsecurity::Mode::ALL
+                    .get(popup.selected)
+                    .copied()
+                    .unwrap_or_default();
+                if mode == self.modsecurity {
+                    return Ok(());
+                }
+                crate::modsecurity::set_host_mode(db, mode)?;
+                *message = Some(match (&self.modsecurity_missing, mode) {
+                    (_, crate::modsecurity::Mode::Off) => {
+                        "ModSecurity off \u{2014} apply (a/A) to take it out of site configs"
+                            .to_string()
+                    }
+                    (Some(why), _) => format!("ModSecurity {} \u{2014} not written until {why}", mode.as_str()),
+                    (None, crate::modsecurity::Mode::Detect) => {
+                        "ModSecurity detect \u{2014} apply (a/A); `stop-bots list-modsecurity-findings` \
+                         then says what it would have blocked"
+                            .to_string()
+                    }
+                    (None, crate::modsecurity::Mode::Block) => {
+                        "ModSecurity block \u{2014} apply (a/A). It also blocks what it gets wrong \
+                         about an application: detect first is how to find that"
+                            .to_string()
+                    }
+                });
+            }
+            NginxSetting::Exploits => {
+                let on = popup.selected == 1;
+                if on == self.exploits {
+                    return Ok(());
+                }
+                crate::exploits::set_host_enabled(db, on)?;
+                *message = Some(if on {
+                    "Exploit rules on for every site that has not chosen \u{2014} apply (a/A) to \
+                     write them. `stop-bots preview-exploit-rules` says what they would have \
+                     turned away."
+                        .to_string()
+                } else {
+                    "Exploit rules off \u{2014} apply (a/A) to take them out of site configs"
+                        .to_string()
                 });
             }
             NginxSetting::RobotsTxt => {
@@ -1652,7 +1803,7 @@ mod tests {
     #[test]
     fn render_with_no_sites_shows_a_hint_instead_of_an_empty_list() {
         let mut screen = test_screen();
-        let backend = TestBackend::new(80, 10);
+        let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| screen.render(frame, frame.area(), Theme::Dark))
@@ -1677,7 +1828,7 @@ mod tests {
         let mut screen = test_screen();
         screen.refresh(&db).unwrap();
 
-        let backend = TestBackend::new(60, 10);
+        let backend = TestBackend::new(60, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| screen.render(frame, frame.area(), Theme::Dark))
@@ -1960,7 +2111,7 @@ mod tests {
         let mut screen = test_screen();
         refresh_with_statuses(&mut screen, &db);
 
-        let backend = TestBackend::new(80, 10);
+        let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| screen.render(frame, frame.area(), Theme::Dark))
@@ -2367,6 +2518,36 @@ mod tests {
         assert!(!db.get_rate_limit_enabled().unwrap());
     }
 
+    /// The row switches them for every site that has not chosen.
+    #[test]
+    fn the_exploit_rules_row_switches_them_for_the_host() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = Nginx::new(WebServer::Nginx, PathBuf::from("tests/fixtures/nginx"));
+        screen.refresh(&db).unwrap();
+        let mut message = None;
+        let row = NginxSetting::ALL
+            .iter()
+            .position(|s| *s == NginxSetting::Exploits)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Tab), &db, &mut message)
+            .unwrap();
+        for _ in 0..row {
+            screen
+                .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
+                .unwrap();
+        }
+        for key in [KeyCode::Enter, KeyCode::Down, KeyCode::Enter] {
+            screen
+                .handle_key(KeyEvent::from(key), &db, &mut message)
+                .unwrap();
+        }
+        assert!(
+            crate::exploits::host_enabled(&db).unwrap(),
+            "said: {message:?}"
+        );
+    }
+
     #[test]
     fn an_apache_hosts_settings_are_called_apaches() {
         let content = apache_screen_text(&Db::open_in_memory().unwrap());
@@ -2383,7 +2564,8 @@ mod tests {
         db.set_serve_robots_txt(true).unwrap();
         let content = screen_text(WebServer::Traefik, &db);
         assert!(
-            content.contains("Traefik settings") && content.matches("none on Traefik").count() == 2,
+            // robots.txt, the rate limit, the exploit rules and ModSecurity.
+            content.contains("Traefik settings") && content.matches("none on Traefik").count() == 4,
             "content was:\n{content}"
         );
         assert!(!content.contains("generated"), "content was:\n{content}");

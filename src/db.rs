@@ -25,6 +25,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod blocks;
+pub mod egress;
 pub mod evidence;
 pub mod guard;
 pub mod keys;
@@ -32,6 +33,7 @@ mod managed;
 mod offences;
 pub mod schema;
 mod uapage;
+pub mod waf;
 
 pub use crate::blocks::RuleSource;
 pub use blocks::{BlockQuery, UNBLOCK_MIN_SECONDS};
@@ -2816,6 +2818,8 @@ impl Db {
             "site_path_exemptions",
             "site_agent_exemptions",
             "site_request_rules",
+            "site_waf",
+            "modsecurity_exclusions",
         ] {
             self.conn
                 .execute(&format!("DELETE FROM {table} WHERE site_id = ?1"), [id])?;

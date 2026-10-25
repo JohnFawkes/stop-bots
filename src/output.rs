@@ -480,6 +480,93 @@ pub struct Trusted {
     pub user_agents: Vec<String>,
 }
 
+/// `list-egress-feeds --json`.
+#[derive(Debug, Serialize)]
+pub struct EgressFeeds {
+    pub feeds: Vec<EgressFeed>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EgressFeed {
+    pub id: String,
+    pub name: String,
+    /// Where it is downloaded from, with everything after the host left
+    /// out: a URL added by hand can carry a key.
+    pub url: Vec<String>,
+    /// `ip` or `domain`.
+    pub kind: &'static str,
+    pub builtin: bool,
+    pub enabled: bool,
+    /// Whether a hit on it may contain what made it.
+    pub contain: bool,
+    pub last_fetched_at: Option<i64>,
+    pub entries: usize,
+    /// Entries the last fetch left out, to keep this host reachable.
+    pub kept_off: usize,
+}
+
+/// `list-egress-hits --json`.
+#[derive(Debug, Serialize)]
+pub struct EgressHits {
+    pub hits: Vec<EgressHit>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EgressHit {
+    /// `host`, from a process here, or `forward`, routed through.
+    pub path: &'static str,
+    pub source: String,
+    pub destination: String,
+    pub port: Option<u16>,
+    pub protocol: String,
+    pub uid: Option<u32>,
+    pub container: Option<String>,
+    pub count: u64,
+    pub first_seen: i64,
+    pub last_seen: i64,
+    pub evidence: String,
+}
+
+/// `list-containments --json`.
+#[derive(Debug, Serialize)]
+pub struct Containments {
+    pub containments: Vec<Containment>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Containment {
+    pub id: i64,
+    /// `container`, `user` or `address`.
+    pub kind: &'static str,
+    pub target: String,
+    pub name: Option<String>,
+    pub addresses: Vec<String>,
+    pub action: String,
+    pub reason: String,
+    pub automatic: bool,
+    pub created_at: i64,
+    pub released_at: Option<i64>,
+}
+
+/// `list-modsecurity-findings --json`.
+#[derive(Debug, Serialize)]
+pub struct ModsecFindings {
+    pub findings: Vec<ModsecFinding>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModsecFinding {
+    /// The site's server_name, `None` for a request no site's block names.
+    pub site: Option<String>,
+    pub rule: u32,
+    pub path: String,
+    pub message: String,
+    pub count: usize,
+    /// Requests the Core Rule Set scored as attacks.
+    pub over_threshold: usize,
+    pub last_seen: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

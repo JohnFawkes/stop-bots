@@ -1445,6 +1445,23 @@ pub fn planned_managed_files(db: &crate::db::Db, root: &Path) -> Result<Vec<(Pat
     if let Some(body) = &trust {
         files.push((trusted_conf_path(&conf_d), body.clone()));
     }
+    if crate::exploits::anywhere(db)? {
+        files.push((
+            crate::exploits::conf_path(&conf_d),
+            crate::exploits::nginx_conf_body(),
+        ));
+    }
+    // The rules before the loader that names them.
+    if let Some((installation, plans)) = crate::modsecurity::plans(db, root)? {
+        files.push((
+            crate::modsecurity::rules_path(),
+            crate::modsecurity::rules_body(&installation, &plans),
+        ));
+        files.push((
+            crate::modsecurity::loader_path(&conf_d),
+            crate::modsecurity::loader_body(),
+        ));
+    }
     if db.get_rate_limit_enabled()? {
         let (rps, megabytes) = (db.get_rate_limit_rps()?, db.get_rate_limit_zone_mb()?);
         // Written even while every site names the untrusted zone instead:
@@ -1501,6 +1518,14 @@ pub(crate) fn fallback_unused_managed_files(
     if !trusted {
         paths.push(trusted_conf_path(&conf_d));
     }
+    if !crate::exploits::anywhere(db)? {
+        paths.push(crate::exploits::conf_path(&conf_d));
+    }
+    // The loader before the rules it names.
+    if crate::modsecurity::plans(db, root)?.is_none() {
+        paths.push(crate::modsecurity::loader_path(&conf_d));
+        paths.push(crate::modsecurity::rules_path());
+    }
     Ok(paths)
 }
 
@@ -1530,6 +1555,8 @@ fn block_text(config: &BlockConfig) -> Option<String> {
         && !config.serve_robots_txt
         && config.rate_limit_burst.is_none()
         && config.request_rules.is_empty()
+        && !config.exploits
+        && config.modsecurity.is_none()
     {
         return None;
     }
@@ -1555,7 +1582,7 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     // `if` — it cannot have one — and is lifted by naming a zone keyed so
     // that a trusted client is not counted; see
     // `UNTRUSTED_RATE_LIMIT_ZONE`.)
-    let blocks_something = pattern.is_some() || !config.request_rules.is_empty();
+    let blocks_something = pattern.is_some() || !config.request_rules.is_empty() || config.exploits;
     let clears_trusted = config.trust.is_some() && blocks_something;
     // Like trust, and unlike the plain exemptions, only where there is a
     // block to clear: they are narrower than a plain exemption, so a site
@@ -1568,7 +1595,8 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     let uses_flag = !exemptions.is_empty()
         || clears_trusted
         || !agent_clears.is_empty()
-        || (pattern.is_some() && !config.request_rules.is_empty());
+        || (pattern.is_some() && !config.request_rules.is_empty())
+        || (config.exploits && (pattern.is_some() || !config.request_rules.is_empty()));
 
     if uses_flag {
         out.push_str("    set $stop_bots_block 0;\n");
@@ -1607,6 +1635,13 @@ fn block_text(config: &BlockConfig) -> Option<String> {
         out.push_str(&format!(
             "    if ({}) {{\n        {set_blocked}",
             condition(*rule)
+        ));
+    }
+    if config.exploits {
+        // The variable `exploits_conf_path`'s file defines.
+        out.push_str(&format!(
+            "    if ({}) {{\n        {set_blocked}",
+            crate::exploits::VAR
         ));
     }
     if !exemptions.is_empty() || !agent_clears.is_empty() {
@@ -1651,6 +1686,9 @@ fn block_text(config: &BlockConfig) -> Option<String> {
         out.push_str(&format!(
             "    limit_req zone={zone} burst={burst} nodelay;\n    limit_req_status 429;\n"
         ));
+    }
+    if let Some(plan) = &config.modsecurity {
+        out.push_str(&crate::modsecurity::block_lines(plan));
     }
     if config.serve_robots_txt {
         // `alias` rather than `return 200 "<body>"` — see
@@ -2147,10 +2185,15 @@ pub fn site_apply_status(
         .trust
         .as_ref()
         .and_then(|_| fs::read_to_string(trusted_conf_path(conf_d)).ok());
+    let exploits_current = !config.exploits
+        || fs::read_to_string(crate::exploits::conf_path(conf_d)).is_ok_and(|text| {
+            crate::generated::same_but_for_the_version(&text, &crate::exploits::nginx_conf_body())
+        });
     if matching
         .iter()
         .all(|block| current_block_text(&content, block) == block_text(&for_block(config, block)))
         && trust_file_is_current(config, trust_on_disk.as_deref())
+        && exploits_current
     {
         SiteApplyStatus::UpToDate
     } else {
@@ -2205,7 +2248,7 @@ fn enables_http2(root: &Path) -> Option<bool> {
 /// The directory `nginx.conf` is in, at `root` or up to
 /// [`MAIN_CONFIG_LEVELS_UP`] above it: the top of the tree NGINX reads its
 /// config from. `None` when there is none to be found.
-fn main_config_dir(root: &Path) -> Option<PathBuf> {
+pub(crate) fn main_config_dir(root: &Path) -> Option<PathBuf> {
     let root = std::path::absolute(root).ok()?;
     root.ancestors()
         .take(MAIN_CONFIG_LEVELS_UP + 1)
@@ -3821,6 +3864,8 @@ mod tests {
             agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
+            exploits: false,
+            modsecurity: None,
         }
     }
 
@@ -3854,6 +3899,8 @@ mod tests {
             agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
+            exploits: false,
+            modsecurity: None,
         };
         let text = block_text(&config).unwrap();
         assert!(text.contains("location = /robots.txt"), "text was:\n{text}");
@@ -4009,6 +4056,8 @@ mod tests {
             agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
+            exploits: false,
+            modsecurity: None,
         }
     }
 
@@ -4061,6 +4110,8 @@ mod tests {
             agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
+            exploits: false,
+            modsecurity: None,
         };
         let text = block_text(&config).unwrap();
         assert!(text.contains("limit_req"), "text was:\n{text}");
@@ -4121,6 +4172,8 @@ mod tests {
             agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
+            exploits: false,
+            modsecurity: None,
         }
     }
 
@@ -4484,6 +4537,8 @@ mod tests {
             agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
+            exploits: false,
+            modsecurity: None,
         };
         let text = block_text(&config).unwrap();
 
@@ -4509,6 +4564,8 @@ mod tests {
             agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
+            exploits: false,
+            modsecurity: None,
         };
         let text = block_text(&config).unwrap();
         assert!(text.contains("/blog"), "text was:\n{text}");
@@ -4536,6 +4593,8 @@ mod tests {
             agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
+            exploits: false,
+            modsecurity: None,
         };
         let text = block_text(&config).unwrap();
 
@@ -4622,6 +4681,8 @@ mod tests {
             agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
+            exploits: false,
+            modsecurity: None,
         };
         let text = block_text(&config).unwrap();
         crate::golden::assert_golden("nginx-block-full.conf", &text);
@@ -5704,6 +5765,34 @@ mod tests {
         assert_eq!(
             site_request_rules(&db, site.id).unwrap(),
             vec![RequestRule::NoAccept]
+        );
+    }
+
+    /// A bot pattern and the exploit rules together, the shape a site with
+    /// them switched on gets: one `if` on the exploit file's variable, in
+    /// the flag idiom so an exempt path is still let through.
+    #[test]
+    fn the_exploit_rules_beside_a_bot_pattern_match_the_golden() {
+        let config = BlockConfig {
+            exploits: true,
+            exempt_paths: vec!["/api/".to_string()],
+            ..cfg(&["BadBot"])
+        };
+        crate::golden::assert_golden("nginx-block-exploits.conf", &block_text(&config).unwrap());
+    }
+
+    /// The rules alone are reason enough for a block: without one, a site
+    /// that blocks no bot would lose them.
+    #[test]
+    fn the_exploit_rules_alone_keep_a_block() {
+        let config = BlockConfig {
+            exploits: true,
+            ..BlockConfig::default()
+        };
+        let block = block_text(&config).expect("no block for the exploit rules");
+        assert!(
+            block.contains("if ($stop_bots_exploit) {\n        return 403;"),
+            "{block}"
         );
     }
 

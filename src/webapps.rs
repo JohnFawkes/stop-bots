@@ -323,6 +323,23 @@ const REDIRECTS: [&str; 6] = [
 /// root counts as in doubt.
 const MAX_ROOT_ENTRIES: usize = 200;
 
+/// The applications `verdicts` say are served, by name: those whose own
+/// paths are all served. In doubt is not served here: what this is for
+/// (ModSecurity's exclusions, `crate::modsecurity`) loosens checks, and
+/// loosening them for an application that is not there is a hole.
+pub fn apps_present(verdicts: &Verdicts) -> Vec<&'static str> {
+    APPS.iter()
+        .filter(|app| {
+            !app.paths.is_empty()
+                && app
+                    .paths
+                    .iter()
+                    .all(|path| matches!(verdicts.get(path), Some(Verdict::Served(_))))
+        })
+        .map(|app| app.name)
+        .collect()
+}
+
 /// What one site serves, from its directives (`None`: its config could
 /// not be read) and, when `files_here`, its document roots on disk.
 pub fn inspect_site(directives: Option<&[Directive]>, files_here: bool) -> Verdicts {

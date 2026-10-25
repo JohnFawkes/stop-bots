@@ -130,6 +130,25 @@
 //! so a port published by a container, which leaves through `forward`, is
 //! never trapped. See [`crate::portscan`].
 //!
+//! ## Outbound: `bot_egress` and `egress_rules`
+//!
+//! With outbound checks on ([`crate::egress`]), or anything contained
+//! ([`crate::contain`]), the table gains a fourth base chain, `bot_egress`
+//! on `output`, and an unhooked `egress_rules` that both it and
+//! `bot_forward` jump to, the same one-copy-two-hooks shape as the inbound
+//! rules. The forward chain jumps to it *first*, before its own
+//! `established` and private-source accepts: a container's outbound
+//! traffic comes from a private address, and is exactly what those accepts
+//! let through.
+//!
+//! `egress_rules` lets private and trusted destinations go, then logs a
+//! new connection this side started to a listed address
+//! ([`crate::egress::LOG_PREFIX`], `flags skuid` for the user behind it)
+//! and, in Block mode, drops every packet to one. The containment sets
+//! (`contained_v4`, `contained_v6`, `contained_uids`) are always declared
+//! with it, so that containing something is adding an element to the
+//! loaded table rather than applying a script.
+//!
 //! This module never executes `nft` itself — applying the generated script
 //! is a manual step for the admin. The container suite
 //! (`tests/container.rs`) loads its output into a real `nft`.
@@ -151,6 +170,13 @@ const FORWARD_CHAIN: &str = "bot_forward";
 /// The unhooked chain holding the rules, jumped to from both base chains
 /// so that the two hooks can never enforce different things.
 const RULES_CHAIN: &str = "bot_rules";
+
+/// The base chain on `output`: traffic this host itself sends.
+const EGRESS_CHAIN: &str = "bot_egress";
+
+/// The unhooked chain of outbound rules, jumped to from `output` and
+/// `forward`.
+const EGRESS_RULES_CHAIN: &str = "egress_rules";
 
 /// The v4 ranges the forward chain lets through untouched: loopback,
 /// RFC1918 and link-local. The set `ipranges::is_local_or_private` treats
@@ -499,6 +525,17 @@ pub fn render_with_trap(
     trap: Option<&crate::portscan::Trap>,
     now: i64,
 ) -> String {
+    render_full(rules, trap, None, now)
+}
+
+/// [`render_with_trap`], with the outbound rules of `egress` (see the
+/// module docs).
+pub fn render_full(
+    rules: &[FirewallRule],
+    trap: Option<&crate::portscan::Trap>,
+    egress: Option<&crate::egress::Egress>,
+    now: i64,
+) -> String {
     let plan = Plan::new(rules, now);
 
     let mut out = String::new();
@@ -521,6 +558,9 @@ pub fn render_with_trap(
     if let Some(trap) = trap {
         trap_comment(&mut out, trap);
     }
+    if let Some(egress) = egress {
+        egress_comment(&mut out, egress);
+    }
     out.push('\n');
 
     // Reset just our own table to a fresh, empty state (see module docs for
@@ -534,10 +574,37 @@ pub fn render_with_trap(
     out.push_str(&format!(
         "add chain {TABLE} {FORWARD_CHAIN} {{ type filter hook forward priority -1; policy accept; }}\n"
     ));
+    if egress.is_some() {
+        out.push_str(&format!(
+            "add chain {TABLE} {EGRESS_CHAIN} {{ type filter hook output priority -1; policy accept; }}\n"
+        ));
+    }
     // No hook and no policy: reached only by the jumps below, so a packet
     // that falls off the end of it simply returns to whichever base chain
     // sent it.
-    out.push_str(&format!("add chain {TABLE} {RULES_CHAIN}\n\n"));
+    out.push_str(&format!("add chain {TABLE} {RULES_CHAIN}\n"));
+    if egress.is_some() {
+        out.push_str(&format!("add chain {TABLE} {EGRESS_RULES_CHAIN}\n"));
+    }
+    out.push('\n');
+
+    let egress_sets = egress.map(EgressSets::new);
+    if let Some(sets) = &egress_sets {
+        sets.declare(&mut out);
+    }
+
+    // What is contained reaches nothing on this host either: ahead of the
+    // `established` accept, so a connection it already has is cut too.
+    if egress.is_some() {
+        out.push_str(&format!(
+            "add rule {TABLE} {CHAIN} ip saddr @{} drop\n",
+            crate::contain::NFT_CONTAINED_V4
+        ));
+        out.push_str(&format!(
+            "add rule {TABLE} {CHAIN} ip6 saddr @{} drop\n",
+            crate::contain::NFT_CONTAINED_V6
+        ));
+    }
 
     out.push_str(&format!(
         "add rule {TABLE} {CHAIN} ct state established,related accept\n"
@@ -564,6 +631,26 @@ pub fn render_with_trap(
         out.push_str(&format!(
             "add rule {TABLE} {CHAIN} tcp dport {{ {ports} }} counter drop\n"
         ));
+    }
+
+    // Outbound first, ahead of the accepts below: see the module docs.
+    if let Some(egress) = egress {
+        for (family, set) in [
+            ("ip", crate::contain::NFT_CONTAINED_V4),
+            ("ip6", crate::contain::NFT_CONTAINED_V6),
+        ] {
+            out.push_str(&format!(
+                "add rule {TABLE} {FORWARD_CHAIN} {family} saddr @{set} drop\n"
+            ));
+            out.push_str(&format!(
+                "add rule {TABLE} {FORWARD_CHAIN} {family} daddr @{set} drop\n"
+            ));
+        }
+        if egress.watches() {
+            out.push_str(&format!(
+                "add rule {TABLE} {FORWARD_CHAIN} jump {EGRESS_RULES_CHAIN}\n"
+            ));
+        }
     }
 
     // The same short-circuit on the forward path. `iif lo` has no meaning
@@ -611,6 +698,10 @@ pub fn render_with_trap(
         "add rule {TABLE} {FORWARD_CHAIN} jump {RULES_CHAIN}\n"
     ));
 
+    if let (Some(egress), Some(sets)) = (egress, &egress_sets) {
+        egress_rules(&mut out, egress, sets);
+    }
+
     if !plan.skipped.is_empty() {
         out.push('\n');
     }
@@ -623,6 +714,9 @@ pub fn render_with_trap(
         ));
     }
     if plan.sets.is_empty() {
+        if let Some(sets) = &egress_sets {
+            sets.fill(&mut out);
+        }
         return out;
     }
 
@@ -667,8 +761,224 @@ pub fn render_with_trap(
         }
         out.push_str("}\n");
     }
+    if let Some(sets) = &egress_sets {
+        sets.fill(&mut out);
+    }
 
     out
+}
+
+/// The outbound sets, each address once and none inside another, ready to
+/// declare and fill.
+struct EgressSets {
+    watches: bool,
+    listed_v4: Vec<Prefix>,
+    listed_v6: Vec<Prefix>,
+    trusted_v4: Vec<Prefix>,
+    trusted_v6: Vec<Prefix>,
+    contained_v4: Vec<Prefix>,
+    contained_v6: Vec<Prefix>,
+    uids: Vec<u32>,
+}
+
+/// `addresses` of one family, as interval-set elements: valid ones only,
+/// and none inside another, which an interval set refuses (see "Why not
+/// `auto-merge`"). Every one lasts for ever, so an inner one is decided by
+/// the outer and left out.
+fn flattened(addresses: &[String], v6: bool) -> Vec<Prefix> {
+    let elements: Vec<Element> = addresses
+        .iter()
+        .filter(|a| crate::db::is_valid_address(a))
+        .filter_map(|a| Prefix::parse(a.trim()))
+        .filter(|p| p.v6 == v6)
+        .map(|prefix| Element {
+            prefix,
+            lifetime: None,
+        })
+        .collect();
+    layers(&elements)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| e.prefix)
+        .collect()
+}
+
+impl EgressSets {
+    fn new(egress: &crate::egress::Egress) -> EgressSets {
+        let listed = egress.listed();
+        EgressSets {
+            watches: egress.watches(),
+            listed_v4: flattened(&listed, false),
+            listed_v6: flattened(&listed, true),
+            trusted_v4: flattened(&egress.trusted, false),
+            trusted_v6: flattened(&egress.trusted, true),
+            contained_v4: flattened(&egress.contained_addresses, false),
+            contained_v6: flattened(&egress.contained_addresses, true),
+            uids: egress.contained_uids.clone(),
+        }
+    }
+
+    /// Every set, by name, type, whether it holds ranges, and its elements.
+    fn sets(&self) -> Vec<(&'static str, &'static str, bool, Vec<String>)> {
+        let text = |prefixes: &[Prefix]| prefixes.iter().map(Prefix::to_string).collect::<Vec<_>>();
+        let mut sets = vec![
+            (
+                crate::contain::NFT_CONTAINED_V4,
+                "ipv4_addr",
+                false,
+                text(&self.contained_v4),
+            ),
+            (
+                crate::contain::NFT_CONTAINED_V6,
+                "ipv6_addr",
+                false,
+                text(&self.contained_v6),
+            ),
+            (
+                crate::contain::NFT_CONTAINED_UIDS,
+                "uid",
+                false,
+                self.uids.iter().map(u32::to_string).collect(),
+            ),
+        ];
+        if self.watches {
+            if !self.trusted_v4.is_empty() {
+                sets.push((
+                    "egress_trusted_v4",
+                    "ipv4_addr",
+                    true,
+                    text(&self.trusted_v4),
+                ));
+            }
+            if !self.trusted_v6.is_empty() {
+                sets.push((
+                    "egress_trusted_v6",
+                    "ipv6_addr",
+                    true,
+                    text(&self.trusted_v6),
+                ));
+            }
+            sets.push(("listed_v4", "ipv4_addr", true, text(&self.listed_v4)));
+            sets.push(("listed_v6", "ipv6_addr", true, text(&self.listed_v6)));
+        }
+        sets
+    }
+
+    /// Declared before any rule names them.
+    fn declare(&self, out: &mut String) {
+        for (name, kind, interval, _) in self.sets() {
+            let flags = if interval { " flags interval;" } else { "" };
+            out.push_str(&format!(
+                "add set {TABLE} {name} {{ type {kind};{flags} }}\n"
+            ));
+        }
+        out.push('\n');
+    }
+
+    /// Filled at the end, with the inbound sets' elements.
+    fn fill(&self, out: &mut String) {
+        for (name, _, _, elements) in self.sets() {
+            if !elements.is_empty() {
+                out.push_str(&format!(
+                    "\nadd element {TABLE} {name} {{\n\t{}\n}}\n",
+                    elements.join(",\n\t")
+                ));
+            }
+        }
+    }
+}
+
+/// The rules of `bot_egress` and `egress_rules`. Their sets are declared
+/// at the end of the script with the others: one transaction, so a rule
+/// may name a set declared below it.
+fn egress_rules(out: &mut String, egress: &crate::egress::Egress, sets: &EgressSets) {
+    use crate::contain::{NFT_CONTAINED_UIDS, NFT_CONTAINED_V4, NFT_CONTAINED_V6};
+
+    out.push('\n');
+    out.push_str(&format!("add rule {TABLE} {EGRESS_CHAIN} oif lo accept\n"));
+    // What a contained user starts goes nowhere; replies to what others
+    // started with it (a web server's answers) still go out.
+    out.push_str(&format!(
+        "add rule {TABLE} {EGRESS_CHAIN} meta skuid @{NFT_CONTAINED_UIDS} ct direction original drop\n"
+    ));
+    out.push_str(&format!(
+        "add rule {TABLE} {EGRESS_CHAIN} ip daddr @{NFT_CONTAINED_V4} drop\n"
+    ));
+    out.push_str(&format!(
+        "add rule {TABLE} {EGRESS_CHAIN} ip6 daddr @{NFT_CONTAINED_V6} drop\n"
+    ));
+    if !egress.watches() {
+        return;
+    }
+    out.push_str(&format!(
+        "add rule {TABLE} {EGRESS_CHAIN} jump {EGRESS_RULES_CHAIN}\n"
+    ));
+
+    // `return`, not `accept`: back to whichever chain jumped here, which
+    // decides the rest. Never an opinion on a private destination: those
+    // are this host's own networks and containers.
+    out.push_str(&format!(
+        "add rule {TABLE} {EGRESS_RULES_CHAIN} ip daddr {{ {PRIVATE_V4} }} return\n"
+    ));
+    out.push_str(&format!(
+        "add rule {TABLE} {EGRESS_RULES_CHAIN} ip6 daddr {{ {PRIVATE_V6} }} return\n"
+    ));
+    if !sets.trusted_v4.is_empty() {
+        out.push_str(&format!(
+            "add rule {TABLE} {EGRESS_RULES_CHAIN} ip daddr @egress_trusted_v4 return\n"
+        ));
+    }
+    if !sets.trusted_v6.is_empty() {
+        out.push_str(&format!(
+            "add rule {TABLE} {EGRESS_RULES_CHAIN} ip6 daddr @egress_trusted_v6 return\n"
+        ));
+    }
+    for (family, set) in [("ip", "listed_v4"), ("ip6", "listed_v6")] {
+        out.push_str(&format!(
+            "add rule {TABLE} {EGRESS_RULES_CHAIN} {family} daddr @{set} ct direction original \
+             limit rate {} log prefix \"{}\" flags skuid\n",
+            crate::egress::LOG_RATE,
+            crate::egress::LOG_PREFIX
+        ));
+    }
+    if egress.blocks() {
+        for (family, set) in [("ip", "listed_v4"), ("ip6", "listed_v6")] {
+            out.push_str(&format!(
+                "add rule {TABLE} {EGRESS_RULES_CHAIN} {family} daddr @{set} counter drop\n"
+            ));
+        }
+    }
+}
+
+/// The header lines that say what the outbound rules do, for either
+/// backend.
+pub(crate) fn egress_comment(out: &mut String, egress: &crate::egress::Egress) {
+    out.push_str("#\n");
+    if egress.watches() {
+        out.push_str(&format!(
+            "# Outbound ({}): a new connection from this host or a container to one\n",
+            egress.mode.as_str()
+        ));
+        out.push_str(&format!(
+            "# of {} listed command-and-control address(es) is logged as \"{}\"",
+            egress.listed().len(),
+            crate::egress::LOG_PREFIX.trim_end()
+        ));
+        out.push_str(if egress.blocks() {
+            ",\n# and dropped.\n"
+        } else {
+            ",\n# and let through.\n"
+        });
+    } else {
+        out.push_str("# Outbound checks are off; only what is contained is cut off.\n");
+    }
+    out.push_str(&format!(
+        "# Contained: {} address(es), {} user(s).\n",
+        egress.contained_addresses.len(),
+        egress.contained_uids.len()
+    ));
 }
 
 /// The header lines that say what the trap is, for either backend.
@@ -1376,6 +1686,90 @@ mod tests {
             disabled("10.0.0.1"),
         ];
         crate::golden::assert_golden("firewall.nft", &render(&rules, NOW));
+    }
+
+    /// The same rule set with outbound checks in Block mode, and a
+    /// container and a user contained.
+    #[test]
+    fn rendered_script_with_outbound_checks_matches_the_golden() {
+        let rules = vec![allow("203.0.113.7"), block("198.51.100.0/24")];
+        crate::golden::assert_golden(
+            "firewall-egress.nft",
+            &render_full(&rules, None, Some(&crate::testing::egress()), NOW),
+        );
+    }
+
+    /// A container's traffic comes from a private address, which the
+    /// forward chain accepts outright: outbound has to be decided first.
+    #[test]
+    fn the_forward_chain_decides_outbound_before_it_accepts_private_sources() {
+        let script = render_full(&[], None, Some(&crate::testing::egress()), NOW);
+        let position = |needle: &str| {
+            script
+                .lines()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle:?} in:\n{script}"))
+        };
+        assert!(
+            position("bot_forward jump egress_rules")
+                < position("bot_forward ct state established"),
+            "{script}"
+        );
+        assert!(
+            position("bot_forward ip saddr @contained_v4 drop")
+                < position("bot_forward ct state established"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn watching_logs_outbound_attempts_and_drops_none() {
+        let egress = crate::egress::Egress {
+            mode: crate::egress::Mode::Watch,
+            ..crate::testing::egress()
+        };
+        let script = render_full(&[], None, Some(&egress), NOW);
+        assert!(
+            script.contains("log prefix \"stop-bots-egress: \" flags skuid"),
+            "{script}"
+        );
+        assert!(
+            !script
+                .lines()
+                .any(|l| l.contains("@listed_") && l.ends_with("drop")),
+            "watching drops:\n{script}"
+        );
+    }
+
+    /// A reply to a listed address that connected in is not a call home.
+    #[test]
+    fn only_connections_this_side_started_are_logged() {
+        let script = render_full(&[], None, Some(&crate::testing::egress()), NOW);
+        for line in script
+            .lines()
+            .filter(|l| l.contains("log prefix \"stop-bots-egress"))
+        {
+            assert!(line.contains("ct direction original"), "{line}");
+        }
+    }
+
+    /// With outbound off, what is contained is still cut off, and nothing
+    /// checks destinations.
+    #[test]
+    fn with_outbound_off_only_containment_is_rendered() {
+        let egress = crate::egress::Egress {
+            mode: crate::egress::Mode::Off,
+            destinations: Vec::new(),
+            sinkhole: None,
+            ..crate::testing::egress()
+        };
+        let script = render_full(&[], None, Some(&egress), NOW);
+        assert!(
+            script.contains("add element inet stop_bots contained_uids {\n\t1001\n}"),
+            "{script}"
+        );
+        assert!(!script.contains("egress_rules ip daddr"), "{script}");
+        assert!(!script.contains("listed_v4"), "{script}");
     }
 
     /// The same rule set with the port-scan detector's trap.

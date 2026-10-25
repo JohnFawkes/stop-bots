@@ -47,6 +47,8 @@ pub mod botlist;
 #[doc(hidden)]
 pub mod cdn;
 #[doc(hidden)]
+pub mod contain;
+#[doc(hidden)]
 pub mod cron;
 #[doc(hidden)]
 pub mod db;
@@ -59,9 +61,13 @@ pub mod docs;
 #[doc(hidden)]
 pub mod dynamic;
 #[doc(hidden)]
+pub mod egress;
+#[doc(hidden)]
 pub mod event;
 #[doc(hidden)]
 pub mod evidence;
+#[doc(hidden)]
+pub mod exploits;
 #[doc(hidden)]
 pub mod exposure;
 #[doc(hidden)]
@@ -101,6 +107,8 @@ pub mod logscan;
 #[doc(hidden)]
 pub mod logtime;
 #[doc(hidden)]
+pub mod modsecurity;
+#[doc(hidden)]
 pub mod nftables;
 #[doc(hidden)]
 pub mod nginx;
@@ -126,6 +134,8 @@ pub mod robots;
 pub mod scanblock;
 #[doc(hidden)]
 pub mod services;
+#[doc(hidden)]
+pub mod sinkhole;
 #[doc(hidden)]
 pub mod sshlog;
 #[cfg(test)]

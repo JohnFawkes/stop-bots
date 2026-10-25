@@ -7003,3 +7003,410 @@ fn set_detector_sets_the_trap_ports_and_refuses_ssh() {
             "only port-scanners has trap ports",
         ));
 }
+
+// ---- outbound traffic to C&C servers ----
+
+/// A list of C&C addresses, as Feodo Tracker serves it, in a file of the
+/// fixture's: these tests never download one.
+fn c2_feed(fx: &Fixture, addresses: &[&str]) -> std::path::PathBuf {
+    let path = fx._tmp.path().join("feodo.txt");
+    let mut text = String::from("# abuse.ch Feodo Tracker Botnet C2 IP Blocklist\n# DstIP\n");
+    for address in addresses {
+        text.push_str(address);
+        text.push('\n');
+    }
+    fs::write(&path, text).unwrap();
+    path
+}
+
+fn render_nft(fx: &Fixture) -> String {
+    let out = fx._tmp.path().join("firewall.nft");
+    fx.run(&[
+        "render-firewall",
+        "--backend",
+        "nftables",
+        "--out",
+        out.to_str().unwrap(),
+        "--ssh-log",
+        "/nonexistent/auth.log",
+    ]);
+    fs::read_to_string(&out).unwrap()
+}
+
+/// A feed switched on changes nothing until a mode says to check, and then
+/// its addresses are matched as destinations, dropped in Block mode.
+#[test]
+fn a_c2_feed_reaches_the_outbound_rules_only_once_a_mode_checks() {
+    let fx = Fixture::new();
+    let feed = c2_feed(&fx, &["198.51.100.7"]);
+    fx.run(&["set-egress-feed", "--feed-id", "feodo", "--enabled", "true"]);
+    fx.run(&[
+        "update-egress-feeds",
+        "--feed-id",
+        "feodo",
+        "--source",
+        feed.to_str().unwrap(),
+    ])
+    .stdout(predicate::str::contains("feodo: 1 entries"));
+
+    let off = render_nft(&fx);
+    assert!(
+        !off.contains("198.51.100.7"),
+        "outbound was checked while off:\n{off}"
+    );
+
+    fx.run(&["set-egress", "--mode", "block"]);
+    let block = render_nft(&fx);
+    let cases = [
+        ("the address is listed", "\t198.51.100.7\n"),
+        ("the output hook is used", "hook output"),
+        (
+            "listed destinations are dropped",
+            "egress_rules ip daddr @listed_v4 counter drop",
+        ),
+    ];
+    for (what, needle) in cases {
+        assert!(block.contains(needle), "{what}: no {needle:?} in:\n{block}");
+    }
+}
+
+/// The guard keeps what the host needs out of a feed, and says so.
+#[test]
+fn a_feed_entry_that_would_cut_the_host_off_is_left_out_and_named() {
+    let fx = Fixture::new();
+    let feed = c2_feed(&fx, &["198.51.100.7", "10.0.0.0/8", "0.0.0.0/0"]);
+    fx.run(&["set-egress-feed", "--feed-id", "feodo", "--enabled", "true"]);
+    let said = fx.run(&[
+        "update-egress-feeds",
+        "--feed-id",
+        "feodo",
+        "--source",
+        feed.to_str().unwrap(),
+    ]);
+    let said = String::from_utf8_lossy(&said.get_output().stdout).into_owned();
+    assert!(
+        said.contains("feodo: 1 entries, left out 10.0.0.0/8") && said.contains("and 1 more"),
+        "update said:\n{said}"
+    );
+}
+
+/// A logged attempt is read by `tick`, which says it even without
+/// `--verbose`: what cron mails.
+#[test]
+fn tick_says_a_c2_hit_out_loud() {
+    let fx = Fixture::new();
+    let access = fx._tmp.path().join("access.log");
+    fs::write(&access, "").unwrap();
+    let ssh = fx.ready_for_tick(&access);
+    let feed = c2_feed(&fx, &["198.51.100.7"]);
+    fx.run(&["set-egress-feed", "--feed-id", "feodo", "--enabled", "true"]);
+    fx.run(&[
+        "update-egress-feeds",
+        "--feed-id",
+        "feodo",
+        "--source",
+        feed.to_str().unwrap(),
+    ]);
+    fx.run(&["set-egress", "--mode", "block"]);
+    {
+        let db = stop_bots::db::Db::open(&fx.db).unwrap();
+        db.set_cron_last_run("update_egress_feeds", stop_bots_now(), "skipped for test")
+            .unwrap();
+    }
+    let kern = fx._tmp.path().join("kern.log");
+    let stamp = std::process::Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%S+00:00"])
+        .output()
+        .unwrap();
+    let stamp = String::from_utf8(stamp.stdout).unwrap();
+    fs::write(
+        &kern,
+        format!(
+            "{} web kernel: stop-bots-egress: IN= OUT=eth0 SRC=192.0.2.10 DST=198.51.100.7 \
+             LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=1 DF PROTO=TCP SPT=40000 DPT=443 WINDOW=64240 \
+             RES=0x00 SYN URGP=0 UID=4242 GID=4242\n",
+            stamp.trim()
+        ),
+    )
+    .unwrap();
+    fx.run(&["set-log-paths", "--kernel-log", kern.to_str().unwrap()]);
+
+    let ran = fx
+        .cmd(&["tick", "--ssh-log", ssh.to_str().unwrap()])
+        .env("TMPDIR", fx._tmp.path())
+        .assert()
+        .success();
+    let said = String::from_utf8_lossy(&ran.get_output().stdout).into_owned();
+    assert!(
+        said.contains("stop-bots: ALERT: uid 4242 connected out to 198.51.100.7:443, listed by feodo (blocked)"),
+        "tick said:\n{said}"
+    );
+    fx.run(&["list-egress-hits"])
+        .stdout(predicate::str::contains("uid 4242 -> 198.51.100.7:443"));
+    fx.cmd(&["status"])
+        .assert()
+        .stdout(predicate::str::contains("Nothing here calls a C&C server"));
+}
+
+fn stop_bots_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+#[test]
+fn root_is_never_contained() {
+    let fx = Fixture::new();
+    fx.cmd(&["contain", "--user", "0", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("root cannot be contained"));
+}
+
+#[test]
+fn a_user_contained_by_hand_is_said_and_nothing_changes_on_a_dry_run() {
+    let fx = Fixture::new();
+    fx.run(&["contain", "--user", "4242", "--dry-run"])
+        .stdout(predicate::str::contains("would have cut off uid 4242"));
+    fx.run(&["list-containments"])
+        .stdout(predicate::str::contains("Nothing is contained."));
+}
+
+/// abuse.ch's exports carry the account's key in the URL.
+#[test]
+fn a_feed_s_key_is_never_listed() {
+    let fx = Fixture::new();
+    fx.run(&[
+        "add-egress-feed",
+        "--name",
+        "ThreatFox",
+        "--url",
+        "https://threatfox-api.abuse.ch/v2/files/exports/s3cr3tkey/recent.csv",
+    ])
+    .stdout(predicate::str::contains("custom-threatfox"))
+    .stdout(predicate::str::contains("s3cr3tkey").not());
+    for args in [&["list-egress-feeds"][..], &["list-egress-feeds", "--json"]] {
+        fx.run(args)
+            .stdout(predicate::str::contains("threatfox-api.abuse.ch"))
+            .stdout(predicate::str::contains("s3cr3tkey").not());
+    }
+}
+
+/// The sinkhole is matched like a listed address once a resolver is told
+/// to use it.
+#[test]
+fn a_chosen_resolver_puts_the_sinkhole_among_the_listed_addresses() {
+    let fx = Fixture::new();
+    fx.run(&["set-egress", "--mode", "watch"]);
+    fx.run(&[
+        "set-egress-dns",
+        "--target",
+        "dnsmasq",
+        "--sinkhole",
+        "192.0.2.99",
+    ]);
+    let script = render_nft(&fx);
+    assert!(script.contains("\t192.0.2.99\n"), "{script}");
+    fx.run(&["apply-egress-dns", "--dry-run"])
+        .stdout(predicate::str::contains(
+            "/etc/dnsmasq.d/stop-bots-egress.conf",
+        ));
+}
+
+// ---- the exploit rules ----
+
+/// Switched on, the rules are a file in `conf.d` and one `if` in each
+/// site's block; switched off, both go again.
+#[test]
+fn the_exploit_rules_are_written_and_taken_away_again() {
+    let fx = Fixture::new();
+    let site = fx.write_site("a.example");
+    fx.scan_sites();
+    let file = fx.conf_d.join("stop-bots-exploits.conf");
+
+    fx.run(&["set-exploit-rules", "--enabled", "true"]);
+    fx.apply_blocks();
+    let written = fs::read_to_string(&site).unwrap();
+    assert!(written.contains("if ($stop_bots_exploit)"), "{written}");
+    let conf = fs::read_to_string(&file).unwrap();
+    assert!(
+        conf.contains("map $request_uri $stop_bots_exploit_request"),
+        "{conf}"
+    );
+
+    fx.run(&["set-exploit-rules", "--enabled", "false"]);
+    fx.apply_blocks();
+    assert!(!fs::read_to_string(&site)
+        .unwrap()
+        .contains("$stop_bots_exploit"));
+    assert!(!file.exists(), "the file outlived the rules");
+}
+
+/// A site's own choice wins, and `--inherit` gives it back to the host.
+#[test]
+fn one_site_can_have_the_exploit_rules_on_its_own() {
+    let fx = Fixture::new();
+    let a = fx.write_site("a.example");
+    let b = fx.write_site("b.example");
+    fx.scan_sites();
+
+    fx.run(&[
+        "set-exploit-rules",
+        "--site",
+        "a.example",
+        "--enabled",
+        "true",
+    ])
+    .stdout(predicate::str::contains(
+        "a.example: exploit payloads are turned away",
+    ));
+    fx.apply_blocks();
+    assert!(fs::read_to_string(&a)
+        .unwrap()
+        .contains("$stop_bots_exploit"));
+    assert!(!fs::read_to_string(&b)
+        .unwrap()
+        .contains("$stop_bots_exploit"));
+
+    fx.run(&["set-exploit-rules", "--site", "a.example", "--inherit"])
+        .stdout(predicate::str::contains("let through, as the host says"));
+}
+
+#[test]
+fn the_preview_says_what_the_exploit_rules_would_have_turned_away() {
+    let fx = Fixture::new();
+    let log = fx._tmp.path().join("access.log");
+    fs::write(
+        &log,
+        "198.51.100.7 - - [25/Oct/2026:10:00:00 +0000] \"GET /?x=%24%7Bjndi:ldap://x/a%7D HTTP/1.1\" 200 5 \"-\" \"curl/8\"\n\
+         203.0.113.5 - - [25/Oct/2026:10:00:01 +0000] \"GET /?s=/etc/passwd HTTP/1.1\" 200 5 \"-\" \"Mozilla/5.0\"\n",
+    )
+    .unwrap();
+    fx.run(&["preview-exploit-rules", "--access-log", log.to_str().unwrap()])
+        .stdout(predicate::str::contains("Of 2 request(s) in the log, the exploit rules would have turned away 1, from 1 address(es)."))
+        .stdout(predicate::str::contains("log4shell"));
+}
+
+// ---- ModSecurity ----
+
+/// The module loaded by this fixture's NGINX, and a Core Rule Set where
+/// `STOP_BOTS_MODSECURITY_CRS` says it is.
+fn with_modsecurity(fx: &Fixture) -> std::path::PathBuf {
+    fs::write(fx.nginx_root.join("nginx.conf"), "events {}\nhttp {}\n").unwrap();
+    fs::create_dir_all(fx.nginx_root.join("modules-enabled")).unwrap();
+    fs::write(
+        fx.nginx_root
+            .join("modules-enabled/50-mod-http-modsecurity.conf"),
+        "load_module modules/ngx_http_modsecurity_module.so;\n",
+    )
+    .unwrap();
+    let crs = fx._tmp.path().join("crs");
+    fs::create_dir_all(crs.join("rules")).unwrap();
+    fs::write(crs.join("crs-setup.conf"), "# crs setup\n").unwrap();
+    crs
+}
+
+fn run_with_crs(fx: &Fixture, crs: &Path, args: &[&str]) -> String {
+    let ran = fx
+        .cmd(args)
+        .env("STOP_BOTS_MODSECURITY_CRS", crs)
+        .assert()
+        .success();
+    String::from_utf8_lossy(&ran.get_output().stdout).into_owned()
+}
+
+#[test]
+fn modsecurity_is_written_for_a_site_and_taken_away_again() {
+    let fx = Fixture::new();
+    let crs = with_modsecurity(&fx);
+    let site = fx.write_site("a.example");
+    fx.scan_sites();
+    let root = fx.nginx_root.to_str().unwrap().to_string();
+    let apply = ["apply-blocks", "--root", root.as_str(), "--no-reload"];
+
+    run_with_crs(&fx, &crs, &["set-modsecurity", "--mode", "detect"]);
+    run_with_crs(&fx, &crs, &apply);
+    let written = fs::read_to_string(&site).unwrap();
+    let rules = fs::read_to_string(fx.managed.join("modsecurity.conf")).unwrap();
+    let loader = fs::read_to_string(fx.conf_d.join("stop-bots-modsecurity.conf")).unwrap();
+    let cases = [
+        (
+            "the site switches it on",
+            written.contains("modsecurity on;"),
+        ),
+        (
+            "its transaction ids name it",
+            written.contains("modsecurity_transaction_id \"sb"),
+        ),
+        (
+            "the rules start in detect",
+            rules.contains("SecRuleEngine DetectionOnly"),
+        ),
+        (
+            "they include the rule set",
+            rules.contains(&format!("Include {}/rules/*.conf", crs.display())),
+        ),
+        (
+            "the loader names the rules",
+            loader.contains("modsecurity_rules_file"),
+        ),
+    ];
+    for (what, true_) in cases {
+        assert!(true_, "{what}:\n{written}\n{rules}\n{loader}");
+    }
+
+    run_with_crs(&fx, &crs, &["set-modsecurity", "--mode", "off"]);
+    run_with_crs(&fx, &crs, &apply);
+    assert!(!fs::read_to_string(&site).unwrap().contains("modsecurity"));
+    assert!(!fx.conf_d.join("stop-bots-modsecurity.conf").exists());
+}
+
+/// `modsecurity on;` without the module fails `nginx -t` and takes every
+/// other change of the apply with it, so nothing is written for it.
+#[test]
+fn without_the_module_nothing_of_modsecurity_is_written() {
+    let fx = Fixture::new();
+    let site = fx.write_site("a.example");
+    fx.scan_sites();
+    fx.run(&["set-modsecurity", "--mode", "detect"])
+        .stdout(predicate::str::contains(
+            "Not written until it is installed",
+        ));
+    fx.apply_blocks();
+    assert!(!fs::read_to_string(&site).unwrap().contains("modsecurity"));
+}
+
+#[test]
+fn an_exclusion_is_written_into_its_site_s_rules() {
+    let fx = Fixture::new();
+    let crs = with_modsecurity(&fx);
+    fx.write_site("a.example");
+    fx.scan_sites();
+    let root = fx.nginx_root.to_str().unwrap().to_string();
+    run_with_crs(&fx, &crs, &["set-modsecurity", "--mode", "block"]);
+    run_with_crs(
+        &fx,
+        &crs,
+        &[
+            "exclude-modsecurity-rule",
+            "--site",
+            "a.example",
+            "--rule",
+            "942100",
+            "--path",
+            "/api/",
+        ],
+    );
+    run_with_crs(
+        &fx,
+        &crs,
+        &["apply-blocks", "--root", root.as_str(), "--no-reload"],
+    );
+    let rules = fs::read_to_string(fx.managed.join("modsecurity.conf")).unwrap();
+    assert!(
+        rules.contains("\"@beginsWith /api/\" \"t:none,ctl:ruleRemoveById=942100\"")
+            && rules.contains("ctl:ruleEngine=On"),
+        "{rules}"
+    );
+}

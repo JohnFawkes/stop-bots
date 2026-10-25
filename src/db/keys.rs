@@ -100,6 +100,41 @@ pub const CLOUD_PORT_80_OPEN: &str = "firewall:cloud_port_80_open";
 /// SSH. Off only for someone who said they never log in over SSH.
 pub const SSH_LOCKOUT_CHECK: &str = "firewall:ssh_lockout_check";
 
+// ---- outbound traffic (see `egress` and `contain`) ----
+
+/// `egress::Mode`: whether outbound connections to listed addresses are
+/// checked, and whether they are stopped.
+pub const EGRESS_MODE: &str = "egress:mode";
+/// `sinkhole::Target`: which resolver is told about listed domains.
+pub const EGRESS_DNS_TARGET: &str = "egress:dns_target";
+/// The address listed domains resolve to.
+pub const EGRESS_SINKHOLE: &str = "egress:sinkhole";
+/// Whether a hit contains what made it, without asking.
+pub const EGRESS_AUTO_CONTAIN: &str = "egress:auto_contain";
+/// Whether automatic containment applies to containers.
+pub const EGRESS_CONTAIN_CONTAINERS: &str = "egress:contain_containers";
+/// Whether automatic containment applies to users on the host.
+pub const EGRESS_CONTAIN_USERS: &str = "egress:contain_users";
+/// `contain::Action`: what is done to a contained container.
+pub const EGRESS_CONTAINER_ACTION: &str = "egress:container_action";
+/// `contain::Action`: what is done to a contained user.
+pub const EGRESS_USER_ACTION: &str = "egress:user_action";
+/// Containers and users never contained automatically, comma-separated.
+pub const EGRESS_NEVER_CONTAIN: &str = "egress:never_contain";
+/// The most automatic containments in an hour before the breaker trips.
+pub const EGRESS_BREAKER_MAX: &str = "egress:breaker_max";
+/// When the breaker tripped, in Unix seconds; unset while it has not.
+pub const EGRESS_BREAKER_TRIPPED: &str = "egress:breaker_tripped_at";
+
+// ---- the web application firewall (see `exploits` and `modsecurity`) ----
+
+/// Whether the exploit rules are on for every site that does not choose.
+pub const WAF_EXPLOIT_RULES: &str = "waf:exploit_rules";
+/// `modsecurity::Mode` for every site that does not choose.
+pub const WAF_MODSECURITY: &str = "waf:modsecurity";
+/// The CRS paranoia level for every site that does not choose.
+pub const WAF_PARANOIA: &str = "waf:paranoia";
+
 // ---- detectors ----
 //
 // A detector's on/off switch and TTL are the `detect:` family below; these
@@ -177,6 +212,20 @@ pub const ALL: &[&str] = &[
     AUTO_APPLY_FIREWALL,
     CLOUD_PORT_80_OPEN,
     SSH_LOCKOUT_CHECK,
+    EGRESS_MODE,
+    EGRESS_DNS_TARGET,
+    EGRESS_SINKHOLE,
+    EGRESS_AUTO_CONTAIN,
+    EGRESS_CONTAIN_CONTAINERS,
+    EGRESS_CONTAIN_USERS,
+    EGRESS_CONTAINER_ACTION,
+    EGRESS_USER_ACTION,
+    EGRESS_NEVER_CONTAIN,
+    EGRESS_BREAKER_MAX,
+    EGRESS_BREAKER_TRIPPED,
+    WAF_EXPLOIT_RULES,
+    WAF_MODSECURITY,
+    WAF_PARANOIA,
     DETECT_PROBE_PATHS_EXTRA,
     DETECT_HONEYPOT_PATH,
     DETECT_SUBNET_ESCALATION,

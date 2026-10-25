@@ -406,6 +406,8 @@ Some directories don't exist yet but should be created if the need arises.
 <root of the repository>
     |- /src               <- The implementation
         |- main.rs        <- CLI entry point: what each subcommand does
+        |- egress_cmd.rs  <- What the outbound and containment subcommands do
+        |- waf_cmd.rs     <- What the exploit-rule and ModSecurity subcommands do
         |- cli.rs         <- The command line itself: every verb, flag and help text (clap)
         |- lib.rs         <- Every module below, for main.rs and tests/; not a supported API
         |- app.rs         <- The TUI app controller, responds to events and controls the UI
@@ -419,6 +421,8 @@ Some directories don't exist yet but should be created if the need arises.
         |- db/managed.rs  <- The record of every generated file written, for cleaning up
         |- db/evidence.rs <- What the detectors have seen, and each log's read cursor
         |- db/blocks.rs   <- The Blocks views' pages, removal by source, and unblocks by hand
+        |- db/egress.rs   <- C&C feeds and what they hold, outbound attempts, containments
+        |- db/waf.rs      <- Each site's exploit-rule and ModSecurity choices, and exclusions
         |- botlist/       <- One file per bot-list source parser, and old_browsers.rs, the
         |                    compiled-in list of old browser agents behind its own switch
         |- fetch.rs       <- The one place an outbound HTTP request is made
@@ -436,8 +440,13 @@ Some directories don't exist yet but should be created if the need arises.
         |- evidence.rs    <- What each detector counts, and the one decision over it
         |- sshlog.rs      <- SSH log parsing and scan detection
         |- portscan.rs    <- The port-scan detector: trap ports, what listens, the kernel log's lines
+        |- egress.rs      <- Outbound connections to C&C servers: feeds, the never-blocked guard, log lines
+        |- contain.rs     <- Containing what called one: containers paused, users cut off, the breaker
+        |- sinkhole.rs    <- C&C domains, sent to a sinkhole address through the host's resolver
         |- accesslog.rs   <- Access log parsing (NGINX's, Apache's and Traefik's), the web-log detectors, UA tallying
         |- injection.rs   <- Recognising an exploit payload in a logged request
+        |- exploits.rs    <- The same signatures as NGINX regexes, refusing a payload as it arrives
+        |- modsecurity.rs <- ModSecurity and the Core Rule Set, per site, and its audit log
         |- protocol.rs    <- Recognising a request that is not for a page: another protocol, or a proxy
         |- accessstats.rs <- What one pass tallied into the access-log UA stats
         |- cdn.rs         <- A CDN's edge addresses, which no detector blocks

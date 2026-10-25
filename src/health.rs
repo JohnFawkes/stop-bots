@@ -243,6 +243,11 @@ pub struct Probe {
     /// counts the right number of rules, while enforcing none of them for
     /// anything behind a published container port.
     pub firewall_covers_forward: Option<bool>,
+    /// Whether the loaded ruleset checks outbound traffic: `bot_egress` in
+    /// our table, or the `OUTPUT` jump into `STOP-BOTS-OUT`. `None` when
+    /// it could not be read, and in a probe from before it was asked.
+    #[serde(default)]
+    pub firewall_covers_egress: Option<bool>,
     /// `(public, parsed)` client addresses in the access log's tail — see
     /// [`crate::accesslog::Survey::public`]. `None` when the log could not
     /// be read, which [`log_sources`] already reports.
@@ -482,6 +487,7 @@ pub fn probe(
         http_renewals: http_renewals(Path::new(CERTBOT_RENEWAL_DIR)),
         exposed_files: exposed_files_survey(server, &config_root, block_status),
         firewall_covers_forward: live.as_ref().map(|state| state.covers_forward),
+        firewall_covers_egress: live.as_ref().map(|state| state.covers_egress),
         container_shares_host_network: container.as_ref().map(|name| {
             run_allowing_failure(
                 "docker",
@@ -643,6 +649,8 @@ struct LiveFirewall {
     /// loads cleanly and counts exactly right while enforcing nothing for
     /// a containerised service. See the module docs in [`crate::nftables`].
     covers_forward: bool,
+    /// Whether it checks outbound traffic (see [`crate::egress`]).
+    covers_egress: bool,
 }
 
 /// Reads it, or `None` when the tool could not be run at all.
@@ -665,12 +673,14 @@ fn live_firewall(backend: FirewallBackend) -> Option<LiveFirewall> {
                 return Some(LiveFirewall {
                     rules: 0,
                     covers_forward: false,
+                    covers_egress: false,
                 });
             }
             let dump = run("nft", &["list", "table", "inet", "stop_bots"])?;
             Some(LiveFirewall {
                 rules: count_nft_rules(&dump),
                 covers_forward: dump.contains("hook forward"),
+                covers_egress: dump.contains("hook output"),
             })
         }
         FirewallBackend::Iptables => {
@@ -703,9 +713,17 @@ fn live_firewall(backend: FirewallBackend) -> Option<LiveFirewall> {
                     dump.lines()
                         .any(|line| line.trim() == "-A DOCKER-USER -j STOP-BOTS")
                 });
+            let covers_egress =
+                run_allowing_failure("iptables", &["-S", "OUTPUT"]).is_some_and(|dump| {
+                    dump.lines().any(|line| {
+                        line.trim()
+                            == format!("-A OUTPUT -j {}", crate::contain::IPTABLES_OUT_CHAIN)
+                    })
+                });
             Some(LiveFirewall {
                 rules,
                 covers_forward,
+                covers_egress,
             })
         }
     }
@@ -982,12 +1000,193 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
             checks.push(check);
         }
     }
+    if let Some(check) = egress_hits(db)? {
+        checks.push(check);
+    }
+    if let Some(check) = modsecurity_ready(db, probe)? {
+        checks.push(check);
+    }
+    if let Some(check) = egress_enforced(db, probe, applied)? {
+        checks.push(check);
+    }
 
     Ok(Report {
         checks,
         checked_at: now_secs(),
         access_logs: probe.access_logs.clone(),
     })
+}
+
+/// How long an outbound attempt stays an alert: long enough to be seen by
+/// someone who looks once a week, and no longer, since `clear-egress-hits`
+/// is how an operator says it has been dealt with.
+const EGRESS_ALERT_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+/// Whether anything on this host called a listed C&C server lately. Silent
+/// with outbound checks off and nothing on record.
+fn egress_hits(db: &Db) -> Result<Option<Check>> {
+    let mode = crate::egress::Mode::get(db)?;
+    let hits = db.list_egress_hits()?;
+    if mode == crate::egress::Mode::Off && hits.is_empty() {
+        return Ok(None);
+    }
+    let recent: Vec<_> = hits
+        .iter()
+        .filter(|hit| hit.last_seen >= now_secs() - EGRESS_ALERT_SECONDS)
+        .collect();
+    let tripped = crate::contain::Settings::get(db)?.tripped_at.is_some();
+    let open = db.open_containments()?;
+    let (level, detail, fix) = match recent.first() {
+        Some(latest) => {
+            let who = latest
+                .container_name
+                .as_ref()
+                .map(|name| format!("container {name}"))
+                .or_else(|| latest.uid.map(|uid| format!("uid {uid}")))
+                .unwrap_or_else(|| latest.source.clone());
+            let mut detail = format!(
+                "{} outbound attempt(s) to listed C&C addresses in the last week, the latest                  from {who} to {} {}",
+                recent.len(),
+                latest.destination,
+                crate::present::ago(latest.last_seen)
+            );
+            if !open.is_empty() {
+                detail.push_str(&format!("; {} contained", open.len()));
+            }
+            (
+                Level::Critical,
+                detail,
+                Some(
+                    "something on this host is probably compromised: `stop-bots                      list-egress-hits` says who, `contain` cuts it off, and `clear-egress-hits`                      once it has been dealt with"
+                        .to_string(),
+                ),
+            )
+        }
+        None if tripped => (
+            Level::Warn,
+            "the containment breaker is tripped: nothing more is contained automatically"
+                .to_string(),
+            Some("stop-bots set-containment --reset-breaker".to_string()),
+        ),
+        None => (
+            Level::Ok,
+            match open.len() {
+                0 => "no outbound attempt to a listed address in the last week".to_string(),
+                n => format!("none in the last week; {n} still contained"),
+            },
+            None,
+        ),
+    };
+    Ok(Some(Check {
+        id: "egress-hits",
+        title: "Nothing here calls a C&C server",
+        level,
+        detail,
+        fix,
+    }))
+}
+
+/// Whether ModSecurity can run where it is switched on. Silent while no
+/// site has it on.
+fn modsecurity_ready(db: &Db, probe: &Probe) -> Result<Option<Check>> {
+    use crate::modsecurity::{self, Mode};
+    let mut on = Vec::new();
+    for site in db.list_sites()? {
+        let mode = modsecurity::site_mode(db, site.id)?;
+        if mode != Mode::Off {
+            on.push(mode);
+        }
+    }
+    if on.is_empty() {
+        return Ok(None);
+    }
+    let blocking = on.iter().filter(|m| **m == Mode::Block).count();
+    let (level, detail, fix) = if probe.web_server != webserver::WebServer::Nginx {
+        (
+            Level::Warn,
+            format!(
+                "switched on for {} site(s), and only NGINX's is written so far",
+                on.len()
+            ),
+            None,
+        )
+    } else {
+        let installed = probe
+            .config_root
+            .as_deref()
+            .map(|root| modsecurity::installation(std::path::Path::new(root)));
+        match installed {
+            None => (
+                Level::Unknown,
+                "could not tell whether the module is installed".to_string(),
+                None,
+            ),
+            Some(modsecurity::Installation::Missing(why)) => (
+                Level::Warn,
+                format!(
+                    "switched on for {} site(s), and not written: {why}",
+                    on.len()
+                ),
+                Some("install it, then apply (a/A, or `stop-bots apply-blocks`)".to_string()),
+            ),
+            Some(modsecurity::Installation::Ready { .. }) => (
+                Level::Ok,
+                format!(
+                    "on for {} site(s), {blocking} blocking and {} detecting \
+                     (`stop-bots list-modsecurity-findings`)",
+                    on.len(),
+                    on.len() - blocking
+                ),
+                None,
+            ),
+        }
+    };
+    Ok(Some(Check {
+        id: "modsecurity",
+        title: "ModSecurity can run where it is on",
+        level,
+        detail,
+        fix,
+    }))
+}
+
+/// Whether the outbound rules are in the kernel when they were applied.
+/// The one sign that is left when someone with root takes them out.
+fn egress_enforced(db: &Db, probe: &Probe, applied: bool) -> Result<Option<Check>> {
+    let Some(egress) = crate::egress::for_render(db)? else {
+        return Ok(None);
+    };
+    let Some(loaded) = probe.firewall_covers_egress else {
+        return Ok(None);
+    };
+    let (level, detail, fix) = match (loaded, applied) {
+        (true, _) => (
+            Level::Ok,
+            format!("outbound rules loaded ({})", egress.mode.as_str()),
+            None,
+        ),
+        (false, false) => (
+            Level::Warn,
+            "outbound checks are configured and not applied yet".to_string(),
+            Some("stop-bots render-firewall --apply".to_string()),
+        ),
+        (false, true) => (
+            Level::Critical,
+            "outbound checks were applied, and the loaded firewall no longer has them:              something removed them, which takes root"
+                .to_string(),
+            Some(
+                "find out what did, then apply again: stop-bots render-firewall --apply"
+                    .to_string(),
+            ),
+        ),
+    };
+    Ok(Some(Check {
+        id: "egress-enforced",
+        title: "Outbound checks are in the kernel",
+        level,
+        detail,
+        fix,
+    }))
 }
 
 /// Whether `user_agent` is refused by a choice somebody made about it: a
@@ -2640,6 +2839,7 @@ mod tests {
             managed_dir_in_container: None,
             container_shares_host_network: None,
             firewall_covers_forward: Some(true),
+            firewall_covers_egress: Some(false),
             nginx_commands: None,
             web_server: crate::webserver::WebServer::Nginx,
             config_root: None,

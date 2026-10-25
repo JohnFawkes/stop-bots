@@ -820,6 +820,38 @@ pub fn honeypot_ips(log_text: &str, honeypot: &str) -> Vec<(String, String)> {
     )
 }
 
+/// What one logged request was, for a caller outside this module that
+/// judges requests on their own: `preview-exploit-rules`, which asks what
+/// the web server's exploit rules would have turned away.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggedRequest {
+    pub ip: IpAddr,
+    pub status: u16,
+    /// The request line as logged, method and protocol included.
+    pub request: String,
+    pub user_agent: String,
+    pub referer: Option<String>,
+    /// The `Host` it was for, when the format logs it.
+    pub host: Option<String>,
+}
+
+/// Each request `log_text` holds, in either format, skipping the lines
+/// that do not parse and this tool's own health probes.
+pub fn logged_requests(log_text: &str) -> impl Iterator<Item = LoggedRequest> + '_ {
+    log_text
+        .lines()
+        .filter_map(parse_line)
+        .filter(|line| !line.is_health_probe())
+        .map(|line| LoggedRequest {
+            ip: line.ip,
+            status: line.status,
+            request: line.request,
+            user_agent: line.user_agent,
+            referer: line.referer,
+            host: line.host,
+        })
+}
+
 /// Every address that sent an exploit payload — in the request line, the
 /// user agent or the referer — with the first signature seen from it.
 ///

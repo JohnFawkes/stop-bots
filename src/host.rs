@@ -78,6 +78,13 @@ pub fn is_installed_in(name: &str, path: Option<&OsStr>, fallbacks: &[&str]) -> 
     find_program(name, path, fallbacks) != Path::new(name)
 }
 
+/// Where `name` is, on `PATH` or in [`SBIN_DIRS`], or `None` when it is
+/// not installed.
+pub fn which(name: &str) -> Option<PathBuf> {
+    let found = find_program(name, std::env::var_os("PATH").as_deref(), &SBIN_DIRS);
+    (found != Path::new(name)).then_some(found)
+}
+
 /// `PATH` for a child that itself runs system programs by name — the
 /// iptables script, whose every line is `iptables ...` — with whichever
 /// of [`SBIN_DIRS`] it lacks appended.

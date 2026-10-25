@@ -151,6 +151,25 @@ struct Popup {
     selected: usize,
 }
 
+/// The rows of the Request rules panel: every rule, then the exploit
+/// rules, then ModSecurity.
+const OPTION_ROWS: usize = RequestRule::ALL.len() + 2;
+const EXPLOITS_ROW: usize = RequestRule::ALL.len();
+const MODSEC_ROW: usize = RequestRule::ALL.len() + 1;
+
+/// The most findings the ModSecurity popup lists.
+const MAX_FINDINGS: usize = 15;
+
+/// What ModSecurity found on this site, open over the detail view: one
+/// key makes the selected one an exclusion.
+#[derive(Debug)]
+struct Findings {
+    rows: Vec<crate::modsecurity::Finding>,
+    selected: usize,
+    /// Why there is nothing to list, when there is not.
+    note: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct SiteDetail {
     site: Site,
@@ -165,6 +184,21 @@ pub struct SiteDetail {
     bot_overrides: Vec<SiteBotOverride>,
     /// Which request-shape rules are on for this site.
     request_rules: Vec<RequestRule>,
+    /// Whether exploit payloads are turned away here, and whether that is
+    /// this site's own choice or the host's (see [`crate::exploits`]):
+    /// the row after the request rules.
+    exploits: bool,
+    exploits_own: bool,
+    /// This site's ModSecurity mode, whether it is its own choice, what
+    /// runs behind it, and why ModSecurity cannot run, when it cannot.
+    modsec_mode: crate::modsecurity::Mode,
+    modsec_own: bool,
+    modsec_apps: Vec<&'static str>,
+    modsec_missing: Option<String>,
+    findings: Option<Findings>,
+    /// Where the findings are read from: ModSecurity's audit log, except
+    /// in tests.
+    audit_log: std::path::PathBuf,
     options_state: ListState,
     exemptions: Vec<Exemption>,
     exemptions_state: ListState,
@@ -188,6 +222,14 @@ impl SiteDetail {
             bots: Vec::new(),
             bot_overrides: Vec::new(),
             request_rules: Vec::new(),
+            exploits: false,
+            exploits_own: false,
+            modsec_mode: crate::modsecurity::Mode::Off,
+            modsec_own: false,
+            modsec_apps: Vec::new(),
+            modsec_missing: None,
+            findings: None,
+            audit_log: crate::modsecurity::audit_log_path(),
             options_state: ListState::default().with_selected(Some(0)),
             exemptions: Vec::new(),
             exemptions_state: ListState::default().with_selected(Some(0)),
@@ -209,6 +251,20 @@ impl SiteDetail {
         self.bots = db.list_bots()?;
         self.bot_overrides = db.site_bot_overrides(self.site.id)?;
         self.request_rules = crate::webserver::site_request_rules(db, self.site.id)?;
+        self.exploits = crate::exploits::for_site(db, self.site.id)?;
+        self.exploits_own = db.site_waf(self.site.id)?.exploit_rules.is_some();
+        self.modsec_mode = crate::modsecurity::site_mode(db, self.site.id)?;
+        self.modsec_own = db.site_waf(self.site.id)?.modsecurity.is_some();
+        self.modsec_apps = crate::modsecurity::apps_behind(
+            std::path::Path::new(&self.site.config_path),
+            &self.site.server_name,
+        );
+        self.modsec_missing = crate::hostconf::HostConf::load().ok().and_then(|host| {
+            match crate::modsecurity::installation(&host.root(None)) {
+                crate::modsecurity::Installation::Missing(why) => Some(why),
+                crate::modsecurity::Installation::Ready { .. } => None,
+            }
+        });
         let plain = db
             .site_path_exemptions(self.site.id)?
             .into_iter()
@@ -284,8 +340,9 @@ impl SiteDetail {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
         let [categories_area, options_area, exemptions_area, details_area] = Layout::vertical([
             Constraint::Length(5),
-            // Two border lines plus one row per request rule.
-            Constraint::Length(RequestRule::ALL.len() as u16 + 2),
+            // Two border lines plus one row per request rule, and the
+            // exploit rules' row.
+            Constraint::Length(OPTION_ROWS as u16 + 2),
             // Two border lines plus the Add row, plus up to three paths
             // before it starts scrolling — enough to see a typical setup
             // at a glance without starving the bot search below it.
@@ -301,6 +358,9 @@ impl SiteDetail {
 
         if let Some(popup) = &self.popup {
             self.render_popup(frame, area, popup, theme);
+        }
+        if let Some(findings) = &self.findings {
+            self.render_findings(frame, area, findings, theme);
         }
     }
 
@@ -328,7 +388,7 @@ impl SiteDetail {
         // Deliberately not one "strict requests" switch: if these hid
         // behind a single toggle and someone's monitoring broke, they'd
         // have no way to tell which rule did it.
-        let items: Vec<ListItem> = RequestRule::ALL
+        let mut items: Vec<ListItem> = RequestRule::ALL
             .iter()
             .map(|rule| {
                 let on = self.request_rules.contains(rule);
@@ -344,6 +404,37 @@ impl SiteDetail {
                 ]))
             })
             .collect();
+        items.push(ListItem::new(Line::from(vec![
+            Span::from(format!("{:<20}", "Exploit payloads")),
+            policy_tag(if self.exploits {
+                Policy::Blocked
+            } else {
+                Policy::Allowed
+            }),
+            Span::from(if self.exploits_own {
+                "  this site's own choice"
+            } else {
+                "  as the NGINX screen says"
+            })
+            .dim(),
+        ])));
+        let tag = match self.modsec_mode {
+            crate::modsecurity::Mode::Off => Span::from("[ OFF    ]").dim(),
+            crate::modsecurity::Mode::Detect => Span::from("[ DETECT ]").yellow(),
+            crate::modsecurity::Mode::Block => Span::from("[ BLOCK  ]").red(),
+        };
+        let note = match (&self.modsec_missing, self.modsec_mode) {
+            (Some(_), mode) if mode != crate::modsecurity::Mode::Off => {
+                "  not installed".to_string()
+            }
+            _ if self.modsec_apps.is_empty() => String::new(),
+            _ => format!("  {}", self.modsec_apps.join(", ")),
+        };
+        items.push(ListItem::new(Line::from(vec![
+            Span::from(format!("{:<20}", "ModSecurity")),
+            tag,
+            Span::from(note).dim(),
+        ])));
 
         let focused = self.focus == Focus::Options;
         let list = crate::tui::select_in(
@@ -431,6 +522,16 @@ impl SiteDetail {
 
     /// The footer's key hints for the focused panel.
     pub fn hints(&self) -> crate::tui::Hints {
+        if self.findings.is_some() {
+            return (
+                "Findings",
+                vec![
+                    ("\u{2191}\u{2193}", "move"),
+                    ("x", "exclude"),
+                    ("Esc", "close"),
+                ],
+            );
+        }
         if self.popup.is_some() {
             return ("Popup", vec![("Enter", "confirm"), ("Esc", "cancel")]);
         }
@@ -495,6 +596,65 @@ impl SiteDetail {
                         ),
                     })
                     .para("Enter overrides it, or sets it back to the Dashboard's.")
+            }
+            Focus::Options if self.options_state.selected() == Some(MODSEC_ROW) => {
+                Explanation::new("ModSecurity")
+                    .para(
+                        "NGINX's web application firewall module, with the OWASP Core Rule Set: \
+                         it checks request bodies, cookies and decoded arguments, which the \
+                         rules above cannot see.",
+                    )
+                    .now(
+                        match (&self.modsec_missing, self.modsec_mode, self.modsec_own) {
+                            (_, crate::modsecurity::Mode::Off, _) => "off.".to_string(),
+                            (Some(why), mode, _) => {
+                                format!("{}, but not written: {why}.", mode.as_str())
+                            }
+                            (None, mode, own) => format!(
+                                "{}: {}{}.",
+                                mode.as_str(),
+                                mode.describe(),
+                                if own {
+                                    ", this site's own choice"
+                                } else {
+                                    ", as the NGINX screen says"
+                                }
+                            ),
+                        },
+                    )
+                    .para(if self.modsec_apps.is_empty() {
+                        "Nothing is recognised behind this site, so it gets the Core Rule Set as \
+                         it is."
+                            .to_string()
+                    } else {
+                        format!(
+                            "Behind it: {}. It gets the exclusions for that, where there are any.",
+                            self.modsec_apps.join(", ")
+                        )
+                    })
+                    .para(
+                        "Space steps through off, detect and block. Enter lists what it found \
+                         here, and x on a finding switches that rule off under that path.",
+                    )
+            }
+            Focus::Options if self.options_state.selected() == Some(EXPLOITS_ROW) => {
+                Explanation::new("Exploit payloads")
+                    .para(
+                        "Turns away a request carrying an exploit payload before this site's \
+                         application sees it: Log4Shell, Shellshock, expression injection, \
+                         PHP-CGI and command injection, ../../ and an encoded NUL byte, in the \
+                         request line and the headers scanners use. Not the request body.",
+                    )
+                    .now(match (self.exploits, self.exploits_own) {
+                        (true, true) => "on, for this site.",
+                        (false, true) => "off, for this site.",
+                        (true, false) => "on, as the NGINX screen says for every site.",
+                        (false, false) => "off, as the NGINX screen says for every site.",
+                    })
+                    .para(
+                        "Enter switches it for this site; switching it to what the NGINX screen \
+                         says makes the site follow that again.",
+                    )
             }
             Focus::Options => {
                 let rule = self
@@ -700,6 +860,10 @@ impl SiteDetail {
             return self.handle_add_exemption_key(key, db, message);
         }
 
+        if self.findings.is_some() {
+            return self.handle_findings_key(key, db, message);
+        }
+
         if self.popup.is_some() {
             return self.handle_option_popup_key(key, db, message);
         }
@@ -764,12 +928,15 @@ impl SiteDetail {
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if self.options_state.selected().unwrap_or(0) + 1 < RequestRule::ALL.len() {
+                    if self.options_state.selected().unwrap_or(0) + 1 < OPTION_ROWS {
                         self.options_state.select_next();
                     } else {
                         self.focus = Focus::Exemptions;
                         self.exemptions_state.select(Some(0));
                     }
+                }
+                KeyCode::Enter if self.options_state.selected() == Some(MODSEC_ROW) => {
+                    self.open_findings();
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     return self.toggle_request_rule(db, message);
@@ -922,6 +1089,12 @@ impl SiteDetail {
     /// somewhere other than this screen — and, for the TLS-only rules,
     /// that they apply to HTTPS blocks only.
     fn toggle_request_rule(&mut self, db: &Db, message: &mut Option<String>) -> Result<KeyOutcome> {
+        if self.options_state.selected() == Some(EXPLOITS_ROW) {
+            return self.toggle_exploits(db, message);
+        }
+        if self.options_state.selected() == Some(MODSEC_ROW) {
+            return self.cycle_modsecurity(db, message);
+        }
         let Some(rule) = self
             .options_state
             .selected()
@@ -946,6 +1119,149 @@ impl SiteDetail {
             )
         });
         Ok(KeyOutcome::Mutated)
+    }
+
+    /// Flips the exploit rules for this site. A site set to what the host
+    /// says follows the host again, rather than keeping a copy of it that
+    /// would stop following when the host changes.
+    fn toggle_exploits(&mut self, db: &Db, message: &mut Option<String>) -> Result<KeyOutcome> {
+        let on = !self.exploits;
+        let own = (on != crate::exploits::host_enabled(db)?).then_some(on);
+        db.set_site_exploit_rules(self.site.id, own)?;
+        *message = Some(format!(
+            "{}: exploit payloads {}{} \u{2014} apply (a/A) to write it",
+            self.site.server_name,
+            if on { "turned away" } else { "let through" },
+            if own.is_none() {
+                ", as for every site"
+            } else {
+                ""
+            }
+        ));
+        Ok(KeyOutcome::Mutated)
+    }
+
+    /// Steps this site's ModSecurity off, detect, block, off. A site set to
+    /// what the host says follows the host again, as the exploit rules do.
+    fn cycle_modsecurity(&mut self, db: &Db, message: &mut Option<String>) -> Result<KeyOutcome> {
+        use crate::modsecurity::Mode;
+        let next = match self.modsec_mode {
+            Mode::Off => Mode::Detect,
+            Mode::Detect => Mode::Block,
+            Mode::Block => Mode::Off,
+        };
+        let own = (next != crate::modsecurity::host_mode(db)?).then_some(next.as_str());
+        db.set_site_modsecurity(self.site.id, own)?;
+        *message = Some(match &self.modsec_missing {
+            Some(why) if next != Mode::Off => format!(
+                "{}: ModSecurity {} \u{2014} not written until it is installed: {why}",
+                self.site.server_name,
+                next.as_str()
+            ),
+            _ => format!(
+                "{}: ModSecurity {} \u{2014} apply (a/A) to write it",
+                self.site.server_name,
+                next.as_str()
+            ),
+        });
+        Ok(KeyOutcome::Mutated)
+    }
+
+    /// Reads what ModSecurity found on this site from its audit log.
+    fn open_findings(&mut self) {
+        let (rows, note) = match crate::modsecurity::read_audit_log(&self.audit_log) {
+            Ok(text) => {
+                let rows: Vec<_> = crate::modsecurity::findings(&text)
+                    .into_iter()
+                    .filter(|f| f.site_id == Some(self.site.id))
+                    .take(MAX_FINDINGS)
+                    .collect();
+                let note = rows
+                    .is_empty()
+                    .then(|| "ModSecurity has found nothing on this site.".to_string());
+                (rows, note)
+            }
+            Err(why) => (Vec::new(), Some(why)),
+        };
+        self.findings = Some(Findings {
+            rows,
+            selected: 0,
+            note,
+        });
+    }
+
+    fn handle_findings_key(
+        &mut self,
+        key: KeyEvent,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(findings) = &mut self.findings else {
+            return Ok(KeyOutcome::Consumed);
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.findings = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                findings.selected = findings.selected.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                findings.selected =
+                    (findings.selected + 1).min(findings.rows.len().saturating_sub(1));
+            }
+            KeyCode::Char('x') => {
+                let Some(finding) = findings.rows.get(findings.selected) else {
+                    return Ok(KeyOutcome::Consumed);
+                };
+                db.add_modsec_exclusion(self.site.id, finding.rule_id, &finding.path)?;
+                *message = Some(format!(
+                    "{}: rule {} off under {} \u{2014} apply (a/A) to write it",
+                    self.site.server_name, finding.rule_id, finding.path
+                ));
+                self.findings = None;
+                return Ok(KeyOutcome::Mutated);
+            }
+            _ => {}
+        }
+        Ok(KeyOutcome::Consumed)
+    }
+
+    fn render_findings(&self, frame: &mut Frame, area: Rect, findings: &Findings, theme: Theme) {
+        let title = format!("ModSecurity on {}", self.site.server_name);
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(note) = &findings.note {
+            lines.push(Line::from(note.clone()));
+        }
+        for (i, finding) in findings.rows.iter().enumerate() {
+            let line = Line::from(format!(
+                "{:>6}  {:>5} seen {:>4} over  {}  {}",
+                finding.rule_id,
+                finding.count,
+                finding.over_threshold,
+                crate::present::terminal_safe(&finding.path),
+                crate::present::terminal_safe(&finding.message)
+            ));
+            lines.push(if i == findings.selected {
+                line.reversed()
+            } else {
+                line
+            });
+        }
+        lines.push(Line::from(""));
+        lines.push(
+            Line::from(
+                "\"over\" is how many CRS scored as attacks. x switches the selected rule off \
+                 under its path, for this site; Esc closes.",
+            )
+            .dim(),
+        );
+        let width = area.width.saturating_sub(4).min(110);
+        let height = (lines.len() as u16 + 4).min(area.height);
+        let popup_area = centered_rect(width, height, area);
+        let paragraph = Paragraph::new(lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(crate::tui::popup(title, theme));
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(paragraph, popup_area);
     }
 
     /// Enter on the exemptions list: row 0 opens the add-path popup, any
@@ -1639,6 +1955,69 @@ mod tests {
             db.get_site_category_override(site_id, CATEGORIES[0])
                 .unwrap(),
             Some(Policy::Blocked)
+        );
+    }
+
+    // ---- exploit rules ----
+
+    /// Space on the row flips them for this site, and a site switched to
+    /// what the host says follows the host again.
+    #[test]
+    fn a_site_s_exploit_rules_follow_the_host_unless_it_differs() {
+        let (db, site) = exemption_fixture();
+        let site_id = site.id;
+        let mut detail = SiteDetail::new(site);
+        detail.refresh(&db).unwrap();
+        focus_options(&mut detail, &db);
+        detail.options_state.select(Some(EXPLOITS_ROW));
+
+        press(&mut detail, &db, KeyCode::Char(' '));
+        assert_eq!(db.site_waf(site_id).unwrap().exploit_rules, Some(true));
+        detail.refresh(&db).unwrap();
+        press(&mut detail, &db, KeyCode::Char(' '));
+        assert_eq!(
+            db.site_waf(site_id).unwrap().exploit_rules,
+            None,
+            "switched back to the host's, the site kept a choice of its own"
+        );
+    }
+
+    /// Space steps the mode, and Enter lists what ModSecurity found here,
+    /// where x switches the selected rule off under its path.
+    #[test]
+    fn a_finding_becomes_an_exclusion_with_one_key() {
+        let (db, site) = exemption_fixture();
+        let site_id = site.id;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("audit.log");
+        std::fs::write(
+            &log,
+            format!(
+                r#"{{"transaction":{{"unique_id":"sb{site_id}-x","time_stamp":"now","request":{{"uri":"/wp-admin/admin-ajax.php?a=1"}},"messages":[{{"message":"SQL Injection","details":{{"ruleId":"942100"}}}}]}}}}"#
+            ),
+        )
+        .unwrap();
+        let mut detail = SiteDetail::new(site);
+        detail.audit_log = log;
+        detail.refresh(&db).unwrap();
+        focus_options(&mut detail, &db);
+        detail.options_state.select(Some(MODSEC_ROW));
+
+        press(&mut detail, &db, KeyCode::Char(' '));
+        assert_eq!(
+            crate::modsecurity::site_mode(&db, site_id).unwrap(),
+            crate::modsecurity::Mode::Detect
+        );
+        press(&mut detail, &db, KeyCode::Enter);
+        assert_eq!(detail.findings.as_ref().map(|f| f.rows.len()), Some(1));
+        press(&mut detail, &db, KeyCode::Char('x'));
+        assert_eq!(
+            db.modsec_exclusions().unwrap(),
+            vec![crate::db::waf::ModsecExclusion {
+                site_id,
+                rule_id: 942100,
+                path: "/wp-admin/admin-ajax.php".to_string(),
+            }]
         );
     }
 

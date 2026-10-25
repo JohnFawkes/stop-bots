@@ -454,6 +454,17 @@ impl WebServer {
         }
     }
 
+    /// Why this server cannot carry out the exploit rules, when it cannot
+    /// (see [`crate::exploits`]): only NGINX's are written so far.
+    pub fn without_exploit_rules(self) -> Option<&'static str> {
+        match self {
+            WebServer::Nginx => None,
+            WebServer::Apache | WebServer::Traefik => Some(
+                "Exploit rules are written for NGINX only so far: turning them on here would                  turn nothing away.",
+            ),
+        }
+    }
+
     /// What a blocked request gets instead, when this server cannot send
     /// `response`: Apache sends no `444`, no `418` and no tarpit, and
     /// Traefik nothing but a plain `403` (see each one's module docs).
@@ -781,6 +792,14 @@ pub struct BlockConfig {
     /// What no guard fixes: each rule turns away some legitimate
     /// non-browser client. See [`RequestRule::caveat`].
     pub request_rules: Vec<RequestRule>,
+    /// Whether requests carrying an exploit payload are turned away (see
+    /// [`crate::exploits`]). NGINX only for now: the other backends
+    /// render nothing for it.
+    pub exploits: bool,
+    /// This site's ModSecurity, when it runs for the site and the module
+    /// and the Core Rule Set are installed (see [`crate::modsecurity`]).
+    /// NGINX only.
+    pub modsecurity: Option<crate::modsecurity::SitePlan>,
     /// What this host trusts (see [`Trust`]), or `None` when it trusts
     /// nothing.
     ///
@@ -983,6 +1002,12 @@ pub fn write_managed_files(server: WebServer, db: &crate::db::Db, root: &Path) -
 /// [`unused_managed_files`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ManagedKind {
+    /// `stop-bots-exploits.conf`, which only a site's block reads.
+    Exploits,
+    /// `stop-bots-modsecurity.conf`, which loads the rules file.
+    ModsecLoader,
+    /// ModSecurity's rules file, which only the loader names.
+    ModsecRules,
     /// `stop-bots-limits-untrusted.conf`, which reads the trust file's
     /// variable.
     UntrustedLimits,
@@ -997,7 +1022,10 @@ pub enum ManagedKind {
 }
 
 impl ManagedKind {
-    const ALL: [ManagedKind; 5] = [
+    const ALL: [ManagedKind; 8] = [
+        ManagedKind::Exploits,
+        ManagedKind::ModsecLoader,
+        ManagedKind::ModsecRules,
         ManagedKind::UntrustedLimits,
         ManagedKind::Limits,
         ManagedKind::RobotsTxt,
@@ -1008,6 +1036,9 @@ impl ManagedKind {
     /// The id in `managed_files.kind`. Stored, so never renamed.
     pub fn id(self) -> &'static str {
         match self {
+            ManagedKind::Exploits => "nginx-exploits",
+            ManagedKind::ModsecLoader => "nginx-modsecurity-loader",
+            ManagedKind::ModsecRules => "nginx-modsecurity-rules",
             ManagedKind::UntrustedLimits => "nginx-untrusted-limits",
             ManagedKind::Limits => "nginx-limits",
             ManagedKind::RobotsTxt => "nginx-robots-txt",
@@ -1027,6 +1058,9 @@ impl ManagedKind {
         let conf_d = Path::new("");
         ManagedKind::ALL.into_iter().find(|kind| {
             let own = match kind {
+                ManagedKind::Exploits => crate::exploits::conf_path(conf_d),
+                ManagedKind::ModsecLoader => crate::modsecurity::loader_path(conf_d),
+                ManagedKind::ModsecRules => PathBuf::from("modsecurity.conf"),
                 ManagedKind::UntrustedLimits => nginx::untrusted_rate_limit_conf_path(conf_d),
                 ManagedKind::Limits => nginx::rate_limit_conf_path(conf_d),
                 ManagedKind::RobotsTxt => PathBuf::from("robots.txt"),
@@ -1437,8 +1471,25 @@ pub fn block_config_for_site(db: &crate::db::Db, site_id: i64) -> Result<BlockCo
         exempt_paths: db.site_path_exemptions(site_id)?,
         agent_exemptions: db.site_agent_exemptions(site_id)?,
         request_rules: site_request_rules(db, site_id)?,
+        exploits: crate::exploits::for_site(db, site_id)?,
+        modsecurity: site_modsecurity(db, site_id)?,
         trust: Trust::of(db)?,
     })
+}
+
+/// [`BlockConfig::modsecurity`] for `site_id`, on an NGINX host.
+fn site_modsecurity(
+    db: &crate::db::Db,
+    site_id: i64,
+) -> Result<Option<crate::modsecurity::SitePlan>> {
+    if crate::modsecurity::site_mode(db, site_id)? == crate::modsecurity::Mode::Off {
+        return Ok(None);
+    }
+    let host = crate::hostconf::HostConf::load()?;
+    if host.web_server() != WebServer::Nginx {
+        return Ok(None);
+    }
+    crate::modsecurity::site_plan(db, site_id, &host.root(None))
 }
 
 /// The request-shape rules switched on for one site, in a stable order.
@@ -1470,6 +1521,10 @@ pub fn default_block_config(db: &crate::db::Db) -> Result<BlockConfig> {
         exempt_paths: Vec::new(),
         agent_exemptions: Vec::new(),
         request_rules: Vec::new(),
+        exploits: crate::exploits::host_enabled(db)?,
+        // Tied to a site row by its transaction ids: a block with none has
+        // none to be tied by.
+        modsecurity: None,
         trust: Trust::of(db)?,
     })
 }

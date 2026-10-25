@@ -89,6 +89,7 @@ const TRAEFIK_ROOT: &str = "traefik_root";
 const ACCESS_LOG: &str = "access_log";
 const SSH_LOG: &str = "ssh_log";
 const KERNEL_LOG: &str = "kernel_log";
+const CONTAINER_RUNTIME: &str = "container_runtime";
 
 /// The host settings. `None` for any of them means "not set": the
 /// built-in default, as it was when nothing was stored in the database.
@@ -124,6 +125,10 @@ pub struct HostConf {
     pub ssh_log: Option<PathBuf>,
     /// The kernel log, which the port-scan detector reads.
     pub kernel_log: Option<PathBuf>,
+    /// The container runtime's command line program, which containment
+    /// asks which container has an address and pauses. `None` is `docker`,
+    /// else `podman`, whichever is installed (see `contain::Runtime`).
+    pub container_runtime: Option<PathBuf>,
 }
 
 impl HostConf {
@@ -185,6 +190,7 @@ impl HostConf {
                 ACCESS_LOG => conf.access_log = value.map(PathBuf::from),
                 SSH_LOG => conf.ssh_log = value.map(PathBuf::from),
                 KERNEL_LOG => conf.kernel_log = value.map(PathBuf::from),
+                CONTAINER_RUNTIME => conf.container_runtime = value.map(PathBuf::from),
                 other => bail!("line {number} sets `{other}`, which is not a host setting"),
             }
             seen.push(key);
@@ -219,6 +225,7 @@ impl HostConf {
             &self.access_log,
             &self.ssh_log,
             &self.kernel_log,
+            &self.container_runtime,
         ]
         .into_iter()
         .flatten()
@@ -259,6 +266,7 @@ impl HostConf {
             (ACCESS_LOG, path_text(&self.access_log)),
             (SSH_LOG, path_text(&self.ssh_log)),
             (KERNEL_LOG, path_text(&self.kernel_log)),
+            (CONTAINER_RUNTIME, path_text(&self.container_runtime)),
         ];
         for (key, value) in lines {
             if let Some(value) = value {
@@ -713,6 +721,7 @@ mod tests {
             access_log: Some("/srv/logs/access.log".into()),
             ssh_log: None,
             kernel_log: Some("/srv/logs/kern.log".into()),
+            container_runtime: Some("/usr/bin/podman".into()),
         };
         conf.save_to(&path).unwrap();
         assert_eq!(HostConf::load_from(&path).unwrap(), conf);

@@ -338,7 +338,7 @@ CRATES="
 	tokio-macros@2.7.2
 	tokio-rustls@0.26.5
 	tokio-util@0.7.19
-	tokio@1.53.2
+	tokio@1.54.1
 	tower-http@0.6.11
 	tower-layer@0.3.3
 	tower-service@0.3.3

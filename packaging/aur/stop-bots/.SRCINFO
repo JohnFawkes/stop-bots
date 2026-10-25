@@ -1,6 +1,6 @@
 pkgbase = stop-bots
 	pkgdesc = A TUI and CLI that help you configure NGINX, Apache or Traefik and your firewall to stop bad bots and still allow good bots
-	pkgver = 0.6.0
+	pkgver = 0.7.0
 	pkgrel = 1
 	url = https://github.com/ivankovic/stop-bots
 	arch = x86_64
@@ -13,7 +13,7 @@ pkgbase = stop-bots
 	optdepends = nftables: to apply the generated firewall script
 	optdepends = iptables: alternative firewall backend
 	options = !lto
-	source = stop-bots-0.6.0.tar.gz::https://static.crates.io/crates/stop-bots/stop-bots-0.6.0.crate
-	sha256sums = 569ba700e0e70669cc0d19f0238361002923df3d09914f38074d3adc288c3057
+	source = stop-bots-0.7.0.tar.gz::https://static.crates.io/crates/stop-bots/stop-bots-0.7.0.crate
+	sha256sums = 3b3d5cc3b42da5476fa4e081d21b2f095d6b10af140575a2770dd859abfc0b4e
 
 pkgname = stop-bots

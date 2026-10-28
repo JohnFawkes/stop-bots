@@ -11,7 +11,7 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 **Before upgrading:** nothing to do. The database gains six empty tables (schemas 9 and
 10), and everything this release adds is off.
 
-**Going back to 0.7.0** does not work once this release has opened the database: 0.7.0
+**Going back to 0.8.0** does not work once this release has opened the database: 0.8.0
 refuses a schema newer than its own. Move back the copy taken before the upgrade
 (`db.sqlite3.bak-v8`, or `.bak-v9` from a build between) to go back.
 
@@ -63,6 +63,58 @@ refuses a schema newer than its own. Move back the copy taken before the upgrade
   detectors, Blocked by address, Outbound C&C checks, Firewall apply), in one column. Under
   Outbound C&C checks, Space steps the mode through Off, Watch and Block; the C&C feeds and
   automatic containment are listed under it once it is on.
+
+## [0.8.0] — 2026-10-28
+
+NPMplus, beside NGINX, Apache and Traefik.
+
+**Before upgrading:** nothing to do. The database schema is unchanged, and an NGINX, Apache
+or Traefik host is configured as before.
+
+**After upgrading:** nothing changes on an NGINX, Apache or Traefik host.
+
+**Going back to 0.7.0.** An NGINX, Apache or Traefik host can. An NPMplus host cannot by
+installing the older release: 0.7.0 refuses a `/etc/stop-bots/host.conf` that names NPMplus.
+First run `sudo stop-bots uninstall web-server` with this release, which takes the blocks out
+of `custom_nginx/server_http.conf` and `custom_nginx/http_top.conf` and deletes what it
+generated in `custom_nginx/stop-bots/`, then delete the `web_server` and `npmplus_*` lines
+from `host.conf`, then install 0.7.0.
+
+### Added
+
+- **NPMplus, beside NGINX, Apache and Traefik.** `sudo stop-bots set-web-server npmplus`
+  reads the hosts NPMplus renders under its data directory (`/opt/npmplus`, or `--root`) and
+  never writes them, since NPMplus rewrites a host's file whenever it is saved. It writes
+  one marked block into `custom_nginx/server_http.conf`, which every proxy, redirection and
+  404 host includes, and one include line into `custom_nginx/http_top.conf`; the rest of
+  each file is left as it was, and `uninstall web-server` takes both out again. The trusted
+  clients, the rate-limit zones and `robots.txt` go in `custom_nginx/stop-bots/`. It tests
+  and reloads with `docker exec npmplus nginx -t` and `docker exec npmplus nginx -s reload`.
+  Tested against NPMplus 2.15.1.
+  - Every host gets the host-wide settings. An apply refuses a site with settings of its
+    own, which includes the request-shape rules, since those are per-site only.
+  - Everything else NGINX does, NPMplus does: every block response, the generated
+    `robots.txt`, rate limiting and trusted clients.
+  - stop-bots runs as root, and NPMplus's data directory is its container's to write, so
+    nothing below it is reached through a link. Every file there is read, written and,
+    after a failed config test, put back through its own directory; a link in the way
+    refuses the apply. A file put back keeps its owner and loses any setuid, setgid or
+    sticky bit. `uninstall web-server` removes only what it generated in
+    `custom_nginx/stop-bots/`, and the directory only if that leaves it empty.
+  - `stop-bots status` gives NPMplus's own fixes: `TRUST_CLOUDFLARE=true` behind
+    Cloudflare, `TRUST_IP` behind another proxy, and `LOGROTATE=true` for its access log.
+- **NPMplus's access log is read**, in both the format its releases write (the referer and
+  the user agent unquoted) and the one its development branch writes (both quoted).
+  NPMplus writes it only with `LOGROTATE=true`, to `/opt/npmplus/nginx/logs/access.log`.
+
+### Fixed
+
+- **A config root holding logs no longer takes the host's memory.** Finding sites read
+  every file under the web server's config root whole. A root that also holds logs, such as
+  a container's bind-mounted directory with its config and its access logs side by side, had
+  them read whole on every `tick`, `status` and apply, and before `set-web-server` would
+  switch away: a 1 GB log took 82 seconds of CPU and 7.7 GB of memory. A file over 4 MiB is
+  now skipped by its size, unread; no file that declares a site comes near that.
 
 ## [0.7.0] — 2026-10-25
 
@@ -2793,7 +2845,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/ivankovic/stop-bots/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ivankovic/stop-bots/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ivankovic/stop-bots/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ivankovic/stop-bots/compare/v0.4.0...v0.5.0

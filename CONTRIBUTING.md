@@ -274,6 +274,13 @@ that upgrade what 0.1.1 actually left on a host rather than a fixture of it. It
 downloads that binary when the image is built, pinned by its published checksum, the
 way every image fetches its packages; no test touches the network.
 
+NPMplus is tested in its own released image, pinned by digest in `tests/container.rs`, and
+not in one of ours: it is Alpine, on musl, and the point is to run stop-bots where an
+operator does, on the host, against NPMplus's data directory as a bind mount, testing and
+reloading with `<runtime> exec`. The hosts are created through NPMplus's API, so the
+config read is the config NPMplus renders. The container has no network, and a stand-in
+ACME account in its data directory keeps NPMplus from registering one on every run.
+
 Under rootless Podman, a test that starts a second container on a network of its own
 fails if Podman's network backend cannot load `ip_tables`, which some kernels refuse to
 an unprivileged user. Those containers only talk to each other on one bridge, which
@@ -431,6 +438,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- nginx.rs       <- NGINX: finding server blocks, rendering and placing its blocks and generated files
         |- apache.rs      <- Apache: finding <VirtualHost>s, its mod_rewrite blocks, trust file and robots.txt
         |- traefik.rs     <- Traefik: finding routers' hosts, and the routers file it writes beside them
+        |- npmplus.rs     <- NPMplus: reading the hosts it renders, and its custom_nginx files every host includes
         |- hostconf.rs    <- /etc/stop-bots/host.conf: the web server, its commands and root, the logs
         |- logpaths.rs    <- Where this host's SSH and access logs are, remembered
         |- logscan.rs     <- One pass over the logs: plan, read (no Db), store
@@ -443,7 +451,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- egress.rs      <- Outbound connections to C&C servers: feeds, the never-blocked guard, log lines
         |- contain.rs     <- Containing what called one: containers paused, users cut off, the breaker
         |- sinkhole.rs    <- C&C domains, sent to a sinkhole address through the host's resolver
-        |- accesslog.rs   <- Access log parsing (NGINX's, Apache's and Traefik's), the web-log detectors, UA tallying
+        |- accesslog.rs   <- Access log parsing (NGINX's, Apache's, Traefik's and NPMplus's), the web-log detectors, UA tallying
         |- injection.rs   <- Recognising an exploit payload in a logged request
         |- exploits.rs    <- The same signatures as NGINX regexes, refusing a payload as it arrives
         |- modsecurity.rs <- ModSecurity and the Core Rule Set, per site, and its audit log

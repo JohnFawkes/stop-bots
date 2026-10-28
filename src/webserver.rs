@@ -609,6 +609,13 @@ pub(crate) fn is_backup_name(name: &str) -> bool {
 /// Counting one made a second row for every site it copied, wrote blocks
 /// into it on every apply, and left that row naming a missing file once
 /// the copy was cleaned up. Anything unreadable is skipped.
+///
+/// So is anything over [`MAX_CONFIG_BYTES`], by its size, before a byte of
+/// it is read. Every caller reads each file whole, and a root is not
+/// always a tree of config: one set to a container's data directory holds
+/// its access logs too. Reading those whole, gigabytes at a time, on every
+/// `tick` and before `set-web-server` would switch away, took a host's
+/// memory and its CPU with it.
 pub(crate) fn config_files(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
     walkdir::WalkDir::new(root)
         .into_iter()
@@ -617,23 +624,38 @@ pub(crate) fn config_files(root: &Path) -> impl Iterator<Item = walkdir::DirEntr
         })
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_file())
+        .filter(|entry| {
+            entry
+                .metadata()
+                .is_ok_and(|meta| meta.len() <= MAX_CONFIG_BYTES)
+        })
 }
+
+/// The largest file [`config_files`] reads: larger than any file that
+/// declares a site, with every bot list's block in it, and far smaller
+/// than a log.
+pub(crate) const MAX_CONFIG_BYTES: u64 = 4 << 20;
 
 /// The text of the regular file at `path`, read without following a link
 /// at it or waiting on a FIFO: `None` for anything else, or nothing.
 ///
 /// For a file [`config_files`] found, which it found as a regular file
 /// and not a link: read this way, one swapped for a link or a FIFO since
-/// is not followed, and cannot hang the apply that holds the lock.
+/// is not followed, and cannot hang the apply that holds the lock. Nor is
+/// one over [`MAX_CONFIG_BYTES`], as [`config_files`] skips: on a root
+/// another user can write, one could grow between the two.
 pub(crate) fn read_regular_file(path: &Path) -> Option<String> {
     use std::io::Read;
-    let mut file = crate::db::guard::open_nofollow(path).ok()??;
-    if !file.metadata().ok()?.is_file() {
+    let file = crate::db::guard::open_nofollow(path).ok()??;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX_CONFIG_BYTES {
         return None;
     }
     let mut text = String::new();
-    file.read_to_string(&mut text).ok()?;
-    Some(text)
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() as u64 <= MAX_CONFIG_BYTES).then_some(text)
 }
 
 /// One address a site is served on, as its config declares it.
@@ -2750,6 +2772,44 @@ pub fn reload_with(server: WebServer, commands: &ServerCommands) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A log under the root is skipped by its size, never read: sparse,
+    /// so the test writes nothing, and named like config, so only its size
+    /// can tell it apart.
+    #[test]
+    fn a_file_too_large_to_be_config_is_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("site.conf"),
+            "server { server_name a.example; }\n",
+        )
+        .unwrap();
+        fs::File::create(dir.path().join("huge.conf"))
+            .unwrap()
+            .set_len(MAX_CONFIG_BYTES + 1)
+            .unwrap();
+        let names: Vec<String> = config_files(dir.path())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["site.conf"]);
+    }
+
+    /// Nor is one read through [`read_regular_file`], which reads files
+    /// under a root another user can write, outside [`config_files`] too.
+    #[test]
+    fn a_file_too_large_to_be_config_is_not_read_as_a_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = dir.path().join("huge.conf");
+        fs::File::create(&huge)
+            .unwrap()
+            .set_len(MAX_CONFIG_BYTES + 1)
+            .unwrap();
+        assert_eq!(
+            read_regular_file(&huge),
+            None,
+            "a sparse file over the cap was read"
+        );
+    }
 
     #[test]
     fn a_backup_is_told_from_a_site_by_its_name() {

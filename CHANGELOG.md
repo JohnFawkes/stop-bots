@@ -47,6 +47,15 @@ from `host.conf`, then install 0.7.0.
   the user agent unquoted) and the one its development branch writes (both quoted).
   NPMplus writes it only with `LOGROTATE=true`, to `/opt/npmplus/nginx/logs/access.log`.
 
+### Fixed
+
+- **A config root holding logs no longer takes the host's memory.** Finding sites read
+  every file under the web server's config root whole. A root that also holds logs, such as
+  a container's bind-mounted directory with its config and its access logs side by side, had
+  them read whole on every `tick`, `status` and apply, and before `set-web-server` would
+  switch away: a 1 GB log took 82 seconds of CPU and 7.7 GB of memory. A file over 4 MiB is
+  now skipped by its size, unread; no file that declares a site comes near that.
+
 ## [0.7.0] — 2026-10-25
 
 **Before upgrading:** nothing to do. The database schema is unchanged.

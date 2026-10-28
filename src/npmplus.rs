@@ -428,15 +428,15 @@ pub fn fallback_unused_managed_files(db: &crate::db::Db, root: &Path) -> Result<
     Ok(paths)
 }
 
-/// The directory a recorded file may be removed from: [`own_dir`], its
-/// links resolved, if it exists.
+/// The directory a recorded file may be removed from: [`own_dir`] under
+/// the resolved root, with nothing below the root resolved. A record is
+/// reached following no link ([`DirFile::exactly`]), so one there now, or
+/// planted later, is never taken for this directory.
 pub fn managed_directories(root: &Path) -> Vec<PathBuf> {
-    let unlinked = |path: &Path| fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir());
-    let own = own_dir(root);
-    if !(unlinked(&root.join(CUSTOM_DIR)) && unlinked(&own)) {
-        return Vec::new();
-    }
-    fs::canonicalize(own).into_iter().collect()
+    fs::canonicalize(root)
+        .map(|root| own_dir(&root))
+        .into_iter()
+        .collect()
 }
 
 /// Whether what is written for every host is what `config` renders to,
@@ -800,6 +800,20 @@ server {
         let err = format!("{:#}", planned.expect_err("a FIFO is not a regular file"));
         assert!(err.contains("refusing to write"), "{err}");
         assert_eq!(status, SiteApplyStatus::Stale);
+    }
+
+    /// Switching away from NPMplus first asks what stop-bots left in its
+    /// data directory: a FIFO at a name it asks about is not waited on.
+    #[test]
+    fn asking_what_was_left_waits_on_no_fifo() {
+        let dir = data_dir("");
+        fs::remove_file(server_file(dir.path())).unwrap();
+        crate::testing::mkfifo(&server_file(dir.path()));
+        crate::testing::mkfifo(&console_site_path(dir.path()));
+
+        let left = crate::webserver::leftovers(WebServer::Npmplus, dir.path());
+
+        assert_eq!(left, Vec::<PathBuf>::new());
     }
 
     /// Cleaning up removes only what stop-bots generated, from its own

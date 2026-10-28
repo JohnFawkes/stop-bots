@@ -2226,8 +2226,10 @@ pub fn leftovers(server: WebServer, root: &Path) -> Vec<PathBuf> {
             found.push(path);
         }
     }
+    // No release wrote a console site on a hostile root, and opening that
+    // name there by path would follow a link or wait on a FIFO.
     let console = server.console_site_path(root);
-    if is_console_site_file(&console) && !found.contains(&console) {
+    if !server.root_is_hostile() && is_console_site_file(&console) && !found.contains(&console) {
         found.push(console);
     }
     found

@@ -6348,11 +6348,14 @@ fn egress_lines(server: &Server) {
 /// on; the containment survives a re-render and a restart of the
 /// container; and releasing it lets both back.
 fn egress_end_to_end(backend: &str) {
-    let server = Server::spawn_with(
-        &format!("stop-bots-egress-{backend}"),
-        None,
-        &["--cap-add=SYS_ADMIN", "--sysctl", "net.ipv4.ip_forward=1"],
-    );
+    // `ip netns add` mounts /run/netns, which Docker's default AppArmor
+    // profile refuses even with `SYS_ADMIN`. Rootless Podman applies no
+    // such profile, as for the systemd image.
+    let mut extra = vec!["--cap-add=SYS_ADMIN", "--sysctl", "net.ipv4.ip_forward=1"];
+    if !runtime_is_podman() {
+        extra.extend(["--security-opt", "apparmor=unconfined"]);
+    }
+    let server = Server::spawn_with(&format!("stop-bots-egress-{backend}"), None, &extra);
     with_a_world(&server);
     server.stop_bots(&format!("set-firewall-backend --backend {backend}"));
 

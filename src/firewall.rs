@@ -1261,7 +1261,8 @@ impl FirewallRun {
 pub struct Prepared {
     pub run: FirewallRun,
     pub built: BuiltFirewall,
-    /// [`signature`] of `built.rules` and its trap, for [`record`].
+    /// [`signature_with`] of `built.rules`, its trap and its outbound
+    /// section, for [`record`]: what [`current_signature`] compares it with.
     pub signature: String,
     /// Whether to run the lockout check at all: [`Db::get_ssh_lockout_check`].
     pub lockout_check: bool,
@@ -1272,7 +1273,7 @@ pub struct Prepared {
 /// at all (see [`build_script`]).
 pub fn prepare(db: &Db, run: FirewallRun) -> Result<Prepared> {
     let built = build_script(db, run.backend)?;
-    let signature = signature(&built.rules, built.trap.as_ref());
+    let signature = signature_with(&built.rules, built.trap.as_ref(), built.egress.as_ref());
     Ok(Prepared {
         run,
         built,
@@ -3043,6 +3044,22 @@ mod tests {
         db.block_address_permanently("192.0.2.1", crate::db::RuleSource::Tui, None)
             .unwrap();
         assert_eq!(script_state(&db).unwrap(), ScriptState::Changed);
+    }
+
+    /// With outbound checks on, a render records the signature the cron
+    /// compares with. It once left the outbound section out, so every
+    /// host with them on re-rendered and re-applied every five minutes,
+    /// and `status` never said the rules were applied.
+    #[test]
+    fn a_render_with_outbound_checks_on_is_not_due_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run) = blocking_the_admin(dir.path());
+        crate::egress::Mode::Block.set(&db).unwrap();
+
+        let outcome = render_and_apply(&db, run.apply(true), SshLog::Text(None)).unwrap();
+
+        assert_eq!(outcome.write, WriteStep::Written, "{}", outcome.summary());
+        assert!(!needs_render(&db).unwrap(), "{}", outcome.summary());
     }
 
     /// A dry run decides everything and does nothing: no file, no

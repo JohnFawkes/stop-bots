@@ -78,7 +78,10 @@
 //!   own servers, as they resolve at the time of the fetch.
 //!
 //! An address the operator trusts (`add-trusted`) is never blocked
-//! either, here as everywhere.
+//! either, here as everywhere, nor one that logged in over SSH lately
+//! ([`Db::recent_ssh_login_ips`]), as inbound: listed, it would lose the
+//! replies to its own session. Both are left out when the firewall is
+//! rendered, not when a feed is fetched, so a login since counts.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -1012,7 +1015,8 @@ pub struct Egress {
     pub mode: Mode,
     /// Every listed address and range, IPv4 and IPv6, in a stable order.
     pub destinations: Vec<String>,
-    /// Addresses the operator trusts, never stopped.
+    /// Addresses the operator trusts and ones that logged in over SSH
+    /// lately, never stopped. Sorted, as it reaches the signature.
     pub trusted: Vec<String>,
     /// The sinkhole the resolver answers listed domains with, when that is
     /// on: a connection to it is a hit like any other.
@@ -1095,10 +1099,14 @@ pub fn for_render(db: &Db) -> Result<Option<Egress>> {
     contained_addresses.dedup();
     contained_uids.sort_unstable();
     contained_uids.dedup();
+    let mut trusted = db.list_trusted_addresses()?;
+    trusted.extend(db.recent_ssh_login_ips()?);
+    trusted.sort();
+    trusted.dedup();
     Ok(Some(Egress {
         mode,
         destinations,
-        trusted: db.list_trusted_addresses()?,
+        trusted,
         sinkhole: (mode != Mode::Off)
             .then(|| crate::sinkhole::active_address(db))
             .transpose()?
@@ -1514,5 +1522,19 @@ mod tests {
         let egress = for_render(&db).unwrap().unwrap();
         assert!(!egress.watches());
         assert_eq!(egress.contained_uids, vec![1001]);
+    }
+
+    /// An address that logged in over SSH lately is never stopped going
+    /// out, as it is never blocked coming in: listed, its session would
+    /// lose every reply.
+    #[test]
+    fn an_address_that_logged_in_over_ssh_is_never_stopped() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_ssh_login_ips(&["198.51.100.7".to_string()])
+            .unwrap();
+        Mode::Block.set(&db).unwrap();
+
+        let egress = for_render(&db).unwrap().unwrap();
+        assert_eq!(egress.trusted, vec!["198.51.100.7"], "{egress:?}");
     }
 }

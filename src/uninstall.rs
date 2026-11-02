@@ -586,7 +586,10 @@ fn remove_nft_table(nft: &Path, options: &Options, report: &mut Report) {
 }
 
 /// Every jump into the chain first — a chain something jumps to cannot be
-/// deleted — then the chain's rules, then the chain.
+/// deleted — then the chain's rules, then the chain. Then the same for the
+/// outbound chains, when there are any (see `crate::iptables`): the first
+/// flush took the jump from `STOP-BOTS` into one of them, and their own
+/// jumps go in order.
 fn remove_iptables_chain(options: &Options, report: &mut Report, iptables: &Path) {
     let name = name_of(iptables);
     if run_program(iptables, &["-w", "-S", IPTABLES_CHAIN]).is_err() {
@@ -594,21 +597,40 @@ fn remove_iptables_chain(options: &Options, report: &mut Report, iptables: &Path
             format!("{name} -X {IPTABLES_CHAIN}"),
             format!("{name} has no {IPTABLES_CHAIN} chain"),
         );
-        return;
+    } else {
+        remove_chain(options, report, iptables, IPTABLES_CHAIN);
     }
+    for chain in [
+        crate::contain::IPTABLES_OUT_CHAIN,
+        crate::contain::IPTABLES_EGRESS_CHAIN,
+    ] {
+        // Found in the whole listing, not by `-S <chain>`: on a host that
+        // never checked outbound traffic, nothing is said about them.
+        let listing = run_program(iptables, &["-w", "-S"]).unwrap_or_default();
+        if listing
+            .lines()
+            .any(|line| line.trim() == format!("-N {chain}"))
+        {
+            remove_chain(options, report, iptables, chain);
+        }
+    }
+}
+
+fn remove_chain(options: &Options, report: &mut Report, iptables: &Path, chain: &str) {
+    let name = name_of(iptables);
     let rules = run_program(iptables, &["-w", "-S"]).unwrap_or_default();
-    for jump in jumps_into(&rules, IPTABLES_CHAIN) {
+    for jump in jumps_into(&rules, chain) {
         let mut args = vec!["-w", "-D"];
         args.extend(jump.iter().map(String::as_str));
         report.step(options, format!("{name} -D {}", jump.join(" ")), || {
             run_program(iptables, &args).map(|_| ())
         });
     }
-    report.step(options, format!("{name} -F {IPTABLES_CHAIN}"), || {
-        run_program(iptables, &["-w", "-F", IPTABLES_CHAIN]).map(|_| ())
+    report.step(options, format!("{name} -F {chain}"), || {
+        run_program(iptables, &["-w", "-F", chain]).map(|_| ())
     });
-    report.step(options, format!("{name} -X {IPTABLES_CHAIN}"), || {
-        run_program(iptables, &["-w", "-X", IPTABLES_CHAIN]).map(|_| ())
+    report.step(options, format!("{name} -X {chain}"), || {
+        run_program(iptables, &["-w", "-X", chain]).map(|_| ())
     });
 }
 

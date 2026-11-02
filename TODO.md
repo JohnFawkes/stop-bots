@@ -52,6 +52,37 @@ eventually ask for, with the reason it isn't there.
   Traefik's root: whether the container mounts that directory at `/data` is in the
   compose file, which is not on this host's path in general.
 
+* **Outbound hits and containments have no TUI screen.** The Dashboard's
+  Outbound C&C checks rows set the mode, the feeds and automatic
+  containment, and its
+  Firewall script panel and the status strip show hits; listing them,
+  containing by hand and releasing are CLI-only (`list-egress-hits`,
+  `contain`, `release`), as are users, the never-contain list and the
+  breaker (`set-containment`).
+* **"Update everything" (`u`, `batch`) does not fetch the C&C feeds.** Their
+  own daily job does, and `update-egress-feeds`: they need the
+  never-blocked guard's resolution step, which `refresh` has no place for.
+* **A rootless Podman container's traffic is its user's.** pasta sends it
+  from a host process, so it is attributed to, and contained as, the user
+  running Podman, not as a container.
+* **A container on Docker's default DNS bypasses the sinkhole.** Docker
+  hands containers the host's upstream servers; only one started with
+  `--dns` pointing at the host's dnsmasq or unbound asks it.
+* **Hit attribution is a snapshot.** A container is found by its address
+  when the hit is answered, up to a minute later; one that stopped and gave
+  its address to another in between is reported as the other.
+
+* **The exploit rules and ModSecurity are NGINX-only.** Apache's `RewriteCond`
+  and `mod_security2` (the same Core Rule Set), and Traefik through Coraza,
+  are the next backends; on either, the settings say they write nothing.
+* **ModSecurity on Debian and Ubuntu's layout only**: the module in
+  `modules-enabled`, CRS in `/etc/modsecurity/crs` and
+  `/usr/share/modsecurity-crs`. An NGINX in a container needs the module in its
+  image, and is reported as not installed.
+* **Own ModSecurity exclusions for Immich's uploads only.** Jellyfin and
+  Navidrome get the Core Rule Set as it is: what they trip, if anything, is for
+  detect mode and the audit log to show.
+
 ## Blocked on machinery this codebase doesn't have
 
 The organising constraint: **there is no runtime component in the request

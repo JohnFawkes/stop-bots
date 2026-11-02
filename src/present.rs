@@ -104,6 +104,9 @@ pub fn check_label(check: &Check) -> &'static str {
         "trusted" => "trusted",
         "hosting-asns" => "hosting",
         "skipped-entries" => "skipped",
+        "egress-hits" => "c&c",
+        "egress-enforced" => "outbound",
+        "modsecurity" => "modsec",
         _ => check.title,
     }
 }

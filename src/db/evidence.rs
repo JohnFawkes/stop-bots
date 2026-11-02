@@ -80,6 +80,9 @@ pub struct Ingest {
     evidence: Vec<(Detector, String, Item, Tally)>,
     user_agents: Vec<(String, u64)>,
     logins: Vec<String>,
+    /// Outbound attempts the kernel log held, stored with the claim, so a
+    /// read stored twice cannot count them twice.
+    egress: Vec<crate::db::egress::NewEgressHit>,
     now: i64,
     claim: Claim,
 }
@@ -120,9 +123,16 @@ impl Ingest {
             evidence: evidence.into_rows(),
             user_agents: user_agents.into_iter().collect(),
             logins,
+            egress: Vec::new(),
             now,
             claim: Claim::NotYet,
         }
+    }
+
+    /// The same, carrying the outbound attempts the read found too.
+    pub fn with_egress(mut self, hits: Vec<crate::db::egress::NewEgressHit>) -> Ingest {
+        self.egress = hits;
+        self
     }
 
     /// Writes the next chunk of at most `chunk` rows, claiming the read
@@ -142,6 +152,7 @@ impl Ingest {
                     db.set_raw_setting(&keys::log_cursor(&self.source), to)?;
                 }
                 db.record_ssh_login_ips(&self.logins)?;
+                db.upsert_egress_hits(&self.egress)?;
             }
             let evidence = self.evidence.len().min(chunk);
             let evidence = self.evidence.split_off(self.evidence.len() - evidence);

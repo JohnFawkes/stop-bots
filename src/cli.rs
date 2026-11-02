@@ -1469,6 +1469,411 @@ pub(crate) enum Command {
         #[arg(long, value_name = "SECS", default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..), help = CONFIRM_TIMEOUT_HELP)]
         confirm_timeout: u64,
     },
+    /// Check outbound connections to command-and-control servers.
+    ///
+    /// `watch` logs every new connection from this host or one of its
+    /// containers to an address an enabled C&C feed lists, and lets it
+    /// through: to see what would be stopped before stopping it. `block`
+    /// logs it and drops it. `off`, the default, checks nothing.
+    ///
+    /// Each logged attempt is read back every minute (`stop-bots tick`, or
+    /// the TUI while it is open), with the container or the user that made
+    /// it, and shown by `list-egress-hits` and `status`. `tick` prints it,
+    /// so cron mails it if MAILTO is set.
+    ///
+    /// Takes effect when the firewall is applied next (`render-firewall
+    /// --apply`). Switch a feed on first: `list-egress-feeds`.
+    SetEgress {
+        /// off, watch (log only) or block (log and drop)
+        #[arg(long, value_enum)]
+        mode: EgressModeArg,
+    },
+    /// List the command-and-control feeds, built in and added by URL
+    ListEgressFeeds {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
+    /// Switch a C&C feed on or off, or say whether its hits may contain.
+    ///
+    /// Every feed is off by default. `--contain true` lets a hit on one of
+    /// its entries contain what made it, when automatic containment is on
+    /// (`set-containment`): Feodo Tracker's is the only feed that may by
+    /// default.
+    SetEgressFeed {
+        /// Which feed, as `list-egress-feeds` names it
+        #[arg(long)]
+        feed_id: String,
+        /// Whether its entries are checked
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        enabled: Option<bool>,
+        /// Whether a hit on it may contain what made it
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        contain: Option<bool>,
+    },
+    /// Add a C&C feed by URL.
+    ///
+    /// For a list this release does not build in, or one that needs an
+    /// account: abuse.ch's ThreatFox and URLhaus exports carry the key in
+    /// their URL. The URL is stored as given and never shown again, only
+    /// its host. Any list with an address (or, with --domains, a domain)
+    /// per line is read: plain, CSV, `ip:port`, a hosts file or an RPZ
+    /// zone. Added off; `set-egress-feed --enabled true` switches it on.
+    AddEgressFeed {
+        /// What to call it; its id is `custom-` and this, in lowercase
+        #[arg(long)]
+        name: String,
+        /// Where to download it from, over https
+        #[arg(long)]
+        url: String,
+        /// It lists domains, for the resolver (`set-egress-dns`), not
+        /// addresses
+        #[arg(long)]
+        domains: bool,
+        /// A hit on it may contain what made it
+        #[arg(long)]
+        contain: bool,
+    },
+    /// Remove a C&C feed added by URL, and what it held
+    RemoveEgressFeed {
+        /// Which feed, as `list-egress-feeds` names it
+        #[arg(long)]
+        feed_id: String,
+    },
+    /// Download the C&C feeds that are switched on, or one.
+    ///
+    /// Whatever would cut this host off is left out of each, as it is
+    /// stored: private and reserved ranges, anything broader than a /8,
+    /// and any range that holds this host's resolvers, apt mirrors, Let's
+    /// Encrypt or the feeds' own servers. What was left out is said.
+    UpdateEgressFeeds {
+        /// Only this feed
+        #[arg(long)]
+        feed_id: Option<String>,
+        /// Read the feed from a local file instead of downloading it, for a
+        /// host with no outbound access, and for tests
+        #[arg(long, requires = "feed_id")]
+        source: Option<PathBuf>,
+    },
+    /// List the outbound attempts to listed addresses, latest first
+    ListEgressHits {
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
+    /// Forget the outbound attempts on record, once they are dealt with
+    ClearEgressHits {
+        /// Only those last seen more than this many days ago
+        #[arg(long)]
+        older_than_days: Option<u32>,
+    },
+    /// Say how a container or a user that calls a C&C server is contained.
+    ///
+    /// With `--auto true`, a hit contains what made it within the minute,
+    /// in Block mode only, and only for a feed allowed to contain
+    /// (`set-egress-feed --contain`). A container is cut off from the
+    /// network both ways and paused (or stopped, or only cut off); a user
+    /// on the host has every outbound connection it starts cut off, and
+    /// with `--user-action kill` its processes killed. Containers are
+    /// contained automatically once this is on; users only with `--users
+    /// true` as well. Root, a user logged in right now, and anything
+    /// `--never-contain` names never are.
+    ///
+    /// More than `--breaker-max` automatic containments in an hour (3 by
+    /// default), or one destination reached from that many sources at
+    /// once, trips a breaker instead: a feed listing something by mistake
+    /// must not take down every container. `--reset-breaker` re-arms it.
+    SetContainment {
+        /// Whether a hit contains what made it, without asking
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        auto: Option<bool>,
+        /// Whether automatic containment applies to containers
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        containers: Option<bool>,
+        /// Whether automatic containment applies to users on the host
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        users: Option<bool>,
+        /// What is done to a contained container
+        #[arg(long, value_enum)]
+        container_action: Option<ContainerActionArg>,
+        /// What is done to a contained user
+        #[arg(long, value_enum)]
+        user_action: Option<UserActionArg>,
+        /// A container or user (by name or uid) never contained
+        /// automatically; may be repeated
+        #[arg(long, value_name = "NAME")]
+        never_contain: Vec<String>,
+        /// Take a name off the never-contain list; may be repeated
+        #[arg(long, value_name = "NAME")]
+        may_contain: Vec<String>,
+        /// The most automatic containments in an hour
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        breaker_max: Option<u32>,
+        /// Re-arm a tripped breaker
+        #[arg(long)]
+        reset_breaker: bool,
+    },
+    /// Contain a container, a user or an address by hand.
+    ///
+    /// The same as a hit would with automatic containment on: recorded,
+    /// cut off in the loaded firewall at once, and kept in every script
+    /// rendered until `release`. Needs outbound checks applied once
+    /// (`set-egress`), which is what puts the containment rules in the
+    /// firewall.
+    Contain {
+        /// A container, by name or id
+        #[arg(long, conflicts_with_all = ["user", "address"], required_unless_present_any = ["user", "address"])]
+        container: Option<String>,
+        /// A user on this host, by name or uid
+        #[arg(long, conflicts_with = "address")]
+        user: Option<String>,
+        /// An address this host forwards for, that no container has
+        #[arg(long)]
+        address: Option<String>,
+        /// What to do besides cutting it off. Defaults to the one
+        /// `set-containment` sets for its kind
+        #[arg(long, value_enum)]
+        action: Option<ContainActionArg>,
+        /// Why, for the record
+        #[arg(long, default_value = "contained by hand")]
+        reason: String,
+        /// Say what would be done, and do none of it
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Release a containment: back on the network, and unpaused.
+    ///
+    /// A stopped container is left stopped; start it once it has been
+    /// looked at.
+    Release {
+        /// Which one, as `list-containments` numbers it
+        #[arg(long, required_unless_present = "all", conflicts_with = "all")]
+        id: Option<i64>,
+        /// Every open containment
+        #[arg(long)]
+        all: bool,
+        /// Say what would be done, and do none of it
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List the open containments, or every one with --all
+    ListContainments {
+        /// Released ones too
+        #[arg(long)]
+        all: bool,
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
+    /// Send listed C&C domains to a sinkhole, through this host's resolver.
+    ///
+    /// The firewall cannot see a domain, only the address it resolved to.
+    /// So the resolver is told instead: every domain the enabled domain
+    /// feeds list resolves to the sinkhole (192.0.2.1 unless set), and a
+    /// connection to the sinkhole is a hit like any other, with the user
+    /// or container that made it. `hosts` writes a block into /etc/hosts
+    /// (this host's programs only, exact names); `dnsmasq` and `unbound` a
+    /// file of their own (a domain and everything under it). Containers
+    /// only ask it if they are given this host's resolver (`--dns`).
+    ///
+    /// Written now and on every feed update; `apply-egress-dns` writes it
+    /// by hand.
+    SetEgressDns {
+        /// Which resolver: hosts, dnsmasq or unbound; off sends nothing to
+        /// the sinkhole and takes it out of the file it was written to
+        #[arg(long, value_enum)]
+        target: DnsTargetArg,
+        /// The address listed domains resolve to
+        #[arg(long)]
+        sinkhole: Option<String>,
+    },
+    /// Write the sinkhole file for the chosen resolver now
+    ApplyEgressDns {
+        /// Show what would be written, and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Write it, and do not reload the resolver
+        #[arg(long)]
+        no_reload: bool,
+    },
+    /// Answer the outbound attempts the kernel logged, now.
+    ///
+    /// What the schedule does every minute: reads the kernel log from
+    /// where the last read stopped, says who each new attempt came from,
+    /// and contains it when automatic containment allows; then makes sure
+    /// every open containment still holds (a container a restart brought
+    /// back is paused again).
+    CheckEgress {
+        /// Read this kernel log instead of the stored one or the journal
+        #[arg(long)]
+        kernel_log: Option<PathBuf>,
+        /// Say what would be done, and contain nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Turn away requests that carry an exploit payload, in NGINX.
+    ///
+    /// The injection detector's strong signatures (Log4Shell, Shellshock,
+    /// OGNL and expression injection, PHP-CGI argument injection, command
+    /// injection, `../../`, an encoded NUL byte), plain, percent-encoded or
+    /// double-encoded, in the request line, the user agent, the referer,
+    /// cookies, X-Forwarded-For and X-Api-Version. Answered with the block
+    /// response, before the application sees the request. Not the request
+    /// body, which NGINX's config cannot see: that takes ModSecurity.
+    ///
+    /// A refusal is a line in the access log, and the injection detector
+    /// blocks the address from it as it always has. Exempt paths and
+    /// trusted clients are let through, as for every rule.
+    ///
+    /// Without --site, for every site that has not chosen; with it, for
+    /// that site. `preview-exploit-rules` says what they would have turned
+    /// away in this host's own log. Run `apply-blocks` afterwards.
+    SetExploitRules {
+        /// Whether payloads are turned away
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set, required_unless_present = "inherit")]
+        enabled: Option<bool>,
+        /// Only this site, by its server_name
+        #[arg(long)]
+        site: Option<String>,
+        /// The site follows the host's setting again
+        #[arg(long, requires = "site", conflicts_with = "enabled")]
+        inherit: bool,
+    },
+    /// Say what the exploit rules would have turned away in the access log.
+    ///
+    /// Judges every request in the log the way the rules would: the request
+    /// line, user agent and referer, which the log records. The other
+    /// headers the rules check are not logged, so this can only undercount.
+    PreviewExploitRules {
+        #[arg(long, help = ACCESS_LOG_HELP)]
+        access_log: Option<PathBuf>,
+    },
+    /// Run ModSecurity with the OWASP Core Rule Set, set up for each site.
+    ///
+    /// ModSecurity checks what NGINX's config cannot: request bodies (form
+    /// posts, JSON calls, uploads), cookies and decoded arguments. It is
+    /// NGINX's module, not stop-bots': install libnginx-mod-http-modsecurity
+    /// and modsecurity-crs first. stop-bots writes its config, switching on
+    /// the Core Rule Set's exclusions for what runs behind each site
+    /// (WordPress, Drupal, Nextcloud), its own for apps CRS has none for, and
+    /// the ones you make from the audit log (`exclude-modsecurity-rule`).
+    ///
+    /// `detect` checks every request and logs what it would block, and
+    /// blocks nothing: start there, and read `list-modsecurity-findings`
+    /// for a while. `block` answers what CRS scores as an attack with a
+    /// 403. `off` does not run it.
+    ///
+    /// Without --site, for every site that has not chosen; with it, for
+    /// that site. Run `apply-blocks` afterwards.
+    SetModsecurity {
+        /// off, detect or block
+        #[arg(long, value_enum, required_unless_present_any = ["inherit", "paranoia"])]
+        mode: Option<ModsecModeArg>,
+        /// The Core Rule Set's paranoia level, 1 (fewest false positives)
+        /// to 4 (most)
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
+        paranoia: Option<u8>,
+        /// Only this site, by its server_name
+        #[arg(long)]
+        site: Option<String>,
+        /// The site follows the host's mode and paranoia again
+        #[arg(long, requires = "site", conflicts_with_all = ["mode", "paranoia"])]
+        inherit: bool,
+    },
+    /// List what ModSecurity found, by site, rule and path.
+    ///
+    /// Read from its audit log. "over threshold" is how many of the
+    /// requests CRS scored as attacks: blocked in block mode, and what
+    /// would have been in detect mode. A rule that fires on what your
+    /// application really does is a false positive: switch it off for that
+    /// path with `exclude-modsecurity-rule`.
+    ListModsecurityFindings {
+        /// Only this site, by its server_name
+        #[arg(long)]
+        site: Option<String>,
+        /// Read this audit log instead of the one stop-bots configures
+        #[arg(long)]
+        audit_log: Option<PathBuf>,
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
+    /// Switch one Core Rule Set rule off for one site, under one path.
+    ///
+    /// For a false positive `list-modsecurity-findings` showed. The rule
+    /// stays on everywhere else. With --remove, switch it back on. Run
+    /// `apply-blocks` afterwards.
+    ExcludeModsecurityRule {
+        /// The site, by its server_name
+        #[arg(long)]
+        site: String,
+        /// The rule's id, e.g. 942100
+        #[arg(long)]
+        rule: u32,
+        /// The path prefix it is switched off under, e.g. /wp-admin/
+        #[arg(long)]
+        path: String,
+        /// Switch it back on there
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Name the container runtime containment asks and pauses with.
+    ///
+    /// Without one, `docker`, else `podman`, whichever is installed.
+    /// Stored in the host settings, which only root can write, since it is
+    /// a program root runs.
+    SetContainerRuntime {
+        /// The runtime's program, an absolute path; empty for the default
+        #[arg(long)]
+        program: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum ModsecModeArg {
+    /// Not run
+    Off,
+    /// Checks every request and logs what it would block
+    Detect,
+    /// Blocks what the Core Rule Set scores as an attack
+    Block,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum EgressModeArg {
+    Off,
+    Watch,
+    Block,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum ContainerActionArg {
+    /// Cut off from the network, and nothing else
+    Isolate,
+    /// Cut off and frozen, memory kept
+    Pause,
+    /// Cut off and stopped
+    Stop,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum UserActionArg {
+    /// Every outbound connection it starts cut off
+    Isolate,
+    /// Cut off, and every process it runs killed (login accounts only)
+    Kill,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum ContainActionArg {
+    Isolate,
+    Pause,
+    Stop,
+    Kill,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum DnsTargetArg {
+    Off,
+    Hosts,
+    Dnsmasq,
+    Unbound,
 }
 
 #[derive(Clone, Copy, ValueEnum)]

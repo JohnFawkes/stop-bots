@@ -71,6 +71,23 @@
 //! fifteen ports at most, so a longer list is several pairs of rules. See
 //! [`crate::portscan`].
 //!
+//! ## Outbound
+//!
+//! With outbound checks on, or anything contained (see
+//! [`crate::nftables`]'s "Outbound" for what the rules do), each family
+//! gains two chains. `STOP-BOTS-EGRESS` holds the rules about
+//! destinations and containment, and is jumped to as the first rule of
+//! `STOP-BOTS`, so `FORWARD` and `DOCKER-USER` reach it ahead of the
+//! `ESTABLISHED` accept. `STOP-BOTS-OUT`, jumped to from `OUTPUT`, cuts off
+//! what a contained user starts (`-m owner`, which only `OUTPUT` has) and
+//! then jumps to `STOP-BOTS-EGRESS` too. Neither accepts anything: what is
+//! not theirs is `RETURN`ed, so every other `OUTPUT` rule still runs.
+//!
+//! iptables has no sets without `ipset`, so a listed address is two rules
+//! (a `LOG` and, in Block mode, a `DROP`). The C&C feeds are small enough
+//! for that; a contained address is two more, put at the head of the chain
+//! by [`crate::contain::LiveFirewall`] without a restore.
+//!
 //! ## Default-deny (allowlist) mode
 //!
 //! For allowlist geo-blocking (block everything except selected countries),
@@ -84,6 +101,13 @@
 use crate::db::{FirewallAction, FirewallRule};
 
 const CHAIN: &str = "STOP-BOTS";
+
+/// Outbound destinations and containment, jumped to from [`CHAIN`] and
+/// [`OUT_CHAIN`]. See "Outbound" in the module docs.
+const EGRESS_CHAIN: &str = crate::contain::IPTABLES_EGRESS_CHAIN;
+
+/// What this host sends, jumped to from `OUTPUT`.
+const OUT_CHAIN: &str = crate::contain::IPTABLES_OUT_CHAIN;
 
 fn action_word(action: FirewallAction) -> &'static str {
     match action {
@@ -157,10 +181,26 @@ pub fn loaded_entries(rules: &[FirewallRule], now: i64) -> usize {
 /// The established/related and loopback accepts come first, before any
 /// user rule, so that a catch-all Block cannot cut existing connections or
 /// local traffic. `head` is what else goes before them for this family.
-fn fragment(out: &mut String, restore: &str, delimiter: &str, head: &[&str], lines: &[String]) {
+fn fragment(
+    out: &mut String,
+    restore: &str,
+    delimiter: &str,
+    head: &[&str],
+    lines: &[String],
+    egress: Option<&[String]>,
+) {
     out.push_str(&format!("{restore} -w --noflush <<'{delimiter}'\n"));
     out.push_str("*filter\n");
     out.push_str(&format!(":{CHAIN} - [0:0]\n"));
+    if let Some(egress) = egress {
+        out.push_str(&format!(":{EGRESS_CHAIN} - [0:0]\n"));
+        out.push_str(&format!(":{OUT_CHAIN} - [0:0]\n"));
+        out.push_str(&format!("-A {CHAIN} -j {EGRESS_CHAIN}\n"));
+        for line in egress {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
     out.push_str(&format!(
         "-A {CHAIN} -m state --state ESTABLISHED,RELATED -j ACCEPT\n"
     ));
@@ -186,6 +226,82 @@ const ND_ACCEPTS: [&str; 3] = [
     "-p ipv6-icmp --icmpv6-type neighbour-solicitation -j ACCEPT",
     "-p ipv6-icmp --icmpv6-type neighbour-advertisement -j ACCEPT",
 ];
+
+/// The rules of the two outbound chains for one family: see "Outbound" in
+/// the module docs.
+fn egress_lines(egress: &crate::egress::Egress, v6: bool) -> Vec<String> {
+    let family = |address: &str| address.contains(':') == v6;
+    let valid = |address: &&String| crate::db::is_valid_address(address) && family(address);
+    let mut lines = Vec::new();
+    lines.push(format!("-A {OUT_CHAIN} -o lo -j RETURN"));
+    for uid in &egress.contained_uids {
+        lines.push(format!(
+            "-A {OUT_CHAIN} -m owner --uid-owner {uid} -m conntrack --ctdir ORIGINAL -j DROP"
+        ));
+    }
+    lines.push(format!("-A {OUT_CHAIN} -j {EGRESS_CHAIN}"));
+    for address in egress.contained_addresses.iter().filter(valid) {
+        let address = address.trim();
+        lines.push(format!("-A {EGRESS_CHAIN} -s {address} -j DROP"));
+        lines.push(format!("-A {EGRESS_CHAIN} -d {address} -j DROP"));
+    }
+    if !egress.watches() {
+        return lines;
+    }
+    let private: &[&str] = if v6 {
+        &["::1", "fc00::/7", "fe80::/10"]
+    } else {
+        &[
+            "127.0.0.0/8",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "169.254.0.0/16",
+        ]
+    };
+    for range in private {
+        lines.push(format!("-A {EGRESS_CHAIN} -d {range} -j RETURN"));
+    }
+    for address in egress.trusted.iter().filter(valid) {
+        lines.push(format!("-A {EGRESS_CHAIN} -d {} -j RETURN", address.trim()));
+    }
+    let listed = egress.listed();
+    for address in listed.iter().filter(valid) {
+        let address = address.trim();
+        lines.push(format!(
+            "-A {EGRESS_CHAIN} -d {address} -m conntrack --ctdir ORIGINAL -m limit --limit {} \
+             -j LOG --log-prefix \"{}\" --log-uid",
+            crate::egress::LOG_RATE,
+            crate::egress::LOG_PREFIX
+        ));
+        if egress.blocks() {
+            lines.push(format!("-A {EGRESS_CHAIN} -d {address} -j DROP"));
+        }
+    }
+    lines
+}
+
+/// Empties the outbound chains an earlier script filled, when this one has
+/// none: a restore only replaces the chains it declares, so they would
+/// otherwise go on enforcing what is no longer asked for.
+fn empty_outbound(out: &mut String, tool: &str, indent: &str) {
+    for chain in [OUT_CHAIN, EGRESS_CHAIN] {
+        out.push_str(&format!(
+            "{indent}if {tool} -w -L {chain} -n >/dev/null 2>&1; then\n"
+        ));
+        out.push_str(&format!("{indent}    {tool} -w -F {chain}\n"));
+        out.push_str(&format!("{indent}fi\n"));
+    }
+}
+
+/// The guarded jump from `OUTPUT` into [`OUT_CHAIN`].
+fn output_jump(out: &mut String, tool: &str, indent: &str) {
+    out.push_str(&format!(
+        "{indent}if ! {tool} -w -C OUTPUT -j {OUT_CHAIN} 2>/dev/null; then\n"
+    ));
+    out.push_str(&format!("{indent}    {tool} -w -I OUTPUT -j {OUT_CHAIN}\n"));
+    out.push_str(&format!("{indent}fi\n"));
+}
 
 /// The guarded jumps into our chain from the chains that see traffic,
 /// indented by `indent`.
@@ -265,6 +381,17 @@ pub fn render_with_trap(
     trap: Option<&crate::portscan::Trap>,
     now: i64,
 ) -> String {
+    render_full(rules, trap, None, now)
+}
+
+/// [`render_with_trap`], with the outbound chains of `egress` (see the
+/// module docs).
+pub fn render_full(
+    rules: &[FirewallRule],
+    trap: Option<&crate::portscan::Trap>,
+    egress: Option<&crate::egress::Egress>,
+    now: i64,
+) -> String {
     let mut plan = Plan::new(rules, now);
     let (v4_rules, v6_rules) = (plan.v4.len(), plan.v6.len());
     if let Some(trap) = trap {
@@ -293,6 +420,9 @@ pub fn render_with_trap(
     if let Some(trap) = trap {
         crate::nftables::trap_comment(&mut out, trap);
     }
+    if let Some(egress) = egress {
+        crate::nftables::egress_comment(&mut out, egress);
+    }
     for address in &plan.skipped {
         // `{:?}`, not `{}`: an unvalidated address can contain a newline,
         // which would end the comment and make the remainder of it a
@@ -303,18 +433,25 @@ pub fn render_with_trap(
     }
     out.push_str("set -e\n\n");
 
+    let egress_v4 = egress.map(|e| egress_lines(e, false));
+    let egress_v6 = egress.map(|e| egress_lines(e, true));
     fragment(
         &mut out,
         "iptables-restore",
         "STOP_BOTS_IPV4",
         &[],
         &plan.v4,
+        egress_v4.as_deref(),
     );
     // `INPUT` alone only covers services running on the host. Traffic for
     // a published container port is DNAT'd and then *forwarded*, so it
     // never reaches `INPUT` and an `INPUT`-only jump enforces nothing for
     // it — see the module docs in `crate::nftables` for the same reasoning.
     jumps(&mut out, "iptables", "");
+    match egress {
+        Some(_) => output_jump(&mut out, "iptables", ""),
+        None => empty_outbound(&mut out, "iptables", ""),
+    }
 
     // Listing `INPUT` is the cheapest proof that ip6tables works here at
     // all; it fails on a kernel booted with IPv6 disabled.
@@ -325,8 +462,13 @@ pub fn render_with_trap(
         "STOP_BOTS_IPV6",
         &ND_ACCEPTS,
         &plan.v6,
+        egress_v6.as_deref(),
     );
     jumps(&mut out, "ip6tables", "    ");
+    match egress {
+        Some(_) => output_jump(&mut out, "ip6tables", "    "),
+        None => empty_outbound(&mut out, "ip6tables", "    "),
+    }
     if v6_rules > 0 {
         out.push_str("else\n");
         out.push_str(&format!(
@@ -420,12 +562,20 @@ mod tests {
     fn render_never_touches_other_chains_or_policies() {
         let rendered = render(&[], NOW);
         // `-P` is the only way to change a policy, and `-F`/`-X` the way to
-        // empty or delete a chain. None appears: our chain is emptied by
-        // being declared in the restore, which touches no other chain.
-        for forbidden in [" -P ", " -F", " -X", "OUTPUT", "flush ruleset"] {
+        // empty or delete a chain. Our chain is emptied by being declared in
+        // the restore, which touches no other chain; the only `-F` is of the
+        // outbound chains, which a script without them empties.
+        for forbidden in [" -P ", " -X", "OUTPUT", "flush ruleset"] {
             assert!(
                 !rendered.contains(forbidden),
                 "{forbidden:?} in:\n{rendered}"
+            );
+        }
+        for line in rendered.lines().filter(|l| l.contains(" -F")) {
+            assert!(
+                line.trim().ends_with(&format!("-F {OUT_CHAIN}"))
+                    || line.trim().ends_with(&format!("-F {EGRESS_CHAIN}")),
+                "a flush of a chain that is not ours: {line}"
             );
         }
     }
@@ -683,6 +833,30 @@ mod tests {
             disabled("10.0.0.1"),
         ];
         crate::golden::assert_golden("firewall.iptables.sh", &render(&rules, NOW));
+    }
+
+    /// The same rule set with outbound checks in Block mode, and a
+    /// container and a user contained.
+    #[test]
+    fn rendered_script_with_outbound_checks_matches_the_golden() {
+        let rules = vec![allow("203.0.113.7"), block("198.51.100.0/24")];
+        crate::golden::assert_golden(
+            "firewall-egress.iptables.sh",
+            &render_full(&rules, None, Some(&crate::testing::egress()), NOW),
+        );
+    }
+
+    /// `ACCEPT` in an `OUTPUT` chain of ours would end the traversal and
+    /// skip every rule the host has after it.
+    #[test]
+    fn the_outbound_chains_accept_nothing() {
+        let script = render_full(&[], None, Some(&crate::testing::egress()), NOW);
+        let accepting: Vec<&str> = script
+            .lines()
+            .filter(|l| l.contains("STOP-BOTS-OUT") || l.contains("STOP-BOTS-EGRESS"))
+            .filter(|l| l.contains("-j ACCEPT"))
+            .collect();
+        assert!(accepting.is_empty(), "{accepting:?}");
     }
 
     /// The same rule set with the port-scan detector's trap.

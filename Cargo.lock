@@ -2829,6 +2829,7 @@ dependencies = [
  "predicates",
  "rand 0.10.3",
  "ratatui",
+ "regex",
  "reqwest",
  "resvg",
  "rusqlite",

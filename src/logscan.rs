@@ -216,15 +216,21 @@ fn wants_access_log(db: &Db, job: CronJob) -> Result<bool> {
 }
 
 /// Whether `job` wants the kernel log: the port-scan detector's, when it
-/// is on.
+/// is on, and the outbound job's, when outbound checks are.
 fn wants_kernel_log(db: &Db, job: CronJob) -> Result<bool> {
     Ok(match job {
         CronJob::Detect(detector) => {
             detector.spec().log == DetectorLog::Kernel && detector.is_enabled(db)?
         }
+        CronJob::Egress => crate::egress::Mode::get(db)? != crate::egress::Mode::Off,
         _ => false,
     })
 }
+
+/// How far back a first read of the journal looks for outbound attempts:
+/// a day, which is what the rules can have logged since an install that
+/// was not reading yet.
+const EGRESS_LOOK_BACK: i64 = 24 * 60 * 60;
 
 /// Whether `job` wants the SSH log.
 fn wants_ssh_log(job: CronJob) -> bool {
@@ -314,7 +320,10 @@ pub fn plan(db: &Db, jobs: &[CronJob], flags: &Flags) -> Result<Plan> {
         }
         Some(KernelPlan {
             cursors,
-            cutoff: now - Detector::PortScanners.window_seconds(db)?,
+            cutoff: now
+                - Detector::PortScanners
+                    .window_seconds(db)?
+                    .max(EGRESS_LOOK_BACK),
         })
     } else {
         None
@@ -515,6 +524,8 @@ pub struct AccessFindings {
 #[derive(Debug, Clone, Default)]
 pub struct KernelFindings {
     pub evidence: Evidence,
+    /// Outbound attempts to listed addresses, one per flow.
+    pub egress: Vec<crate::db::egress::NewEgressHit>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -703,12 +714,15 @@ fn read_kernel(plan: &KernelPlan, now: i64, reader: &dyn LogReader) -> Outcome<K
         ..Request::new(hostlog::Log::Kernel, plan.cursors.clone())
     };
     let mut observer: Option<crate::portscan::Observer> = None;
+    let mut egress: Option<crate::egress::Observer> = None;
     let followed = follow(reader, request, &mut |chunk| {
-        let observer = observer.get_or_insert_with(|| {
-            crate::portscan::Observer::new(plan.cutoff, now, chunk.resumed.then_some(now))
-        });
+        let undated = chunk.resumed.then_some(now);
+        let observer = observer
+            .get_or_insert_with(|| crate::portscan::Observer::new(plan.cutoff, now, undated));
+        let egress = egress.get_or_insert_with(|| crate::egress::Observer::new(now, undated));
         for line in chunk.lines.split_terminator('\n') {
             observer.line(line);
+            egress.line(line);
         }
     });
     match followed {
@@ -719,6 +733,7 @@ fn read_kernel(plan: &KernelPlan, now: i64, reader: &dyn LogReader) -> Outcome<K
             amount: done.amount,
             findings: KernelFindings {
                 evidence: observer.map(|o| o.finish()).unwrap_or_default(),
+                egress: egress.map(|o| o.finish()).unwrap_or_default(),
             },
         }),
         Err(tried) => Outcome::Unavailable(tried),
@@ -926,7 +941,8 @@ pub fn store(read: Read) -> Storing {
                     HashMap::new(),
                     Vec::new(),
                     read.now,
-                ),
+                )
+                .with_egress(log.findings.egress),
             ));
         }
     }

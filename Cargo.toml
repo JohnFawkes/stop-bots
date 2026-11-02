@@ -175,6 +175,10 @@ clap_complete = "4.6.11"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+# Checking that the exploit rules generated for the web servers' PCRE
+# match what `injection` matches (`exploits.rs`). Tests only: the shipped
+# binary carries no regex engine, for its size.
+regex = "1"
 
 # The pty harness that drives the TUI in e2e tests (tests/tui.rs) is on
 # raw libc, which is now a normal dependency — see the comment there for

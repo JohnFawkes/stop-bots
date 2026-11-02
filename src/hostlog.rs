@@ -47,7 +47,8 @@
 //! user`, as [`crate::sshlog`] reads them — and from the journal only the
 //! entries of sshd's own units. Nothing else in `auth.log` (sudo, cron,
 //! every user's sessions) and nothing else in the journal is returned.
-//! Of the kernel log, only the trap's lines ([`crate::portscan`]).
+//! Of the kernel log, only the trap's lines ([`crate::portscan`]) and the
+//! outbound rules' ([`crate::egress`]).
 //!
 //! The lines come back unparsed, and are parsed where they are used.
 //!
@@ -134,8 +135,14 @@ const KERNEL_JOURNAL: JournalLog = JournalLog {
     units: &[],
     matches: crate::portscan::JOURNAL_MATCHES,
     tried: "journald (kernel messages)",
-    keep: crate::portscan::is_trap_line,
+    keep: is_kernel_line_kept,
 };
+
+/// The kernel log lines anything here reads: the trap's, and the outbound
+/// rules'.
+fn is_kernel_line_kept(line: &str) -> bool {
+    crate::portscan::is_trap_line(line) || crate::egress::is_egress_line(line)
+}
 
 /// Where an earlier read of one log stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -25,6 +25,8 @@ use stop_bots::protection::Detector;
 use stop_bots::{accesslog, botlist, ipranges, nginx, say, say_err, say_inline, sshlog, webserver};
 
 mod cli;
+mod egress_cmd;
+mod waf_cmd;
 use cli::*;
 
 const DEFAULT_DB_PATH: &str = stop_bots::db::SYSTEM_PATH;
@@ -442,6 +444,99 @@ async fn run() -> Result<()> {
         Some(Command::SetOldBrowsers { enabled }) => set_old_browsers(db, enabled),
         Some(Command::SetUiMode { mode }) => set_ui_mode(db, mode),
         Some(Command::ShowRobotsTxt) => show_robots_txt(db),
+        Some(Command::SetEgress { mode }) => egress_cmd::set_egress(db, mode),
+        Some(Command::ListEgressFeeds { json }) => egress_cmd::list_feeds(db, json),
+        Some(Command::SetEgressFeed {
+            feed_id,
+            enabled,
+            contain,
+        }) => egress_cmd::set_feed(db, feed_id, enabled, contain),
+        Some(Command::AddEgressFeed {
+            name,
+            url,
+            domains,
+            contain,
+        }) => egress_cmd::add_feed(db, name, url, domains, contain),
+        Some(Command::RemoveEgressFeed { feed_id }) => egress_cmd::remove_feed(db, feed_id),
+        Some(Command::UpdateEgressFeeds { feed_id, source }) => {
+            egress_cmd::update_feeds(db, feed_id, source).await
+        }
+        Some(Command::ListEgressHits { json }) => egress_cmd::list_hits(db, json),
+        Some(Command::ClearEgressHits { older_than_days }) => {
+            egress_cmd::clear_hits(db, older_than_days)
+        }
+        Some(Command::SetContainment {
+            auto,
+            containers,
+            users,
+            container_action,
+            user_action,
+            never_contain,
+            may_contain,
+            breaker_max,
+            reset_breaker,
+        }) => egress_cmd::set_containment(
+            db,
+            auto,
+            containers,
+            users,
+            container_action,
+            user_action,
+            never_contain,
+            may_contain,
+            breaker_max,
+            reset_breaker,
+        ),
+        Some(Command::Contain {
+            container,
+            user,
+            address,
+            action,
+            reason,
+            dry_run,
+        }) => egress_cmd::contain_by_hand(db, container, user, address, action, reason, dry_run),
+        Some(Command::Release { id, all, dry_run }) => egress_cmd::release(db, id, all, dry_run),
+        Some(Command::ListContainments { all, json }) => {
+            egress_cmd::list_containments(db, all, json)
+        }
+        Some(Command::SetEgressDns { target, sinkhole }) => {
+            egress_cmd::set_dns(db, target, sinkhole)
+        }
+        Some(Command::ApplyEgressDns { dry_run, no_reload }) => {
+            egress_cmd::apply_dns(db, dry_run, no_reload)
+        }
+        Some(Command::SetExploitRules {
+            enabled,
+            site,
+            inherit,
+        }) => waf_cmd::set_exploit_rules(db, enabled, site, inherit),
+        Some(Command::PreviewExploitRules { access_log }) => {
+            waf_cmd::preview_exploit_rules(db, access_log)
+        }
+        Some(Command::SetModsecurity {
+            mode,
+            paranoia,
+            site,
+            inherit,
+        }) => waf_cmd::set_modsecurity(db, mode, paranoia, site, inherit),
+        Some(Command::ListModsecurityFindings {
+            site,
+            audit_log,
+            json,
+        }) => waf_cmd::list_modsecurity_findings(db, site, audit_log, json),
+        Some(Command::ExcludeModsecurityRule {
+            site,
+            rule,
+            path,
+            remove,
+        }) => waf_cmd::exclude_modsecurity_rule(db, site, rule, path, remove),
+        Some(Command::CheckEgress {
+            kernel_log,
+            dry_run,
+        }) => egress_cmd::check(db, kernel_log, dry_run),
+        Some(Command::SetContainerRuntime { program }) => {
+            egress_cmd::set_container_runtime(db, program)
+        }
         Some(Command::GenerateDocs { out }) => {
             use clap::CommandFactory;
             for path in stop_bots::docs::generate(Cli::command(), &out)? {
@@ -2683,6 +2778,15 @@ async fn run_tick(
         for (job, summary) in ran {
             say!("{}: {}", job.label(), terminal_safe(&summary));
         }
+    } else {
+        // Quiet, except for the one thing nobody should learn about from a
+        // dashboard: a call to a C&C server. Cron mails what this prints
+        // when MAILTO is set, so a new hit reaches the operator's inbox.
+        for (job, summary) in ran {
+            if job == stop_bots::cron::CronJob::Egress && summary.starts_with("ALERT: ") {
+                say!("stop-bots: {}", terminal_safe(&summary));
+            }
+        }
     }
     drop(lock);
     Ok(())
@@ -2717,7 +2821,20 @@ fn run_uninstall(
         );
     }
 
-    let plan = Plan::resolve(prefix.as_deref(), db, root.as_deref())?;
+    let plan = Plan::resolve(prefix.as_deref(), db.clone(), root.as_deref())?;
+    // Before the firewall goes: a paused container is unpaused, so that
+    // nothing this contained stays frozen once the tool is gone.
+    let released =
+        if prefix.is_none() && matches!(target, UninstallTarget::All | UninstallTarget::Firewall) {
+            egress_cmd::release_for_uninstall(db, dry_run)
+        } else {
+            Vec::new()
+        };
+    let unsunk = if target == UninstallTarget::All && !dry_run {
+        stop_bots::sinkhole::remove(prefix.as_deref().unwrap_or(Path::new("/")))
+    } else {
+        Ok(Vec::new())
+    };
     let report = uninstall::run(&plan, target.into(), &uninstall::Options { dry_run, purge });
 
     say!(
@@ -2728,6 +2845,17 @@ fn run_uninstall(
             "Uninstalling:"
         }
     );
+    for line in &released {
+        say!("  {}", terminal_safe(line));
+    }
+    match &unsunk {
+        Ok(paths) => {
+            for path in paths {
+                say!("  done     take the C&C sinkhole out of {}", path.display());
+            }
+        }
+        Err(err) => say!("  FAILED   take the C&C sinkhole out: {err:#}"),
+    }
     for step in &report.steps {
         match &step.outcome {
             Outcome::Done => say!("  done     {}", step.what),
@@ -2747,7 +2875,12 @@ fn run_uninstall(
             say!("  {kept}");
         }
     }
-    let failed = report.failures();
+    let failed = report.failures()
+        + usize::from(unsunk.is_err())
+        + released
+            .iter()
+            .filter(|line| line.starts_with("FAILED"))
+            .count();
     if failed > 0 {
         anyhow::bail!(
             "{failed} step(s) failed; every other step was done. Fix what is named above \
@@ -4091,6 +4224,32 @@ fn maintain(db_path: Option<PathBuf>, force_compact: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Runs `f` on a thread with room for clap. It builds every subcommand
+    /// in one function, whose frame in a debug build has outgrown the 2 MB
+    /// a test thread is given; the binary does this on its main thread,
+    /// which has 8, and a release build's frame is a fraction of it.
+    fn on_a_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(16 << 20)
+            .spawn(f)
+            .expect("could not start a thread")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
+    fn cli_command() -> clap::Command {
+        on_a_big_stack(<Cli as clap::CommandFactory>::command)
+    }
+
+    fn parse_cli<I, T>(args: I) -> Result<Cli, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString>,
+    {
+        let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+        on_a_big_stack(move || <Cli as clap::Parser>::try_parse_from(args))
+    }
+
     // ---- `--help` ----
     //
     // Doc comments on `Command` used to slide onto the wrong variant: a
@@ -4099,11 +4258,9 @@ mod tests {
     // `batch`. Nothing failed, because every string was well-formed. These
     // walk the whole command tree instead of spot-checking a few verbs.
 
-    use clap::CommandFactory;
-
     /// Every subcommand, by name, with its clap definition.
     fn subcommands() -> Vec<clap::Command> {
-        Cli::command()
+        cli_command()
             .get_subcommands()
             .filter(|c| c.get_name() != "help")
             .cloned()
@@ -4149,7 +4306,7 @@ mod tests {
     #[test]
     fn every_visible_verb_gets_a_man_page_and_generate_docs_is_not_one() {
         let dir = tempfile::tempdir().unwrap();
-        stop_bots::docs::generate(Cli::command(), dir.path()).unwrap();
+        stop_bots::docs::generate(cli_command(), dir.path()).unwrap();
 
         let page = |name: &str| dir.path().join(format!("man/{name}.1"));
         assert!(page("stop-bots").is_file());
@@ -4158,7 +4315,7 @@ mod tests {
             assert!(page(&name).is_file(), "no man page for `{name}`");
         }
         assert!(!page("stop-bots-generate-docs").exists());
-        let help = Cli::command().render_help().to_string();
+        let help = cli_command().render_help().to_string();
         assert!(!help.contains("generate-docs"), "{help}");
     }
 
@@ -4284,7 +4441,7 @@ mod tests {
     /// only when asked, and a debug build panics on them at startup.
     #[test]
     fn the_command_line_definition_is_consistent() {
-        Cli::command().debug_assert();
+        cli_command().debug_assert();
     }
 
     /// A script reads `status` and every `list-*` the same way, so one
@@ -4317,7 +4474,7 @@ mod tests {
             &["stop-bots", "--db", "/tmp/x.db", "list-trusted"][..],
             &["stop-bots", "list-trusted", "--db", "/tmp/x.db"][..],
         ] {
-            let cli = Cli::try_parse_from(args).unwrap();
+            let cli = parse_cli(args).unwrap();
             assert_eq!(cli.db.as_deref(), Some(Path::new("/tmp/x.db")), "{args:?}");
         }
     }
@@ -4330,7 +4487,7 @@ mod tests {
     /// and says so on stderr; none is advertised in `--help`.
     #[test]
     fn every_deprecated_spelling_is_rewritten_to_its_replacement_and_warns() {
-        let help = Cli::command().render_help().to_string();
+        let help = cli_command().render_help().to_string();
         for (old, flag, new, insert) in DEPRECATED {
             let mut given = vec!["stop-bots", old];
             if !flag.is_empty() {
@@ -4375,11 +4532,11 @@ mod tests {
             ])
         );
         assert!(warning.is_some());
-        let cli = Cli::try_parse_from(rewritten).unwrap();
+        let cli = parse_cli(rewritten).unwrap();
         assert!(matches!(cli.command, Some(Command::RemoveTrusted { .. })));
 
         let (rewritten, _) = undeprecate(args(&["stop-bots", "block-scanners", "--dry-run"]));
-        let cli = Cli::try_parse_from(rewritten).unwrap();
+        let cli = parse_cli(rewritten).unwrap();
         assert!(
             matches!(
                 cli.command,
@@ -4414,7 +4571,7 @@ mod tests {
     fn every_detector_has_a_command_line_name_and_accepts_its_stored_id() {
         for detector in DetectorArg::ALL {
             for spelling in [detector.name(), detector.0.id()] {
-                let cli = Cli::try_parse_from(["stop-bots", "set-detector", spelling]).unwrap();
+                let cli = parse_cli(["stop-bots", "set-detector", spelling]).unwrap();
                 let Some(Command::SetDetector {
                     detector: parsed, ..
                 }) = cli.command

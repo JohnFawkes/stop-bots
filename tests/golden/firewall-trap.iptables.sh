@@ -38,6 +38,12 @@ if iptables -w -L DOCKER-USER -n >/dev/null 2>&1; then
         iptables -w -I DOCKER-USER -j STOP-BOTS
     fi
 fi
+if iptables -w -L STOP-BOTS-OUT -n >/dev/null 2>&1; then
+    iptables -w -F STOP-BOTS-OUT
+fi
+if iptables -w -L STOP-BOTS-EGRESS -n >/dev/null 2>&1; then
+    iptables -w -F STOP-BOTS-EGRESS
+fi
 
 if ip6tables -w -L INPUT -n >/dev/null 2>&1; then
 ip6tables-restore -w --noflush <<'STOP_BOTS_IPV6'
@@ -63,6 +69,12 @@ STOP_BOTS_IPV6
         if ! ip6tables -w -C DOCKER-USER -j STOP-BOTS 2>/dev/null; then
             ip6tables -w -I DOCKER-USER -j STOP-BOTS
         fi
+    fi
+    if ip6tables -w -L STOP-BOTS-OUT -n >/dev/null 2>&1; then
+        ip6tables -w -F STOP-BOTS-OUT
+    fi
+    if ip6tables -w -L STOP-BOTS-EGRESS -n >/dev/null 2>&1; then
+        ip6tables -w -F STOP-BOTS-EGRESS
     fi
 else
     echo "stop-bots: ip6tables cannot be used on this host, so 1 IPv6 rule(s) were not applied" >&2

@@ -542,6 +542,8 @@ pub struct BuiltFirewall {
     /// left once what listens is taken out (see [`crate::portscan`]).
     /// Not rules: it adds no address, and no count above includes it.
     pub trap: Option<crate::portscan::Trap>,
+    /// The outbound section, when there is one (see [`crate::egress`]).
+    pub egress: Option<crate::egress::Egress>,
 }
 
 /// Every rule currently in effect — the Allows that nothing may override
@@ -726,6 +728,17 @@ pub fn rules_signature(rules: &[FirewallRule]) -> String {
 /// [`rules_signature`], so a host that never turns the port-scan detector
 /// on keeps the signatures it has.
 pub fn signature(rules: &[FirewallRule], trap: Option<&crate::portscan::Trap>) -> String {
+    signature_with(rules, trap, None)
+}
+
+/// [`signature`], and the outbound section: with none it is exactly
+/// [`signature`], so a host that never turns outbound checks on keeps the
+/// signatures it has.
+pub fn signature_with(
+    rules: &[FirewallRule],
+    trap: Option<&crate::portscan::Trap>,
+    egress: Option<&crate::egress::Egress>,
+) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -737,6 +750,10 @@ pub fn signature(rules: &[FirewallRule], trap: Option<&crate::portscan::Trap>) -
         // A line no rule can produce: `rendered_fields` starts with
         // `FirewallRule`.
         hasher.update(format!("trap ports {:?}\n", trap.ports).as_bytes());
+    }
+    if let Some(egress) = egress {
+        hasher.update(egress.signature_line().as_bytes());
+        hasher.update(b"\n");
     }
     hasher
         .finalize()
@@ -789,9 +806,10 @@ pub fn needs_render(db: &Db) -> Result<bool> {
 /// The [`signature`] of what a render would write now: every rule, and the
 /// trap. Asks `ss` what listens when the port-scan detector is on.
 pub fn current_signature(db: &Db) -> Result<String> {
-    Ok(signature(
+    Ok(signature_with(
         &all_rules(db)?,
         crate::portscan::for_render(db)?.as_ref(),
+        crate::egress::for_render(db)?.as_ref(),
     ))
 }
 
@@ -824,10 +842,15 @@ pub fn build_script_at(db: &Db, backend: FirewallBackend, now: i64) -> Result<Bu
     let mut rules = all_rules(db)?;
     rules.retain(|rule| rule.expires_at.is_none_or(|at| at > now));
     let trap = crate::portscan::for_render(db)?;
+    let egress = crate::egress::for_render(db)?;
 
     let script = match backend {
-        FirewallBackend::Iptables => iptables::render_with_trap(&rules, trap.as_ref(), now),
-        FirewallBackend::Nftables => nftables::render_with_trap(&rules, trap.as_ref(), now),
+        FirewallBackend::Iptables => {
+            iptables::render_full(&rules, trap.as_ref(), egress.as_ref(), now)
+        }
+        FirewallBackend::Nftables => {
+            nftables::render_full(&rules, trap.as_ref(), egress.as_ref(), now)
+        }
     };
     let written = loaded_entries(&rules, backend, now);
 
@@ -836,6 +859,7 @@ pub fn build_script_at(db: &Db, backend: FirewallBackend, now: i64) -> Result<Bu
         script,
         written,
         trap,
+        egress,
     })
 }
 
@@ -1237,7 +1261,8 @@ impl FirewallRun {
 pub struct Prepared {
     pub run: FirewallRun,
     pub built: BuiltFirewall,
-    /// [`signature`] of `built.rules` and its trap, for [`record`].
+    /// [`signature_with`] of `built.rules`, its trap and its outbound
+    /// section, for [`record`]: what [`current_signature`] compares it with.
     pub signature: String,
     /// Whether to run the lockout check at all: [`Db::get_ssh_lockout_check`].
     pub lockout_check: bool,
@@ -1248,7 +1273,7 @@ pub struct Prepared {
 /// at all (see [`build_script`]).
 pub fn prepare(db: &Db, run: FirewallRun) -> Result<Prepared> {
     let built = build_script(db, run.backend)?;
-    let signature = signature(&built.rules, built.trap.as_ref());
+    let signature = signature_with(&built.rules, built.trap.as_ref(), built.egress.as_ref());
     Ok(Prepared {
         run,
         built,
@@ -3019,6 +3044,22 @@ mod tests {
         db.block_address_permanently("192.0.2.1", crate::db::RuleSource::Tui, None)
             .unwrap();
         assert_eq!(script_state(&db).unwrap(), ScriptState::Changed);
+    }
+
+    /// With outbound checks on, a render records the signature the cron
+    /// compares with. It once left the outbound section out, so every
+    /// host with them on re-rendered and re-applied every five minutes,
+    /// and `status` never said the rules were applied.
+    #[test]
+    fn a_render_with_outbound_checks_on_is_not_due_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run) = blocking_the_admin(dir.path());
+        crate::egress::Mode::Block.set(&db).unwrap();
+
+        let outcome = render_and_apply(&db, run.apply(true), SshLog::Text(None)).unwrap();
+
+        assert_eq!(outcome.write, WriteStep::Written, "{}", outcome.summary());
+        assert!(!needs_render(&db).unwrap(), "{}", outcome.summary());
     }
 
     /// A dry run decides everything and does nothing: no file, no

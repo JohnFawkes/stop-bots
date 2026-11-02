@@ -412,6 +412,7 @@ impl App {
         // repeat every startup — registration never touches an existing
         // row's `enabled` flag.
         crate::ipranges::reputation::register_all_reputation_sources(&app.db)?;
+        crate::egress::register_builtin_feeds(&app.db)?;
         app.dashboard.installed = Some(crate::firewall::Installed::detect());
         let simple = app.db.get_ui_mode()? == crate::db::UiMode::Simple;
         app.dashboard.set_simple(simple);
@@ -1846,6 +1847,13 @@ impl App {
             }
             KeyOutcome::FetchReputationSource(source_id) => {
                 self.start_reputation_fetch(source_id);
+                return Ok(());
+            }
+            KeyOutcome::UpdateEgressFeeds => {
+                self.refresh()?;
+                self.start_cron_job(crate::cron::Task::Job(
+                    crate::cron::CronJob::UpdateEgressFeeds,
+                ))?;
                 return Ok(());
             }
             KeyOutcome::FetchHostingAsns(asns) => {

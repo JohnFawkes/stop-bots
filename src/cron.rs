@@ -116,6 +116,14 @@ pub enum CronJob {
     /// reloads NGINX — but only when the admin has switched
     /// `Db::get_auto_apply` on. See [`apply_nginx`].
     ApplyNginx,
+    /// Reads the outbound attempts the kernel logged, says who made them,
+    /// contains them when that is switched on, and keeps every open
+    /// containment true to what is running. See [`crate::contain`].
+    Egress,
+    /// Downloads the command-and-control feeds that are switched on, and
+    /// rewrites the resolver's sinkhole file when one is chosen. Daily:
+    /// these lists change by the hour. See [`crate::egress`].
+    UpdateEgressFeeds,
 }
 
 impl CronJob {
@@ -125,11 +133,15 @@ impl CronJob {
             .into_iter()
             .chain(Detector::ALL.into_iter().map(CronJob::Detect))
             .chain([
+                // Before the render, so what it contains is in the script
+                // the same pass writes.
+                CronJob::Egress,
                 CronJob::RecordAccessStats,
                 CronJob::RenderFirewall,
                 CronJob::HealthCheck,
                 CronJob::Maintenance,
                 CronJob::ApplyNginx,
+                CronJob::UpdateEgressFeeds,
             ])
             .collect()
     }
@@ -149,6 +161,8 @@ impl CronJob {
             CronJob::HealthCheck => "health_check",
             CronJob::Maintenance => "maintenance",
             CronJob::ApplyNginx => "apply_nginx",
+            CronJob::Egress => "egress",
+            CronJob::UpdateEgressFeeds => "update_egress_feeds",
         }
     }
 
@@ -163,6 +177,8 @@ impl CronJob {
             CronJob::HealthCheck => "Check system health",
             CronJob::Maintenance => "Prune and compact the database",
             CronJob::ApplyNginx => "Auto-apply site configs",
+            CronJob::Egress => "Answer outbound attempts",
+            CronJob::UpdateEgressFeeds => "Update C&C feeds",
         }
     }
 
@@ -176,9 +192,10 @@ impl CronJob {
     /// - `RenderFirewall`: daily — nothing about it is time-sensitive.
     pub fn interval(self) -> Duration {
         match self {
-            CronJob::UpdateIpRanges | CronJob::RenderFirewall | CronJob::Maintenance => {
-                Duration::from_secs(24 * 60 * 60)
-            }
+            CronJob::UpdateIpRanges
+            | CronJob::RenderFirewall
+            | CronJob::Maintenance
+            | CronJob::UpdateEgressFeeds => Duration::from_secs(24 * 60 * 60),
             // Hourly. `nft list` on a large ruleset is megabytes of text,
             // so this is not something to do per render — but a host that
             // silently stopped being protected should not stay that way
@@ -190,7 +207,9 @@ impl CronJob {
             // still being far inside "I turned the switch on and it
             // happened".
             CronJob::HealthCheck | CronJob::ApplyNginx => Duration::from_secs(60 * 60),
-            CronJob::Detect(_) | CronJob::RecordAccessStats => Duration::from_secs(60),
+            CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::Egress => {
+                Duration::from_secs(60)
+            }
             CronJob::UpdateEverything => Duration::from_secs(7 * 24 * 60 * 60),
         }
     }
@@ -418,6 +437,8 @@ pub fn uses_ssh_log(job: CronJob) -> bool {
         CronJob::Detect(detector) => detector.spec().log == crate::protection::DetectorLog::Ssh,
         CronJob::RenderFirewall => true,
         CronJob::RecordAccessStats
+        | CronJob::Egress
+        | CronJob::UpdateEgressFeeds
         | CronJob::UpdateIpRanges
         | CronJob::UpdateEverything
         | CronJob::HealthCheck
@@ -432,7 +453,7 @@ pub fn uses_ssh_log(job: CronJob) -> bool {
 pub fn is_log_job(job: CronJob) -> bool {
     matches!(
         job,
-        CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::RenderFirewall
+        CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::RenderFirewall | CronJob::Egress
     )
 }
 
@@ -464,6 +485,7 @@ pub fn run_log_jobs(
     applied: &crate::logscan::Applied,
     firewall_out: Option<&std::path::Path>,
     apply_for_real: bool,
+    egress: Option<&EgressInputs>,
 ) -> Result<Vec<(CronJob, String)>> {
     let mut summaries = Vec::new();
     for &job in jobs {
@@ -496,7 +518,9 @@ pub fn run_log_jobs(
                 };
                 render_firewall(db, firewall_out, connected.as_deref(), apply_for_real)
             }
-            CronJob::UpdateIpRanges
+            CronJob::Egress => run_egress(db, applied, egress, apply_for_real),
+            CronJob::UpdateEgressFeeds
+            | CronJob::UpdateIpRanges
             | CronJob::UpdateEverything
             | CronJob::HealthCheck
             | CronJob::Maintenance
@@ -805,6 +829,54 @@ fn run_detector(db: &Db, detector: Detector, applied: &crate::logscan::Applied) 
     }
 }
 
+/// What the `Egress` job is given, besides the log pass: the host as it
+/// looked from the slow half, where asking the container runtime belongs,
+/// and the runtime to pause with.
+#[derive(Debug, Clone)]
+pub struct EgressInputs {
+    pub host: crate::contain::Host,
+    pub runtime: Option<crate::contain::Runtime>,
+}
+
+/// The work behind the `Egress` job. Answers what the kernel logged when
+/// it could be read, and keeps the containments true either way: a
+/// container a restart brought back is paused again whether or not the
+/// log could be read this minute.
+fn run_egress(
+    db: &Db,
+    applied: &crate::logscan::Applied,
+    inputs: Option<&EgressInputs>,
+    for_real: bool,
+) -> String {
+    let result: Result<String> = (|| {
+        let mode = crate::egress::Mode::get(db)?;
+        let open = db.open_containments()?.len();
+        if mode == crate::egress::Mode::Off && open == 0 {
+            return Ok("outbound checks are off".to_string());
+        }
+        let firewall = crate::contain::LiveFirewall {
+            backend: crate::firewall::stored_backend(db)?,
+        };
+        let empty = EgressInputs {
+            host: crate::contain::Host::default(),
+            runtime: None,
+        };
+        let inputs = inputs.unwrap_or(&empty);
+        let ctx = crate::contain::Ctx {
+            firewall: &firewall,
+            runtime: inputs.runtime.as_ref(),
+            for_real,
+        };
+        if mode != crate::egress::Mode::Off && !applied.kernel.is_readable() {
+            let mut said = vec!["kernel log unavailable".to_string()];
+            said.extend(crate::contain::maintain(db, &ctx, &inputs.host)?);
+            return Ok(said.join("; "));
+        }
+        Ok(crate::contain::respond(db, &ctx, &inputs.host, applied.now)?.summary())
+    })();
+    result.unwrap_or_else(|err| format!("error: {err:#}"))
+}
+
 /// The work behind the `RenderFirewall` job: renders the current rules for
 /// the stored backend and writes them beside the applied script (see
 /// [`crate::firewall::rendered_path`]) — never over it, so what the boot
@@ -1003,6 +1075,7 @@ enum Slow {
         plan: Box<crate::logscan::Plan>,
         firewall_out: Option<std::path::PathBuf>,
         for_real: bool,
+        egress: Option<EgressLook>,
     },
     CrawlerRanges {
         lease: crate::refresh::Lease,
@@ -1012,6 +1085,20 @@ enum Slow {
         source: crate::refresh::Source,
     },
     Probe(Box<ProbeInputs>),
+    EgressFeeds {
+        lease: crate::refresh::Lease,
+        feeds: Vec<crate::db::egress::EgressFeed>,
+        for_real: bool,
+    },
+}
+
+/// What the `Egress` job's slow half asks of the host.
+#[derive(Debug, Clone)]
+struct EgressLook {
+    runtime: Option<crate::contain::Runtime>,
+    /// Whether to ask the runtime which containers there are: only when a
+    /// hit may need it or a container is contained.
+    containers: bool,
 }
 
 /// A [`Work`] that has run, for [`finish`]. `Clone` because the TUI's
@@ -1026,6 +1113,7 @@ enum Finished {
         read: Box<crate::logscan::Read>,
         firewall_out: Option<std::path::PathBuf>,
         for_real: bool,
+        egress: Option<Box<EgressInputs>>,
     },
     CrawlerRanges {
         lease: crate::refresh::Lease,
@@ -1040,6 +1128,15 @@ enum Finished {
         fetched: std::result::Result<String, String>,
     },
     Probe(Box<crate::health::Probe>),
+    EgressFeeds {
+        lease: crate::refresh::Lease,
+        fetched: Vec<(
+            crate::db::egress::EgressFeed,
+            std::result::Result<String, String>,
+        )>,
+        protected: Vec<crate::egress::Protected>,
+        for_real: bool,
+    },
 }
 
 impl Work {
@@ -1050,6 +1147,7 @@ impl Work {
             Slow::CrawlerRanges { .. } => vec![CronJob::UpdateIpRanges],
             Slow::Download { .. } => vec![CronJob::UpdateEverything],
             Slow::Probe(_) => vec![CronJob::HealthCheck],
+            Slow::EgressFeeds { .. } => vec![CronJob::UpdateEgressFeeds],
         }
     }
 
@@ -1078,6 +1176,7 @@ impl Work {
                 plan,
                 firewall_out,
                 for_real,
+                egress,
             } => Finished::LogPass {
                 jobs,
                 read: Box::new(
@@ -1085,6 +1184,19 @@ impl Work {
                 ),
                 firewall_out,
                 for_real,
+                egress: match egress {
+                    Some(look) => Some(Box::new(
+                        off_thread(move || EgressInputs {
+                            host: crate::contain::Host::look(
+                                look.runtime.as_ref(),
+                                look.containers,
+                            ),
+                            runtime: look.runtime,
+                        })
+                        .await,
+                    )),
+                    None => None,
+                },
             },
             Slow::CrawlerRanges { lease } => Finished::CrawlerRanges {
                 lease,
@@ -1101,6 +1213,40 @@ impl Work {
                 }
             }
             Slow::Probe(inputs) => Finished::Probe(Box::new(off_thread(|| inputs.probe()).await)),
+            Slow::EgressFeeds {
+                lease,
+                feeds,
+                for_real,
+            } => {
+                let mut fetched = Vec::new();
+                for feed in feeds {
+                    let raw = crate::egress::fetch(&feed)
+                        .await
+                        .map_err(|err| format!("{err:#}"));
+                    fetched.push((feed, raw));
+                }
+                let urls: Vec<String> = fetched
+                    .iter()
+                    .flat_map(|(feed, _)| crate::egress::feed_urls(feed))
+                    .collect();
+                // Resolving is the network too.
+                let protected = off_thread(move || {
+                    crate::egress::protected_destinations(
+                        &crate::egress::Surroundings {
+                            root: std::path::Path::new("/"),
+                            resolve: &crate::egress::system_resolve,
+                        },
+                        &urls,
+                    )
+                })
+                .await;
+                Finished::EgressFeeds {
+                    lease,
+                    fetched,
+                    protected,
+                    for_real,
+                }
+            }
         })
     }
 }
@@ -1113,6 +1259,7 @@ impl Done {
             Finished::CrawlerRanges { .. } => vec![CronJob::UpdateIpRanges],
             Finished::Download { .. } => vec![CronJob::UpdateEverything],
             Finished::Probe(_) => vec![CronJob::HealthCheck],
+            Finished::EgressFeeds { .. } => vec![CronJob::UpdateEgressFeeds],
         }
     }
 
@@ -1200,6 +1347,25 @@ pub fn start(db: &Db, task: &Task, settings: &Settings) -> Result<Next> {
             Some(summary) => ran(db, job, summary),
             None => Next::ApplySites,
         },
+        CronJob::Egress => return start_log_pass(db, vec![job], settings),
+        CronJob::UpdateEgressFeeds => {
+            let feeds: Vec<_> = db
+                .list_egress_feeds()?
+                .into_iter()
+                .filter(|feed| feed.enabled)
+                .collect();
+            if feeds.is_empty() {
+                return Ok(ran(db, job, "no C&C feed is switched on".to_string()));
+            }
+            match crate::refresh::claim(db, now())? {
+                crate::refresh::Claim::Busy { .. } => Next::Waiting,
+                crate::refresh::Claim::Granted(lease) => Next::Work(Work(Slow::EgressFeeds {
+                    lease,
+                    feeds,
+                    for_real: settings.for_real,
+                })),
+            }
+        }
     })
 }
 
@@ -1211,11 +1377,24 @@ fn start_log_pass(db: &Db, jobs: Vec<CronJob>, settings: &Settings) -> Result<Ne
         stored: settings.host.log_paths(),
     };
     let plan = crate::logscan::plan(db, &jobs, &flags)?;
+    // Nothing is asked of the host while there is nothing to answer or
+    // keep: no `who`, no `docker ps`, once a minute on every host.
+    let watching = crate::egress::Mode::get(db)? != crate::egress::Mode::Off;
+    let open = db.open_containments()?;
+    let egress =
+        (jobs.contains(&CronJob::Egress) && (watching || !open.is_empty())).then(|| EgressLook {
+            runtime: crate::contain::Runtime::find(settings.host),
+            containers: watching
+                || open
+                    .iter()
+                    .any(|c| c.kind == crate::db::egress::ContainmentKind::Container),
+        });
     Ok(Next::Work(Work(Slow::LogPass {
         jobs,
         plan: Box::new(plan),
         firewall_out: settings.firewall_out.map(std::path::Path::to_path_buf),
         for_real: settings.for_real,
+        egress,
     })))
 }
 
@@ -1246,6 +1425,7 @@ pub fn finish(db: &Db, done: Done) -> Result<Next> {
             read,
             firewall_out,
             for_real,
+            egress,
         } => {
             let applied = crate::logscan::apply(db, *read)?;
             Next::Ran(run_log_jobs(
@@ -1254,7 +1434,25 @@ pub fn finish(db: &Db, done: Done) -> Result<Next> {
                 &applied,
                 firewall_out.as_deref(),
                 for_real,
+                egress.as_deref(),
             )?)
+        }
+        Finished::EgressFeeds {
+            lease,
+            fetched,
+            protected,
+            for_real,
+        } => {
+            let (mut summary, _) = crate::egress::store_fetched(db, &protected, fetched);
+            match crate::sinkhole::apply(db, std::path::Path::new("/"), for_real) {
+                Ok(Some(written)) if for_real => {
+                    summary.push_str(&format!("; {}", written.summary()))
+                }
+                Ok(_) => {}
+                Err(err) => summary.push_str(&format!("; sinkhole: {err:#}")),
+            }
+            crate::refresh::release(db, &lease)?;
+            ran(db, CronJob::UpdateEgressFeeds, summary)
         }
         Finished::CrawlerRanges { lease, results } => {
             let stored = store_ip_ranges(db, results);
@@ -1915,7 +2113,7 @@ mod tests {
             ..Default::default()
         };
         let applied = crate::logscan::run(db, jobs, &flags).unwrap();
-        run_log_jobs(db, jobs, &applied, Some(&dir.join("fw.nft")), false).unwrap()
+        run_log_jobs(db, jobs, &applied, Some(&dir.join("fw.nft")), false, None).unwrap()
     }
 
     /// Recording happens on every pass that reads the SSH log, not in one

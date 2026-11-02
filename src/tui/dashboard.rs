@@ -31,9 +31,8 @@
 //! category defaults), "Geo" (the country list, with the mode in its
 //! title) and "Firewall script" (rule count, whether the script on disk
 //! is stale, and the inputs it is rendered from). The right column is
-//! what the host does on its own — "Automatic blocking", which deals its
-//! rows into as many columns as its own width allows so that all of them
-//! are visible at once, and "Scheduled". The "Log" at the foot spans
+//! what the host does on its own — "Automatic blocking", one row per
+//! switch in a single column, and "Scheduled". The "Log" at the foot spans
 //! both: every message `App` has shown, newest first. On a short terminal
 //! Automatic blocking is the panel that gives (it falls back to
 //! scrolling); Scheduled never vanishes, because it reports what the
@@ -42,10 +41,7 @@
 //! Focus flows *linearly* through the three lists (Categories ->
 //! Countries -> Protection) via Up/Down, and Tab/Shift+Tab step between
 //! them; only the focused one draws a highlight, so there's never
-//! ambiguity about which list the arrows move. Within Automatic blocking
-//! the rows fill one column before starting the next, so a single
-//! selection index still walks them in reading order: Down at the foot of
-//! one column arrives at the head of the next.
+//! ambiguity about which list the arrows move.
 //!
 //! ## The host-wide actions
 //!
@@ -209,7 +205,61 @@ enum ProtectionRow {
     /// rendered script and the kernel. Switching it off asks first — see
     /// [`Popup::NoLogins`].
     LockoutCheck,
+    /// Outbound checks (`egress::Mode`): Off, Watch or Block. Space steps
+    /// through them; Enter chooses in a popup. The C&C feeds and
+    /// containment rows under it appear once it is not Off.
+    Outbound,
+    /// One C&C feed, by index into `Dashboard::egress_feeds`.
+    EgressFeed(usize),
+    /// Whether a hit contains the container that made it
+    /// (`contain::Settings::auto`). Switching it on asks first.
+    AutoContain,
 }
+
+/// The headings the "Automatic blocking" rows are listed under, in order.
+/// Display only: a heading is never selected, and the selection index
+/// walks [`Dashboard::protection_rows`] as it always did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtectionGroup {
+    /// The detectors, and the two switches that change what they do.
+    Detectors,
+    /// Lists of addresses blocked whatever they do: the reputation and
+    /// cloud feeds, and hosting providers by AS number.
+    Addresses,
+    /// Outbound checks, their feeds and containment.
+    Outbound,
+    /// What happens to the script once it is written.
+    Apply,
+}
+
+impl ProtectionGroup {
+    fn heading(self) -> &'static str {
+        match self {
+            ProtectionGroup::Detectors => "Log detectors",
+            ProtectionGroup::Addresses => "Blocked by address",
+            ProtectionGroup::Outbound => "Outbound C&C checks",
+            ProtectionGroup::Apply => "Firewall apply",
+        }
+    }
+
+    fn of(row: ProtectionRow) -> ProtectionGroup {
+        match row {
+            ProtectionRow::Detect(_)
+            | ProtectionRow::RepeatOffenders
+            | ProtectionRow::AppProbePaths => ProtectionGroup::Detectors,
+            ProtectionRow::Feed(_) | ProtectionRow::HostingProviders => ProtectionGroup::Addresses,
+            ProtectionRow::Outbound | ProtectionRow::EgressFeed(_) | ProtectionRow::AutoContain => {
+                ProtectionGroup::Outbound
+            }
+            ProtectionRow::AutoApplyFirewall | ProtectionRow::LockoutCheck => {
+                ProtectionGroup::Apply
+            }
+        }
+    }
+}
+
+/// How far a row is indented under its heading.
+const PROTECTION_INDENT: usize = 2;
 
 impl ProtectionRow {
     /// Whether this row is a detector (whose popup offers Off plus a TTL
@@ -340,6 +390,8 @@ enum Confirm {
     /// The simple screen's "Keep running by itself", switched on: a cron
     /// file written as root, and both auto-applies.
     KeepRunning,
+    /// Containing what calls a C&C server, without asking each time.
+    AutoContain,
 }
 
 #[derive(Debug, Default)]
@@ -401,6 +453,11 @@ pub struct Dashboard {
     /// `Db::get_ssh_lockout_check`, for the `ProtectionRow::LockoutCheck`
     /// row.
     ssh_lockout_check: bool,
+    /// Outbound checks, the C&C feeds, and whether a hit contains: the
+    /// "Automatic blocking" rows for [`crate::egress`].
+    egress_mode: crate::egress::Mode,
+    egress_feeds: Vec<crate::db::egress::EgressFeed>,
+    auto_contain: bool,
     /// Whether this host serves humans only. Drives both the extra
     /// detector row and the greying of the three category rows.
     humans_only: bool,
@@ -438,6 +495,18 @@ pub struct Dashboard {
     /// blocks are from the last day: the simple screen's status line.
     blocked_now: usize,
     blocked_today: usize,
+    /// Outbound checks, when they are on or something is contained: the
+    /// Firewall script panel's third line. See [`crate::egress`].
+    egress: Option<Outbound>,
+}
+
+/// What the Firewall script panel says about outbound traffic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Outbound {
+    mode: crate::egress::Mode,
+    /// Attempts to listed addresses seen in the last week.
+    recent_hits: usize,
+    contained: usize,
 }
 
 impl Dashboard {
@@ -475,6 +544,9 @@ impl Dashboard {
         self.crawlers = ipranges::crawler_sources(db)?;
         self.auto_apply_firewall = db.get_auto_apply_firewall()?;
         self.ssh_lockout_check = db.get_ssh_lockout_check()?;
+        self.egress_mode = crate::egress::Mode::get(db)?;
+        self.egress_feeds = db.list_egress_feeds()?;
+        self.auto_contain = crate::contain::Settings::get(db)?.auto;
         self.cron_status = crate::cron::status(db)?;
         self.script_state = crate::firewall::script_state(db)?;
         self.rule_count = crate::firewall::all_rules(db)?.len();
@@ -485,6 +557,19 @@ impl Dashboard {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
+        let mode = crate::egress::Mode::get(db)?;
+        let contained = db.open_containments()?.len();
+        let recent_hits = db
+            .list_egress_hits()?
+            .iter()
+            .filter(|hit| hit.last_seen > now - 7 * 24 * 60 * 60)
+            .count();
+        self.egress = (mode != crate::egress::Mode::Off || contained > 0 || recent_hits > 0)
+            .then_some(Outbound {
+                mode,
+                recent_hits,
+                contained,
+            });
         let blocking: Vec<crate::db::FirewallRule> = db
             .list_firewall_rules()?
             .into_iter()
@@ -1007,6 +1092,76 @@ impl Dashboard {
                      you reach through your provider's console. stop-bots status warns if \
                      anyone logs in over SSH while it is off.",
                 ),
+            ProtectionRow::Outbound => Explanation::new(label)
+                .para(
+                    "Checks connections this host and its containers start, to the \
+                     command-and-control servers the feeds below list. A connection to one \
+                     means something here is probably compromised. Watch logs it and lets it \
+                     through; Block logs it and drops it. Each one is read back every minute, \
+                     with the user or container that made it.",
+                )
+                .now(format!("{}.", self.egress_mode.describe()))
+                .para(
+                    "Whatever would cut this host off is left out of every feed: private and \
+                     reserved ranges, its resolvers, apt mirrors, Let's Encrypt and the feeds' \
+                     own servers. Trusted addresses are never stopped.",
+                )
+                .para(
+                    "Space steps through Off, Watch and Block; Enter chooses. The feeds \
+                     (Feodo Tracker is the one to start with) and containment are listed under \
+                     it once it is on.",
+                )
+                .takes_effect(self.auto_apply_firewall),
+            ProtectionRow::EgressFeed(i) => {
+                let Some(feed) = self.egress_feeds.get(i) else {
+                    return Explanation::new(label);
+                };
+                let about = crate::egress::FeedKind::from_id(&feed.id)
+                    .filter(|_| feed.builtin)
+                    .map(|k| k.about().to_string())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "Added by URL, from {}.",
+                            crate::egress::masked_url(&feed.url)
+                        )
+                    });
+                Explanation::new(label)
+                    .para(about)
+                    .now(match (feed.enabled, feed.last_fetched_at) {
+                        (false, _) => "off.".to_string(),
+                        (true, None) => {
+                            "on, but not downloaded yet, so it checks nothing.".to_string()
+                        }
+                        (true, Some(at)) => format!(
+                            "on, {} entries, downloaded {}{}.",
+                            feed.entry_count,
+                            crate::present::ago(at),
+                            if feed.contain {
+                                ", and a hit on it may contain"
+                            } else {
+                                ""
+                            }
+                        ),
+                    })
+                    .para("Space switches it. It is downloaded again every day.")
+                    .takes_effect(self.auto_apply_firewall)
+            }
+            ProtectionRow::AutoContain => Explanation::new(label)
+                .para(
+                    "Cuts off and pauses a container that calls a C&C server, within the \
+                     minute, in Block mode only, and only for a feed allowed to contain. A \
+                     breaker stops it after three in an hour. Root, a user logged in now and \
+                     anything on the never-contain list are never contained.",
+                )
+                .now(if self.auto_contain {
+                    "on: containers are contained automatically."
+                } else {
+                    "off: hits are reported, nothing is contained."
+                })
+                .para(
+                    "Users on the host, other actions and the never-contain list are set with \
+                     `stop-bots set-containment`; `stop-bots release` lets one go.",
+                ),
         }
     }
 
@@ -1073,9 +1228,8 @@ impl Dashboard {
         // message can come from either side.
         //
         // Automatic blocking has the right column to itself because it is
-        // the panel that grows: a row per detector and feed, one column of
-        // them at 100 columns wide. On a terminal too short for every row it
-        // scrolls. Scheduled tasks holds `Min(3)` on the left, beside the
+        // the panel that grows: a row per detector and feed, in one column.
+        // On a terminal too short for every row it scrolls. Scheduled tasks holds `Min(3)` on the left, beside the
         // script it runs, so it never vanishes: it is the panel reporting
         // what the detectors just did.
         let [columns_area, log_area] =
@@ -1089,15 +1243,16 @@ impl Dashboard {
                 Constraint::Length(POLICY_ROWS as u16 + 2),
                 Constraint::Min(4),
                 Constraint::Length(ipranges::IpRangeSourceKind::ALL.len() as u16 + 2),
-                Constraint::Length(4),
+                Constraint::Length(if self.egress.is_some() { 5 } else { 4 }),
                 Constraint::Min(3),
             ])
             .areas(left);
-        // Measured once for both the height it needs and the drawing:
-        // the same width goes into both, and measuring means formatting
-        // every row's label.
-        let (label_width, columns) = self.protection_columns(right.width);
-        let protection_height = self.protection_panel_height(columns);
+        let label_width = self.protection_label_width();
+        let rows = self.protection_rows();
+        let mut headings: Vec<ProtectionGroup> =
+            rows.iter().map(|r| ProtectionGroup::of(*r)).collect();
+        headings.dedup();
+        let protection_height = (rows.len() + headings.len()) as u16 + 2;
         let [protection_area, _] =
             Layout::vertical([Constraint::Max(protection_height), Constraint::Min(0)]).areas(right);
 
@@ -1105,7 +1260,7 @@ impl Dashboard {
         self.render_geo(frame, geo_area, theme);
         self.render_crawlers(frame, crawlers_area, theme);
         self.render_firewall(frame, firewall_area, theme);
-        self.render_protection(frame, protection_area, theme, label_width, columns);
+        self.render_protection(frame, protection_area, theme, label_width);
         self.render_cron(frame, cron_area, theme, running_jobs);
         self.render_log(frame, log_area, theme, log);
 
@@ -1204,90 +1359,47 @@ impl Dashboard {
         ])
     }
 
-    /// How wide one column of Automatic blocking rows has to be, and how
-    /// many of them fit in `width`.
-    ///
-    /// Measured from the rows actually on screen rather than fixed, so a
-    /// detector with a longer label than any of today's widens its column
-    /// instead of being cut off. At least one column, so a terminal too
-    /// narrow for even that scrolls rather than dividing by zero. The
-    /// selection column ([`crate::tui::select_in`] reserves one cell) is
-    /// counted in, or the last character of every row would be clipped.
-    fn protection_columns(&self, width: u16) -> (u16, u16) {
-        let rows = self.protection_rows();
-        let widest = |f: fn(&Self, ProtectionRow) -> String| {
-            rows.iter()
-                .map(|row| f(self, *row).chars().count() as u16)
-                .max()
-                .unwrap_or(0)
-        };
-        let label_width = widest(Self::protection_label);
-        let column_width = 1 + label_width + PROTECTION_TAG_WIDTH + widest(Self::protection_detail);
-        let columns =
-            (width.saturating_sub(2) / column_width.max(1)).clamp(1, rows.len().max(1) as u16);
-        (label_width, columns)
+    /// How wide the widest row label is, so every tag lines up beneath
+    /// the one above it. Measured from the rows on screen rather than
+    /// fixed, so a longer label widens the column instead of being cut off.
+    fn protection_label_width(&self) -> u16 {
+        self.protection_rows()
+            .iter()
+            .map(|row| self.protection_label(*row).chars().count() as u16)
+            .max()
+            .unwrap_or(0)
     }
 
-    /// How tall the Automatic blocking panel wants to be once dealt into
-    /// `columns`: two border lines plus however many rows survive.
-    fn protection_panel_height(&self, columns: u16) -> u16 {
-        (self.protection_rows().len() as u16).div_ceil(columns) + 2
-    }
-
-    /// Draws the rows in as many columns as the width allows, so all of
-    /// them are visible at once instead of five of fourteen.
-    ///
-    /// One `List` per column, filled top to bottom and then left to right,
-    /// so the single selection index the key handler moves still walks
-    /// them in reading order: Down at the foot of one column arrives at the
-    /// head of the next. Only the column holding the selection draws a
-    /// highlight, and it draws it at the row's index *within that column*.
-    fn render_protection(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        theme: Theme,
-        label_width: u16,
-        columns: u16,
-    ) {
-        let rows = self.protection_rows();
-        let per_column = (rows.len() as u16).div_ceil(columns) as usize;
-
-        // The block is drawn once, around the lot; the columns are laid
-        // out inside it. Rendering a bordered block per column would put a
-        // line between every pair of them.
+    /// Draws the rows in one column. It used to deal them into as many
+    /// columns as the width allowed; one reads better, and on a terminal
+    /// too short for every row the list scrolls to the selection.
+    fn render_protection(&mut self, frame: &mut Frame, area: Rect, theme: Theme, label_width: u16) {
         let focused = self.focus == Focus::Protection;
-        let block = crate::tui::panel("Automatic blocking", focused, theme);
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        let column_areas = Layout::horizontal(std::iter::repeat_n(
-            Constraint::Ratio(1, u32::from(columns)),
-            columns as usize,
-        ))
-        .split(inner);
-
-        let selected = self.protection_state.selected();
-        for (column, column_area) in column_areas.iter().enumerate() {
-            let first = column * per_column;
-            let Some(chunk) = rows.get(first..(first + per_column).min(rows.len())) else {
-                continue;
-            };
-            let items: Vec<ListItem> = chunk
-                .iter()
-                .map(|row| ListItem::new(self.protection_row_line(*row, label_width as usize)))
-                .collect();
-            // `Some(index)` only for the column the selection is in;
-            // `None` everywhere else, so exactly one row is highlighted.
-            let mut state = ListState::default();
-            let in_column = selected
-                .filter(|i| (first..first + chunk.len()).contains(i))
-                .map(|i| i - first);
-            state.select(in_column);
-            let list =
-                crate::tui::select_in(List::new(items), focused && in_column.is_some(), theme);
-            frame.render_stateful_widget(list, *column_area, &mut state);
+        let mut items: Vec<ListItem> = Vec::new();
+        let mut selected_line = None;
+        let mut group = None;
+        for (index, row) in self.protection_rows().into_iter().enumerate() {
+            let this = ProtectionGroup::of(row);
+            if group != Some(this) {
+                group = Some(this);
+                items.push(ListItem::new(Line::from(this.heading().bold())));
+            }
+            if self.protection_state.selected() == Some(index) {
+                selected_line = Some(items.len());
+            }
+            items.push(ListItem::new(
+                self.protection_row_line(row, label_width as usize),
+            ));
         }
+        // The headings are lines of their own, so the list is drawn with
+        // the selection moved to the line its row landed on.
+        let mut state = ListState::default().with_selected(selected_line);
+        let list = crate::tui::select_in(
+            List::new(items).block(crate::tui::panel("Automatic blocking", focused, theme)),
+            focused,
+            theme,
+        );
+        frame.render_stateful_widget(list, area, &mut state);
     }
 
     /// What the rules become: the script, and whether the one on disk is
@@ -1331,11 +1443,27 @@ impl Dashboard {
             )
             .into(),
         ]);
-        let panel = Paragraph::new(vec![script, inputs]).block(crate::tui::panel(
-            "Firewall script",
-            false,
-            theme,
-        ));
+        let mut lines = vec![script, inputs];
+        if let Some(outbound) = &self.egress {
+            let mut line = vec![
+                " outbound ".into(),
+                outbound.mode.as_str().to_string().bold(),
+            ];
+            if outbound.contained > 0 {
+                line.push("  \u{00b7}  ".fg(theme.dim()));
+                line.push(format!("{} contained", outbound.contained).yellow());
+            }
+            if outbound.recent_hits > 0 {
+                line.push("  ".into());
+                line.push(
+                    format!("[ {} C&C HIT(S) ]", outbound.recent_hits)
+                        .red()
+                        .bold(),
+                );
+            }
+            lines.push(Line::from(line));
+        }
+        let panel = Paragraph::new(lines).block(crate::tui::panel("Firewall script", false, theme));
         frame.render_widget(panel, area);
     }
 
@@ -1461,8 +1589,16 @@ impl Dashboard {
             .map(ProtectionRow::Detect)
             .chain([ProtectionRow::RepeatOffenders, ProtectionRow::AppProbePaths])
             .chain((0..self.reputation.len()).map(ProtectionRow::Feed))
+            .chain([ProtectionRow::HostingProviders, ProtectionRow::Outbound])
+            // Only once outbound checks are on: until then a feed would
+            // check nothing.
+            .chain(
+                (0..self.egress_feeds.len())
+                    .map(ProtectionRow::EgressFeed)
+                    .chain([ProtectionRow::AutoContain])
+                    .filter(|_| self.egress_mode != crate::egress::Mode::Off),
+            )
             .chain([
-                ProtectionRow::HostingProviders,
                 ProtectionRow::AutoApplyFirewall,
                 ProtectionRow::LockoutCheck,
             ])
@@ -1482,6 +1618,13 @@ impl Dashboard {
             ProtectionRow::AppProbePaths => "Probes for absent apps".to_string(),
             ProtectionRow::AutoApplyFirewall => "Auto-apply the script".to_string(),
             ProtectionRow::LockoutCheck => "SSH lock-out check".to_string(),
+            ProtectionRow::Outbound => "Checks".to_string(),
+            ProtectionRow::EgressFeed(i) => self
+                .egress_feeds
+                .get(i)
+                .map(|f| f.name.clone())
+                .unwrap_or_default(),
+            ProtectionRow::AutoContain => "Contain on a hit".to_string(),
         }
     }
 
@@ -1498,6 +1641,9 @@ impl Dashboard {
             ProtectionRow::AppProbePaths => self.app_probe_paths,
             ProtectionRow::AutoApplyFirewall => self.auto_apply_firewall,
             ProtectionRow::LockoutCheck => self.ssh_lockout_check,
+            ProtectionRow::Outbound => self.egress_mode != crate::egress::Mode::Off,
+            ProtectionRow::EgressFeed(i) => self.egress_feeds.get(i).is_some_and(|f| f.enabled),
+            ProtectionRow::AutoContain => self.auto_contain,
         }
     }
 
@@ -1527,13 +1673,16 @@ impl Dashboard {
             | ProtectionRow::RepeatOffenders
             | ProtectionRow::AppProbePaths
             | ProtectionRow::AutoApplyFirewall
-            | ProtectionRow::LockoutCheck => 0,
+            | ProtectionRow::LockoutCheck
+            | ProtectionRow::Outbound
+            | ProtectionRow::EgressFeed(_)
+            | ProtectionRow::AutoContain => 0,
         }
     }
 
     /// What follows a row's tag: a feed's range count (or that it has none
     /// yet), or an enabled detector's TTL. Its own method so
-    /// [`Self::protection_columns`] can measure it.
+    /// [`Self::protection_label_width`]'s rows can line up.
     fn protection_detail(&self, row: ProtectionRow) -> String {
         match row {
             ProtectionRow::Feed(i) => match self.reputation.get(i) {
@@ -1559,6 +1708,24 @@ impl Dashboard {
             // No TTL and no count — the state is the whole story, and the
             // tag already carries it.
             ProtectionRow::AutoApplyFirewall | ProtectionRow::LockoutCheck => String::new(),
+            // How many feeds, the one thing the tag cannot say, and that
+            // a hit contains.
+            ProtectionRow::Outbound if self.egress_mode == crate::egress::Mode::Off => {
+                String::new()
+            }
+            ProtectionRow::Outbound => {
+                if self.egress_feeds.iter().any(|f| f.enabled) {
+                    String::new()
+                } else {
+                    " no feed on".to_string()
+                }
+            }
+            ProtectionRow::AutoContain => String::new(),
+            ProtectionRow::EgressFeed(i) => match self.egress_feeds.get(i) {
+                Some(f) if f.last_fetched_at.is_none() => " not fetched".to_string(),
+                Some(f) => format!(" {}", f.entry_count),
+                None => String::new(),
+            },
             _ if self.protection_is_new(row) => " new".to_string(),
             // How much longer, at most: the whole rule is in the message
             // switching it on leaves.
@@ -1579,15 +1746,19 @@ impl Dashboard {
         // would read as the opposite of what it says. Same
         // theme-independent green as `policy_tag`'s allowed state, so the
         // two still look like one system.
-        let tag = if enabled {
-            Span::from("[ ON  ]").green()
-        } else {
-            Span::from("[ OFF ]").dim()
+        let tag = match (row, self.egress_mode) {
+            // Three states, so the tag says which.
+            (ProtectionRow::Outbound, crate::egress::Mode::Watch) => Span::from("[WATCH]").yellow(),
+            (ProtectionRow::Outbound, crate::egress::Mode::Block) => Span::from("[BLOCK]").green(),
+            _ if enabled => Span::from("[ ON  ]").green(),
+            _ => Span::from("[ OFF ]").dim(),
         };
         Line::from(vec![
             Span::from(format!(
-                "{:<label_width$} ",
+                "{:indent$}{:<label_width$} ",
+                "",
                 self.protection_label(row),
+                indent = PROTECTION_INDENT,
                 label_width = label_width
             )),
             tag,
@@ -1626,7 +1797,7 @@ impl Dashboard {
                 frame,
                 area,
                 &self.protection_label(row),
-                &protection_options(row.is_detector()),
+                &protection_options(row),
                 selected,
                 theme,
             ),
@@ -1997,6 +2168,10 @@ impl Dashboard {
             self.open_hosting_providers_popup();
             return Ok(KeyOutcome::Consumed);
         }
+        if row == ProtectionRow::Outbound {
+            self.cycle_outbound(db, message)?;
+            return Ok(KeyOutcome::Mutated);
+        }
         let selected = if self.protection_enabled(row) {
             0
         } else if !row.is_detector() {
@@ -2031,6 +2206,14 @@ impl Dashboard {
             self.open_hosting_providers_popup();
             return;
         }
+        if row == ProtectionRow::Outbound {
+            let selected = crate::egress::Mode::ALL
+                .iter()
+                .position(|mode| *mode == self.egress_mode)
+                .unwrap_or(0);
+            self.popup = Some(Popup::Protection { row, selected });
+            return;
+        }
         let selected = if !self.protection_enabled(row) {
             0
         } else if !row.is_detector() {
@@ -2062,6 +2245,37 @@ impl Dashboard {
         if let ProtectionRow::Feed(i) = row {
             return self.commit_feed(db, i, selected == 1, message);
         }
+        if row == ProtectionRow::Outbound {
+            let mode = crate::egress::Mode::ALL
+                .get(selected)
+                .copied()
+                .unwrap_or_default();
+            while self.egress_mode != mode {
+                self.cycle_outbound(db, message)?;
+            }
+            return Ok(KeyOutcome::Mutated);
+        }
+        if let ProtectionRow::EgressFeed(i) = row {
+            if self.protection_enabled(row) == (selected == 1) {
+                return Ok(KeyOutcome::Consumed);
+            }
+            return Ok(if self.toggle_egress_feed(db, i, message)? {
+                KeyOutcome::UpdateEgressFeeds
+            } else {
+                KeyOutcome::Mutated
+            });
+        }
+        if row == ProtectionRow::AutoContain {
+            if selected == 1 && !self.auto_contain {
+                self.popup = Some(Popup::Confirm {
+                    what: Confirm::AutoContain,
+                    selected: 0,
+                });
+                return Ok(KeyOutcome::Consumed);
+            }
+            return self.commit_auto_contain(db, selected == 1, message);
+        }
+
         if row == ProtectionRow::LockoutCheck {
             if selected == 0 {
                 // Off only once asked: see `Popup::NoLogins`.
@@ -2214,6 +2428,97 @@ impl Dashboard {
             "{} on{note} ({} range(s)) — apply (a) to enforce them{warning}",
             source.name, source.range_count
         ));
+        Ok(KeyOutcome::Mutated)
+    }
+
+    /// The next mode after the current one, Off -> Watch -> Block -> Off,
+    /// and what it takes to enforce: the rules reach the kernel on the
+    /// next apply, and check nothing until a feed is on.
+    fn cycle_outbound(&mut self, db: &Db, message: &mut Option<String>) -> Result<()> {
+        let mode = match self.egress_mode {
+            crate::egress::Mode::Off => crate::egress::Mode::Watch,
+            crate::egress::Mode::Watch => crate::egress::Mode::Block,
+            crate::egress::Mode::Block => crate::egress::Mode::Off,
+        };
+        mode.set(db)?;
+        self.egress_mode = mode;
+        let any_feed = self
+            .egress_feeds
+            .iter()
+            .any(|f| f.enabled && f.kind == crate::egress::EntryKind::Ip);
+        *message = Some(match mode {
+            crate::egress::Mode::Off => {
+                "Outbound checks off \u{2014} apply (a) to take them out of the firewall"
+                    .to_string()
+            }
+            _ if !any_feed => format!(
+                "Outbound checks: {} \u{2014} tick a C&C feed, then apply (a)",
+                mode.as_str()
+            ),
+            _ => format!(
+                "Outbound checks: {} \u{2014} apply (a) to load them",
+                mode.as_str()
+            ),
+        });
+        Ok(())
+    }
+
+    /// Switches C&C feed `index`, and says whether it needs a first
+    /// download, which `App` runs once the popup closes
+    /// (`KeyOutcome::UpdateEgressFeeds`), for the reason
+    /// [`Self::commit_feed`] gives.
+    fn toggle_egress_feed(
+        &mut self,
+        db: &Db,
+        index: usize,
+        message: &mut Option<String>,
+    ) -> Result<bool> {
+        let Some(feed) = self.egress_feeds.get_mut(index) else {
+            return Ok(false);
+        };
+        feed.enabled = !feed.enabled;
+        db.set_egress_feed_enabled(&feed.id, feed.enabled)?;
+        let feed = feed.clone();
+        if !feed.enabled {
+            *message = Some(format!(
+                "{} off \u{2014} apply (a) to stop checking it",
+                feed.name
+            ));
+            return Ok(false);
+        }
+        let resolver = if feed.kind == crate::egress::EntryKind::Domain {
+            " Domains reach the resolver once `stop-bots set-egress-dns` chooses one."
+        } else {
+            ""
+        };
+        if feed.last_fetched_at.is_none() {
+            *message = Some(format!("{} on, fetching\u{2026}{resolver}", feed.name));
+            return Ok(true);
+        }
+        *message = Some(format!(
+            "{} on ({} entries) \u{2014} apply (a) to check them.{resolver}",
+            feed.name, feed.entry_count
+        ));
+        Ok(false)
+    }
+
+    fn commit_auto_contain(
+        &mut self,
+        db: &Db,
+        on: bool,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        db.set_bool_setting(crate::db::keys::EGRESS_AUTO_CONTAIN, on)?;
+        self.auto_contain = on;
+        *message = Some(if !on {
+            "Containment off \u{2014} a hit is reported, and nothing is contained".to_string()
+        } else if self.egress_mode != crate::egress::Mode::Block {
+            "Containment on \u{2014} it acts in Block mode only, and this host is watching"
+                .to_string()
+        } else {
+            "Containment on \u{2014} a container that calls a C&C server is cut off and paused"
+                .to_string()
+        });
         Ok(KeyOutcome::Mutated)
     }
 
@@ -2521,7 +2826,7 @@ impl Dashboard {
                 Ok(KeyOutcome::Consumed)
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                let last = protection_options(row.is_detector()).len() - 1;
+                let last = protection_options(*row).len() - 1;
                 *selected = (*selected + 1).min(last);
                 Ok(KeyOutcome::Consumed)
             }
@@ -2724,6 +3029,7 @@ impl Dashboard {
                     }
                     Confirm::HumansOnly => self.commit_humans_only(db, true, message),
                     Confirm::KeepRunning => Ok(KeyOutcome::KeepRunning(true)),
+                    Confirm::AutoContain => self.commit_auto_contain(db, true, message),
                 };
             }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char(' ') => {
@@ -2827,6 +3133,24 @@ impl Dashboard {
                 [
                     "Turn auto-apply on".to_string(),
                     "Keep applying by hand".to_string(),
+                ],
+            ),
+            Confirm::AutoContain => (
+                "Contain what calls a C&C server?".to_string(),
+                vec![
+                    "When a container connects to an address a feed allowed to contain lists \
+                     (Feodo Tracker's, by default), it is cut off from the network both ways \
+                     and paused, within the minute. Only in Block mode."
+                        .into(),
+                    "".into(),
+                    "More than three in an hour, or one address reached from several at once, \
+                     trips a breaker instead. `stop-bots release` lets one go; users on the host \
+                     are contained only with `stop-bots set-containment --users true`."
+                        .into(),
+                ],
+                [
+                    "Contain automatically".to_string(),
+                    "Only report hits".to_string(),
                 ],
             ),
             Confirm::HumansOnly => (
@@ -3267,8 +3591,18 @@ pub(crate) fn render_option_list(
 /// the key handler can never disagree about how many rows there are or what
 /// index means what — the same reason NGINX has its own
 /// `setting_options`.
-fn protection_options(is_detector: bool) -> Vec<String> {
-    if !is_detector {
+fn protection_options(row: ProtectionRow) -> Vec<String> {
+    if row == ProtectionRow::Outbound {
+        return crate::egress::Mode::ALL
+            .into_iter()
+            .map(|mode| match mode {
+                crate::egress::Mode::Off => "Off".to_string(),
+                crate::egress::Mode::Watch => "Watch \u{2014} log, and let through".to_string(),
+                crate::egress::Mode::Block => "Block \u{2014} log, and drop".to_string(),
+            })
+            .collect();
+    }
+    if !row.is_detector() {
         // A feed has no TTL to choose: its blocks are derived fresh from
         // the stored ranges every time the firewall is rendered, so there
         // is nothing that expires.
@@ -3501,12 +3835,9 @@ fn widest_line(lines: &[Line<'_>]) -> u16 {
         .unwrap_or(0)
 }
 
-/// The `[ ON  ]`/`[ OFF ]` tag, plus the gutter either side of it.
 /// The Log panel: two border lines and two messages. The newest is the
 /// one that matters; the one before it is context.
 const LOG_HEIGHT: u16 = 4;
-
-const PROTECTION_TAG_WIDTH: u16 = 9;
 
 fn cron_status_line(status: &crate::cron::JobStatus, running: bool, theme: Theme) -> Line<'static> {
     let last_run = match status.last_run {
@@ -3761,6 +4092,59 @@ mod tests {
             "content was:\n{content}"
         );
         assert!(content.contains("1 site(s)"), "content was:\n{content}");
+    }
+
+    /// A call to a C&C server is the one thing on this screen that means
+    /// the host is already compromised, so it is said in the panel beside
+    /// the firewall it got past, not only in the status strip.
+    #[test]
+    fn a_c_and_c_hit_is_shown_beside_the_firewall_script() {
+        let db = Db::open_in_memory().unwrap();
+        crate::egress::Mode::Block.set(&db).unwrap();
+        let now = crate::testing::now_secs();
+        db.upsert_egress_hits(&[crate::db::egress::NewEgressHit {
+            path: crate::egress::Path::Forward,
+            source: "172.18.0.5".to_string(),
+            destination: "198.51.100.7".to_string(),
+            port: Some(443),
+            protocol: "TCP".to_string(),
+            uid: None,
+            count: 1,
+            first_seen: now,
+            last_seen: now,
+            evidence: "a line".to_string(),
+        }])
+        .unwrap();
+
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        let mut terminal = test_terminal();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &[],
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            content.contains("outbound block"),
+            "content was:\n{content}"
+        );
+        assert!(
+            content.contains("[ 1 C&C HIT(S) ]"),
+            "content was:\n{content}"
+        );
     }
 
     #[test]
@@ -5646,9 +6030,9 @@ mod tests {
             rows.len(),
             // ...plus `RepeatOffenders` and `AppProbePaths`, between the
             // detectors and the feeds, and the `HostingProviders`,
-            // `AutoApplyFirewall` and `LockoutCheck` rows, which sit after
-            // the feeds. None of the five is a detector.
-            detectors + ReputationSourceKind::ALL.len() + 5
+            // `Outbound`, `AutoApplyFirewall` and `LockoutCheck` rows, which
+            // sit after the feeds. None of the six is a detector.
+            detectors + ReputationSourceKind::ALL.len() + 6
         );
         assert_eq!(rows[detectors], ProtectionRow::RepeatOffenders);
         assert_eq!(rows[detectors + 1], ProtectionRow::AppProbePaths);
@@ -5678,6 +6062,186 @@ mod tests {
                 .contains(&ProtectionRow::Detect(Detector::RobotsTxt)),
             "the row is missing with the mode on"
         );
+    }
+
+    /// A Dashboard with the Automatic blocking panel focused on `row`.
+    fn focused_on(db: &Db, row: ProtectionRow) -> Dashboard {
+        crate::egress::register_builtin_feeds(db).unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(db).unwrap();
+        focus_protection(&mut dashboard, db);
+        let index = dashboard
+            .protection_rows()
+            .iter()
+            .position(|r| *r == row)
+            .unwrap_or_else(|| panic!("no {row:?} row"));
+        dashboard.protection_state.select(Some(index));
+        dashboard
+    }
+
+    fn feodo(db: &Db) -> ProtectionRow {
+        crate::egress::register_builtin_feeds(db).unwrap();
+        ProtectionRow::EgressFeed(
+            db.list_egress_feeds()
+                .unwrap()
+                .iter()
+                .position(|f| f.id == "feodo")
+                .unwrap(),
+        )
+    }
+
+    /// Everything a frame drew, row by row.
+    fn screen(dashboard: &mut Dashboard, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(100, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &[],
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn space_on_outbound_checks_steps_through_the_modes() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = focused_on(&db, ProtectionRow::Outbound);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            press(&mut dashboard, &db, KeyCode::Char(' '));
+            seen.push(crate::egress::Mode::get(&db).unwrap());
+        }
+        use crate::egress::Mode;
+        assert_eq!(seen, [Mode::Watch, Mode::Block, Mode::Off]);
+    }
+
+    /// Until outbound checks are on, a feed would check nothing.
+    #[test]
+    fn the_c2_feeds_are_listed_once_outbound_checks_are_on() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = focused_on(&db, ProtectionRow::Outbound);
+        let listed = |d: &Dashboard| {
+            d.protection_rows()
+                .iter()
+                .filter(|r| matches!(r, ProtectionRow::EgressFeed(_) | ProtectionRow::AutoContain))
+                .count()
+        };
+        assert_eq!(listed(&dashboard), 0);
+        press(&mut dashboard, &db, KeyCode::Char(' '));
+        dashboard.refresh(&db).unwrap();
+        assert_eq!(listed(&dashboard), crate::egress::FeedKind::ALL.len() + 1);
+    }
+
+    #[test]
+    fn switching_on_an_unfetched_c2_feed_asks_for_the_feed_job() {
+        let db = Db::open_in_memory().unwrap();
+        crate::egress::Mode::Watch.set(&db).unwrap();
+        let row = feodo(&db);
+        let mut dashboard = focused_on(&db, row);
+        assert_eq!(
+            press(&mut dashboard, &db, KeyCode::Char(' ')),
+            KeyOutcome::UpdateEgressFeeds
+        );
+        assert!(db.get_egress_feed("feodo").unwrap().unwrap().enabled);
+    }
+
+    /// Containing a container is a bigger step than reporting a hit.
+    #[test]
+    fn automatic_containment_is_switched_on_only_once_confirmed() {
+        let db = Db::open_in_memory().unwrap();
+        crate::egress::Mode::Block.set(&db).unwrap();
+        let mut dashboard = focused_on(&db, ProtectionRow::AutoContain);
+        press(&mut dashboard, &db, KeyCode::Char(' '));
+        assert!(
+            !crate::contain::Settings::get(&db).unwrap().auto,
+            "on before confirming"
+        );
+        press(&mut dashboard, &db, KeyCode::Enter);
+        assert!(
+            crate::contain::Settings::get(&db).unwrap().auto,
+            "still off after confirming"
+        );
+    }
+
+    /// Each row is drawn indented under its group's heading, in order.
+    #[test]
+    fn the_rows_are_listed_under_their_headings() {
+        let db = Db::open_in_memory().unwrap();
+        crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
+        crate::egress::Mode::Watch.set(&db).unwrap();
+        let mut dashboard = focused_on(&db, ProtectionRow::Outbound);
+        let lines = screen(&mut dashboard, 48);
+        let line_of = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle:?} in:\n{}", lines.join("\n")))
+        };
+        let order = [
+            "Log detectors",
+            "  SSH scanners",
+            "Blocked by address",
+            "  FireHOL level 1",
+            "Outbound C&C checks",
+            "  Checks",
+            "  abuse.ch Feodo Tracker",
+            "  Contain on a hit",
+            "Firewall apply",
+            "  SSH lock-out check",
+        ];
+        let at: Vec<usize> = order.iter().map(|needle| line_of(needle)).collect();
+        assert!(
+            at.windows(2).all(|pair| pair[0] < pair[1]),
+            "out of order: {:?}\n{}",
+            order.iter().zip(&at).collect::<Vec<_>>(),
+            lines.join("\n")
+        );
+    }
+
+    /// A heading is a line of its own, never a row: the highlight lands
+    /// on the row selected, below the heading it sits under.
+    #[test]
+    fn a_heading_is_never_highlighted() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = focused_on(&db, ProtectionRow::Outbound);
+        let mut terminal = test_terminal();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &[],
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let highlighted: Vec<String> = (0..buffer.area.height)
+            .filter(|&y| {
+                (0..buffer.area.width)
+                    .any(|x| buffer[(x, y)].style().bg == Some(Theme::Dark.selection_bg()))
+            })
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(highlighted.len(), 1, "{highlighted:?}");
+        assert!(highlighted[0].contains("  Checks"), "{highlighted:?}");
     }
 
     /// Enabling a never-fetched feed must ask `App` to download it —
@@ -5739,8 +6303,8 @@ mod tests {
     /// A feed's popup has no TTL rows — there's nothing that expires.
     #[test]
     fn a_feed_popup_offers_only_off_and_on() {
-        assert_eq!(protection_options(false).len(), 2);
-        assert!(protection_options(true).len() > 2);
+        assert_eq!(protection_options(ProtectionRow::LockoutCheck).len(), 2);
+        assert!(protection_options(ProtectionRow::Detect(Detector::ALL[0])).len() > 2);
     }
 
     #[test]
@@ -5775,23 +6339,15 @@ mod tests {
     }
 
     /// The provider feeds block real visitors; enabling one must say so.
-    /// The selection follows the eye across the columns: with the rows
-    /// dealt down one column and then the next, the highlight has to land
-    /// in the right column at the right row — and in exactly one place.
-    ///
-    /// Nothing else would notice getting this wrong. Each column is its
-    /// own `List` with its own state, so a selection off the end of the
-    /// first column simply highlights nothing, and every other test here
-    /// asserts on text rather than on style.
+    /// The highlight lands on the selected row, and in exactly one place:
+    /// every other test here asserts on text rather than on style.
     #[test]
-    fn the_highlight_lands_in_the_column_holding_the_selected_row() {
+    fn the_highlight_lands_on_the_selected_row() {
         let db = Db::open_in_memory().unwrap();
         crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
         dashboard.focus = Focus::Protection;
-        // Row 9 of 14: with seven to a column, the third row of the second
-        // column — a spot only reachable if the split is right.
         dashboard.protection_state.select(Some(9));
 
         let mut terminal = test_terminal();
@@ -6105,44 +6661,25 @@ mod tests {
         );
     }
 
-    /// Every automatic-blocking option is on screen at once. There are
-    /// sixteen of them and the panel is nine rows tall, which only works
-    /// because they are dealt into columns — so this is really a test that
-    /// the column layout is still doing its job. It used to show five of
-    /// the fourteen there were then, in half the width, and the other nine
-    /// were a scroll away with nothing saying they existed.
+    /// Every automatic-blocking option is on screen at once, in one
+    /// column under its heading, on a 100x36 terminal: a row more and this
+    /// is the test that says the panel no longer fits. Shorter than that,
+    /// it scrolls.
     #[test]
     fn every_automatic_blocking_option_is_visible_without_scrolling() {
         let db = Db::open_in_memory().unwrap();
         crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
-
-        let mut terminal = test_terminal();
-        terminal
-            .draw(|frame| {
-                dashboard.render(
-                    frame,
-                    frame.area(),
-                    Theme::Dark,
-                    &[],
-                    &std::collections::HashSet::new(),
-                )
-            })
-            .unwrap();
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let content = screen(&mut dashboard, 36).join("\n");
         let rows = dashboard.protection_rows();
-        assert_eq!(rows.len(), 25, "if this changes, so does the panel height");
+        assert_eq!(rows.len(), 26, "if this changes, so does the panel height");
         for row in rows {
             let label = dashboard.protection_label(row);
-            assert!(content.contains(&label), "{label:?} is not on screen");
+            assert!(
+                content.contains(&label),
+                "{label:?} is not on screen:\n{content}"
+            );
         }
     }
 

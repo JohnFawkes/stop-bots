@@ -148,6 +148,7 @@ async fn main() -> Result<()> {
             managed_dir_in_container: None,
             container_shares_host_network: None,
             firewall_covers_forward: Some(true),
+            firewall_covers_egress: None,
             nginx_commands: None,
             web_server: stop_bots::webserver::WebServer::Nginx,
             config_root: None,

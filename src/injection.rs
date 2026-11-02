@@ -177,6 +177,33 @@ const WEAK: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// The strong signatures, by name: what the web server's exploit rules
+/// are generated from (see [`crate::exploits`]). The weak ones are left
+/// to the detector, which can tell a search box from a payload.
+pub fn strong_signatures() -> &'static [(&'static str, &'static [&'static str])] {
+    STRONG
+}
+
+/// Which strong signature, if any, a request carries: what the web
+/// server's exploit rules turn away, judged the way they judge it. Every
+/// field the same way, with no allowance for search boxes or referers,
+/// because a strong signature is no person's typing; and a user agent
+/// that names a CVE.
+///
+/// `target` is the request's path and query; `request` lines as logged
+/// carry their method and protocol around it, which change nothing here.
+pub fn blocking_signature(
+    target: &str,
+    user_agent: &str,
+    referer: Option<&str>,
+) -> Option<&'static str> {
+    raw_signature(target)
+        .or_else(|| strong(&normalize(target)))
+        .or_else(|| names_a_cve(user_agent).then_some("exploit announced by cve"))
+        .or_else(|| strong(&normalize(user_agent)))
+        .or_else(|| referer.and_then(|r| strong(&normalize(r))))
+}
+
 /// Which signature, if any, a request carries.
 ///
 /// `request` is the request line as logged (`GET /a?b=1 HTTP/1.1`), whole:

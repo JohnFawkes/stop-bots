@@ -48,7 +48,7 @@ use super::{keys, Category, GeoMode, Policy};
 /// Always equal to `MIGRATIONS.len()`; a test holds the two together, so
 /// adding a migration without bumping this (or the reverse) fails the
 /// build's tests rather than a user's upgrade.
-pub const CURRENT_VERSION: u32 = 8;
+pub const CURRENT_VERSION: u32 = 10;
 
 /// The generation of defaults this binary creates a database with.
 ///
@@ -150,6 +150,14 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         summary: "hosting_asns and hosting_asn_ranges, hosting providers blocked by AS number",
         apply: v8_hosting_asns,
+    },
+    Migration {
+        summary: "egress_feeds, egress_entries, egress_hits and containments, for outbound traffic",
+        apply: v9_egress,
+    },
+    Migration {
+        summary: "site_waf and modsecurity_exclusions, each site's web application firewall",
+        apply: v10_site_waf,
     },
 ];
 
@@ -894,6 +902,103 @@ fn v8_hosting_asns(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
+/// Outbound traffic to command-and-control addresses (`crate::egress`):
+/// the feeds that name them and what each holds, the attempts the kernel
+/// logged, and what was contained because of them. All empty to begin
+/// with, and nothing in them acts until the operator switches it on.
+///
+/// - `egress_feeds`: a list of addresses (`kind` `ip`) or domains
+///   (`domain`), built in or added by URL. `contain` is whether a hit on
+///   one of its entries may contain what made it; `kept_off`, how many of
+///   its entries the last fetch left out because blocking them would cut
+///   the host off from something it needs.
+/// - `egress_entries`: what each feed holds, a CIDR or a domain a row.
+/// - `egress_hits`: one row per source, destination, port and user, with
+///   how often and over what time; `responded_at` is when the response to
+///   it was last decided, so a hit newer than that is unanswered. The
+///   unique index treats a missing port or user as one value, which a
+///   plain `UNIQUE` over nullable columns would not.
+/// - `containments`: one row per container, user or address cut off, open
+///   until `released_at`; at most one open row per target.
+fn v9_egress(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE egress_feeds (
+             id TEXT PRIMARY KEY,
+             name TEXT NOT NULL,
+             url TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             builtin INTEGER NOT NULL,
+             enabled INTEGER NOT NULL DEFAULT 0,
+             contain INTEGER NOT NULL DEFAULT 0,
+             last_fetched_at INTEGER,
+             entry_count INTEGER NOT NULL DEFAULT 0,
+             kept_off INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE egress_entries (
+             feed_id TEXT NOT NULL REFERENCES egress_feeds(id),
+             entry TEXT NOT NULL,
+             PRIMARY KEY (feed_id, entry)
+         );
+         CREATE TABLE egress_hits (
+             id INTEGER PRIMARY KEY,
+             path TEXT NOT NULL,
+             source TEXT NOT NULL,
+             destination TEXT NOT NULL,
+             port INTEGER,
+             protocol TEXT NOT NULL,
+             uid INTEGER,
+             count INTEGER NOT NULL,
+             first_seen INTEGER NOT NULL,
+             last_seen INTEGER NOT NULL,
+             evidence TEXT NOT NULL,
+             container_id TEXT,
+             container_name TEXT,
+             responded_at INTEGER
+         );
+         CREATE UNIQUE INDEX egress_hits_flow ON egress_hits
+             (path, source, destination, ifnull(port, -1), ifnull(uid, -1));
+         CREATE TABLE containments (
+             id INTEGER PRIMARY KEY,
+             kind TEXT NOT NULL,
+             target TEXT NOT NULL,
+             name TEXT,
+             addresses TEXT NOT NULL DEFAULT '',
+             action TEXT NOT NULL,
+             reason TEXT NOT NULL,
+             automatic INTEGER NOT NULL,
+             created_at INTEGER NOT NULL,
+             released_at INTEGER
+         );
+         CREATE UNIQUE INDEX containments_open ON containments (kind, target)
+             WHERE released_at IS NULL;",
+    )
+}
+
+/// Each site's own choice about the web application firewall: the exploit
+/// rules (`crate::exploits`) and ModSecurity (`crate::modsecurity`). A
+/// column left empty is no choice of its own, and the host's setting
+/// applies; a site with no row has made none at all.
+///
+/// `modsecurity_exclusions` are the operator's "this rule is wrong here":
+/// a CRS rule switched off for requests under one path of one site.
+fn v10_site_waf(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE site_waf (
+             site_id INTEGER PRIMARY KEY REFERENCES sites(id),
+             exploit_rules INTEGER,
+             modsecurity TEXT,
+             paranoia INTEGER
+         );
+         CREATE TABLE modsecurity_exclusions (
+             site_id INTEGER NOT NULL REFERENCES sites(id),
+             rule_id INTEGER NOT NULL,
+             path TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             PRIMARY KEY (site_id, rule_id, path)
+         );",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1593,6 +1698,36 @@ mod tests {
             db.offences_before("198.51.100.9", 0).unwrap(),
             0,
             "an offence appeared from nowhere"
+        );
+    }
+
+    /// A version 8 database, the last before outbound checks, gains their
+    /// tables empty, keeps its rules, and checks nothing outbound.
+    #[test]
+    fn a_version_8_database_gains_empty_outbound_tables_and_stays_off() {
+        let conn = Connection::open_in_memory().unwrap();
+        for step in &MIGRATIONS[..8] {
+            (step.apply)(&conn).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 8).unwrap();
+        conn.execute(
+            "INSERT INTO firewall_rules (address, action, enabled, created_at, source)
+             VALUES ('198.51.100.9', 'block', 1, 1, 'cli')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn, None).unwrap();
+        let db = Db { conn };
+
+        assert_eq!(version_of(&db), CURRENT_VERSION);
+        assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
+        assert!(db.list_egress_feeds().unwrap().is_empty());
+        assert!(db.list_egress_hits().unwrap().is_empty());
+        assert!(db.list_containments().unwrap().is_empty());
+        assert_eq!(
+            crate::egress::Mode::get(&db).unwrap(),
+            crate::egress::Mode::Off
         );
     }
 

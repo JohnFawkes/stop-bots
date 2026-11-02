@@ -327,6 +327,10 @@ pub enum KeyOutcome {
     /// offline. Enabling an already-fetched feed returns `Mutated`
     /// instead, since nothing needs downloading.
     FetchReputationSource(String),
+    /// The Dashboard switched on a C&C feed that has never been
+    /// downloaded. `App` runs the schedule's feed job, which downloads
+    /// every feed that is on, now.
+    UpdateEgressFeeds,
     /// The Dashboard chose hosting providers to block, these AS numbers
     /// among them with no ranges yet. `App` downloads the ASN table once
     /// for all of them and stores their ranges (`App::start_hosting_asn_fetch`).

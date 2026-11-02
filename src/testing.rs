@@ -100,6 +100,27 @@ pub(crate) fn trap() -> crate::portscan::Trap {
     )
 }
 
+/// Outbound checks in Block mode on a typical host: two listed servers,
+/// one listed network that holds one of them, an IPv6 one, a trusted
+/// address, the DNS sinkhole, and a contained container and user.
+pub(crate) fn egress() -> crate::egress::Egress {
+    crate::egress::Egress {
+        mode: crate::egress::Mode::Block,
+        destinations: [
+            "198.51.100.7",
+            "203.0.113.0/24",
+            "203.0.113.9",
+            "2001:db8:dead::/48",
+        ]
+        .map(String::from)
+        .to_vec(),
+        trusted: vec!["192.0.2.53".to_string()],
+        sinkhole: Some("192.0.2.1".to_string()),
+        contained_addresses: vec!["172.18.0.5".to_string()],
+        contained_uids: vec![1001],
+    }
+}
+
 /// A rule that exists but is switched off — renderers must skip it.
 pub(crate) fn disabled(address: &str) -> FirewallRule {
     FirewallRule {

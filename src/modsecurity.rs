@@ -603,8 +603,35 @@ fn is_scoring_rule(id: u32) -> bool {
     matches!(id, 949110 | 959100 | 980130 | 980140 | 949111 | 980170)
 }
 
+/// Whether `transaction` is one of the exposure check's own requests
+/// ([`crate::exposure::is_own_request`]). It asks every site for `/.env`
+/// and friends about once an hour, and CRS flags each one, so without
+/// this the top of the findings is the health check, on every host.
+fn is_own_request(transaction: &serde_json::Value, path: &str) -> bool {
+    let Some(ip) = transaction
+        .get("client_ip")
+        .and_then(|v| v.as_str())
+        .and_then(|ip| ip.parse().ok())
+    else {
+        return false;
+    };
+    // As the client sent it: reqwest's is lowercase, but nothing says so.
+    let user_agent = transaction
+        .pointer("/request/headers")
+        .and_then(|v| v.as_object())
+        .and_then(|headers| {
+            headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        })
+        .and_then(|(_, v)| v.as_str())
+        .unwrap_or("");
+    crate::exposure::is_own_request(&ip, user_agent, path)
+}
+
 /// Reads ModSecurity's JSON audit log, one transaction a line, into one
-/// finding per site, rule and path, the commonest first.
+/// finding per site, rule and path, the commonest first. The exposure
+/// check's own requests are left out ([`is_own_request`]).
 pub fn findings(audit_log: &str) -> Vec<Finding> {
     let mut found: Vec<Finding> = Vec::new();
     for line in audit_log.lines() {
@@ -627,6 +654,9 @@ pub fn findings(audit_log: &str) -> Vec<Finding> {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let path = uri.split('?').next().unwrap_or("").to_string();
+        if is_own_request(transaction, &path) {
+            continue;
+        }
         let time = transaction
             .get("time_stamp")
             .and_then(|v| v.as_str())
@@ -827,5 +857,48 @@ mod tests {
                 (None, 920350, "/", 1, 0),
             ]
         );
+    }
+
+    /// The exposure check asks every site for `/.env` over loopback; CRS
+    /// flags it each time, and that is not a finding. A scanner asking for
+    /// the same, or anything else from loopback, still is.
+    #[test]
+    fn the_exposure_checks_own_requests_are_not_findings() {
+        let firefox = crate::exposure::USER_AGENT;
+        let entry = |ip: &str, user_agent: &str, uri: &str| {
+            format!(
+                r#"{{"transaction":{{"client_ip":"{ip}","unique_id":"sb1-x","time_stamp":"Mon Oct 26 12:36:44 2026","request":{{"method":"GET","uri":"{uri}","headers":{{"user-agent":"{user_agent}"}}}},"messages":[{{"message":"Restricted File Access Attempt","details":{{"ruleId":"930130"}}}}]}}}}"#
+            )
+        };
+        let cases = [
+            (
+                "the check's own request",
+                entry("127.0.0.1", firefox, "/.env"),
+                false,
+            ),
+            (
+                "the check over IPv6",
+                entry("::1", firefox, "/.git/config"),
+                false,
+            ),
+            (
+                "a scanner asking the same",
+                entry("203.0.113.9", firefox, "/.env"),
+                true,
+            ),
+            (
+                "another agent on loopback",
+                entry("127.0.0.1", "curl/8.0", "/.env"),
+                true,
+            ),
+            (
+                "a path the check never asks",
+                entry("127.0.0.1", firefox, "/.env.bak"),
+                true,
+            ),
+        ];
+        for (what, log, reported) in cases {
+            assert_eq!(!findings(&log).is_empty(), reported, "{what}:\n{log}");
+        }
     }
 }

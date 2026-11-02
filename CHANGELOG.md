@@ -8,6 +8,10 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-11-02
+
+Outbound checks against C&C servers, and a web application firewall for NGINX.
+
 **Before upgrading:** nothing to do. The database gains six empty tables (schemas 9 and
 10), and everything this release adds is off.
 
@@ -2845,7 +2849,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/ivankovic/stop-bots/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ivankovic/stop-bots/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ivankovic/stop-bots/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ivankovic/stop-bots/compare/v0.5.0...v0.6.0

@@ -29,8 +29,8 @@ refuses a schema newer than its own. Move back the copy taken before the upgrade
   for cron to mail. Feeds update daily.
 - **Never cutting the host off.** Each feed is stored without private and reserved ranges,
   ranges broader than a /8, and any range holding this host's resolvers, apt mirrors,
-  Let's Encrypt or the feeds' own servers; what was left out is said. Trusted addresses
-  are never stopped.
+  Let's Encrypt or the feeds' own servers; what was left out is said. Trusted addresses,
+  and any that logged in over SSH in the last week, are never stopped.
 - **Containment.** `contain` and `release` by hand, and with `set-containment --auto true`
   on a hit: a container is cut off both ways and paused (or stopped, or only cut off); a
   user has every connection it starts cut off (and with `--user-action kill`, its

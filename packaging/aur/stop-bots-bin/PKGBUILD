@@ -1,7 +1,7 @@
 # Maintainer: Marko Ivankovic <marko@ivankovic.me>
 pkgname=stop-bots-bin
 _pkgname=stop-bots
-pkgver=0.7.0
+pkgver=0.9.0
 pkgrel=1
 pkgdesc="A TUI and CLI that help you configure NGINX, Apache or Traefik and your firewall to stop bad bots and still allow good bots (prebuilt binary)"
 # Both architectures the release workflow builds a static musl binary for.
@@ -26,8 +26,8 @@ source_x86_64=("$_pkgname-$pkgver-x86_64.tar.gz::$_release-x86_64-unknown-linux-
 source_aarch64=("$_pkgname-$pkgver-aarch64.tar.gz::$_release-aarch64-unknown-linux-musl.tar.gz")
 # Written by packaging/bump.py from the .sha256 file the release workflow
 # publishes next to each tarball, rather than from a fresh download.
-sha256sums_x86_64=('82a02f64d1639da5def0be72e47b38d3101abb6ccdd2dd3c0e0e9b5f9b49a0c8')
-sha256sums_aarch64=('123fdf115efb04dd600bc16fe7633e149ca556617cb619bec83eaf6beb0d9c9d')
+sha256sums_x86_64=('25c835cda5efe10a8a8e678342d8be56e19f3f9c518f638d0c4e8d1088eececf')
+sha256sums_aarch64=('c0c0b6d707022aab1f13d93d7e38a5428d0459222785c99249e766a7fc991d3b')
 
 package() {
   cd "$_pkgname-$pkgver-$CARCH-unknown-linux-musl"

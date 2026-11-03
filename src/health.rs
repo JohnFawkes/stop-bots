@@ -506,7 +506,10 @@ fn exposed_files_survey(
     block_status: u16,
 ) -> Option<crate::exposure::Survey> {
     let sites = server.site_listens(root).ok()?;
-    let targets = crate::exposure::targets(&sites);
+    // The address the detectors know as the check's own, read the same
+    // way they read it: a check asking from an address they did not know
+    // would get this host blocked by itself.
+    let targets = crate::exposure::targets(&sites, crate::exposure::own_address());
     if targets.is_empty() {
         return None;
     }

@@ -1157,6 +1157,7 @@ fn add_block_rules_now(
     let ssh_logins: Vec<std::net::IpAddr> =
         ssh_logins.iter().filter_map(|ip| ip.parse().ok()).collect();
     let trusted = db.list_trusted_addresses()?;
+    let own_address = crate::exposure::own_address();
     // Addresses an operator unblocked by hand. Matched exactly, since a
     // detector writes the same address for the same client every time,
     // and by overlap for a range, which is what an escalated /24 becomes.
@@ -1228,9 +1229,14 @@ fn add_block_rules_now(
         // Overlap, not containment one way: a trusted /28 inside the /24
         // an escalation just produced matters as much as a trusted /24
         // around a single scanner.
+        // The address the exposure check asks this host's sites from, when
+        // one is set, is as good as trusted: the check asks for `/.env`
+        // from it on purpose (see `crate::exposure`), and blocking it would
+        // be this host blocking itself.
         if trusted
             .iter()
             .any(|range| crate::ipranges::cidrs_overlap(range, &ip))
+            || own_address.is_some_and(|own| crate::ipranges::cidr_contains(&ip, own))
         {
             skipped_trusted += 1;
             continue;

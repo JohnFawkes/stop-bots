@@ -377,6 +377,9 @@ async fn run() -> Result<()> {
             ssh_log,
             kernel_log,
         }) => run_set_log_paths(db, access_log, ssh_log, kernel_log),
+        Some(Command::SetExposureCheck { address, reset }) => {
+            run_set_exposure_check(db, address, reset)
+        }
         Some(Command::SetNginxCommands {
             test,
             reload,
@@ -2653,6 +2656,38 @@ fn run_set_log_paths(
     match &paths.kernel {
         Some(path) => say!("  kernel log: {}", path.display()),
         None => say!("  kernel log: auto-detected (kern.log, messages, then journalctl)"),
+    }
+    Ok(())
+}
+
+fn run_set_exposure_check(
+    db_path: Option<PathBuf>,
+    address: Option<std::net::IpAddr>,
+    reset: bool,
+) -> Result<()> {
+    // Opened for the migration only, as in `set-log-paths`: this is a host
+    // setting, in `hostconf::path()`, which only root writes.
+    let _db = open_db(db_path)?;
+    let path = stop_bots::hostconf::path();
+    let mut host = stop_bots::hostconf::HostConf::load_from(&path)?;
+    if let Some(address) = address {
+        if address.is_unspecified() {
+            anyhow::bail!(
+                "{address} is every address, not one to ask at: give this host's own public \
+                 address"
+            );
+        }
+        host.exposure_check_address = Some(address);
+        host.save_to(&path)?;
+    } else if reset {
+        host.exposure_check_address = None;
+        host.save_to(&path)?;
+    } else {
+        say!("Nothing to change. Current setting:");
+    }
+    match host.exposure_check_address {
+        Some(address) => say!("  exposure check asks at: {address}"),
+        None => say!("  exposure check asks at: loopback (default — nothing stored)"),
     }
     Ok(())
 }

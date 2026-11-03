@@ -93,6 +93,7 @@ const ACCESS_LOG: &str = "access_log";
 const SSH_LOG: &str = "ssh_log";
 const KERNEL_LOG: &str = "kernel_log";
 const CONTAINER_RUNTIME: &str = "container_runtime";
+const EXPOSURE_CHECK_ADDRESS: &str = "exposure_check_address";
 
 /// The host settings. `None` for any of them means "not set": the
 /// built-in default, as it was when nothing was stored in the database.
@@ -138,6 +139,10 @@ pub struct HostConf {
     /// asks which container has an address and pauses. `None` is `docker`,
     /// else `podman`, whichever is installed (see `contain::Runtime`).
     pub container_runtime: Option<PathBuf>,
+    /// The address the exposure check asks this host's sites at, in place
+    /// of loopback: for a host whose sites answer only on its own public
+    /// address. `None` is loopback. See [`crate::exposure`].
+    pub exposure_check_address: Option<std::net::IpAddr>,
 }
 
 impl HostConf {
@@ -203,6 +208,16 @@ impl HostConf {
                 SSH_LOG => conf.ssh_log = value.map(PathBuf::from),
                 KERNEL_LOG => conf.kernel_log = value.map(PathBuf::from),
                 CONTAINER_RUNTIME => conf.container_runtime = value.map(PathBuf::from),
+                EXPOSURE_CHECK_ADDRESS => {
+                    conf.exposure_check_address = match value.as_deref() {
+                        None => None,
+                        Some(text) => Some(text.parse().with_context(|| {
+                            format!(
+                                "line {number} sets `{key}` to `{text}`, which is not an address"
+                            )
+                        })?),
+                    }
+                }
                 other => bail!("line {number} sets `{other}`, which is not a host setting"),
             }
             seen.push(key);
@@ -285,6 +300,11 @@ impl HostConf {
             (SSH_LOG, path_text(&self.ssh_log)),
             (KERNEL_LOG, path_text(&self.kernel_log)),
             (CONTAINER_RUNTIME, path_text(&self.container_runtime)),
+            (
+                EXPOSURE_CHECK_ADDRESS,
+                self.exposure_check_address
+                    .map(|address| address.to_string()),
+            ),
         ];
         for (key, value) in lines {
             if let Some(value) = value {
@@ -688,6 +708,15 @@ mod tests {
     }
 
     #[test]
+    fn an_exposure_check_address_that_is_not_one_is_refused() {
+        let err = HostConf::parse("exposure_check_address = my.server.example\n").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("line 1 sets `exposure_check_address`"),
+            "error was: {err:#}"
+        );
+    }
+
+    #[test]
     fn an_unknown_web_server_is_refused() {
         let err = HostConf::parse("web_server = caddy\n").unwrap_err();
         assert!(
@@ -750,6 +779,7 @@ mod tests {
             ssh_log: None,
             kernel_log: Some("/srv/logs/kern.log".into()),
             container_runtime: Some("/usr/bin/podman".into()),
+            exposure_check_address: Some("2001:db8::50".parse().unwrap()),
         };
         conf.save_to(&path).unwrap();
         assert_eq!(HostConf::load_from(&path).unwrap(), conf);

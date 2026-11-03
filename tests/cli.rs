@@ -5051,6 +5051,64 @@ fn npmplus_applied_under_prefix() -> (tempfile::TempDir, std::path::PathBuf) {
     (tmp, root)
 }
 
+// ---- the exposure check's address ----
+
+#[test]
+fn set_exposure_check_stores_an_address_and_resets_to_loopback() {
+    let fx = Fixture::new();
+
+    fx.run(&["set-exposure-check", "--address", "203.0.113.50"])
+        .stdout(predicate::str::contains("asks at: 203.0.113.50"));
+
+    let host = fs::read_to_string(fx.host_conf()).unwrap();
+    assert!(
+        host.contains("exposure_check_address = 203.0.113.50"),
+        "host.conf:\n{host}"
+    );
+    fx.run(&["set-exposure-check"])
+        .stdout(predicate::str::contains("asks at: 203.0.113.50"));
+    fx.run(&["set-exposure-check", "--reset"])
+        .stdout(predicate::str::contains("asks at: loopback"));
+}
+
+#[test]
+fn set_exposure_check_refuses_every_address() {
+    let fx = Fixture::new();
+    fx.cmd(&["set-exposure-check", "--address", "0.0.0.0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is every address"));
+}
+
+/// The check asks for `/.env` from the address set for it, on purpose, so
+/// no detector blocks that address: not even for a request the check did
+/// not make, which the access log's readers do count. The same request
+/// from any other address is blocked as before.
+#[test]
+fn no_detector_blocks_the_exposure_checks_own_address() {
+    let fx = Fixture::new();
+    fs::write(fx.host_conf(), "exposure_check_address = 203.0.113.50\n").unwrap();
+    let log = fx._tmp.path().join("access.log");
+    let probe = |ip: &str| access_line(ip, "/.env", 404, "curl/8");
+    fs::write(&log, probe("203.0.113.50") + &probe("203.0.113.9")).unwrap();
+
+    fx.run(&[
+        "run-detector",
+        "probe-paths",
+        "--access-log",
+        log.to_str().unwrap(),
+    ]);
+
+    let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    let blocked: Vec<String> = db
+        .list_firewall_rules()
+        .unwrap()
+        .into_iter()
+        .map(|rule| rule.address)
+        .collect();
+    assert_eq!(blocked, ["203.0.113.9"]);
+}
+
 // ---- auto-apply ----
 
 /// The switch itself: off by default, settable, and readable back.

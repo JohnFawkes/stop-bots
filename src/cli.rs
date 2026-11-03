@@ -1124,6 +1124,30 @@ pub(crate) enum Command {
         #[arg(long)]
         kernel_log: Option<String>,
     },
+    /// Choose the address the exposure check asks this host's sites at.
+    ///
+    /// `status` asks each site for files it should never serve (`/.env`,
+    /// `/.git/config`, a database dump) the way a scanner would, over
+    /// loopback (127.0.0.1). A host whose sites answer only on its own
+    /// public address, such as a proxy in a container with its ports
+    /// published there, answers nothing at loopback, and every site reads
+    /// as not answering. Give that address here and the check asks there
+    /// instead; a site listening on loopback alone is still asked there.
+    ///
+    /// The check then also asks from that address, so no detector ever
+    /// blocks it, as none blocks a trusted address, and its own requests
+    /// are left out of what the access log counts. Settings are read when
+    /// a process starts, so a running TUI sees a change once restarted.
+    ///
+    /// Give no flag to print what is stored.
+    SetExposureCheck {
+        /// The address to ask at: this host's own public address.
+        #[arg(long, conflicts_with = "reset")]
+        address: Option<std::net::IpAddr>,
+        /// Ask over loopback again.
+        #[arg(long)]
+        reset: bool,
+    },
     /// Set the commands used to test and reload NGINX, and its config root.
     ///
     /// NGINX only. `set-web-server` takes the same flags for either

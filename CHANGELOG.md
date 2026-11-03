@@ -8,6 +8,23 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+**Going back to 0.9.0.** A host that never set the exposure check's address can. One that
+did cannot by installing the older release: 0.9.0 refuses a `/etc/stop-bots/host.conf`
+with an `exposure_check_address` line. Run `sudo stop-bots set-exposure-check --reset`
+with this release first, which takes the line out.
+
+### Added
+
+- **The exposure check can ask at this host's own address.** `status` asks each site for
+  files it should never serve over loopback, and a host whose sites answer only on its
+  public address (a proxy in a container with its ports published there) answered nothing
+  there, so every site read as not answering. `sudo stop-bots set-exposure-check --address
+  <ip>` makes it ask there instead, and `--reset` goes back to loopback. A site listening
+  on loopback alone is still asked at loopback.
+  - The check then asks from that address, which is public, so no detector ever blocks it,
+    as none blocks a trusted address, and its own requests are left out of what the
+    access log counts, as its requests from loopback are.
+
 ## [0.9.0] — 2026-11-02
 
 Outbound checks against C&C servers, and a web application firewall for NGINX.

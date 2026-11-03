@@ -47,6 +47,22 @@
 //! blocks ([`crate::ipranges::is_local_or_private`]), so asking for
 //! `/.env` here does not get this host blocked by itself.
 //!
+//! ## Or this host's own address
+//!
+//! Some hosts serve their sites only at their own public address: a
+//! proxy in a container whose ports are published there, or a server that
+//! listens on that address alone. Loopback reaches nothing there, and the
+//! check would report every site as not answering. So the address can be
+//! set (`set-exposure-check --address`, [`own_address`]): the sites are
+//! then asked there, and the requests come from there.
+//!
+//! That address is public, so the two things loopback gave for free are
+//! given by name instead. Its requests are still the check's own
+//! ([`is_own_request`]), left out of what the access log's readers count,
+//! and no detector ever blocks it (`scanblock`), as none blocks a trusted
+//! address: otherwise asking for `/.env` would get this host blocked by
+//! itself.
+//!
 //! ## Bounded
 //!
 //! This runs in every health probe, from cron and the TUI as well as
@@ -126,15 +142,34 @@ const fn lesser(path: &'static str, looks_like: fn(&[u8]) -> bool) -> Sensitive 
 /// What the path that cannot exist starts with.
 const ABSENT_PREFIX: &str = "/stop-bots-exposure-check-";
 
-/// Whether a logged request is one of this check's own: from loopback,
-/// as [`USER_AGENT`], for one of [`PATHS`] or the path that cannot exist.
+/// The address the check asks from, when it is set in the host settings
+/// rather than loopback (see the module docs). Read once per process, as
+/// [`crate::webserver::WebServer::configured`] reads its setting: a host
+/// setting changes by a command, which a running process does not see.
+pub fn own_address() -> Option<IpAddr> {
+    static OWN: std::sync::OnceLock<Option<IpAddr>> = std::sync::OnceLock::new();
+    *OWN.get_or_init(|| {
+        crate::hostconf::HostConf::load()
+            .ok()
+            .and_then(|host| host.exposure_check_address)
+    })
+}
+
+/// Whether a logged request is one of this check's own: from loopback or
+/// the address set for it ([`own_address`]), as [`USER_AGENT`], for one of
+/// [`PATHS`] or the path that cannot exist.
 ///
 /// The access log's readers leave these out. Every probe adds twenty
 /// lines per site from `127.0.0.1`, and on a quiet host that is enough to
 /// make the log read as mostly a proxy's, and to count a Firefox nobody
 /// runs among the clients this host serves.
 pub fn is_own_request(ip: &IpAddr, user_agent: &str, path: &str) -> bool {
-    ip.is_loopback()
+    is_own_request_from(ip, user_agent, path, own_address())
+}
+
+/// [`is_own_request`], with the address the check asks from given.
+fn is_own_request_from(ip: &IpAddr, user_agent: &str, path: &str, own: Option<IpAddr>) -> bool {
+    (ip.is_loopback() || Some(*ip) == own)
         && user_agent == USER_AGENT
         && (path.starts_with(ABSENT_PREFIX) || PATHS.iter().any(|p| p.path == path))
 }
@@ -152,7 +187,8 @@ pub fn is_secret(path: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub site: String,
-    /// Always a loopback address. See [`targets`].
+    /// A loopback address, or the address set for the check. See
+    /// [`targets`].
     pub ip: IpAddr,
     pub port: u16,
     pub tls: bool,
@@ -172,19 +208,23 @@ impl Target {
 }
 
 /// What to ask: every site by name, at every port it listens on, over
-/// loopback.
+/// loopback, or at `own` when an address is set for the check.
 ///
 /// A site's port-80 and port-443 blocks are both asked, since either can
 /// serve the file. Left out:
 ///
 /// - names that are not a host name a request can carry: `_`, a regex
 ///   (`~^…`), a wildcard, a variable, an address;
-/// - a listen on a specific address that is not loopback. The request
-///   would come from that address, which is public, and the probe-paths
-///   detector would block this host for asking.
+/// - a listen on a specific address that is neither loopback nor `own`.
+///   The request would come from that address, which is public, and the
+///   probe-paths detector would block this host for asking: `own` is the
+///   one public address that is safe to ask from (see the module docs).
 ///
-/// `[::]` is asked at `::1`, unless the same port is also on IPv4.
-pub fn targets(sites: &[SiteListens]) -> Vec<Target> {
+/// With `own` set, a listen on every address of its family is asked at
+/// `own`, and so is a listen on `own` itself; a listen on loopback alone is
+/// still asked there, where it answers. `[::]` is otherwise asked at `::1`,
+/// unless the same port is also on IPv4.
+pub fn targets(sites: &[SiteListens], own: Option<IpAddr>) -> Vec<Target> {
     let mut out: Vec<Target> = Vec::new();
     for site in sites {
         let name = site.server_name.trim_end_matches('.').to_ascii_lowercase();
@@ -202,7 +242,7 @@ pub fn targets(sites: &[SiteListens]) -> Vec<Target> {
             &site.listens[..]
         };
         for listen in listens {
-            let Some(ip) = loopback_for(listen.address) else {
+            let Some(ip) = address_for(listen.address, own) else {
                 continue;
             };
             let target = Target {
@@ -222,6 +262,23 @@ pub fn targets(sites: &[SiteListens]) -> Vec<Target> {
         }
     }
     out
+}
+
+/// The address to ask a listen on `address` at: `own` when it reaches the
+/// listen (`own` itself, or every address of its family), else the
+/// loopback address that does, if one does.
+fn address_for(address: Option<IpAddr>, own: Option<IpAddr>) -> Option<IpAddr> {
+    if let Some(own) = own {
+        let reaches = match address {
+            None => own.is_ipv4(),
+            Some(listen) if listen.is_unspecified() => listen.is_ipv4() == own.is_ipv4(),
+            Some(listen) => listen == own,
+        };
+        if reaches {
+            return Some(own);
+        }
+    }
+    loopback_for(address)
 }
 
 /// The loopback address that reaches a listen on `address`, if one does.
@@ -969,7 +1026,7 @@ mod tests {
             ),
         ];
         for (what, site, expected) in cases {
-            let got: Vec<(String, u16)> = targets(&[site])
+            let got: Vec<(String, u16)> = targets(&[site], None)
                 .into_iter()
                 .map(|t| (t.ip.to_string(), t.port))
                 .collect();
@@ -978,6 +1035,86 @@ mod tests {
                 .into_iter()
                 .collect();
             assert_eq!(got, expected, "{what}");
+        }
+    }
+
+    /// With an address set for the check, every listen it reaches is
+    /// asked there; loopback-only listens still at loopback, and other
+    /// public addresses still not at all.
+    #[test]
+    fn with_an_address_set_each_listen_it_reaches_is_asked_there() {
+        let own: IpAddr = "203.0.113.50".parse().unwrap();
+        let cases = [
+            (
+                "every IPv4 address is asked at it",
+                listens("a.example", &[(None, 443, true)]),
+                Some(("203.0.113.50", 443)),
+            ),
+            (
+                "so is 0.0.0.0",
+                listens("a.example", &[(Some("0.0.0.0"), 80, false)]),
+                Some(("203.0.113.50", 80)),
+            ),
+            (
+                "a listen on it alone is asked there",
+                listens("a.example", &[(Some("203.0.113.50"), 8080, false)]),
+                Some(("203.0.113.50", 8080)),
+            ),
+            (
+                "a listen on loopback alone is still asked at loopback",
+                listens("a.example", &[(Some("127.0.0.1"), 8081, false)]),
+                Some(("127.0.0.1", 8081)),
+            ),
+            (
+                "another public address is still not asked",
+                listens("a.example", &[(Some("203.0.113.5"), 80, false)]),
+                None,
+            ),
+            (
+                "IPv6 everywhere is still ::1 for an IPv4 address",
+                listens("a.example", &[(Some("::"), 8443, true)]),
+                Some(("::1", 8443)),
+            ),
+        ];
+        for (what, site, expected) in cases {
+            let got: Vec<(String, u16)> = targets(&[site], Some(own))
+                .into_iter()
+                .map(|t| (t.ip.to_string(), t.port))
+                .collect();
+            let expected: Vec<(String, u16)> = expected
+                .map(|(ip, port)| (ip.to_string(), port))
+                .into_iter()
+                .collect();
+            assert_eq!(got, expected, "{what}");
+        }
+    }
+
+    /// The check's requests from the address set for it are its own, as
+    /// its requests from loopback are; another public address's are not,
+    /// nor is anyone else's request from the set address.
+    #[test]
+    fn a_request_from_the_set_address_is_the_checks_own() {
+        let own: IpAddr = "203.0.113.50".parse().unwrap();
+        let cases = [
+            ("loopback", "127.0.0.1", USER_AGENT, "/.env", true),
+            ("the set address", "203.0.113.50", USER_AGENT, "/.env", true),
+            (
+                "another address",
+                "203.0.113.51",
+                USER_AGENT,
+                "/.env",
+                false,
+            ),
+            ("another agent", "203.0.113.50", "curl/8", "/.env", false),
+            ("another path", "203.0.113.50", USER_AGENT, "/admin", false),
+        ];
+        for (what, ip, agent, path, expected) in cases {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!(
+                is_own_request_from(&ip, agent, path, Some(own)),
+                expected,
+                "{what}"
+            );
         }
     }
 
